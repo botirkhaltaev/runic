@@ -1,0 +1,21 @@
+# Rust build output
+/target/
+
+# Local external allocator references. Keep read-only and out of commits.
+/allocator-refs/
+
+# Editor and OS files
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Local logs and scratch output
+*.log
+/tmp/

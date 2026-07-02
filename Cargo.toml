@@ -1,0 +1,17 @@
+[workspace]
+members = [
+    "crates/ferralloc",
+    "crates/ferralloc-core",
+    "crates/ferralloc-test-support",
+    "crates/ferralloc-bench",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/botirk/ferralloc"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
