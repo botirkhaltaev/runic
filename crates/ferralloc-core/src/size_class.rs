@@ -31,11 +31,7 @@ impl SizeClasses {
     pub(crate) const COUNT: usize = 27;
     pub(crate) const SMALL_MAX: usize = 32 * 1024;
 
-    pub(crate) const fn new() -> Self {
-        Self
-    }
-
-    pub(crate) fn get(&self, spec: LayoutSpec) -> Option<SizeClass> {
+    pub(crate) fn get(spec: LayoutSpec) -> Option<SizeClass> {
         let required = spec.minimum_block_size();
 
         if required > Self::SMALL_MAX {
@@ -69,18 +65,16 @@ mod tests {
     #[test]
     fn size_classes_map_one_byte_to_eight() {
         let spec = LayoutSpec::from_size_align(1, 1).unwrap();
-        let class = SizeClasses::new().get(spec).unwrap();
+        let class = SizeClasses::get(spec).unwrap();
 
         assert_eq!(class.block_size(), 8);
     }
 
     #[test]
     fn size_classes_map_exact_boundaries_to_themselves() {
-        let classes = SizeClasses::new();
-
         for &size in &SIZES {
             let spec = LayoutSpec::from_size_align(size, 1).unwrap();
-            let class = classes.get(spec).unwrap();
+            let class = SizeClasses::get(spec).unwrap();
 
             assert_eq!(class.block_size(), size);
         }
@@ -90,26 +84,24 @@ mod tests {
     fn size_classes_reject_larger_than_small_max() {
         let spec = LayoutSpec::from_size_align(SizeClasses::SMALL_MAX + 1, 1).unwrap();
 
-        assert!(SizeClasses::new().get(spec).is_none());
+        assert!(SizeClasses::get(spec).is_none());
     }
 
     #[test]
     fn size_classes_choose_naturally_aligned_block() {
         let spec = LayoutSpec::from_size_align(17, 16).unwrap();
-        let class = SizeClasses::new().get(spec).unwrap();
+        let class = SizeClasses::get(spec).unwrap();
 
         assert_eq!(class.block_size(), 32);
     }
 
     #[test]
     fn size_classes_return_only_classes_that_satisfy_layout() {
-        let classes = SizeClasses::new();
-
         for size in 1..=SizeClasses::SMALL_MAX {
             for align in [1, 2, 4, 8, 16, 32, 64, 128, 4096] {
                 let layout = Layout::from_size_align(size, align).unwrap();
                 let spec = LayoutSpec::from_layout(layout);
-                let Some(class) = classes.get(spec) else {
+                let Some(class) = SizeClasses::get(spec) else {
                     continue;
                 };
 

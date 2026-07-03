@@ -77,15 +77,11 @@ impl MappingParts {
 pub(crate) struct OsMemory;
 
 impl OsMemory {
-    pub(crate) const fn new() -> Self {
-        Self
-    }
-
-    pub(crate) fn page_size(&self) -> usize {
+    pub(crate) const fn page_size() -> usize {
         PAGE_SIZE
     }
 
-    pub(crate) fn map(&self, len: usize) -> Option<Mapping> {
+    pub(crate) fn map(len: usize) -> Option<Mapping> {
         let rounded_len = Self::round_to_page(len)?;
         // SAFETY: mmap is called with a null hint, anonymous private mapping, and a page-rounded length.
         let ptr = unsafe {
@@ -133,8 +129,7 @@ mod tests {
 
     #[test]
     fn os_memory_map_returns_page_aligned_mapping() {
-        let memory = OsMemory::new();
-        let mapping = memory.map(1).unwrap();
+        let mapping = OsMemory::map(1).unwrap();
 
         assert_eq!(mapping.base().as_ptr() as usize % PAGE_SIZE, 0);
         assert_eq!(mapping.len(), PAGE_SIZE);
@@ -144,8 +139,7 @@ mod tests {
 
     #[test]
     fn os_memory_mapping_is_writable() {
-        let memory = OsMemory::new();
-        let mapping = memory.map(PAGE_SIZE).unwrap();
+        let mapping = OsMemory::map(PAGE_SIZE).unwrap();
 
         unsafe {
             mapping.base().as_ptr().write(0xab);

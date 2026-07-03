@@ -31,7 +31,9 @@ impl Allocator {
     /// incompatible layout violates the allocator contract and may abort.
     pub unsafe fn dealloc(ptr: *mut u8, layout: Layout) {
         let mut heap = HEAP.lock();
-        heap.dealloc(ptr, layout);
+        if heap.dealloc(ptr, layout).is_err() {
+            Self::abort();
+        }
     }
 
     /// Changes the size of an allocation using allocate-copy-free semantics.
@@ -44,6 +46,7 @@ impl Allocator {
     pub unsafe fn realloc(ptr: *mut u8, old: Layout, new_size: usize) -> *mut u8 {
         let mut heap = HEAP.lock();
         heap.realloc(ptr, old, new_size)
+            .unwrap_or_else(|_| Self::abort())
     }
 
     /// Allocates zero-initialized memory for `layout`.
@@ -56,5 +59,12 @@ impl Allocator {
     pub unsafe fn alloc_zeroed(layout: Layout) -> *mut u8 {
         let mut heap = HEAP.lock();
         heap.alloc_zeroed(layout)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn abort() -> ! {
+        // SAFETY: abort terminates the process and does not unwind across allocator boundaries.
+        unsafe { libc::abort() }
     }
 }

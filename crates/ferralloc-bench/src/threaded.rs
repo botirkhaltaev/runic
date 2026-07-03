@@ -11,6 +11,12 @@ struct SendPtr(*mut u8);
 
 unsafe impl Send for SendPtr {}
 
+/// Runs per-thread local allocation churn.
+///
+/// # Panics
+///
+/// Panics if a worker thread panics.
+#[must_use]
 pub fn thread_local_churn(target: AllocatorTarget, threads: usize, ops_per_thread: usize) -> usize {
     thread::scope(|scope| {
         let barrier = Arc::new(Barrier::new(threads));
@@ -31,6 +37,12 @@ pub fn thread_local_churn(target: AllocatorTarget, threads: usize, ops_per_threa
     })
 }
 
+/// Sends allocations around a thread ring and frees them on another thread.
+///
+/// # Panics
+///
+/// Panics if layout construction, allocation, channel operations, or thread joins fail.
+#[must_use]
 pub fn cross_thread_free_ring(
     target: AllocatorTarget,
     threads: usize,
@@ -60,7 +72,7 @@ pub fn cross_thread_free_ring(
                 let mut checksum = 0_usize;
                 for i in 0..ops_per_thread {
                     let ptr = target.alloc(black_box(layout));
-                    unsafe { ptr.as_ptr().write(i as u8) };
+                    unsafe { ptr.as_ptr().write(byte(i)) };
                     tx.send(SendPtr(ptr.as_ptr())).unwrap();
                     let received = rx.recv().unwrap();
                     checksum ^= received.0 as usize;
@@ -78,6 +90,12 @@ pub fn cross_thread_free_ring(
     })
 }
 
+/// Runs randomized small-allocation traces on multiple threads.
+///
+/// # Panics
+///
+/// Panics if a worker thread panics.
+#[must_use]
 pub fn mixed_thread_random(
     target: AllocatorTarget,
     threads: usize,
@@ -102,4 +120,8 @@ pub fn mixed_thread_random(
             .map(|handle| handle.join().unwrap())
             .sum()
     })
+}
+
+fn byte(value: usize) -> u8 {
+    value.to_le_bytes()[0]
 }

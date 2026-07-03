@@ -41,7 +41,7 @@ impl ExtentTable {
         }
     }
 
-    pub(crate) fn reserve(&mut self, memory: &OsMemory) -> Option<ExtentReservation> {
+    pub(crate) fn reserve(&mut self) -> Option<ExtentReservation> {
         let start = usize::try_from(self.next).ok()?;
 
         for offset in 0..Self::MAX_EXTENTS {
@@ -52,7 +52,7 @@ impl ExtentTable {
                 sum
             };
 
-            let slot = self.slots_mut(memory)?.get_mut(index)?;
+            let slot = self.slots_mut()?.get_mut(index)?;
 
             if slot.reserve() {
                 let next = if index + 1 == Self::MAX_EXTENTS {
@@ -110,9 +110,9 @@ impl ExtentTable {
         self.slots.as_ref()
     }
 
-    fn slots_mut(&mut self, memory: &OsMemory) -> Option<&mut ExtentSlots> {
+    fn slots_mut(&mut self) -> Option<&mut ExtentSlots> {
         if self.slots.is_none() {
-            self.slots = Some(ExtentSlots::new(memory, Self::MAX_EXTENTS)?);
+            self.slots = Some(ExtentSlots::new(Self::MAX_EXTENTS)?);
         }
 
         self.slots.as_mut()
@@ -141,9 +141,9 @@ struct ExtentSlots {
 unsafe impl Send for ExtentSlots {}
 
 impl ExtentSlots {
-    fn new(memory: &OsMemory, len: usize) -> Option<Self> {
+    fn new(len: usize) -> Option<Self> {
         let byte_len = len.checked_mul(core::mem::size_of::<ExtentSlot>())?;
-        let mapping = memory.map(byte_len)?;
+        let mapping = OsMemory::map(byte_len)?;
         let slots = mapping.base().cast::<ExtentSlot>();
 
         Some(Self { mapping, slots })

@@ -18,6 +18,7 @@ pub struct RssReport {
 }
 
 impl RssReport {
+    #[must_use]
     pub fn measure(
         allocator: &'static str,
         workload: &'static str,
@@ -55,13 +56,14 @@ impl RssReport {
             self.elapsed.as_nanos(),
             self.before.current_bytes,
             self.after.current_bytes,
-            self.after.current_bytes as isize - self.before.current_bytes as isize,
+            self.after.current_bytes.cast_signed() - self.before.current_bytes.cast_signed(),
             self.after.peak_bytes.max(self.before.peak_bytes),
         );
     }
 }
 
 impl RssSample {
+    #[must_use]
     pub fn read() -> Self {
         let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
         let current_bytes = status_value_kb(&status, "VmRSS:").unwrap_or(0) * 1024;

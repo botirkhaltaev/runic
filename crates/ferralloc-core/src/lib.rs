@@ -10,17 +10,17 @@
     )
 )]
 
-mod address;
-mod allocator;
-mod extent;
-mod extent_table;
-mod free_list;
-mod heap;
-mod layout;
-mod os_memory;
-mod page_map;
-mod run;
-mod run_table;
-mod size_class;
+pub(crate) mod address;
+pub(crate) mod allocator;
+pub(crate) mod extent;
+pub(crate) mod extent_table;
+pub(crate) mod free_list;
+pub(crate) mod heap;
+pub(crate) mod layout;
+pub(crate) mod os_memory;
+pub(crate) mod page_map;
+pub(crate) mod run;
+pub(crate) mod run_table;
+pub(crate) mod size_class;
 
 pub use allocator::Allocator;

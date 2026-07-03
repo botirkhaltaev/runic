@@ -121,14 +121,14 @@ impl L1Table {
             .and_then(|entry| entry.table())
     }
 
-    fn get_or_create(&mut self, index: L1Index, memory: &OsMemory) -> Option<NonNull<L2Table>> {
+    fn get_or_create(&mut self, index: L1Index) -> Option<NonNull<L2Table>> {
         let entry = self.entries.get_mut(index.get())?;
 
         if let Some(table) = entry.table() {
             return Some(table);
         }
 
-        let mapping = memory.map(size_of::<L2Table>())?;
+        let mapping = OsMemory::map(size_of::<L2Table>())?;
         let table = mapping.base().cast::<L2Table>();
         entry.set(table, mapping);
 
@@ -270,12 +270,11 @@ impl PageMap {
         &mut self,
         range: PageRange,
         entry: PageEntry,
-        memory: &OsMemory,
     ) -> Result<(), PageMapError> {
         let occupied = MapEntry::occupied(entry).ok_or(PageMapError::InvalidRange)?;
 
         self.validate_insert(range)?;
-        self.prepare_insert(range, memory)?;
+        self.prepare_insert(range)?;
 
         for page in range.pages() {
             if let Err(error) = self.commit_page(page, occupied) {
@@ -317,11 +316,10 @@ impl PageMap {
         Some(unsafe { l1.as_mut() })
     }
 
-    fn l1_or_init(&mut self, memory: &OsMemory) -> Result<&mut L1Table, PageMapError> {
+    fn l1_or_init(&mut self) -> Result<&mut L1Table, PageMapError> {
         if self.l1.is_none() {
-            let mapping = memory
-                .map(size_of::<L1Table>())
-                .ok_or(PageMapError::MetadataAllocFailed)?;
+            let mapping =
+                OsMemory::map(size_of::<L1Table>()).ok_or(PageMapError::MetadataAllocFailed)?;
             self.l1 = Some(L1Storage { mapping });
         }
 
@@ -353,14 +351,10 @@ impl PageMap {
             .ok_or(PageMapError::InvalidRange)
     }
 
-    fn prepare_insert(&mut self, range: PageRange, memory: &OsMemory) -> Result<(), PageMapError> {
+    fn prepare_insert(&mut self, range: PageRange) -> Result<(), PageMapError> {
         for page in range.pages() {
             let (l1_index, _) = page.indexes().ok_or(PageMapError::InvalidRange)?;
-            if self
-                .l1_or_init(memory)?
-                .get_or_create(l1_index, memory)
-                .is_none()
-            {
+            if self.l1_or_init()?.get_or_create(l1_index).is_none() {
                 return Err(PageMapError::MetadataAllocFailed);
             }
         }
@@ -423,8 +417,6 @@ const _: () = assert!(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::os_memory::OsMemory;
-
     fn id(raw: u32) -> RunId {
         RunId::new(raw).unwrap()
     }
@@ -442,9 +434,9 @@ mod tests {
     }
 
     impl TestMapping {
-        fn new(memory: &OsMemory, len: usize) -> Self {
+        fn new(len: usize) -> Self {
             Self {
-                mapping: memory.map(len).unwrap(),
+                mapping: OsMemory::map(len).unwrap(),
             }
         }
 
@@ -480,12 +472,11 @@ mod tests {
 
     #[test]
     fn page_map_insert_range_maps_interior_pointer() {
-        let memory = OsMemory::new();
-        let mapping = TestMapping::new(&memory, PAGE_SIZE * 2);
+        let mapping = TestMapping::new(PAGE_SIZE * 2);
         let mut map = PageMap::new();
         let range = mapping.page_range();
 
-        assert!(map.insert(range, run(7), &memory).is_ok());
+        assert!(map.insert(range, run(7)).is_ok());
 
         let interior = mapping.ptr_at(PAGE_SIZE + 17);
         assert_eq!(map.get(interior), Some(run(7)));
@@ -493,12 +484,11 @@ mod tests {
 
     #[test]
     fn page_map_insert_range_maps_extent_entry() {
-        let memory = OsMemory::new();
-        let mapping = TestMapping::new(&memory, PAGE_SIZE * 2);
+        let mapping = TestMapping::new(PAGE_SIZE * 2);
         let mut map = PageMap::new();
         let range = mapping.page_range();
 
-        assert!(map.insert(range, extent(4), &memory).is_ok());
+        assert!(map.insert(range, extent(4)).is_ok());
 
         let interior = mapping.ptr_at(PAGE_SIZE + 17);
         assert_eq!(map.get(interior), Some(extent(4)));
@@ -506,12 +496,11 @@ mod tests {
 
     #[test]
     fn page_map_remove_range_clears_mapped_pages() {
-        let memory = OsMemory::new();
-        let mapping = TestMapping::new(&memory, PAGE_SIZE * 2);
+        let mapping = TestMapping::new(PAGE_SIZE * 2);
         let mut map = PageMap::new();
         let range = mapping.page_range();
 
-        assert!(map.insert(range, run(8), &memory).is_ok());
+        assert!(map.insert(range, run(8)).is_ok());
         map.remove(range);
 
         assert!(map.get(mapping.base()).is_none());
@@ -521,23 +510,22 @@ mod tests {
 
     #[test]
     fn page_map_remove_range_preserves_neighboring_page() {
-        let memory = OsMemory::new();
-        let mapping = TestMapping::new(&memory, PAGE_SIZE * 3);
+        let mapping = TestMapping::new(PAGE_SIZE * 3);
         let mut map = PageMap::new();
         let first = mapping.base();
         let second = mapping.ptr_at(PAGE_SIZE);
         let third = mapping.ptr_at(PAGE_SIZE * 2);
 
         assert!(
-            map.insert(PageRange::new(first, PAGE_SIZE).unwrap(), run(1), &memory)
+            map.insert(PageRange::new(first, PAGE_SIZE).unwrap(), run(1))
                 .is_ok()
         );
         assert!(
-            map.insert(PageRange::new(second, PAGE_SIZE).unwrap(), run(2), &memory)
+            map.insert(PageRange::new(second, PAGE_SIZE).unwrap(), run(2))
                 .is_ok()
         );
         assert!(
-            map.insert(PageRange::new(third, PAGE_SIZE).unwrap(), run(3), &memory)
+            map.insert(PageRange::new(third, PAGE_SIZE).unwrap(), run(3))
                 .is_ok()
         );
 
@@ -550,8 +538,7 @@ mod tests {
 
     #[test]
     fn page_map_insert_range_rejects_overlapping_different_run() {
-        let memory = OsMemory::new();
-        let mapping = TestMapping::new(&memory, PAGE_SIZE * 2);
+        let mapping = TestMapping::new(PAGE_SIZE * 2);
         let mut map = PageMap::new();
         let second = mapping.ptr_at(PAGE_SIZE);
 
@@ -559,12 +546,11 @@ mod tests {
             map.insert(
                 PageRange::new(mapping.base(), PAGE_SIZE * 2).unwrap(),
                 run(11),
-                &memory,
             )
             .is_ok()
         );
         assert_eq!(
-            map.insert(PageRange::new(second, PAGE_SIZE).unwrap(), run(12), &memory),
+            map.insert(PageRange::new(second, PAGE_SIZE).unwrap(), run(12)),
             Err(PageMapError::Overlap)
         );
         assert_eq!(map.get(second), Some(run(11)));
@@ -572,35 +558,26 @@ mod tests {
 
     #[test]
     fn page_map_insert_range_rejects_existing_same_entry() {
-        let memory = OsMemory::new();
-        let mapping = TestMapping::new(&memory, PAGE_SIZE);
+        let mapping = TestMapping::new(PAGE_SIZE);
         let mut map = PageMap::new();
         let range = mapping.page_range();
 
-        assert!(map.insert(range, run(13), &memory).is_ok());
-        assert_eq!(
-            map.insert(range, run(13), &memory),
-            Err(PageMapError::Overlap)
-        );
+        assert!(map.insert(range, run(13)).is_ok());
+        assert_eq!(map.insert(range, run(13)), Err(PageMapError::Overlap));
         assert_eq!(map.get(mapping.base()), Some(run(13)));
     }
 
     #[test]
     fn page_map_overlap_validation_does_not_allocate_empty_l2_tables() {
-        let memory = OsMemory::new();
-        let mapping = TestMapping::new(&memory, (L2_ENTRIES * 2 + 2) * PAGE_SIZE);
+        let mapping = TestMapping::new((L2_ENTRIES * 2 + 2) * PAGE_SIZE);
         let mut map = PageMap::new();
         let (_, base_l2) = Page::containing(mapping.base()).indexes().unwrap();
         let pages_to_next_l2 = L2_ENTRIES - base_l2.get();
         let overlap = mapping.ptr_at(pages_to_next_l2 * PAGE_SIZE);
 
         assert!(
-            map.insert(
-                PageRange::new(overlap, PAGE_SIZE).unwrap(),
-                run(21),
-                &memory
-            )
-            .is_ok()
+            map.insert(PageRange::new(overlap, PAGE_SIZE).unwrap(), run(21))
+                .is_ok()
         );
         assert!(!map.has_l2_table(mapping.base()));
 
@@ -608,7 +585,6 @@ mod tests {
             map.insert(
                 PageRange::new(mapping.base(), (pages_to_next_l2 + 1) * PAGE_SIZE).unwrap(),
                 run(22),
-                &memory,
             ),
             Err(PageMapError::Overlap)
         );
@@ -620,21 +596,19 @@ mod tests {
 
     #[test]
     fn page_map_insert_range_rejects_zero_len() {
-        let memory = OsMemory::new();
-        let mapping = TestMapping::new(&memory, PAGE_SIZE);
+        let mapping = TestMapping::new(PAGE_SIZE);
 
         assert!(PageRange::new(mapping.base(), 0).is_none());
     }
 
     #[test]
     fn page_map_insert_range_crosses_l2_boundary() {
-        let memory = OsMemory::new();
         let len = (L2_ENTRIES + 2) * PAGE_SIZE;
-        let mapping = TestMapping::new(&memory, len);
+        let mapping = TestMapping::new(len);
         let mut map = PageMap::new();
         let range = mapping.page_range();
 
-        assert!(map.insert(range, run(10), &memory).is_ok());
+        assert!(map.insert(range, run(10)).is_ok());
 
         let last = mapping.ptr_at(mapping.len() - 1);
         assert_eq!(map.get(mapping.base()), Some(run(10)));

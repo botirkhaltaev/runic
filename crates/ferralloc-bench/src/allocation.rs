@@ -10,6 +10,12 @@ pub struct AllocationRecord {
 }
 
 impl AllocationRecord {
+    /// Allocates a record and writes marker bytes used for later validation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the target allocator returns an unaligned pointer or allocation fails.
+    #[must_use]
     pub fn new(target: AllocatorTarget, layout: Layout, id: u64) -> Self {
         let ptr = target.alloc(layout);
         assert_eq!(ptr.as_ptr() as usize % layout.align(), 0);
@@ -23,6 +29,13 @@ impl AllocationRecord {
         record
     }
 
+    /// Allocates zeroed memory, validates marker positions, then writes marker bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the target allocator returns an unaligned pointer, allocation fails,
+    /// or the returned memory is not zero-initialized at marker positions.
+    #[must_use]
     pub fn zeroed(target: AllocatorTarget, layout: Layout, id: u64) -> Self {
         let ptr = target.alloc_zeroed(layout);
         assert_eq!(ptr.as_ptr() as usize % layout.align(), 0);
@@ -39,10 +52,12 @@ impl AllocationRecord {
         record
     }
 
+    #[must_use]
     pub fn ptr(&self) -> NonNull<u8> {
         self.ptr
     }
 
+    #[must_use]
     pub fn layout(&self) -> Layout {
         self.layout
     }
@@ -63,6 +78,11 @@ impl AllocationRecord {
         self.check_markers();
     }
 
+    /// Checks marker bytes against the record pattern.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any marker byte differs from the expected pattern.
     pub fn check_markers(&self) {
         for index in marker_indices(self.layout.size()) {
             let byte = unsafe { self.ptr.as_ptr().add(index).read() };
@@ -70,6 +90,11 @@ impl AllocationRecord {
         }
     }
 
+    /// Checks every byte in `ptr[..len]` against the record pattern.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any byte differs from the expected pattern.
     pub fn check_prefix(&self, ptr: NonNull<u8>, len: usize) {
         for index in 0..len {
             let byte = unsafe { ptr.as_ptr().add(index).read() };
@@ -77,6 +102,11 @@ impl AllocationRecord {
         }
     }
 
+    /// Checks marker bytes within `ptr[..len]` against the record pattern.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any checked marker byte differs from the expected pattern.
     pub fn check_prefix_markers(&self, ptr: NonNull<u8>, len: usize) {
         for index in marker_indices(self.layout.size())
             .into_iter()
@@ -87,6 +117,12 @@ impl AllocationRecord {
         }
     }
 
+    /// Reallocates this record and validates preserved marker bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if reallocation fails, returns an unaligned pointer, or corrupts
+    /// preserved marker bytes.
     pub fn realloc(&mut self, new_size: usize) {
         self.check_pattern();
         let old = self.layout;
@@ -110,7 +146,8 @@ impl AllocationRecord {
         self.id
             .wrapping_mul(131)
             .wrapping_add(index as u64)
-            .wrapping_add(self.layout.size() as u64) as u8
+            .wrapping_add(self.layout.size() as u64)
+            .to_le_bytes()[0]
     }
 }
 

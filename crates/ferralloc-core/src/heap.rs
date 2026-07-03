@@ -15,19 +15,25 @@ use crate::{
 };
 
 pub(crate) struct Heap {
-    memory: OsMemory,
-    classes: SizeClasses,
     runs: RunTable,
     extents: ExtentTable,
     pages: PageMap,
     active: [Option<RunId>; SizeClasses::COUNT],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HeapError {
+    UnknownPointer,
+    MissingRun,
+    MissingExtent,
+    InvalidRunPointer,
+    InvalidExtentPointer,
+    InvalidMetadata,
+}
+
 impl Heap {
     pub(crate) const fn new() -> Self {
         Self {
-            memory: OsMemory::new(),
-            classes: SizeClasses::new(),
             runs: RunTable::new(),
             extents: ExtentTable::new(),
             pages: PageMap::new(),
@@ -41,107 +47,128 @@ impl Heap {
         self.alloc_spec(spec)
     }
 
-    pub(crate) fn dealloc(&mut self, raw_ptr: *mut u8, _layout: Layout) {
+    pub(crate) fn dealloc(&mut self, raw_ptr: *mut u8, _layout: Layout) -> Result<(), HeapError> {
         let Some(ptr) = NonNull::new(raw_ptr) else {
-            return;
+            return Ok(());
         };
 
         let Some(entry) = self.pages.get(ptr) else {
-            Self::abort();
+            return Err(HeapError::UnknownPointer);
         };
 
         match entry {
             PageEntry::Run(id) => {
                 let class_index = {
                     let Some(run) = self.runs.get_mut(id) else {
-                        Self::abort();
+                        return Err(HeapError::MissingRun);
                     };
 
                     if run.free(ptr).is_err() {
-                        Self::abort();
+                        return Err(HeapError::InvalidRunPointer);
                     }
 
                     run.class().index()
                 };
 
                 let Some(active_slot) = self.active.get_mut(class_index) else {
-                    Self::abort();
+                    return Err(HeapError::InvalidMetadata);
                 };
                 *active_slot = Some(id);
             }
             PageEntry::Extent(id) => {
                 let range = {
                     let Some(extent) = self.extents.get(id) else {
-                        Self::abort();
+                        return Err(HeapError::MissingExtent);
                     };
 
                     if extent.free(ptr).is_err() {
-                        Self::abort();
+                        return Err(HeapError::InvalidExtentPointer);
                     }
 
                     extent.range()
                 };
 
                 let Some(page_range) = PageRange::from_range(range) else {
-                    Self::abort();
+                    return Err(HeapError::InvalidMetadata);
                 };
                 self.pages.remove(page_range);
 
                 if self.extents.remove(id).is_none() {
-                    Self::abort();
+                    return Err(HeapError::MissingExtent);
                 }
             }
         }
+
+        Ok(())
     }
 
-    pub(crate) fn realloc(&mut self, ptr: *mut u8, old: Layout, new_size: usize) -> *mut u8 {
+    pub(crate) fn realloc(
+        &mut self,
+        ptr: *mut u8,
+        old: Layout,
+        new_size: usize,
+    ) -> Result<*mut u8, HeapError> {
         if ptr.is_null() {
             let Some(spec) = LayoutSpec::from_size_align(new_size, old.align()) else {
-                return null_mut();
+                return Ok(null_mut());
             };
 
-            return self.alloc_spec(spec);
+            return Ok(self.alloc_spec(spec));
         }
 
         if new_size == 0 {
-            self.dealloc(ptr, old);
-            return null_mut();
+            self.dealloc(ptr, old)?;
+            return Ok(null_mut());
         }
 
         let Some(old_ptr) = NonNull::new(ptr) else {
-            return null_mut();
+            return Ok(null_mut());
         };
 
         let Some(entry) = self.pages.get(old_ptr) else {
-            Self::abort();
+            return Err(HeapError::UnknownPointer);
         };
         match entry {
             PageEntry::Run(id) => {
-                if self.runs.get(id).is_none() {
-                    Self::abort();
+                let Some(run) = self.runs.get(id) else {
+                    return Err(HeapError::MissingRun);
+                };
+
+                if run.block_at(old_ptr).is_none() {
+                    return Err(HeapError::InvalidRunPointer);
                 }
             }
             PageEntry::Extent(id) => {
-                if self.extents.get(id).is_none() {
-                    Self::abort();
+                let Some(extent) = self.extents.get(id) else {
+                    return Err(HeapError::MissingExtent);
+                };
+
+                if !extent.starts_at(old_ptr) {
+                    return Err(HeapError::InvalidExtentPointer);
                 }
             }
         }
 
-        let Some(new_spec) = LayoutSpec::from_size_align(new_size, old.align()) else {
-            return null_mut();
+        let Ok(new_layout) = Layout::from_size_align(new_size, old.align()) else {
+            return Ok(null_mut());
         };
+        let new_spec = LayoutSpec::from_layout(new_layout);
         let new_ptr = self.alloc_spec(new_spec);
 
         if new_ptr.is_null() {
-            return null_mut();
+            return Ok(null_mut());
         }
 
         // SAFETY: new_ptr is a fresh allocation of at least new_size bytes; ptr is valid for old.size().
         unsafe { copy_nonoverlapping(ptr, new_ptr, old.size().min(new_size)) };
 
-        self.dealloc(ptr, old);
-        new_ptr
+        if let Err(error) = self.dealloc(ptr, old) {
+            let _ = self.dealloc(new_ptr, new_layout);
+
+            return Err(error);
+        }
+
+        Ok(new_ptr)
     }
 
     pub(crate) fn alloc_zeroed(&mut self, layout: Layout) -> *mut u8 {
@@ -156,7 +183,7 @@ impl Heap {
     }
 
     fn alloc_spec(&mut self, spec: LayoutSpec) -> *mut u8 {
-        match self.classes.get(spec) {
+        match SizeClasses::get(spec) {
             Some(class) => self.alloc_small(spec, class),
             None => self.alloc_large(spec),
         }
@@ -175,17 +202,17 @@ impl Heap {
 
         if let Some((id, ptr)) = self.runs.allocate(class, spec) {
             let Some(active_slot) = self.active.get_mut(class_index) else {
-                Self::abort();
+                return null_mut();
             };
             *active_slot = Some(id);
 
             return ptr.as_ptr();
         }
 
-        let Some(mapping) = self.memory.map(RUN_SIZE) else {
+        let Some(mapping) = OsMemory::map(RUN_SIZE) else {
             return null_mut();
         };
-        let Some(reservation) = self.runs.reserve(&self.memory) else {
+        let Some(reservation) = self.runs.reserve() else {
             return null_mut();
         };
         let id = reservation.id();
@@ -196,12 +223,12 @@ impl Heap {
         }
 
         let Some(active_slot) = self.active.get_mut(class_index) else {
-            Self::abort();
+            return null_mut();
         };
         *active_slot = Some(id);
 
         let Some(inserted_run) = self.runs.get_mut(id) else {
-            Self::abort();
+            return null_mut();
         };
 
         inserted_run
@@ -210,13 +237,13 @@ impl Heap {
     }
 
     fn alloc_large(&mut self, spec: LayoutSpec) -> *mut u8 {
-        let Some(len) = spec.mapping_len(self.memory.page_size()) else {
+        let Some(len) = spec.mapping_len(OsMemory::page_size()) else {
             return null_mut();
         };
-        let Some(mapping) = self.memory.map(len) else {
+        let Some(mapping) = OsMemory::map(len) else {
             return null_mut();
         };
-        let Some(reservation) = self.extents.reserve(&self.memory) else {
+        let Some(reservation) = self.extents.reserve() else {
             return null_mut();
         };
         let id = reservation.id();
@@ -247,11 +274,7 @@ impl Heap {
             return Err(());
         };
 
-        if self
-            .pages
-            .insert(page_range, PageEntry::Run(id), &self.memory)
-            .is_err()
-        {
+        if self.pages.insert(page_range, PageEntry::Run(id)).is_err() {
             let _removed = self.runs.remove(id);
             return Err(());
         }
@@ -274,7 +297,7 @@ impl Heap {
 
         if self
             .pages
-            .insert(page_range, PageEntry::Extent(id), &self.memory)
+            .insert(page_range, PageEntry::Extent(id))
             .is_err()
         {
             let _removed = self.extents.remove(id);
@@ -282,12 +305,5 @@ impl Heap {
         }
 
         Ok(())
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn abort() -> ! {
-        // SAFETY: abort terminates the process and does not unwind across allocator boundaries.
-        unsafe { libc::abort() }
     }
 }

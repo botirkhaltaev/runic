@@ -43,7 +43,7 @@ impl RunTable {
         }
     }
 
-    pub(crate) fn reserve(&mut self, memory: &OsMemory) -> Option<RunReservation> {
+    pub(crate) fn reserve(&mut self) -> Option<RunReservation> {
         let start = usize::try_from(self.next).ok()?;
 
         for offset in 0..Self::MAX_RUNS {
@@ -54,7 +54,7 @@ impl RunTable {
                 sum
             };
 
-            let slot = self.slots_mut(memory)?.get_mut(index)?;
+            let slot = self.slots_mut()?.get_mut(index)?;
 
             if slot.reserve() {
                 let next = if index + 1 == Self::MAX_RUNS {
@@ -142,9 +142,9 @@ impl RunTable {
         self.slots.as_ref()
     }
 
-    fn slots_mut(&mut self, memory: &OsMemory) -> Option<&mut RunSlots> {
+    fn slots_mut(&mut self) -> Option<&mut RunSlots> {
         if self.slots.is_none() {
-            self.slots = Some(RunSlots::new(memory, Self::MAX_RUNS)?);
+            self.slots = Some(RunSlots::new(Self::MAX_RUNS)?);
         }
 
         self.slots.as_mut()
@@ -173,9 +173,9 @@ struct RunSlots {
 unsafe impl Send for RunSlots {}
 
 impl RunSlots {
-    fn new(memory: &OsMemory, len: usize) -> Option<Self> {
+    fn new(len: usize) -> Option<Self> {
         let byte_len = len.checked_mul(core::mem::size_of::<RunSlot>())?;
-        let mapping = memory.map(byte_len)?;
+        let mapping = OsMemory::map(byte_len)?;
         let slots = mapping.base().cast::<RunSlot>();
 
         Some(Self { mapping, slots })
@@ -325,45 +325,41 @@ mod tests {
     use super::*;
 
     fn reusable_run(id: RunId) -> Run {
-        let memory = OsMemory::new();
-        let mapping = memory.map(RUN_SIZE).unwrap();
+        let mapping = OsMemory::map(RUN_SIZE).unwrap();
         let spec = LayoutSpec::from_size_align(64, 8).unwrap();
-        let class = SizeClasses::new().get(spec).unwrap();
+        let class = SizeClasses::get(spec).unwrap();
 
         Run::new(id, mapping, class)
     }
 
     #[test]
     fn run_table_reserves_ids_from_zero() {
-        let memory = OsMemory::new();
         let mut table = RunTable::new();
 
-        assert_eq!(table.reserve(&memory).unwrap().id().get(), 0);
-        assert_eq!(table.reserve(&memory).unwrap().id().get(), 1);
+        assert_eq!(table.reserve().unwrap().id().get(), 0);
+        assert_eq!(table.reserve().unwrap().id().get(), 1);
     }
 
     #[test]
     fn run_table_release_makes_reserved_slot_available() {
-        let memory = OsMemory::new();
         let mut table = RunTable::new();
-        let first = table.reserve(&memory).unwrap();
-        let second = table.reserve(&memory).unwrap();
+        let first = table.reserve().unwrap();
+        let second = table.reserve().unwrap();
 
         table.release(first);
 
         assert_eq!(second.id().get(), 1);
         let max_runs = u32::try_from(RunTable::MAX_RUNS).unwrap();
         for expected in 2..max_runs {
-            assert_eq!(table.reserve(&memory).unwrap().id().get(), expected);
+            assert_eq!(table.reserve().unwrap().id().get(), expected);
         }
-        assert_eq!(table.reserve(&memory).unwrap().id(), first.id());
+        assert_eq!(table.reserve().unwrap().id(), first.id());
     }
 
     #[test]
     fn run_table_insert_get_round_trip() {
-        let memory = OsMemory::new();
         let mut table = RunTable::new();
-        let reservation = table.reserve(&memory).unwrap();
+        let reservation = table.reserve().unwrap();
         let run = reusable_run(reservation.id());
 
         let id = table.insert(reservation, run).unwrap();
@@ -375,9 +371,8 @@ mod tests {
 
     #[test]
     fn run_table_rejects_occupied_slot() {
-        let memory = OsMemory::new();
         let mut table = RunTable::new();
-        let reservation = table.reserve(&memory).unwrap();
+        let reservation = table.reserve().unwrap();
         let first = reusable_run(reservation.id());
         let second = reusable_run(reservation.id());
 
@@ -404,9 +399,8 @@ mod tests {
 
     #[test]
     fn run_table_get_mut_allows_run_mutation() {
-        let memory = OsMemory::new();
         let mut table = RunTable::new();
-        let reservation = table.reserve(&memory).unwrap();
+        let reservation = table.reserve().unwrap();
         let run = reusable_run(reservation.id());
         let spec = LayoutSpec::from_size_align(64, 8).unwrap();
 
@@ -420,9 +414,8 @@ mod tests {
 
     #[test]
     fn run_table_remove_clears_slot() {
-        let memory = OsMemory::new();
         let mut table = RunTable::new();
-        let reservation = table.reserve(&memory).unwrap();
+        let reservation = table.reserve().unwrap();
         let run = reusable_run(reservation.id());
 
         let id = table.insert(reservation, run).unwrap();
