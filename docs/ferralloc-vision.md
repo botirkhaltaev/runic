@@ -32,4 +32,4 @@ The first milestone is intentionally small:
 A global-lock Rust allocator that can run real Rust programs and survive randomized allocation traces.
 ```
 
-Only after that should the project focus on making the span map fast, adding thread-local heaps, supporting remote frees, and hardening behavior.
+Only after that should the project focus on block-state tracking, better span reuse/release policy, thread-local heaps, remote frees, and hardening behavior.

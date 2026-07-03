@@ -9,7 +9,7 @@ Correctness comes before speed.
 ## Workspace
 
 ```text
-crates/ferralloc-core          allocator mechanics
+crates/ferralloc-core          allocator mechanics and global state
 crates/ferralloc               GlobalAlloc wrapper
 crates/ferralloc-test-support  reusable test machinery
 crates/ferralloc-bench         benchmark harness

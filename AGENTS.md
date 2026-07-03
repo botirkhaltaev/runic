@@ -33,20 +33,22 @@ Use this first:
 
 ```text
 GlobalAlloc
-  -> Central
+  -> Allocator
+      -> State
       -> SpanMap
+      -> SpanTable
       -> Span
           -> FreeList
-      -> MmapBackend
+      -> OsMemory
 ```
 
-Use one global lock around `Central`.
+Use one global lock around `State`.
 
 ## Rust Rules
 
 - Use `#![deny(unsafe_op_in_unsafe_fn)]`.
 - Keep unsafe code small, explicit, and local.
-- Prefer methods on `Central`, `Span`, `SpanMap`, `FreeList`, `MmapBackend`, and `SizeClassTable`.
+- Prefer methods on `Allocator`, `State`, `Span`, `SpanMap`, `SpanTable`, `FreeList`, `OsMemory`, and `SizeClasses`.
 - Avoid allocator-internal `Vec`, `Box`, `HashMap`, `String`, formatting, or panic paths unless recursion risk is addressed.
 - Abort on invalid frees in v0.1.
 - Do not unwind across allocator boundaries.
@@ -54,6 +56,11 @@ Use one global lock around `Central`.
 ## Allocator References
 
 `allocator-refs/` contains external allocator projects and benchmark suites for inspiration. Treat it as read-only reference material. Use it for test ideas, invariants, workload shapes, and benchmark categories, not copied implementation code.
+
+## Issue Tracking
+
+- If an agent notices a real issue, critique, or improvement that is out of scope for the current task, create or update a GitHub issue instead of expanding scope.
+- Current known follow-ups: improve `SpanMap` metadata allocation, add block-state tracking for double-free detection, and revisit `SpanTable` test/production capacity differences.
 
 ## Commands
 
