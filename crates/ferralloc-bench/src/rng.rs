@@ -30,8 +30,8 @@ impl TraceRng {
             .trailing_zeros()
             .min(max_exp.saturating_sub(1));
         let base = 1_usize << class.max(3);
-        let span = base.min(1_usize << max_exp);
-        base.saturating_add(self.next_usize(span)).max(1)
+        let range = base.min(1_usize << max_exp);
+        base.saturating_add(self.next_usize(range)).max(1)
     }
 
     pub fn alignment(&mut self) -> usize {

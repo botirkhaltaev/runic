@@ -1,14 +1,61 @@
-use core::ptr::NonNull;
+use core::{mem::ManuallyDrop, ptr::NonNull};
+
+use crate::address::AddressRange;
 
 pub(crate) const PAGE_SIZE: usize = 4096;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Mapping {
     base: NonNull<u8>,
     len: usize,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct MappingParts {
+    base: NonNull<u8>,
+    len: usize,
+}
+
 impl Mapping {
+    pub(crate) const fn new(base: NonNull<u8>, len: usize) -> Self {
+        Self { base, len }
+    }
+
+    pub(crate) const fn base(&self) -> NonNull<u8> {
+        self.base
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) const fn range(&self) -> AddressRange {
+        AddressRange::new(self.base, self.len)
+    }
+
+    pub(crate) fn into_parts(self) -> MappingParts {
+        let mapping = ManuallyDrop::new(self);
+
+        MappingParts {
+            base: mapping.base,
+            len: mapping.len,
+        }
+    }
+}
+
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        // SAFETY: Mapping owns an mmap allocation returned by OsMemory::map.
+        unsafe { libc::munmap(self.base.as_ptr().cast(), self.len) };
+    }
+}
+
+// SAFETY: Mapping owns a process-private mmap region. Moving ownership to another
+// thread does not permit concurrent mutation of allocator metadata.
+unsafe impl Send for Mapping {}
+
+impl MappingParts {
     pub(crate) const fn new(base: NonNull<u8>, len: usize) -> Self {
         Self { base, len }
     }
@@ -19,6 +66,11 @@ impl Mapping {
 
     pub(crate) const fn len(self) -> usize {
         self.len
+    }
+
+    pub(crate) unsafe fn unmap(self) {
+        // SAFETY: caller guarantees these parts came from Mapping::into_parts and are still owned.
+        unsafe { libc::munmap(self.base.as_ptr().cast(), self.len) };
     }
 }
 
@@ -34,11 +86,12 @@ impl OsMemory {
     }
 
     pub(crate) fn map(&self, len: usize) -> Option<Mapping> {
-        let len = Self::round_to_page(len)?;
+        let rounded_len = Self::round_to_page(len)?;
+        // SAFETY: mmap is called with a null hint, anonymous private mapping, and a page-rounded length.
         let ptr = unsafe {
             libc::mmap(
                 core::ptr::null_mut(),
-                len,
+                rounded_len,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                 -1,
@@ -50,13 +103,7 @@ impl OsMemory {
             return None;
         }
 
-        NonNull::new(ptr.cast::<u8>()).map(|base| Mapping::new(base, len))
-    }
-
-    pub(crate) unsafe fn unmap(&self, mapping: Mapping) {
-        unsafe {
-            libc::munmap(mapping.base().as_ptr().cast(), mapping.len());
-        }
+        NonNull::new(ptr.cast::<u8>()).map(|base| Mapping::new(base, rounded_len))
     }
 
     pub(crate) fn round_to_page(len: usize) -> Option<usize> {
@@ -92,7 +139,7 @@ mod tests {
         assert_eq!(mapping.base().as_ptr() as usize % PAGE_SIZE, 0);
         assert_eq!(mapping.len(), PAGE_SIZE);
 
-        unsafe { memory.unmap(mapping) };
+        drop(mapping);
     }
 
     #[test]
@@ -105,7 +152,6 @@ mod tests {
             mapping.base().as_ptr().add(PAGE_SIZE - 1).write(0xcd);
             assert_eq!(mapping.base().as_ptr().read(), 0xab);
             assert_eq!(mapping.base().as_ptr().add(PAGE_SIZE - 1).read(), 0xcd);
-            memory.unmap(mapping);
         }
     }
 }

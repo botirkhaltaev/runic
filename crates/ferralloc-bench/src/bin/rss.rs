@@ -53,12 +53,11 @@ fn run_subprocess(allocator: &str, workload: &str) {
         .output()
         .unwrap();
 
-    if !output.status.success() {
-        panic!(
-            "rss case failed for {allocator}/{workload}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    assert!(
+        output.status.success(),
+        "rss case failed for {allocator}/{workload}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     print!("{}", String::from_utf8_lossy(&output.stdout));
 }
@@ -71,19 +70,22 @@ fn run_case(args: &[String]) {
         .iter()
         .find(|case| case.name == workload_name)
         .expect("unknown workload");
+    let ops = args.get(4).map_or(case.ops, |value| {
+        value.parse::<usize>().expect("invalid ops")
+    });
 
     match case.name {
-        "single_size_churn_64" => RssReport::measure(target.name(), case.name, case.ops, || {
-            workload::single_size_churn(target, 64, case.ops);
+        "single_size_churn_64" => RssReport::measure(target.name(), case.name, ops, || {
+            workload::single_size_churn(target, 64, ops);
         }),
-        "size_boundary_sweep" => RssReport::measure(target.name(), case.name, case.ops, || {
-            workload::size_boundary_sweep(target, case.ops);
+        "size_boundary_sweep" => RssReport::measure(target.name(), case.name, ops, || {
+            workload::size_boundary_sweep(target, ops);
         }),
-        "small_biased_random" => RssReport::measure(target.name(), case.name, case.ops, || {
-            workload::small_biased_random(target, 0xf3ee_a110_c001_cafe, case.ops, 1024);
+        "small_biased_random" => RssReport::measure(target.name(), case.name, ops, || {
+            workload::small_biased_random(target, 0xf3ee_a110_c001_cafe, ops, 1024);
         }),
-        "large_alloc_churn_256k" => RssReport::measure(target.name(), case.name, case.ops, || {
-            workload::large_alloc_churn(target, 256 * 1024, case.ops);
+        "large_alloc_churn_256k" => RssReport::measure(target.name(), case.name, ops, || {
+            workload::large_alloc_churn(target, 256 * 1024, ops);
         }),
         _ => unreachable!(),
     }

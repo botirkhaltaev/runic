@@ -2,7 +2,7 @@
 
 Ferralloc is an experimental Rust-native allocator project.
 
-The first milestone is deliberately small: build a global-lock allocator core with mmap-backed spans, size classes, out-of-line metadata, pointer-to-span lookup, block boundary checks, basic `realloc`, basic `alloc_zeroed`, and randomized tests.
+The first milestone is deliberately small: build a global-lock allocator core with size-classed runs, dedicated extents, out-of-line metadata, page-indexed pointer lookup, block-boundary checks, exact-pointer extent frees, basic `realloc`, basic `alloc_zeroed`, and randomized tests.
 
 Correctness comes before speed.
 

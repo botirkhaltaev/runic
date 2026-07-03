@@ -2,7 +2,7 @@ use core::ptr::NonNull;
 
 #[repr(C)]
 struct FreeNode {
-    next: Option<NonNull<FreeNode>>,
+    next: Option<NonNull<Self>>,
 }
 
 pub(crate) struct FreeList {
@@ -17,9 +17,8 @@ impl FreeList {
     pub(crate) unsafe fn push(&mut self, ptr: NonNull<u8>) {
         let node = ptr.cast::<FreeNode>();
 
-        unsafe {
-            node.as_ptr().write(FreeNode { next: self.head });
-        }
+        // SAFETY: caller guarantees ptr is writable memory large enough to hold FreeNode.
+        unsafe { node.as_ptr().write(FreeNode { next: self.head }) };
 
         self.head = Some(node);
     }
@@ -27,9 +26,8 @@ impl FreeList {
     pub(crate) fn pop(&mut self) -> Option<NonNull<u8>> {
         let head = self.head?;
 
-        unsafe {
-            self.head = head.as_ref().next;
-        }
+        // SAFETY: head was previously written by push as a valid FreeNode.
+        unsafe { self.head = head.as_ref().next };
 
         Some(head.cast())
     }

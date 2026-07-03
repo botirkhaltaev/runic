@@ -13,20 +13,31 @@ Use `ROADMAP.md` as the source of truth for project thesis, current scope, archi
 - Prefer entity-based architecture and design.
 - Avoid free helper functions unless there is a strong reason.
 - Put behavior on the type that owns the data or invariant.
+- No backward compatibility is needed for internal allocator APIs unless explicitly requested.
+- Prefer best-practice, idiomatic Rust over preserving existing internal shapes.
+- Prefer general, composable APIs over narrow methods tailored to one caller.
+- Keep naming simple, direct, and domain-based.
+- Avoid overfit method names that encode current implementation details or a single call path.
+- Model real domain concepts as explicit entity types when they own data, invariants, or behavior.
+- Apply architectural feedback repository-wide, not only at the site where an issue was noticed.
+- Prefer small cohesive types with clear responsibilities over broad manager APIs.
+- API shape should make invalid states hard to express without adding unnecessary abstraction.
 - Keep code and architecture simple wherever possible.
 - Write idiomatic, performance-aware Rust without premature optimization.
 - Introduce abstractions only when they reduce complexity or clarify invariants.
 - Avoid callback-style helper patterns for ordinary control flow; prefer direct, explicit calls.
+- Avoid lint workarounds that reduce code quality; remove or narrow lints that fight idiomatic Rust.
+- Do not use `#[allow]` or `#[expect]` as a shortcut when a cleaner design or refactor is reasonable.
 
 ## v0.1 Scope
 
-Build only: Linux x86_64, Rust stable, `GlobalAlloc`, global lock, mmap-backed spans, small size classes, large direct mmap allocations, out-of-line metadata, pointer-to-span lookup, block boundary checks, basic `realloc`, basic `alloc_zeroed`, and randomized tests.
+Build only: Linux x86_64, Rust stable, `GlobalAlloc`, global lock, mmap-backed runs for small size classes, mmap-backed extents for dedicated allocations, out-of-line metadata, page-indexed pointer lookup, run block-boundary checks, extent exact-pointer checks, basic `realloc`, basic `alloc_zeroed`, and randomized tests.
 
 Do not add profiles, thread-local heaps, remote frees, quarantine, canaries, hugepages, NUMA, C ABI support, ML placement, or dashboards yet.
 
 ## Core Invariant
 
-Every pointer returned by ferralloc belongs to exactly one span, every span owns blocks of exactly one size class, and every free must map back to a known span and block boundary.
+Every returned pointer maps to exactly one page-map entry. Runs own one mapping and divide it into fixed-size reusable blocks from one size class. Extents own one mapping dedicated to exactly one returned allocation. Every free must map back to a known entry: run frees must be valid block boundaries, and extent frees must be the exact returned pointer.
 
 Correctness comes before speed.
 
@@ -38,10 +49,12 @@ Use this first:
 GlobalAlloc
   -> Allocator
       -> Heap
-      -> SpanMap
-      -> SpanTable
-      -> Span
+      -> PageMap
+      -> RunTable
+      -> ExtentTable
+      -> Run
           -> FreeList
+      -> Extent
       -> OsMemory
 ```
 
@@ -51,7 +64,7 @@ Use one global lock around `Heap`.
 
 - Use `#![deny(unsafe_op_in_unsafe_fn)]`.
 - Keep unsafe code small, explicit, and local.
-- Prefer methods on `Allocator`, `Heap`, `Span`, `SpanMap`, `SpanTable`, `FreeList`, `OsMemory`, and `SizeClasses`.
+- Prefer methods on `Allocator`, `Heap`, `Run`, `Extent`, `PageMap`, `RunTable`, `ExtentTable`, `FreeList`, `OsMemory`, and `SizeClasses`.
 - Avoid allocator-internal `Vec`, `Box`, `HashMap`, `String`, formatting, or panic paths unless recursion risk is addressed.
 - Abort on invalid frees in v0.1.
 - Do not unwind across allocator boundaries.
@@ -63,7 +76,7 @@ Use one global lock around `Heap`.
 ## Issue Tracking
 
 - If an agent notices a real issue, critique, or improvement that is out of scope for the current task, create or update a GitHub issue instead of expanding scope.
-- Current known follow-ups: improve `SpanMap` metadata allocation, add block-state tracking for double-free detection, and revisit `SpanTable` test/production capacity differences.
+- Current known follow-ups: improve `PageMap` metadata allocation, add block-state tracking for double-free detection, and revisit `RunTable` test/production capacity differences.
 
 ## Commands
 

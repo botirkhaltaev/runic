@@ -13,13 +13,16 @@ fn allocator_reuses_freed_small_block() {
 
     let first = unsafe { Allocator::alloc(layout) };
     assert!(!first.is_null());
-
-    unsafe { Allocator::dealloc(first, layout) };
-
     let second = unsafe { Allocator::alloc(layout) };
-    assert_eq!(first, second);
+    assert!(!second.is_null());
 
     unsafe { Allocator::dealloc(second, layout) };
+
+    let reused = unsafe { Allocator::alloc(layout) };
+    assert_eq!(second, reused);
+
+    unsafe { Allocator::dealloc(reused, layout) };
+    unsafe { Allocator::dealloc(first, layout) };
 }
 
 #[test]
@@ -53,14 +56,14 @@ fn allocator_realloc_preserves_prefix() {
     assert!(!ptr.is_null());
 
     for index in 0..old.size() {
-        unsafe { ptr.add(index).write(index as u8) };
+        unsafe { ptr.add(index).write(byte(index)) };
     }
 
     let new_ptr = unsafe { Allocator::realloc(ptr, old, 128) };
     assert!(!new_ptr.is_null());
 
     for index in 0..old.size() {
-        assert_eq!(unsafe { new_ptr.add(index).read() }, index as u8);
+        assert_eq!(unsafe { new_ptr.add(index).read() }, byte(index));
     }
 
     let new = Layout::from_size_align(128, 8).unwrap();
@@ -74,14 +77,14 @@ fn allocator_realloc_uses_old_layout_size_for_copy_len() {
     assert!(!ptr.is_null());
 
     for index in 0..old.size() {
-        unsafe { ptr.add(index).write((index + 1) as u8) };
+        unsafe { ptr.add(index).write(byte(index + 1)) };
     }
 
     let new_ptr = unsafe { Allocator::realloc(ptr, old, 128) };
     assert!(!new_ptr.is_null());
 
     for index in 0..old.size() {
-        assert_eq!(unsafe { new_ptr.add(index).read() }, (index + 1) as u8);
+        assert_eq!(unsafe { new_ptr.add(index).read() }, byte(index + 1));
     }
 
     let new = Layout::from_size_align(128, 8).unwrap();
@@ -146,19 +149,19 @@ fn allocator_returns_aligned_pointer_for_size_alignment_matrix() {
 }
 
 #[test]
-fn allocator_handles_many_small_allocations_across_span_boundary() {
+fn allocator_handles_many_small_allocations_across_run_boundary() {
     let layout = Layout::from_size_align(8, 8).unwrap();
     let mut allocations = Vec::new();
 
-    for index in 0..9000 {
+    for index in 0_usize..9000 {
         let ptr = unsafe { Allocator::alloc(layout) };
         assert!(!ptr.is_null(), "index {index}");
-        unsafe { ptr.write((index % 251) as u8) };
+        unsafe { ptr.write(byte(index)) };
         allocations.push((ptr, index));
     }
 
     for (ptr, index) in &allocations {
-        assert_eq!(unsafe { ptr.read() }, (index % 251) as u8);
+        assert_eq!(unsafe { ptr.read() }, byte(*index));
     }
 
     for (ptr, _) in allocations {
@@ -173,14 +176,14 @@ fn allocator_realloc_small_to_large_preserves_prefix() {
     assert!(!ptr.is_null());
 
     for index in 0..old.size() {
-        unsafe { ptr.add(index).write((index % 251) as u8) };
+        unsafe { ptr.add(index).write(byte(index)) };
     }
 
     let new_ptr = unsafe { Allocator::realloc(ptr, old, 128 * 1024) };
     assert!(!new_ptr.is_null());
 
     for index in 0..old.size() {
-        assert_eq!(unsafe { new_ptr.add(index).read() }, (index % 251) as u8);
+        assert_eq!(unsafe { new_ptr.add(index).read() }, byte(index));
     }
 
     let new = Layout::from_size_align(128 * 1024, 16).unwrap();
@@ -194,14 +197,14 @@ fn allocator_realloc_large_to_small_preserves_prefix() {
     assert!(!ptr.is_null());
 
     for index in 0..4096 {
-        unsafe { ptr.add(index).write((index % 251) as u8) };
+        unsafe { ptr.add(index).write(byte(index)) };
     }
 
     let new_ptr = unsafe { Allocator::realloc(ptr, old, 4096) };
     assert!(!new_ptr.is_null());
 
     for index in 0..4096 {
-        assert_eq!(unsafe { new_ptr.add(index).read() }, (index % 251) as u8);
+        assert_eq!(unsafe { new_ptr.add(index).read() }, byte(index));
     }
 
     let new = Layout::from_size_align(4096, 64).unwrap();
@@ -316,10 +319,13 @@ impl AllocationRecord {
     }
 
     fn byte_at(&self, index: usize) -> u8 {
-        self.id
+        let value = self
+            .id
             .wrapping_mul(131)
-            .wrapping_add(index as u64)
-            .wrapping_add(self.layout.size() as u64) as u8
+            .wrapping_add(u64::try_from(index).unwrap())
+            .wrapping_add(u64::try_from(self.layout.size()).unwrap());
+
+        value.to_le_bytes()[0]
     }
 }
 
@@ -340,7 +346,10 @@ impl TraceRng {
     }
 
     fn next_usize(&mut self, upper: usize) -> usize {
-        (self.next() as usize) % upper
+        let upper = u64::try_from(upper).unwrap();
+        let value = self.next() % upper;
+
+        usize::try_from(value).unwrap()
     }
 
     fn biased_size(&mut self, max: usize) -> usize {
@@ -353,4 +362,8 @@ impl TraceRng {
 
         ALIGNS[self.next_usize(ALIGNS.len())]
     }
+}
+
+fn byte(value: usize) -> u8 {
+    u8::try_from(value % 251).unwrap()
 }

@@ -6,6 +6,7 @@ use crate::heap::Heap;
 
 static HEAP: Mutex<Heap> = Mutex::new(Heap::new());
 
+#[non_exhaustive]
 pub struct Allocator;
 
 impl Allocator {

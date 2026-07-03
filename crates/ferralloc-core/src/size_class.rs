@@ -1,11 +1,11 @@
 use crate::layout::LayoutSpec;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SizeClassId(u8);
+pub(crate) struct SizeClassId(usize);
 
 impl SizeClassId {
     pub(crate) const fn index(self) -> usize {
-        self.0 as usize
+        self.0
     }
 }
 
@@ -36,7 +36,7 @@ impl SizeClasses {
     }
 
     pub(crate) fn get(&self, spec: LayoutSpec) -> Option<SizeClass> {
-        let required = spec.class_requirement();
+        let required = spec.minimum_block_size();
 
         if required > Self::SMALL_MAX {
             return None;
@@ -45,7 +45,7 @@ impl SizeClasses {
         for (index, &block_size) in SIZES.iter().enumerate() {
             if block_size >= spec.size() && block_size.is_multiple_of(spec.align()) {
                 return Some(SizeClass {
-                    id: SizeClassId(index as u8),
+                    id: SizeClassId(index),
                     block_size,
                 });
             }
@@ -108,7 +108,7 @@ mod tests {
         for size in 1..=SizeClasses::SMALL_MAX {
             for align in [1, 2, 4, 8, 16, 32, 64, 128, 4096] {
                 let layout = Layout::from_size_align(size, align).unwrap();
-                let spec = LayoutSpec::from_layout(layout).unwrap();
+                let spec = LayoutSpec::from_layout(layout);
                 let Some(class) = classes.get(spec) else {
                     continue;
                 };

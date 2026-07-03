@@ -7,17 +7,19 @@ pub(crate) struct LayoutSpec {
 }
 
 impl LayoutSpec {
-    pub(crate) fn from_layout(layout: Layout) -> Option<Self> {
-        Some(Self {
-            size: layout.size().max(1),
+    pub(crate) const fn from_layout(layout: Layout) -> Self {
+        let size = if layout.size() == 0 { 1 } else { layout.size() };
+
+        Self {
+            size,
             align: layout.align(),
-        })
+        }
     }
 
     pub(crate) fn from_size_align(size: usize, align: usize) -> Option<Self> {
         Layout::from_size_align(size, align)
             .ok()
-            .and_then(Self::from_layout)
+            .map(Self::from_layout)
     }
 
     pub(crate) const fn size(self) -> usize {
@@ -28,7 +30,7 @@ impl LayoutSpec {
         self.align
     }
 
-    pub(crate) fn class_requirement(self) -> usize {
+    pub(crate) fn minimum_block_size(self) -> usize {
         self.size.max(self.align)
     }
 
@@ -37,7 +39,7 @@ impl LayoutSpec {
         addr.checked_add(mask).map(|value| value & !mask)
     }
 
-    pub(crate) fn large_mapping_len(self, page_size: usize) -> Option<usize> {
+    pub(crate) fn mapping_len(self, page_size: usize) -> Option<usize> {
         let len = self.size.checked_add(self.align)?;
         let mask = page_size.checked_sub(1)?;
         len.checked_add(mask).map(|value| value & !mask)
@@ -53,7 +55,7 @@ mod tests {
     #[test]
     fn layout_spec_normalizes_zero_size_to_one() {
         let layout = Layout::from_size_align(0, 8).unwrap();
-        let spec = LayoutSpec::from_layout(layout).unwrap();
+        let spec = LayoutSpec::from_layout(layout);
 
         assert_eq!(spec.size(), 1);
     }
@@ -66,10 +68,10 @@ mod tests {
     }
 
     #[test]
-    fn layout_spec_class_requirement_is_max_size_or_align() {
+    fn layout_spec_minimum_block_size_is_max_size_or_align() {
         let spec = LayoutSpec::from_size_align(17, 64).unwrap();
 
-        assert_eq!(spec.class_requirement(), 64);
+        assert_eq!(spec.minimum_block_size(), 64);
     }
 
     #[test]
@@ -94,19 +96,19 @@ mod tests {
     }
 
     #[test]
-    fn layout_spec_large_mapping_len_rounds_to_page() {
+    fn layout_spec_mapping_len_rounds_to_page() {
         let spec = LayoutSpec::from_size_align(4097, 8).unwrap();
 
-        assert_eq!(spec.large_mapping_len(4096), Some(8192));
+        assert_eq!(spec.mapping_len(4096), Some(8192));
     }
 
     #[test]
-    fn layout_spec_large_mapping_len_detects_overflow() {
+    fn layout_spec_mapping_len_detects_overflow() {
         let spec = LayoutSpec {
             size: usize::MAX,
             align: 1,
         };
 
-        assert_eq!(spec.large_mapping_len(4096), None);
+        assert_eq!(spec.mapping_len(4096), None);
     }
 }
