@@ -91,7 +91,9 @@ impl Heap {
                 let Some(page_range) = PageRange::from_range(range) else {
                     return Err(HeapError::InvalidMetadata);
                 };
-                self.pages.remove(page_range);
+                self.pages
+                    .remove(page_range, PageEntry::Extent(id))
+                    .map_err(|_| HeapError::InvalidMetadata)?;
 
                 if self.extents.remove(id).is_none() {
                     return Err(HeapError::MissingExtent);

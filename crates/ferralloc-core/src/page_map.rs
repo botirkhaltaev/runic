@@ -17,6 +17,7 @@ pub(crate) enum PageMapError {
     InvalidRange,
     MetadataAllocFailed,
     Overlap,
+    UnexpectedEntry,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -118,13 +119,13 @@ impl L1Table {
     fn get(&self, index: L1Index) -> Option<NonNull<L2Table>> {
         self.entries
             .get(index.get())
-            .and_then(|entry| entry.table())
+            .and_then(|entry| entry.l2_table())
     }
 
     fn get_or_create(&mut self, index: L1Index) -> Option<NonNull<L2Table>> {
         let entry = self.entries.get_mut(index.get())?;
 
-        if let Some(table) = entry.table() {
+        if let Some(table) = entry.l2_table() {
             return Some(table);
         }
 
@@ -145,7 +146,7 @@ struct L1Entry {
 }
 
 impl L1Entry {
-    fn table(self) -> Option<NonNull<L2Table>> {
+    fn l2_table(self) -> Option<NonNull<L2Table>> {
         NonNull::new(self.raw)
     }
 
@@ -241,16 +242,16 @@ impl MapEntry {
 }
 
 pub(crate) struct PageMap {
-    l1: Option<L1Storage>,
+    l1: Option<L1Map>,
 }
 
-struct L1Storage {
+struct L1Map {
     mapping: Mapping,
 }
 
-// SAFETY: L1Storage owns mmap-backed metadata. Moving ownership to another
+// SAFETY: L1Map owns mmap-backed metadata. Moving ownership to another
 // thread does not allow concurrent mutation; global access remains locked.
-unsafe impl Send for L1Storage {}
+unsafe impl Send for L1Map {}
 
 impl PageMap {
     pub(crate) const fn new() -> Self {
@@ -278,7 +279,7 @@ impl PageMap {
 
         for page in range.pages() {
             if let Err(error) = self.commit_page(page, occupied) {
-                self.remove(range);
+                self.clear_matching(range, occupied);
 
                 return Err(error);
             }
@@ -287,30 +288,39 @@ impl PageMap {
         Ok(())
     }
 
-    pub(crate) fn remove(&mut self, range: PageRange) {
-        for page in range.pages() {
-            let Some((l1_index, l2_index)) = page.indexes() else {
-                continue;
-            };
-            let Some(mut table) = self.l1_mut().and_then(|l1| l1.get(l1_index)) else {
-                continue;
-            };
+    pub(crate) fn remove(
+        &mut self,
+        range: PageRange,
+        expected: PageEntry,
+    ) -> Result<(), PageMapError> {
+        self.validate_remove(range, expected)?;
 
-            // SAFETY: L1Entry only stores non-null L2 table pointers allocated by L1Table::get_or_create.
-            let cleared = unsafe { table.as_mut() }.clear(l2_index);
-            debug_assert!(cleared, "validated L2 index should be clearable");
+        for page in range.pages() {
+            self.clear_page(page)?;
+        }
+
+        Ok(())
+    }
+
+    fn clear_matching(&mut self, range: PageRange, entry: MapEntry) {
+        for page in range.pages() {
+            if self.entry_for_page(page).ok().flatten() != Some(entry) {
+                continue;
+            }
+
+            let _ = self.clear_page(page);
         }
     }
 
     fn l1(&self) -> Option<&L1Table> {
-        let l1 = self.l1.as_ref()?.table();
+        let l1 = self.l1.as_ref()?.as_table();
 
         // SAFETY: l1 points to an mmap allocation sized for L1Table and lives for the process.
         Some(unsafe { l1.as_ref() })
     }
 
     fn l1_mut(&mut self) -> Option<&mut L1Table> {
-        let mut l1 = self.l1.as_mut()?.table();
+        let mut l1 = self.l1.as_mut()?.as_table();
 
         // SAFETY: PageMap is only accessed behind the global heap lock.
         Some(unsafe { l1.as_mut() })
@@ -320,7 +330,7 @@ impl PageMap {
         if self.l1.is_none() {
             let mapping =
                 OsMemory::map(size_of::<L1Table>()).ok_or(PageMapError::MetadataAllocFailed)?;
-            self.l1 = Some(L1Storage { mapping });
+            self.l1 = Some(L1Map { mapping });
         }
 
         self.l1_mut().ok_or(PageMapError::MetadataAllocFailed)
@@ -332,6 +342,18 @@ impl PageMap {
 
             if existing.is_some_and(|existing| !existing.is_empty()) {
                 return Err(PageMapError::Overlap);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_remove(&self, range: PageRange, expected: PageEntry) -> Result<(), PageMapError> {
+        let expected = MapEntry::occupied(expected).ok_or(PageMapError::InvalidRange)?;
+
+        for page in range.pages() {
+            if self.entry_for_page(page)? != Some(expected) {
+                return Err(PageMapError::UnexpectedEntry);
             }
         }
 
@@ -376,6 +398,20 @@ impl PageMap {
         }
     }
 
+    fn clear_page(&mut self, page: Page) -> Result<(), PageMapError> {
+        let (l1_index, l2_index) = page.indexes().ok_or(PageMapError::InvalidRange)?;
+        let Some(mut table) = self.l1_mut().and_then(|l1| l1.get(l1_index)) else {
+            return Err(PageMapError::UnexpectedEntry);
+        };
+
+        // SAFETY: L1Entry only stores non-null L2 table pointers allocated by L1Table::get_or_create.
+        if unsafe { table.as_mut() }.clear(l2_index) {
+            Ok(())
+        } else {
+            Err(PageMapError::InvalidRange)
+        }
+    }
+
     #[cfg(test)]
     fn has_l2_table(&self, ptr: NonNull<u8>) -> bool {
         let Some((l1_index, _)) = Page::containing(ptr).indexes() else {
@@ -386,8 +422,8 @@ impl PageMap {
     }
 }
 
-impl L1Storage {
-    fn table(&self) -> NonNull<L1Table> {
+impl L1Map {
+    fn as_table(&self) -> NonNull<L1Table> {
         self.mapping.base().cast::<L1Table>()
     }
 }
@@ -501,7 +537,7 @@ mod tests {
         let range = mapping.page_range();
 
         assert!(map.insert(range, run(8)).is_ok());
-        map.remove(range);
+        assert_eq!(map.remove(range, run(8)), Ok(()));
 
         assert!(map.get(mapping.base()).is_none());
         let second = mapping.ptr_at(PAGE_SIZE);
@@ -529,11 +565,95 @@ mod tests {
                 .is_ok()
         );
 
-        map.remove(PageRange::new(second, PAGE_SIZE).unwrap());
+        assert_eq!(
+            map.remove(PageRange::new(second, PAGE_SIZE).unwrap(), run(2)),
+            Ok(())
+        );
 
         assert_eq!(map.get(first), Some(run(1)));
         assert!(map.get(second).is_none());
         assert_eq!(map.get(third), Some(run(3)));
+    }
+
+    #[test]
+    fn page_map_remove_range_rejects_wrong_owner_without_clearing() {
+        let mapping = TestMapping::new(PAGE_SIZE);
+        let mut map = PageMap::new();
+        let range = mapping.page_range();
+
+        assert!(map.insert(range, run(1)).is_ok());
+
+        assert_eq!(
+            map.remove(range, run(2)),
+            Err(PageMapError::UnexpectedEntry)
+        );
+        assert_eq!(map.get(mapping.base()), Some(run(1)));
+    }
+
+    #[test]
+    fn page_map_remove_range_rejects_missing_entry_without_clearing() {
+        let mapping = TestMapping::new(PAGE_SIZE * 2);
+        let mut map = PageMap::new();
+        let first = mapping.base();
+        let second = mapping.ptr_at(PAGE_SIZE);
+
+        assert!(
+            map.insert(PageRange::new(first, PAGE_SIZE).unwrap(), run(1))
+                .is_ok()
+        );
+
+        assert_eq!(
+            map.remove(mapping.page_range(), run(1)),
+            Err(PageMapError::UnexpectedEntry)
+        );
+        assert_eq!(map.get(first), Some(run(1)));
+        assert!(map.get(second).is_none());
+    }
+
+    #[test]
+    fn page_map_remove_range_rejects_partial_mismatch_without_clearing() {
+        let mapping = TestMapping::new(PAGE_SIZE * 2);
+        let mut map = PageMap::new();
+        let first = mapping.base();
+        let second = mapping.ptr_at(PAGE_SIZE);
+
+        assert!(
+            map.insert(PageRange::new(first, PAGE_SIZE).unwrap(), run(1))
+                .is_ok()
+        );
+        assert!(
+            map.insert(PageRange::new(second, PAGE_SIZE).unwrap(), run(2))
+                .is_ok()
+        );
+
+        assert_eq!(
+            map.remove(mapping.page_range(), run(1)),
+            Err(PageMapError::UnexpectedEntry)
+        );
+        assert_eq!(map.get(first), Some(run(1)));
+        assert_eq!(map.get(second), Some(run(2)));
+    }
+
+    #[test]
+    fn page_map_clear_matching_preserves_other_owners() {
+        let mapping = TestMapping::new(PAGE_SIZE * 2);
+        let mut map = PageMap::new();
+        let first = mapping.base();
+        let second = mapping.ptr_at(PAGE_SIZE);
+
+        assert!(
+            map.insert(PageRange::new(first, PAGE_SIZE).unwrap(), run(1))
+                .is_ok()
+        );
+        assert!(
+            map.insert(PageRange::new(second, PAGE_SIZE).unwrap(), run(2))
+                .is_ok()
+        );
+
+        map.clear_matching(mapping.page_range(), MapEntry::occupied(run(1)).unwrap());
+
+        assert!(map.get(first).is_none());
+        assert_eq!(map.get(second), Some(run(2)));
     }
 
     #[test]
