@@ -10,7 +10,7 @@ publish = false
 workspace = true
 
 [dependencies]
-runic = { path = "../runic" }
+runic = { package = "runic-alloc", path = "../runic" }
 mimalloc = "0.1"
 snmalloc-rs = "0.3"
 tikv-jemallocator = "0.6"

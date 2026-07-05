@@ -1,10 +1,13 @@
 [package]
-name = "runic"
+name = "runic-alloc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description.workspace = true
+
+[lib]
+name = "runic"
 
 [lints]
 workspace = true

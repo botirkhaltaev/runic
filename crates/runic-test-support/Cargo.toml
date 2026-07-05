@@ -10,5 +10,5 @@ publish = false
 workspace = true
 
 [dependencies]
-runic = { path = "../runic" }
+runic = { package = "runic-alloc", path = "../runic" }
 runic-core = { path = "../runic-core" }

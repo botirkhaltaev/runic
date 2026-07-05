@@ -35,12 +35,12 @@ jobs:
       - name: Validate package version
         run: |
           metadata=$(cargo metadata --format-version 1)
-          runic_version=$(jq -r '.packages[] | select(.name == "runic") | .version' <<< "$metadata")
+          runic_version=$(jq -r '.packages[] | select(.name == "runic-alloc") | .version' <<< "$metadata")
           core_version=$(jq -r '.packages[] | select(.name == "runic-core") | .version' <<< "$metadata")
-          core_requirement=$(jq -r '.packages[] | select(.name == "runic") | .dependencies[] | select(.name == "runic-core") | .req' <<< "$metadata")
+          core_requirement=$(jq -r '.packages[] | select(.name == "runic-alloc") | .dependencies[] | select(.name == "runic-core") | .req' <<< "$metadata")
 
           if [[ "$GITHUB_REF_NAME" != "$runic_version" ]]; then
-            echo "Tag $GITHUB_REF_NAME does not match runic version $runic_version"
+            echo "Tag $GITHUB_REF_NAME does not match runic-alloc version $runic_version"
             exit 1
           fi
 
@@ -85,18 +85,15 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Publish runic-core
-        run: cargo publish -p runic-core --token "$CARGO_REGISTRY_TOKEN"
+        run: cargo publish -p runic-core
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-      - name: Wait for crates.io index
-        run: sleep 60
+      - name: Dry-run publish runic-alloc
+        run: cargo publish -p runic-alloc --dry-run
 
-      - name: Dry-run publish runic
-        run: cargo publish -p runic --dry-run
-
-      - name: Publish runic
-        run: cargo publish -p runic --token "$CARGO_REGISTRY_TOKEN"
+      - name: Publish runic-alloc
+        run: cargo publish -p runic-alloc
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
