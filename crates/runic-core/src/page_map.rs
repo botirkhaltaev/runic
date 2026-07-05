@@ -148,9 +148,40 @@ impl L1Table {
     }
 
     fn clear_empty_l2(&mut self, index: L1Index) -> bool {
-        self.entries
-            .get_mut(index.get())
-            .is_some_and(L1Entry::clear_empty_l2)
+        self.entries.get_mut(index.get()).is_some_and(|entry| {
+            if !entry.is_empty_l2() {
+                return false;
+            }
+
+            entry.clear_l2()
+        })
+    }
+
+    fn set(&mut self, l1_index: L1Index, l2_index: L2Index, value: MapEntry) -> bool {
+        let Some(entry) = self.entries.get_mut(l1_index.get()) else {
+            return false;
+        };
+        let Some(mut table) = entry.l2_table() else {
+            return false;
+        };
+
+        // SAFETY: l2_table returns the live L2 table pointer owned by this L1 entry.
+        let table = unsafe { table.as_mut() };
+        let Some(previous) = table.get(l2_index) else {
+            return false;
+        };
+
+        if !table.set(l2_index, value) {
+            return false;
+        }
+
+        entry.record_transition(previous, value);
+
+        true
+    }
+
+    fn clear(&mut self, l1_index: L1Index, l2_index: L2Index) -> bool {
+        self.set(l1_index, l2_index, MapEntry::empty())
     }
 }
 
@@ -158,6 +189,7 @@ impl L1Table {
 struct L1Entry {
     mapping: MaybeUninit<Mapping>,
     state: L1EntryState,
+    occupied_pages: u32,
 }
 
 impl L1Entry {
@@ -178,6 +210,7 @@ impl L1Entry {
     fn set(&mut self, mapping: Mapping) {
         self.mapping.write(mapping);
         self.state = L1EntryState::occupied();
+        self.occupied_pages = 0;
     }
 
     fn remove_mapping(&mut self) -> Option<Mapping> {
@@ -191,21 +224,29 @@ impl L1Entry {
         Some(unsafe { self.mapping.assume_init_read() })
     }
 
-    fn clear_empty_l2(&mut self) -> bool {
-        let Some(table) = self.l2_table() else {
-            return false;
-        };
-
-        // SAFETY: l2_table returns the live L2 table pointer owned by this entry.
-        if !unsafe { table.as_ref() }.is_empty() {
-            return false;
-        }
-
-        self.clear_l2()
+    fn is_empty_l2(&self) -> bool {
+        self.state.is_occupied() && self.occupied_pages == 0
     }
 
     fn clear_l2(&mut self) -> bool {
-        self.remove_mapping().is_some()
+        let removed = self.remove_mapping().is_some();
+        if removed {
+            self.occupied_pages = 0;
+        }
+
+        removed
+    }
+
+    fn record_transition(&mut self, previous: MapEntry, next: MapEntry) {
+        match (previous.is_empty(), next.is_empty()) {
+            (true, false) => {
+                self.occupied_pages = self.occupied_pages.saturating_add(1);
+            }
+            (false, true) => {
+                self.occupied_pages = self.occupied_pages.saturating_sub(1);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -251,14 +292,6 @@ impl L2Table {
 
         *entry = value;
         true
-    }
-
-    fn clear(&mut self, index: L2Index) -> bool {
-        self.set(index, MapEntry::empty())
-    }
-
-    fn is_empty(&self) -> bool {
-        self.entries.iter().all(|entry| entry.is_empty())
     }
 }
 
@@ -482,12 +515,11 @@ impl PageMap {
 
     fn set_page(&mut self, page: Page, entry: MapEntry) -> Result<(), PageMapError> {
         let (l1_index, l2_index) = page.indexes().ok_or(PageMapError::InvalidRange)?;
-        let Some(mut table) = self.l1_mut().and_then(|l1| l1.get(l1_index)) else {
+        let Some(l1) = self.l1_mut() else {
             return Err(PageMapError::MetadataAllocFailed);
         };
 
-        // SAFETY: table was allocated or found during prepare_insert.
-        if unsafe { table.as_mut() }.set(l2_index, entry) {
+        if l1.set(l1_index, l2_index, entry) {
             Ok(())
         } else {
             Err(PageMapError::InvalidRange)
@@ -496,12 +528,11 @@ impl PageMap {
 
     fn clear_page(&mut self, page: Page) -> Result<(), PageMapError> {
         let (l1_index, l2_index) = page.indexes().ok_or(PageMapError::InvalidRange)?;
-        let Some(mut table) = self.l1_mut().and_then(|l1| l1.get(l1_index)) else {
+        let Some(l1) = self.l1_mut() else {
             return Err(PageMapError::UnexpectedEntry);
         };
 
-        // SAFETY: L1Entry only stores non-null L2 table pointers allocated by L1Table::get_or_create.
-        if unsafe { table.as_mut() }.clear(l2_index) {
+        if l1.clear(l1_index, l2_index) {
             Ok(())
         } else {
             Err(PageMapError::InvalidRange)
