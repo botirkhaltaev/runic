@@ -12,6 +12,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/botirkhaltaev/runic"
+description = "A correctness-first Rust allocator"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

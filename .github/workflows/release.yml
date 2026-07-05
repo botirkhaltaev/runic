@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "*.*.*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+
+      - name: Validate tag
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tags must use plain semver, for example 0.1.0"
+            exit 1
+          fi
+
+      - name: Validate package version
+        run: |
+          metadata=$(cargo metadata --format-version 1)
+          runic_version=$(jq -r '.packages[] | select(.name == "runic") | .version' <<< "$metadata")
+          core_version=$(jq -r '.packages[] | select(.name == "runic-core") | .version' <<< "$metadata")
+          core_requirement=$(jq -r '.packages[] | select(.name == "runic") | .dependencies[] | select(.name == "runic-core") | .req' <<< "$metadata")
+
+          if [[ "$GITHUB_REF_NAME" != "$runic_version" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match runic version $runic_version"
+            exit 1
+          fi
+
+          if [[ "$GITHUB_REF_NAME" != "$core_version" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match runic-core version $core_version"
+            exit 1
+          fi
+
+          if [[ "^$GITHUB_REF_NAME" != "$core_requirement" ]]; then
+            echo "runic dependency on runic-core is $core_requirement, expected ^$GITHUB_REF_NAME"
+            exit 1
+          fi
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --workspace
+
+      - name: Test workspace
+        run: cargo test --workspace
+
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Build benchmarks
+        run: cargo bench -p runic-bench --no-run
+
+      - name: Dry-run publish runic-core
+        run: cargo publish -p runic-core --dry-run
+
+  publish:
+    name: Publish Crates
+    runs-on: ubuntu-latest
+    needs: verify
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish runic-core
+        run: cargo publish -p runic-core --token "$CARGO_REGISTRY_TOKEN"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Wait for crates.io index
+        run: sleep 60
+
+      - name: Dry-run publish runic
+        run: cargo publish -p runic --dry-run
+
+      - name: Publish runic
+        run: cargo publish -p runic --token "$CARGO_REGISTRY_TOKEN"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  github-release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    needs: publish
+    permissions:
+      contents: write
+
+    steps:
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true

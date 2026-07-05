@@ -4,9 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+description.workspace = true
 
 [lints]
 workspace = true
 
 [dependencies]
-runic-core = { path = "../runic-core" }
+runic-core = { version = "0.1.0", path = "../runic-core" }
