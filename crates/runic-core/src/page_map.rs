@@ -538,15 +538,6 @@ impl PageMap {
             Err(PageMapError::InvalidRange)
         }
     }
-
-    #[cfg(test)]
-    fn has_l2_table(&self, ptr: NonNull<u8>) -> bool {
-        let Some((l1_index, _)) = Page::containing(ptr).indexes() else {
-            return false;
-        };
-
-        self.l1().and_then(|l1| l1.get(l1_index)).is_some()
-    }
 }
 
 impl L1Map {
@@ -587,6 +578,14 @@ mod tests {
         PageEntry::Extent(ExtentId::from_index(raw).unwrap())
     }
 
+    fn has_l2_table(map: &PageMap, ptr: NonNull<u8>) -> bool {
+        let Some((l1_index, _)) = Page::containing(ptr).indexes() else {
+            return false;
+        };
+
+        map.l1().and_then(|l1| l1.get(l1_index)).is_some()
+    }
+
     struct TestMapping {
         mapping: crate::os_memory::Mapping,
     }
@@ -603,7 +602,7 @@ mod tests {
         }
 
         fn len(&self) -> usize {
-            self.mapping.len()
+            self.mapping.range().len()
         }
 
         fn page_range(&self) -> PageRange {
@@ -673,12 +672,12 @@ mod tests {
         let range = mapping.page_range();
 
         assert!(map.insert(range, run(1)).is_ok());
-        assert!(map.has_l2_table(mapping.base()));
+        assert!(has_l2_table(&map, mapping.base()));
 
         assert_eq!(map.remove(range, run(1)), Ok(()));
 
         assert!(map.get(mapping.base()).is_none());
-        assert!(!map.has_l2_table(mapping.base()));
+        assert!(!has_l2_table(&map, mapping.base()));
     }
 
     #[test]
@@ -704,7 +703,7 @@ mod tests {
 
         assert!(map.get(first).is_none());
         assert_eq!(map.get(second), Some(run(2)));
-        assert!(map.has_l2_table(second));
+        assert!(has_l2_table(&map, second));
     }
 
     #[test]
@@ -862,7 +861,7 @@ mod tests {
             map.insert(PageRange::new(overlap, PAGE_SIZE).unwrap(), run(21))
                 .is_ok()
         );
-        assert!(!map.has_l2_table(mapping.base()));
+        assert!(!has_l2_table(&map, mapping.base()));
 
         assert_eq!(
             map.insert(
@@ -872,7 +871,7 @@ mod tests {
             Err(PageMapError::Overlap)
         );
 
-        assert!(!map.has_l2_table(mapping.base()));
+        assert!(!has_l2_table(&map, mapping.base()));
         assert_eq!(map.get(mapping.base()), None);
         assert_eq!(map.get(overlap), Some(run(21)));
     }

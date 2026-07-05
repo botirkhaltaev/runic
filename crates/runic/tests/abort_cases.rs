@@ -16,6 +16,11 @@ fn large_interior_pointer_free_aborts() {
 }
 
 #[test]
+fn small_double_free_aborts() {
+    AbortCase::new("small-double-free").assert_aborts();
+}
+
+#[test]
 fn small_interior_pointer_realloc_aborts() {
     AbortCase::new("small-interior-realloc").assert_aborts();
 }
@@ -23,6 +28,11 @@ fn small_interior_pointer_realloc_aborts() {
 #[test]
 fn large_interior_pointer_realloc_aborts() {
     AbortCase::new("large-interior-realloc").assert_aborts();
+}
+
+#[test]
+fn small_realloc_after_free_aborts() {
+    AbortCase::new("small-realloc-after-free").assert_aborts();
 }
 
 struct AbortCase {

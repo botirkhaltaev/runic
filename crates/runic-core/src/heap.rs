@@ -9,7 +9,7 @@ use crate::{
     layout::LayoutSpec,
     os_memory::OsMemory,
     page_map::{PageEntry, PageMap, PageRange},
-    run::{RUN_SIZE, Run, RunId},
+    run::{RUN_SIZE, Run, RunError, RunId},
     run_table::{RunReservation, RunTable},
     size_class::{SizeClass, SizeClasses},
 };
@@ -21,12 +21,6 @@ pub(crate) struct Heap {
     active: [Option<RunId>; SizeClasses::COUNT],
 }
 
-#[cfg(test)]
-pub(crate) struct HeapBuilder {
-    runs: RunTable,
-    extents: ExtentTable,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HeapError {
     UnknownPointer,
@@ -34,6 +28,7 @@ pub(crate) enum HeapError {
     MissingExtent,
     InvalidRunPointer,
     InvalidExtentPointer,
+    DoubleFree,
     InvalidMetadata,
 }
 
@@ -47,11 +42,6 @@ impl Heap {
             pages: PageMap::new(),
             active: [None; SizeClasses::COUNT],
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn builder() -> HeapBuilder {
-        HeapBuilder::new()
     }
 
     pub(crate) fn alloc(&mut self, layout: Layout) -> *mut u8 {
@@ -76,9 +66,7 @@ impl Heap {
                         return Err(HeapError::MissingRun);
                     };
 
-                    if run.free(ptr).is_err() {
-                        return Err(HeapError::InvalidRunPointer);
-                    }
+                    run.free(ptr).map_err(HeapError::from)?;
 
                     run.class().index()
                 };
@@ -148,9 +136,7 @@ impl Heap {
                     return Err(HeapError::MissingRun);
                 };
 
-                if run.block_at(old_ptr).is_none() {
-                    return Err(HeapError::InvalidRunPointer);
-                }
+                run.allocated_block_at(old_ptr).map_err(HeapError::from)?;
             }
             PageEntry::Extent(id) => {
                 let Some(extent) = self.extents.get(id) else {
@@ -322,31 +308,12 @@ impl Heap {
     }
 }
 
-#[cfg(test)]
-impl HeapBuilder {
-    pub(crate) const fn new() -> Self {
-        Self {
-            runs: RunTable::new(Heap::DEFAULT_TABLE_CAPACITY),
-            extents: ExtentTable::new(Heap::DEFAULT_TABLE_CAPACITY),
-        }
-    }
-
-    pub(crate) fn runs(mut self, runs: RunTable) -> Self {
-        self.runs = runs;
-        self
-    }
-
-    pub(crate) fn extents(mut self, extents: ExtentTable) -> Self {
-        self.extents = extents;
-        self
-    }
-
-    pub(crate) fn build(self) -> Heap {
-        Heap {
-            runs: self.runs,
-            extents: self.extents,
-            pages: PageMap::new(),
-            active: [None; SizeClasses::COUNT],
+impl From<RunError> for HeapError {
+    fn from(error: RunError) -> Self {
+        match error {
+            RunError::InvalidPointer => Self::InvalidRunPointer,
+            RunError::DoubleFree => Self::DoubleFree,
+            RunError::FreeUnderflow => Self::InvalidMetadata,
         }
     }
 }
@@ -374,10 +341,34 @@ mod tests {
     }
 
     fn test_heap() -> Heap {
-        Heap::builder()
-            .runs(RunTable::new(4))
-            .extents(ExtentTable::new(4))
-            .build()
+        Heap {
+            runs: RunTable::new(4),
+            extents: ExtentTable::new(4),
+            pages: PageMap::new(),
+            active: [None; SizeClasses::COUNT],
+        }
+    }
+
+    #[test]
+    fn heap_reports_small_double_free() {
+        let mut heap = test_heap();
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        let ptr = heap.alloc(layout);
+
+        assert!(!ptr.is_null());
+        assert_eq!(heap.dealloc(ptr, layout), Ok(()));
+        assert_eq!(heap.dealloc(ptr, layout), Err(HeapError::DoubleFree));
+    }
+
+    #[test]
+    fn heap_reports_small_realloc_after_free() {
+        let mut heap = test_heap();
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        let ptr = heap.alloc(layout);
+
+        assert!(!ptr.is_null());
+        assert_eq!(heap.dealloc(ptr, layout), Ok(()));
+        assert_eq!(heap.realloc(ptr, layout, 128), Err(HeapError::DoubleFree));
     }
 
     #[test]
