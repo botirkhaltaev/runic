@@ -63,7 +63,7 @@ impl Extent {
         self.mapping.range().len()
     }
 
-    pub(crate) fn release(self) -> Mapping {
+    pub(crate) fn into_mapping(self) -> Mapping {
         self.mapping
     }
 

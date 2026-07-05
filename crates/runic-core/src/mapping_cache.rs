@@ -2,12 +2,12 @@ use core::mem::MaybeUninit;
 
 use crate::os_memory::Mapping;
 
-pub(crate) struct ExtentMappingCache {
+pub(crate) struct MappingCache {
     slots: [ExtentMappingSlot; Self::SLOTS],
     retained_bytes: usize,
 }
 
-impl ExtentMappingCache {
+impl MappingCache {
     const SLOTS: usize = 32;
     const MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
 
@@ -61,7 +61,7 @@ impl ExtentMappingCache {
     }
 }
 
-impl Drop for ExtentMappingCache {
+impl Drop for MappingCache {
     fn drop(&mut self) {
         for slot in &mut self.slots {
             let _ = slot.take();
@@ -125,8 +125,8 @@ mod tests {
     }
 
     #[test]
-    fn extent_mapping_cache_reuses_exact_length() {
-        let mut cache = ExtentMappingCache::new();
+    fn mapping_cache_reuses_exact_length() {
+        let mut cache = MappingCache::new();
         let mapping = mapping(256 * 1024);
         let len = mapping.range().len();
         let ptr = mapping.base();
@@ -138,18 +138,18 @@ mod tests {
     }
 
     #[test]
-    fn extent_mapping_cache_rejects_nonmatching_length_lookup() {
-        let mut cache = ExtentMappingCache::new();
+    fn mapping_cache_rejects_nonmatching_length_lookup() {
+        let mut cache = MappingCache::new();
 
         assert!(cache.insert(mapping(256 * 1024)).is_ok());
         assert!(cache.take_exact(128 * 1024).is_none());
     }
 
     #[test]
-    fn extent_mapping_cache_enforces_slot_capacity() {
-        let mut cache = ExtentMappingCache::new();
+    fn mapping_cache_enforces_slot_capacity() {
+        let mut cache = MappingCache::new();
 
-        for _ in 0..ExtentMappingCache::SLOTS {
+        for _ in 0..MappingCache::SLOTS {
             assert!(cache.insert(mapping(4096)).is_ok());
         }
 
@@ -157,12 +157,12 @@ mod tests {
     }
 
     #[test]
-    fn extent_mapping_cache_enforces_byte_capacity() {
-        let mut cache = ExtentMappingCache::new();
+    fn mapping_cache_enforces_byte_capacity() {
+        let mut cache = MappingCache::new();
 
         assert!(
             cache
-                .insert(mapping(ExtentMappingCache::MAX_RETAINED_BYTES))
+                .insert(mapping(MappingCache::MAX_RETAINED_BYTES))
                 .is_ok()
         );
         assert!(cache.insert(mapping(4096)).is_err());

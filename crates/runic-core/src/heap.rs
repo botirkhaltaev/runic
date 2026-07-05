@@ -5,9 +5,9 @@ use core::{
 
 use crate::{
     extent::Extent,
-    extent_mapping_cache::ExtentMappingCache,
     extent_table::{ExtentReservation, ExtentTable},
     layout::LayoutSpec,
+    mapping_cache::MappingCache,
     os_memory::OsMemory,
     page_map::{EmptyL2Tables, PageEntry, PageMap, PageRange},
     run::{RUN_SIZE, Run, RunError, RunId},
@@ -18,7 +18,7 @@ use crate::{
 pub(crate) struct Heap {
     runs: RunTable,
     extents: ExtentTable,
-    extent_mappings: ExtentMappingCache,
+    mapping_cache: MappingCache,
     pages: PageMap,
     active: [Option<RunId>; SizeClasses::COUNT],
 }
@@ -41,7 +41,7 @@ impl Heap {
         Self {
             runs: RunTable::new(Self::DEFAULT_TABLE_CAPACITY),
             extents: ExtentTable::new(Self::DEFAULT_TABLE_CAPACITY),
-            extent_mappings: ExtentMappingCache::new(),
+            mapping_cache: MappingCache::new(),
             pages: PageMap::new(),
             active: [None; SizeClasses::COUNT],
         }
@@ -92,7 +92,7 @@ impl Heap {
                     (extent.range(), extent.mapping_len())
                 };
 
-                let retain_mapping = self.extent_mappings.can_retain(mapping_len);
+                let retain_mapping = self.mapping_cache.can_retain(mapping_len);
                 let Some(page_range) = PageRange::from_range(range) else {
                     return Err(HeapError::InvalidMetadata);
                 };
@@ -110,8 +110,8 @@ impl Heap {
                     return Err(HeapError::MissingExtent);
                 };
 
-                let mapping = extent.release();
-                if let Err(mapping) = self.extent_mappings.insert(mapping) {
+                let mapping = extent.into_mapping();
+                if let Err(mapping) = self.mapping_cache.insert(mapping) {
                     drop(mapping);
                 }
             }
@@ -255,7 +255,7 @@ impl Heap {
         let Some(len) = spec.mapping_len(OsMemory::page_size()) else {
             return null_mut();
         };
-        let mapping = if let Some(mapping) = self.extent_mappings.take_exact(len) {
+        let mapping = if let Some(mapping) = self.mapping_cache.take_exact(len) {
             mapping
         } else {
             let Some(mapping) = OsMemory::map(len) else {
@@ -366,7 +366,7 @@ mod tests {
         Heap {
             runs: RunTable::new(4),
             extents: ExtentTable::new(4),
-            extent_mappings: ExtentMappingCache::new(),
+            mapping_cache: MappingCache::new(),
             pages: PageMap::new(),
             active: [None; SizeClasses::COUNT],
         }
