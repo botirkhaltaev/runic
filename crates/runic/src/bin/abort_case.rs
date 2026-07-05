@@ -17,8 +17,10 @@ fn main() {
         "unknown-free" => unknown_free(),
         "small-interior-free" => small_interior_free(),
         "large-interior-free" => large_interior_free(),
+        "small-double-free" => small_double_free(),
         "small-interior-realloc" => small_interior_realloc(),
         "large-interior-realloc" => large_interior_realloc(),
+        "small-realloc-after-free" => small_realloc_after_free(),
         _ => std::process::abort(),
     }
 }
@@ -44,6 +46,14 @@ fn large_interior_free() {
     unsafe { dealloc(ptr.add(4096), layout) };
 }
 
+fn small_double_free() {
+    let layout = Layout::from_size_align(64, 8).unwrap();
+    let ptr = allocate(layout);
+
+    unsafe { dealloc(ptr, layout) };
+    unsafe { dealloc(ptr, layout) };
+}
+
 fn small_interior_realloc() {
     let layout = Layout::from_size_align(64, 8).unwrap();
     let ptr = allocate(layout);
@@ -56,6 +66,14 @@ fn large_interior_realloc() {
     let ptr = allocate(layout);
 
     let _ = unsafe { realloc(ptr.add(4096), layout, 256 * 1024) };
+}
+
+fn small_realloc_after_free() {
+    let layout = Layout::from_size_align(64, 8).unwrap();
+    let ptr = allocate(layout);
+
+    unsafe { dealloc(ptr, layout) };
+    let _ = unsafe { realloc(ptr, layout, 128) };
 }
 
 fn allocate(layout: Layout) -> *mut u8 {

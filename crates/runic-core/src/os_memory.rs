@@ -19,11 +19,6 @@ impl Mapping {
         self.base
     }
 
-    #[cfg(test)]
-    pub(crate) const fn len(&self) -> usize {
-        self.len
-    }
-
     pub(crate) const fn range(&self) -> AddressRange {
         AddressRange::new(self.base, self.len)
     }
@@ -98,7 +93,7 @@ mod tests {
         let mapping = OsMemory::map(1).unwrap();
 
         assert_eq!(mapping.base().as_ptr() as usize % PAGE_SIZE, 0);
-        assert_eq!(mapping.len(), PAGE_SIZE);
+        assert_eq!(mapping.range().len(), PAGE_SIZE);
 
         drop(mapping);
     }
