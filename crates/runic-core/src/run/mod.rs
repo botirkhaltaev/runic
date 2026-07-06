@@ -171,6 +171,7 @@ pub(crate) struct Run {
     block_size: usize,
     capacity: u32,
     live: u32,
+    available_next: Option<RunId>,
     states: BlockStates,
     free: FreeList,
 }
@@ -188,6 +189,7 @@ impl Run {
             block_size,
             capacity: u32::try_from(capacity).unwrap_or(u32::MAX),
             live: 0,
+            available_next: None,
             states: BlockStates::new(),
             free: FreeList::new(),
         };
@@ -217,6 +219,26 @@ impl Run {
 
     pub(crate) const fn class(&self) -> SizeClassId {
         self.class
+    }
+
+    pub(crate) const fn has_available_blocks(&self) -> bool {
+        self.live < self.capacity
+    }
+
+    pub(crate) const fn is_full(&self) -> bool {
+        !self.has_available_blocks()
+    }
+
+    pub(crate) const fn available_next(&self) -> Option<RunId> {
+        self.available_next
+    }
+
+    pub(crate) fn set_available_next(&mut self, next: Option<RunId>) {
+        self.available_next = next;
+    }
+
+    pub(crate) fn take_available_next(&mut self) -> Option<RunId> {
+        self.available_next.take()
     }
 
     pub(crate) fn range(&self) -> AddressRange {

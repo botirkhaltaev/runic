@@ -12,7 +12,7 @@ use super::RunReservation;
 
 pub(crate) struct RunAllocator {
     runs: RunTable,
-    active: [Option<RunId>; SizeClasses::COUNT],
+    available: [Option<RunId>; SizeClasses::COUNT],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,7 +27,7 @@ impl RunAllocator {
     pub(crate) const fn new(capacity: u32) -> Self {
         Self {
             runs: RunTable::new(capacity),
-            active: [None; SizeClasses::COUNT],
+            available: [None; SizeClasses::COUNT],
         }
     }
 
@@ -38,20 +38,9 @@ impl RunAllocator {
         pages: &mut PageMap,
     ) -> Option<Allocation> {
         let class_index = class.id().index();
-        let active_id = self.active.get(class_index).copied().flatten();
 
-        if let Some(id) = active_id
-            && let Some(run) = self.runs.get_mut(id)
-            && let Some(ptr) = run.allocate(spec)
-        {
-            return Some(Allocation::new(ptr, ZeroStatus::NeedsZeroing));
-        }
-
-        if let Some((id, ptr)) = self.runs.allocate(class, spec) {
-            let active_slot = self.active.get_mut(class_index)?;
-            *active_slot = Some(id);
-
-            return Some(Allocation::new(ptr, ZeroStatus::NeedsZeroing));
+        if let Some(allocation) = self.allocate_from_available(class_index, spec) {
+            return Some(allocation);
         }
 
         let mapping = crate::memory::OsMemory::map(RUN_SIZE)?;
@@ -63,30 +52,31 @@ impl RunAllocator {
             return None;
         }
 
-        let active_slot = self.active.get_mut(class_index)?;
-        *active_slot = Some(id);
-
         let inserted_run = self.runs.get_mut(id)?;
-        inserted_run
-            .allocate(spec)
-            .map(|ptr| Allocation::new(ptr, ZeroStatus::NeedsZeroing))
+        let ptr = inserted_run.allocate(spec)?;
+
+        if inserted_run.has_available_blocks() {
+            self.push_available(class_index, id).ok()?;
+        }
+
+        Some(Allocation::new(ptr, ZeroStatus::NeedsZeroing))
     }
 
     pub(crate) fn free(&mut self, id: RunId, ptr: NonNull<u8>) -> Result<(), RunAllocatorError> {
-        let class_index = {
+        let (class_index, was_full) = {
             let Some(run) = self.runs.get_mut(id) else {
                 return Err(RunAllocatorError::MissingRun);
             };
 
+            let was_full = run.is_full();
             run.free(ptr).map_err(RunAllocatorError::from)?;
 
-            run.class().index()
+            (run.class().index(), was_full)
         };
 
-        let Some(active_slot) = self.active.get_mut(class_index) else {
-            return Err(RunAllocatorError::InvalidMetadata);
-        };
-        *active_slot = Some(id);
+        if was_full {
+            self.push_available(class_index, id)?;
+        }
 
         Ok(())
     }
@@ -103,6 +93,56 @@ impl RunAllocator {
 
         run.resize_in_place(ptr, spec)
             .map_err(RunAllocatorError::from)
+    }
+
+    fn allocate_from_available(
+        &mut self,
+        class_index: usize,
+        spec: LayoutSpec,
+    ) -> Option<Allocation> {
+        loop {
+            let id = *self.available.get(class_index)?.as_ref()?;
+            let (ptr, remains_available, next) = {
+                let run = self.runs.get_mut(id)?;
+                let ptr = run.allocate(spec);
+                let remains_available = ptr.is_some() && run.has_available_blocks();
+                let next = if remains_available {
+                    run.available_next()
+                } else {
+                    run.take_available_next()
+                };
+
+                (ptr, remains_available, next)
+            };
+
+            if !remains_available {
+                let available = self.available.get_mut(class_index)?;
+                *available = next;
+            }
+
+            if let Some(ptr) = ptr {
+                return Some(Allocation::new(ptr, ZeroStatus::NeedsZeroing));
+            }
+        }
+    }
+
+    fn push_available(&mut self, class_index: usize, id: RunId) -> Result<(), RunAllocatorError> {
+        let Some(available) = self.available.get_mut(class_index) else {
+            return Err(RunAllocatorError::InvalidMetadata);
+        };
+
+        let Some(run) = self.runs.get_mut(id) else {
+            return Err(RunAllocatorError::MissingRun);
+        };
+
+        if !run.has_available_blocks() {
+            return Err(RunAllocatorError::InvalidMetadata);
+        }
+
+        run.set_available_next(*available);
+        *available = Some(id);
+
+        Ok(())
     }
 
     fn insert_run(
@@ -159,6 +199,31 @@ mod tests {
         let class = SizeClasses::get(spec).unwrap();
 
         Run::new(id, mapping, class)
+    }
+
+    #[test]
+    fn allocator_relinks_previously_full_run_after_free() {
+        let mut allocator = RunAllocator::new(2);
+        let mut pages = PageMap::new();
+        let spec = LayoutSpec::from_size_align(64, 8).unwrap();
+        let class = SizeClasses::get(spec).unwrap();
+        let class_index = class.id().index();
+        let capacity = RUN_SIZE / class.block_size();
+        let id = RunId::from_index(0).unwrap();
+        let first = allocator.allocate(spec, class, &mut pages).unwrap().ptr();
+
+        for _ in 1..capacity {
+            assert!(allocator.allocate(spec, class, &mut pages).is_some());
+        }
+
+        assert_eq!(allocator.available[class_index], None);
+        assert_eq!(allocator.free(id, first), Ok(()));
+        assert_eq!(allocator.available[class_index], Some(id));
+
+        let reused = allocator.allocate(spec, class, &mut pages).unwrap().ptr();
+
+        assert_eq!(reused, first);
+        assert_eq!(allocator.available[class_index], None);
     }
 
     #[test]

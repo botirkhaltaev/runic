@@ -77,10 +77,6 @@ impl<T> SlotStore<T> {
         self.slot_mut(index)?.remove()
     }
 
-    pub(crate) fn occupied_mut(&mut self) -> Option<OccupiedMut<'_, T>> {
-        self.slots.as_mut().map(Slots::occupied_mut)
-    }
-
     pub(crate) fn capacity(&self) -> Option<usize> {
         usize::try_from(self.capacity).ok()
     }
@@ -141,32 +137,6 @@ impl<T> Slots<T> {
 
         // SAFETY: Slots has unique access to the mmap storage here.
         unsafe { slice::from_raw_parts_mut(self.base.as_ptr(), self.len) }
-    }
-
-    fn occupied_mut(&mut self) -> OccupiedMut<'_, T> {
-        OccupiedMut {
-            slots: self.slots_mut().iter_mut().enumerate(),
-        }
-    }
-}
-
-pub(crate) struct OccupiedMut<'a, T> {
-    slots: core::iter::Enumerate<slice::IterMut<'a, Slot<T>>>,
-}
-
-impl<'a, T> Iterator for OccupiedMut<'a, T> {
-    type Item = (usize, &'a mut T);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        for (index, slot) in self.slots.by_ref() {
-            let Some(value) = slot.get_mut() else {
-                continue;
-            };
-
-            return Some((index, value));
-        }
-
-        None
     }
 }
 
