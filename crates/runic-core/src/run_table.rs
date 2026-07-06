@@ -1,8 +1,8 @@
-use core::{mem::MaybeUninit, ptr::NonNull, slice};
+use core::ptr::NonNull;
 
 use crate::{
     layout::LayoutSpec,
-    os_memory::OsMemory,
+    metadata_slot::{SlotStore, SlotStoreError},
     run::{Run, RunId},
     size_class::SizeClass,
 };
@@ -25,59 +25,36 @@ impl RunReservation {
 }
 
 pub(crate) struct RunTable {
-    slots: Option<RunSlots>,
-    next: u32,
-    capacity: u32,
+    slots: SlotStore<Run>,
 }
+
+// SAFETY: RunTable owns allocator metadata accessed through the global heap lock.
+// Moving ownership to another thread does not permit concurrent metadata mutation.
+unsafe impl Send for RunTable {}
 
 impl RunTable {
     pub(crate) const fn new(capacity: u32) -> Self {
         Self {
-            slots: None,
-            next: 0,
-            capacity,
+            slots: SlotStore::new(capacity),
         }
     }
 
     pub(crate) fn reserve(&mut self) -> Option<RunReservation> {
-        let capacity = usize::try_from(self.capacity).ok()?;
-        if capacity == 0 {
+        let index = self.slots.reserve()?;
+        let Some(id) = Self::id(index) else {
+            let _ = self.slots.release(index);
             return None;
-        }
-        let start = usize::try_from(self.next).ok()?;
+        };
 
-        for offset in 0..capacity {
-            let sum = start.checked_add(offset)?;
-            let index = if sum >= capacity {
-                sum.checked_sub(capacity)?
-            } else {
-                sum
-            };
-
-            let slot = self.slots_mut()?.get_mut(index)?;
-
-            if slot.reserve() {
-                let next = if index + 1 == capacity {
-                    0
-                } else {
-                    index.checked_add(1)?
-                };
-                self.next = u32::try_from(next).ok()?;
-                let id = RunId::from_index(u32::try_from(index).ok()?)?;
-
-                return Some(RunReservation { id });
-            }
-        }
-
-        None
+        Some(RunReservation { id })
     }
 
     pub(crate) fn release(&mut self, reservation: RunReservation) {
-        let Some(slot) = self.slot_mut(reservation.id) else {
+        let Some(index) = Self::index(reservation.id) else {
             return;
         };
 
-        slot.release();
+        let _ = self.slots.release(index);
     }
 
     pub(crate) fn insert(
@@ -90,24 +67,21 @@ impl RunTable {
             return Err(RunTableError::InvalidReservation);
         }
 
-        let Some(slot) = self.slot_mut(reservation.id) else {
+        let Some(index) = Self::index(reservation.id) else {
             return Err(RunTableError::InvalidReservation);
         };
 
-        if slot.insert(run) {
-            Ok(reservation.id)
-        } else {
-            slot.release();
-            Err(RunTableError::Occupied)
-        }
+        self.slots.insert(index, run).map_err(RunTableError::from)?;
+
+        Ok(reservation.id)
     }
 
     pub(crate) fn get(&self, id: RunId) -> Option<&Run> {
-        self.slot(id)?.get()
+        self.slots.get(Self::index(id)?)
     }
 
     pub(crate) fn get_mut(&mut self, id: RunId) -> Option<&mut Run> {
-        self.slot_mut(id)?.get_mut()
+        self.slots.get_mut(Self::index(id)?)
     }
 
     pub(crate) fn allocate(
@@ -115,11 +89,7 @@ impl RunTable {
         class: SizeClass,
         spec: LayoutSpec,
     ) -> Option<(RunId, NonNull<u8>)> {
-        for (index, slot) in self.slots.as_mut()?.slots_mut().iter_mut().enumerate() {
-            let Some(run) = slot.get_mut() else {
-                continue;
-            };
-
+        for (index, run) in self.slots.occupied_mut()? {
             if run.class() != class.id() {
                 continue;
             }
@@ -127,7 +97,7 @@ impl RunTable {
             let Some(ptr) = run.allocate(spec) else {
                 continue;
             };
-            let id = RunId::from_index(u32::try_from(index).ok()?)?;
+            let id = Self::id(index)?;
 
             return Some((id, ptr));
         }
@@ -136,186 +106,24 @@ impl RunTable {
     }
 
     pub(crate) fn remove(&mut self, id: RunId) -> Option<Run> {
-        self.slot_mut(id)?.remove()
-    }
-
-    fn slots(&self) -> Option<&RunSlots> {
-        self.slots.as_ref()
-    }
-
-    fn slots_mut(&mut self) -> Option<&mut RunSlots> {
-        if self.slots.is_none() {
-            self.slots = Some(RunSlots::new(usize::try_from(self.capacity).ok()?)?);
-        }
-
-        self.slots.as_mut()
-    }
-
-    fn slot(&self, id: RunId) -> Option<&RunSlot> {
-        self.slots()?.get(Self::index(id)?)
-    }
-
-    fn slot_mut(&mut self, id: RunId) -> Option<&mut RunSlot> {
-        self.slots.as_mut()?.get_mut(Self::index(id)?)
+        self.slots.remove(Self::index(id)?)
     }
 
     fn index(id: RunId) -> Option<usize> {
         usize::try_from(id.index()).ok()
     }
-}
 
-struct RunSlots {
-    mapping: crate::os_memory::Mapping,
-    slots: NonNull<RunSlot>,
-}
-
-// SAFETY: RunSlots owns mmap-backed slots. Moving ownership to another
-// thread does not permit concurrent mutation of allocator metadata.
-unsafe impl Send for RunSlots {}
-
-impl RunSlots {
-    fn new(len: usize) -> Option<Self> {
-        let byte_len = len.checked_mul(core::mem::size_of::<RunSlot>())?;
-        let mapping = OsMemory::map(byte_len)?;
-        let slots = mapping.base().cast::<RunSlot>();
-
-        Some(Self { mapping, slots })
-    }
-
-    fn get(&self, index: usize) -> Option<&RunSlot> {
-        self.slots().get(index)
-    }
-
-    fn get_mut(&mut self, index: usize) -> Option<&mut RunSlot> {
-        self.slots_mut().get_mut(index)
-    }
-
-    fn slots(&self) -> &[RunSlot] {
-        let len = self.mapping.range().len() / core::mem::size_of::<RunSlot>();
-
-        // SAFETY: slots points to mmap storage sized for len RunSlot entries.
-        unsafe { slice::from_raw_parts(self.slots.as_ptr(), len) }
-    }
-
-    fn slots_mut(&mut self) -> &mut [RunSlot] {
-        let len = self.mapping.range().len() / core::mem::size_of::<RunSlot>();
-
-        // SAFETY: RunSlots has unique access to the mmap storage here.
-        unsafe { slice::from_raw_parts_mut(self.slots.as_ptr(), len) }
+    fn id(index: usize) -> Option<RunId> {
+        RunId::from_index(u32::try_from(index).ok()?)
     }
 }
 
-impl Drop for RunSlots {
-    fn drop(&mut self) {
-        for slot in self.slots_mut() {
-            slot.drop_run();
+impl From<SlotStoreError> for RunTableError {
+    fn from(error: SlotStoreError) -> Self {
+        match error {
+            SlotStoreError::InvalidIndex | SlotStoreError::NotReserved => Self::InvalidReservation,
+            SlotStoreError::Occupied => Self::Occupied,
         }
-    }
-}
-
-#[repr(C)]
-struct RunSlot {
-    run: MaybeUninit<Run>,
-    state: SlotState,
-}
-
-impl RunSlot {
-    fn reserve(&mut self) -> bool {
-        if !self.state.is_empty() {
-            return false;
-        }
-
-        self.state = SlotState::reserved();
-        true
-    }
-
-    fn release(&mut self) {
-        if self.state.is_reserved() {
-            self.state = SlotState::empty();
-        }
-    }
-
-    fn insert(&mut self, run: Run) -> bool {
-        if !self.state.is_reserved() {
-            return false;
-        }
-
-        self.run.write(run);
-        self.state = SlotState::occupied();
-        true
-    }
-
-    fn get(&self) -> Option<&Run> {
-        if !self.state.is_occupied() {
-            return None;
-        }
-
-        // SAFETY: occupied state is set only after run.write initializes the slot.
-        Some(unsafe { self.run.assume_init_ref() })
-    }
-
-    fn get_mut(&mut self) -> Option<&mut Run> {
-        if !self.state.is_occupied() {
-            return None;
-        }
-
-        // SAFETY: occupied state is set only after run.write initializes the slot.
-        Some(unsafe { self.run.assume_init_mut() })
-    }
-
-    fn remove(&mut self) -> Option<Run> {
-        if !self.state.is_occupied() {
-            return None;
-        }
-
-        self.state = SlotState::empty();
-
-        // SAFETY: occupied state was true on entry, so the slot contains an initialized Run.
-        Some(unsafe { self.run.assume_init_read() })
-    }
-
-    fn drop_run(&mut self) {
-        let _ = self.remove();
-    }
-}
-
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-struct SlotState {
-    raw: u8,
-}
-
-impl SlotState {
-    const EMPTY: u8 = 0;
-    const RESERVED: u8 = 1;
-    const OCCUPIED: u8 = 2;
-
-    const fn empty() -> Self {
-        Self { raw: Self::EMPTY }
-    }
-
-    const fn reserved() -> Self {
-        Self {
-            raw: Self::RESERVED,
-        }
-    }
-
-    const fn occupied() -> Self {
-        Self {
-            raw: Self::OCCUPIED,
-        }
-    }
-
-    const fn is_empty(self) -> bool {
-        self.raw == Self::EMPTY
-    }
-
-    const fn is_reserved(self) -> bool {
-        self.raw == Self::RESERVED
-    }
-
-    const fn is_occupied(self) -> bool {
-        self.raw == Self::OCCUPIED
     }
 }
 
