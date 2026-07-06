@@ -737,7 +737,6 @@ impl PageMap {
         range: PageRange,
         entry: PageEntry,
     ) -> Result<(), PageMapError> {
-        let prefer_span = matches!(entry, PageEntry::Extent(_));
         let occupied = MapEntry::occupied(entry).ok_or(PageMapError::InvalidRange)?;
 
         self.validate_insert(range)?;
@@ -747,10 +746,9 @@ impl PageMap {
             let mut result = Ok(());
 
             for segment in range.segments() {
-                let published = if prefer_span {
-                    l1.publish_empty_span(segment, occupied)
-                } else {
-                    l1.publish_empty_pages(segment, occupied)
+                let published = match entry {
+                    PageEntry::Run(_) => l1.publish_empty_pages(segment, occupied),
+                    PageEntry::Extent(_) => l1.publish_empty_span(segment, occupied),
                 };
 
                 if let Err(error) = published {
