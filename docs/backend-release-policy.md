@@ -2,35 +2,37 @@
 
 Issue: #26
 
-Runic's first backend release policy is intentionally small and deterministic. It applies to cached dedicated extent mappings, where reuse improves large-allocation churn but unbounded retention would inflate RSS.
+Runic's backend release policy should be small and deterministic. It applies to cached dedicated extent mappings, where reuse improves large-allocation churn but unbounded retention would inflate RSS.
+
+This PR records the policy and measurement gate only. It does not change runtime behavior because an earlier decay implementation had mixed benchmark results and therefore did not meet the no-regression bar.
 
 ## Policy
 
-`MappingCache` owns the policy because it owns retained extent mappings:
+`MappingCache` should own the policy because it owns retained extent mappings:
 
 - admit a freed mapping only if slot capacity and a hard byte budget allow it
 - retain exact-size mappings for fast reuse
-- decay retained mappings to a soft byte target after insertion
-- release the oldest cached mappings first
+- decay retained mappings to a soft byte target only after benchmarks show no latency regression
+- release selected cached mappings through a deterministic order, such as oldest first
 - retain at least one mapping that is larger than the soft target when it fits under the hard cap
 
-The policy is fixed for now. It is not adaptive and does not allocate internally.
+The current implementation already has fixed slot and byte caps. Any new decay behavior must be fixed, non-adaptive, and allocation-free until benchmark evidence justifies additional complexity.
 
-## Current Budgets
+## Current And Candidate Budgets
 
-- soft retained target: 8 MiB
-- hard retained limit: 16 MiB
-- slot limit: 32 mappings
+- current hard retained limit: 16 MiB
+- current slot limit: 32 mappings
+- candidate soft retained target: 8 MiB, only if benchmarked as non-regressing
 
-These values keep the existing large-churn fast path useful while bounding mixed-size extent retention.
+The current hard cap keeps the existing large-churn fast path useful. A soft target should be added only with mixed-size benchmarks that show bounded RSS without slower churn.
 
 ## Testing
 
-The release path is deterministic enough to test in `MappingCache`:
+The current cache is deterministic enough to test in `MappingCache`:
 
 - exact-size reuse still works
 - slot and byte caps are enforced
-- decay releases the oldest mapping when retained bytes exceed the soft target
+- a future decay path releases mappings in a deterministic order when retained bytes exceed the soft target
 
 ## Measurement
 
