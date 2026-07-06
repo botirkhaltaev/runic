@@ -2,7 +2,7 @@
 
 Runic is a correctness-first Rust allocator with a small auditable unsafe core, out-of-line metadata, and explicit allocation invariants.
 
-The current release is an experimental v0.1 global-lock allocator for Linux x86_64. It is useful for allocator development, tests, and architecture work; it is not yet tuned for production performance.
+The current release is an experimental v0.2 global-lock allocator for Linux x86_64. It is useful for allocator development, tests, and architecture work; it is not yet tuned for production performance.
 
 ## Install
 
@@ -32,7 +32,7 @@ fn main() {
 
 ## Status
 
-Runic v0.1 implements:
+Runic v0.2 implements:
 
 - `GlobalAlloc`
 - one global heap lock
