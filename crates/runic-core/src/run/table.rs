@@ -131,7 +131,7 @@ impl From<SlotStoreError> for RunTableError {
 mod tests {
     use crate::{
         layout::LayoutSpec,
-        os_memory::OsMemory,
+        memory::OsMemory,
         run::{RUN_SIZE, Run, RunId},
         size_class::SizeClasses,
     };

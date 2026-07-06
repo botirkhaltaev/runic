@@ -1,6 +1,6 @@
 use core::mem::MaybeUninit;
 
-use crate::os_memory::Mapping;
+use crate::memory::Mapping;
 
 pub(crate) struct MappingCache {
     slots: [ExtentMappingSlot; Self::SLOTS],
@@ -116,7 +116,7 @@ impl ExtentMappingSlot {
 
 #[cfg(test)]
 mod tests {
-    use crate::os_memory::OsMemory;
+    use crate::memory::OsMemory;
 
     use super::*;
 

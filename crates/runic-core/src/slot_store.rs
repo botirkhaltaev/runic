@@ -1,6 +1,6 @@
 use core::{mem::MaybeUninit, ptr::NonNull, slice};
 
-use crate::os_memory::{Mapping, OsMemory};
+use crate::memory::{Mapping, OsMemory};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SlotStoreError {

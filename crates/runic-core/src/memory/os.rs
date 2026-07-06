@@ -1,6 +1,6 @@
 use core::ptr::NonNull;
 
-use crate::address::AddressRange;
+use crate::memory::AddressRange;
 
 pub(crate) const PAGE_SIZE: usize = 4096;
 

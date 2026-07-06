@@ -105,7 +105,7 @@ mod tests {
     use crate::{
         extent::{Extent, ExtentId},
         layout::LayoutSpec,
-        os_memory::OsMemory,
+        memory::OsMemory,
     };
 
     use super::*;

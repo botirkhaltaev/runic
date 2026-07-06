@@ -1,6 +1,16 @@
 use core::{num::NonZeroU32, ptr::NonNull};
 
-use crate::{address::AddressRange, layout::LayoutSpec, os_memory::Mapping};
+mod allocator;
+mod mapping_cache;
+mod table;
+
+use crate::{
+    layout::LayoutSpec,
+    memory::{AddressRange, Mapping},
+};
+
+pub(crate) use allocator::{ExtentAllocator, ExtentAllocatorError};
+pub(crate) use table::{ExtentReservation, ExtentTable};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ExtentId {
@@ -78,7 +88,7 @@ impl Extent {
 
 #[cfg(test)]
 mod tests {
-    use crate::{layout::LayoutSpec, os_memory::OsMemory};
+    use crate::{layout::LayoutSpec, memory::OsMemory};
 
     use super::*;
 

@@ -1,12 +1,19 @@
 use core::{num::NonZeroU32, ptr::NonNull};
 
+mod allocator;
+mod free_list;
+mod table;
+
 use crate::{
-    address::AddressRange,
-    free_list::{FreeBlock, FreeList},
     layout::LayoutSpec,
-    os_memory::Mapping,
+    memory::{AddressRange, Mapping},
     size_class::{SizeClass, SizeClassId},
 };
+
+use free_list::{FreeBlock, FreeList};
+
+pub(crate) use allocator::{RunAllocator, RunAllocatorError};
+pub(crate) use table::{RunReservation, RunTable};
 
 pub(crate) const RUN_SIZE: usize = 64 * 1024;
 const MIN_BLOCK_SIZE: usize = 8;
@@ -297,7 +304,7 @@ impl Run {
 
 #[cfg(test)]
 mod tests {
-    use crate::{layout::LayoutSpec, os_memory::OsMemory, size_class::SizeClasses};
+    use crate::{layout::LayoutSpec, memory::OsMemory, size_class::SizeClasses};
 
     use super::*;
 

@@ -7,7 +7,7 @@ use core::{
 
 use crate::{
     extent::ExtentId,
-    os_memory::{Mapping, OsMemory, PAGE_SIZE},
+    memory::{Mapping, OsMemory, PAGE_SIZE},
     run::RunId,
 };
 
@@ -916,7 +916,7 @@ mod tests {
     }
 
     struct TestMapping {
-        mapping: crate::os_memory::Mapping,
+        mapping: crate::memory::Mapping,
     }
 
     impl TestMapping {
