@@ -23,5 +23,6 @@ pub(crate) mod page_map;
 pub(crate) mod run;
 pub(crate) mod run_table;
 pub(crate) mod size_class;
+pub(crate) mod slot_store;
 
 pub use allocator::Allocator;
