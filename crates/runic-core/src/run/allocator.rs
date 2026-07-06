@@ -91,19 +91,18 @@ impl RunAllocator {
         Ok(())
     }
 
-    pub(crate) fn validate_allocated(
+    pub(crate) fn resize_in_place(
         &self,
         id: RunId,
         ptr: NonNull<u8>,
-    ) -> Result<(), RunAllocatorError> {
+        spec: LayoutSpec,
+    ) -> Result<bool, RunAllocatorError> {
         let Some(run) = self.runs.get(id) else {
             return Err(RunAllocatorError::MissingRun);
         };
 
-        run.allocated_block_at(ptr)
-            .map_err(RunAllocatorError::from)?;
-
-        Ok(())
+        run.resize_in_place(ptr, spec)
+            .map_err(RunAllocatorError::from)
     }
 
     fn insert_run(

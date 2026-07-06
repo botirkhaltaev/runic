@@ -97,20 +97,19 @@ impl ExtentAllocator {
         Ok(())
     }
 
-    pub(crate) fn validate_allocated(
-        &self,
+    pub(crate) fn resize_in_place(
+        &mut self,
         id: ExtentId,
         ptr: NonNull<u8>,
-    ) -> Result<(), ExtentAllocatorError> {
-        let Some(extent) = self.extents.get(id) else {
+        spec: LayoutSpec,
+    ) -> Result<bool, ExtentAllocatorError> {
+        let Some(extent) = self.extents.get_mut(id) else {
             return Err(ExtentAllocatorError::MissingExtent);
         };
 
-        if !extent.starts_at(ptr) {
-            return Err(ExtentAllocatorError::InvalidPointer);
-        }
-
-        Ok(())
+        extent
+            .resize_in_place(ptr, spec)
+            .map_err(|_| ExtentAllocatorError::InvalidPointer)
     }
 
     fn insert_extent(

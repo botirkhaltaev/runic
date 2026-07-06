@@ -78,6 +78,10 @@ impl ExtentTable {
         self.slots.get(Self::index(id)?)
     }
 
+    pub(crate) fn get_mut(&mut self, id: ExtentId) -> Option<&mut Extent> {
+        self.slots.get_mut(Self::index(id)?)
+    }
+
     pub(crate) fn remove(&mut self, id: ExtentId) -> Option<Extent> {
         self.slots.remove(Self::index(id)?)
     }

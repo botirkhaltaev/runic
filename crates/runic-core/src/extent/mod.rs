@@ -6,7 +6,7 @@ mod table;
 
 use crate::{
     layout::LayoutSpec,
-    memory::{AddressRange, Mapping},
+    memory::{AddressRange, Mapping, PageRange},
 };
 
 pub(crate) use allocator::{ExtentAllocator, ExtentAllocatorError};
@@ -61,6 +61,39 @@ impl Extent {
 
     pub(crate) fn starts_at(&self, ptr: NonNull<u8>) -> bool {
         ptr == self.ptr()
+    }
+
+    pub(crate) fn resize_in_place(
+        &mut self,
+        ptr: NonNull<u8>,
+        spec: LayoutSpec,
+    ) -> Result<bool, ExtentError> {
+        if !self.starts_at(ptr) {
+            return Err(ExtentError::InvalidPointer);
+        }
+
+        if !ptr.as_ptr().addr().is_multiple_of(spec.align()) {
+            return Ok(false);
+        }
+
+        let requested = AddressRange::new(ptr, spec.size());
+        if !self.mapping.range().contains(requested) {
+            return Ok(false);
+        }
+
+        let Some(current_pages) = PageRange::new(self.range.base(), self.range.len()) else {
+            return Err(ExtentError::InvalidPointer);
+        };
+        let Some(requested_pages) = PageRange::new(requested.base(), requested.len()) else {
+            return Ok(false);
+        };
+
+        if requested_pages == current_pages {
+            self.range = requested;
+            return Ok(true);
+        }
+
+        Ok(spec.size() <= self.range.len())
     }
 
     pub(crate) fn range(&self) -> AddressRange {
@@ -124,5 +157,36 @@ mod tests {
 
         assert!(extent.starts_at(extent.ptr()));
         assert_eq!(extent.free(extent.ptr()), Ok(()));
+    }
+
+    #[test]
+    fn extent_resizes_in_place_for_smaller_layout() {
+        let spec = LayoutSpec::from_size_align(128 * 1024, 4096).unwrap();
+        let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
+        let mut extent = Extent::new(ExtentId::from_index(3).unwrap(), mapping, spec).unwrap();
+        let smaller = LayoutSpec::from_size_align(64 * 1024, 4096).unwrap();
+
+        assert_eq!(extent.resize_in_place(extent.ptr(), smaller), Ok(true));
+    }
+
+    #[test]
+    fn extent_does_not_resize_in_place_beyond_mapping() {
+        let spec = LayoutSpec::from_size_align(128 * 1024, 4096).unwrap();
+        let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
+        let mut extent = Extent::new(ExtentId::from_index(4).unwrap(), mapping, spec).unwrap();
+        let larger = LayoutSpec::from_size_align(256 * 1024, 4096).unwrap();
+
+        assert_eq!(extent.resize_in_place(extent.ptr(), larger), Ok(false));
+    }
+
+    #[test]
+    fn extent_grows_in_place_when_page_range_does_not_change() {
+        let spec = LayoutSpec::from_size_align(4095, 8).unwrap();
+        let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
+        let mut extent = Extent::new(ExtentId::from_index(5).unwrap(), mapping, spec).unwrap();
+        let larger = LayoutSpec::from_size_align(4096, 8).unwrap();
+
+        assert_eq!(extent.resize_in_place(extent.ptr(), larger), Ok(true));
+        assert_eq!(extent.range().len(), 4096);
     }
 }

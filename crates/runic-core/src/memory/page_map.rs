@@ -38,7 +38,7 @@ pub(crate) enum L2TablePolicy {
     RetainEmpty,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PageRange {
     first: Page,
     end: Page,
@@ -67,7 +67,7 @@ impl PageRange {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Page {
     number: usize,
 }
