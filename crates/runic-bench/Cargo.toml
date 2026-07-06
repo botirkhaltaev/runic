@@ -27,6 +27,14 @@ name = "threaded"
 harness = false
 
 [[bench]]
+name = "compare_explicit"
+harness = false
+
+[[bench]]
+name = "compare_threaded"
+harness = false
+
+[[bench]]
 name = "global_system"
 harness = false
 
