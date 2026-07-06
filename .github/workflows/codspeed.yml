@@ -37,7 +37,7 @@ jobs:
           tool: cargo-codspeed
 
       - name: Build the benchmark target(s)
-        run: cargo codspeed build -p runic-bench
+        run: cargo codspeed build -m walltime -p runic-bench
 
       - name: Run the benchmarks
         uses: CodSpeedHQ/action@v4
