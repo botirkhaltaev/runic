@@ -6,7 +6,6 @@ use core::{
 };
 
 use crate::{
-    address::AddressRange,
     extent::ExtentId,
     os_memory::{Mapping, OsMemory, PAGE_SIZE},
     run::RunId,
@@ -58,10 +57,6 @@ impl PageRange {
         }
 
         Some(Self { first, end })
-    }
-
-    pub(crate) fn from_range(range: AddressRange) -> Option<Self> {
-        Self::new(range.base(), range.len())
     }
 
     fn segments(self) -> PageSegments {
