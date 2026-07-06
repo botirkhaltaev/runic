@@ -93,21 +93,33 @@ impl Heap {
         let Some(entry) = self.pages.get(old_ptr) else {
             return Err(HeapError::UnknownPointer);
         };
-        match entry {
-            PageEntry::Run(id) => self
-                .runs
-                .validate_allocated(id, old_ptr)
-                .map_err(HeapError::from)?,
-            PageEntry::Extent(id) => self
-                .extents
-                .validate_allocated(id, old_ptr)
-                .map_err(HeapError::from)?,
-        }
 
         let Ok(new_layout) = Layout::from_size_align(new_size, old.align()) else {
             return Ok(null_mut());
         };
         let new_spec = LayoutSpec::from_layout(new_layout);
+
+        match entry {
+            PageEntry::Run(id) => {
+                if self
+                    .runs
+                    .allocation_satisfies(id, old_ptr, new_spec)
+                    .map_err(HeapError::from)?
+                {
+                    return Ok(ptr);
+                }
+            }
+            PageEntry::Extent(id) => {
+                if self
+                    .extents
+                    .allocation_satisfies(id, old_ptr, new_spec)
+                    .map_err(HeapError::from)?
+                {
+                    return Ok(ptr);
+                }
+            }
+        }
+
         let new_ptr = self
             .allocate(new_spec)
             .map_or(null_mut(), |allocation| allocation.ptr().as_ptr());
@@ -243,6 +255,58 @@ mod tests {
             heap.realloc(ptr, layout, 512 * 1024),
             Err(HeapError::UnknownPointer)
         );
+    }
+
+    #[test]
+    fn heap_realloc_keeps_same_run_block_for_same_size_class() {
+        let mut heap = test_heap();
+        let old = Layout::from_size_align(49, 8).unwrap();
+        let ptr = heap.alloc(old);
+
+        assert!(!ptr.is_null());
+        for index in 0..old.size() {
+            let value = u8::try_from(index % 251).unwrap().wrapping_add(1);
+            // SAFETY: ptr was allocated for old.size() bytes above.
+            unsafe { ptr.add(index).write(value) };
+        }
+
+        let new_ptr = heap.realloc(ptr, old, 64).unwrap();
+
+        assert_eq!(new_ptr, ptr);
+        for index in 0..old.size() {
+            let value = u8::try_from(index % 251).unwrap().wrapping_add(1);
+            // SAFETY: new_ptr is the same live allocation and old.size() bytes remain initialized.
+            assert_eq!(unsafe { new_ptr.add(index).read() }, value);
+        }
+
+        let new = Layout::from_size_align(64, 8).unwrap();
+        assert_eq!(heap.dealloc(new_ptr, new), Ok(()));
+    }
+
+    #[test]
+    fn heap_realloc_keeps_extent_when_new_layout_fits() {
+        let mut heap = test_heap();
+        let old = Layout::from_size_align(256 * 1024, 4096).unwrap();
+        let ptr = heap.alloc(old);
+
+        assert!(!ptr.is_null());
+        for index in 0..4096 {
+            let value = u8::try_from(index % 251).unwrap().wrapping_add(1);
+            // SAFETY: ptr was allocated for old.size() bytes above and index is within that range.
+            unsafe { ptr.add(index).write(value) };
+        }
+
+        let new_ptr = heap.realloc(ptr, old, 128 * 1024).unwrap();
+
+        assert_eq!(new_ptr, ptr);
+        for index in 0..4096 {
+            let value = u8::try_from(index % 251).unwrap().wrapping_add(1);
+            // SAFETY: new_ptr is the same live allocation and these prefix bytes remain initialized.
+            assert_eq!(unsafe { new_ptr.add(index).read() }, value);
+        }
+
+        let new = Layout::from_size_align(128 * 1024, 4096).unwrap();
+        assert_eq!(heap.dealloc(new_ptr, new), Ok(()));
     }
 
     #[test]

@@ -63,6 +63,18 @@ impl Extent {
         ptr == self.ptr()
     }
 
+    pub(crate) fn satisfies(
+        &self,
+        ptr: NonNull<u8>,
+        spec: LayoutSpec,
+    ) -> Result<bool, ExtentError> {
+        if !self.starts_at(ptr) {
+            return Err(ExtentError::InvalidPointer);
+        }
+
+        Ok(ptr.as_ptr().addr().is_multiple_of(spec.align()) && spec.size() <= self.range.len())
+    }
+
     pub(crate) fn range(&self) -> AddressRange {
         debug_assert!(self.mapping.range().contains(self.range));
 
@@ -124,5 +136,25 @@ mod tests {
 
         assert!(extent.starts_at(extent.ptr()));
         assert_eq!(extent.free(extent.ptr()), Ok(()));
+    }
+
+    #[test]
+    fn extent_reports_exact_pointer_satisfies_smaller_layout() {
+        let spec = LayoutSpec::from_size_align(128 * 1024, 4096).unwrap();
+        let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
+        let extent = Extent::new(ExtentId::from_index(3).unwrap(), mapping, spec).unwrap();
+        let smaller = LayoutSpec::from_size_align(64 * 1024, 4096).unwrap();
+
+        assert_eq!(extent.satisfies(extent.ptr(), smaller), Ok(true));
+    }
+
+    #[test]
+    fn extent_reports_exact_pointer_does_not_satisfy_larger_layout() {
+        let spec = LayoutSpec::from_size_align(128 * 1024, 4096).unwrap();
+        let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
+        let extent = Extent::new(ExtentId::from_index(4).unwrap(), mapping, spec).unwrap();
+        let larger = LayoutSpec::from_size_align(256 * 1024, 4096).unwrap();
+
+        assert_eq!(extent.satisfies(extent.ptr(), larger), Ok(false));
     }
 }
