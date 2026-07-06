@@ -7,8 +7,9 @@ use crate::{
     extent::Extent,
     extent_table::{ExtentReservation, ExtentTable},
     layout::LayoutSpec,
+    mapping_cache::MappingCache,
     os_memory::OsMemory,
-    page_map::{PageEntry, PageMap, PageRange},
+    page_map::{EmptyL2Tables, PageEntry, PageMap, PageRange},
     run::{RUN_SIZE, Run, RunError, RunId},
     run_table::{RunReservation, RunTable},
     size_class::{SizeClass, SizeClasses},
@@ -17,6 +18,7 @@ use crate::{
 pub(crate) struct Heap {
     runs: RunTable,
     extents: ExtentTable,
+    mapping_cache: MappingCache,
     pages: PageMap,
     active: [Option<RunId>; SizeClasses::COUNT],
 }
@@ -39,6 +41,7 @@ impl Heap {
         Self {
             runs: RunTable::new(Self::DEFAULT_TABLE_CAPACITY),
             extents: ExtentTable::new(Self::DEFAULT_TABLE_CAPACITY),
+            mapping_cache: MappingCache::new(),
             pages: PageMap::new(),
             active: [None; SizeClasses::COUNT],
         }
@@ -77,7 +80,7 @@ impl Heap {
                 *active_slot = Some(id);
             }
             PageEntry::Extent(id) => {
-                let range = {
+                let (range, mapping_len) = {
                     let Some(extent) = self.extents.get(id) else {
                         return Err(HeapError::MissingExtent);
                     };
@@ -86,18 +89,30 @@ impl Heap {
                         return Err(HeapError::InvalidExtentPointer);
                     }
 
-                    extent.range()
+                    (extent.range(), extent.mapping_len())
                 };
 
+                let retain_mapping = self.mapping_cache.can_retain(mapping_len);
                 let Some(page_range) = PageRange::from_range(range) else {
                     return Err(HeapError::InvalidMetadata);
                 };
+
+                let empty_l2_tables = if retain_mapping {
+                    EmptyL2Tables::Retain
+                } else {
+                    EmptyL2Tables::Release
+                };
                 self.pages
-                    .remove(page_range, PageEntry::Extent(id))
+                    .remove(page_range, PageEntry::Extent(id), empty_l2_tables)
                     .map_err(|_| HeapError::InvalidMetadata)?;
 
-                if self.extents.remove(id).is_none() {
+                let Some(extent) = self.extents.remove(id) else {
                     return Err(HeapError::MissingExtent);
+                };
+
+                let mapping = extent.into_mapping();
+                if let Err(mapping) = self.mapping_cache.insert(mapping) {
+                    drop(mapping);
                 }
             }
         }
@@ -240,9 +255,16 @@ impl Heap {
         let Some(len) = spec.mapping_len(OsMemory::page_size()) else {
             return null_mut();
         };
-        let Some(mapping) = OsMemory::map(len) else {
-            return null_mut();
+        let mapping = if let Some(mapping) = self.mapping_cache.take_exact(len) {
+            mapping
+        } else {
+            let Some(mapping) = OsMemory::map(len) else {
+                return null_mut();
+            };
+
+            mapping
         };
+
         let Some(reservation) = self.extents.reserve() else {
             return null_mut();
         };
@@ -344,6 +366,7 @@ mod tests {
         Heap {
             runs: RunTable::new(4),
             extents: ExtentTable::new(4),
+            mapping_cache: MappingCache::new(),
             pages: PageMap::new(),
             active: [None; SizeClasses::COUNT],
         }
@@ -369,6 +392,45 @@ mod tests {
         assert!(!ptr.is_null());
         assert_eq!(heap.dealloc(ptr, layout), Ok(()));
         assert_eq!(heap.realloc(ptr, layout, 128), Err(HeapError::DoubleFree));
+    }
+
+    #[test]
+    fn heap_reuses_freed_large_extent_mapping() {
+        let mut heap = test_heap();
+        let layout = Layout::from_size_align(256 * 1024, 4096).unwrap();
+        let first = heap.alloc(layout);
+
+        assert!(!first.is_null());
+        assert_eq!(heap.dealloc(first, layout), Ok(()));
+
+        let second = heap.alloc(layout);
+        assert_eq!(second, first);
+        assert_eq!(heap.dealloc(second, layout), Ok(()));
+    }
+
+    #[test]
+    fn heap_reports_large_double_free_as_unknown_pointer_after_caching() {
+        let mut heap = test_heap();
+        let layout = Layout::from_size_align(256 * 1024, 4096).unwrap();
+        let ptr = heap.alloc(layout);
+
+        assert!(!ptr.is_null());
+        assert_eq!(heap.dealloc(ptr, layout), Ok(()));
+        assert_eq!(heap.dealloc(ptr, layout), Err(HeapError::UnknownPointer));
+    }
+
+    #[test]
+    fn heap_reports_large_realloc_after_free_as_unknown_pointer_after_caching() {
+        let mut heap = test_heap();
+        let layout = Layout::from_size_align(256 * 1024, 4096).unwrap();
+        let ptr = heap.alloc(layout);
+
+        assert!(!ptr.is_null());
+        assert_eq!(heap.dealloc(ptr, layout), Ok(()));
+        assert_eq!(
+            heap.realloc(ptr, layout, 512 * 1024),
+            Err(HeapError::UnknownPointer)
+        );
     }
 
     #[test]

@@ -29,6 +29,12 @@ pub(crate) enum PageEntry {
     Extent(ExtentId),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EmptyL2Tables {
+    Release,
+    Retain,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct PageRange {
     first: Page,
@@ -398,6 +404,7 @@ impl PageMap {
         &mut self,
         range: PageRange,
         expected: PageEntry,
+        empty_l2_tables: EmptyL2Tables,
     ) -> Result<(), PageMapError> {
         self.validate_remove(range, expected)?;
 
@@ -405,7 +412,9 @@ impl PageMap {
             self.clear_page(page)?;
         }
 
-        self.clear_empty_l2_tables(range);
+        if empty_l2_tables == EmptyL2Tables::Release {
+            self.clear_empty_l2_tables(range);
+        }
 
         Ok(())
     }
@@ -658,7 +667,7 @@ mod tests {
         let range = mapping.page_range();
 
         assert!(map.insert(range, run(8)).is_ok());
-        assert_eq!(map.remove(range, run(8)), Ok(()));
+        assert_eq!(map.remove(range, run(8), EmptyL2Tables::Release), Ok(()));
 
         assert!(map.get(mapping.base()).is_none());
         let second = mapping.ptr_at(PAGE_SIZE);
@@ -674,7 +683,7 @@ mod tests {
         assert!(map.insert(range, run(1)).is_ok());
         assert!(has_l2_table(&map, mapping.base()));
 
-        assert_eq!(map.remove(range, run(1)), Ok(()));
+        assert_eq!(map.remove(range, run(1), EmptyL2Tables::Release), Ok(()));
 
         assert!(map.get(mapping.base()).is_none());
         assert!(!has_l2_table(&map, mapping.base()));
@@ -697,7 +706,11 @@ mod tests {
         );
 
         assert_eq!(
-            map.remove(PageRange::new(first, PAGE_SIZE).unwrap(), run(1)),
+            map.remove(
+                PageRange::new(first, PAGE_SIZE).unwrap(),
+                run(1),
+                EmptyL2Tables::Release,
+            ),
             Ok(())
         );
 
@@ -728,7 +741,11 @@ mod tests {
         );
 
         assert_eq!(
-            map.remove(PageRange::new(second, PAGE_SIZE).unwrap(), run(2)),
+            map.remove(
+                PageRange::new(second, PAGE_SIZE).unwrap(),
+                run(2),
+                EmptyL2Tables::Release,
+            ),
             Ok(())
         );
 
@@ -746,7 +763,7 @@ mod tests {
         assert!(map.insert(range, run(1)).is_ok());
 
         assert_eq!(
-            map.remove(range, run(2)),
+            map.remove(range, run(2), EmptyL2Tables::Release),
             Err(PageMapError::UnexpectedEntry)
         );
         assert_eq!(map.get(mapping.base()), Some(run(1)));
@@ -765,7 +782,7 @@ mod tests {
         );
 
         assert_eq!(
-            map.remove(mapping.page_range(), run(1)),
+            map.remove(mapping.page_range(), run(1), EmptyL2Tables::Release),
             Err(PageMapError::UnexpectedEntry)
         );
         assert_eq!(map.get(first), Some(run(1)));
@@ -789,7 +806,7 @@ mod tests {
         );
 
         assert_eq!(
-            map.remove(mapping.page_range(), run(1)),
+            map.remove(mapping.page_range(), run(1), EmptyL2Tables::Release),
             Err(PageMapError::UnexpectedEntry)
         );
         assert_eq!(map.get(first), Some(run(1)));

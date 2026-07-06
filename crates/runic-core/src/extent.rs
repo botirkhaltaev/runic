@@ -59,6 +59,14 @@ impl Extent {
         self.range
     }
 
+    pub(crate) fn mapping_len(&self) -> usize {
+        self.mapping.range().len()
+    }
+
+    pub(crate) fn into_mapping(self) -> Mapping {
+        self.mapping
+    }
+
     pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<(), ExtentError> {
         if self.starts_at(ptr) {
             Ok(())
