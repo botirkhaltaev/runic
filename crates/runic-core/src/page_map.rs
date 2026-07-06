@@ -1,10 +1,11 @@
 use core::{
     mem::{MaybeUninit, size_of},
+    num::NonZeroU16,
+    ops::Range,
     ptr::NonNull,
 };
 
 use crate::{
-    address::AddressRange,
     extent::ExtentId,
     os_memory::{Mapping, OsMemory, PAGE_SIZE},
     run::RunId,
@@ -14,6 +15,8 @@ const PAGE_SHIFT: usize = 12;
 const L2_BITS: usize = 12;
 const L2_ENTRIES: usize = 1 << L2_BITS;
 const L1_ENTRIES: usize = 1 << (48 - PAGE_SHIFT - L2_BITS);
+const ADDRESSABLE_PAGES: usize = L1_ENTRIES * L2_ENTRIES;
+const SPAN_SLOTS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PageMapError {
@@ -30,36 +33,36 @@ pub(crate) enum PageEntry {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum EmptyL2Tables {
-    Release,
-    Retain,
+pub(crate) enum L2TablePolicy {
+    ReleaseEmpty,
+    RetainEmpty,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct PageRange {
     first: Page,
-    last: Page,
+    end: Page,
 }
 
 impl PageRange {
     pub(crate) fn new(base: NonNull<u8>, len: usize) -> Option<Self> {
         let first = Page::containing(base);
         let end_addr = base.as_ptr().addr().checked_add(len.checked_sub(1)?)?;
-        let last = Page {
+        let end = Page {
             number: (end_addr >> PAGE_SHIFT).checked_add(1)?,
         };
 
-        Some(Self { first, last })
+        if first.number >= ADDRESSABLE_PAGES || end.number > ADDRESSABLE_PAGES {
+            return None;
+        }
+
+        Some(Self { first, end })
     }
 
-    pub(crate) fn from_range(range: AddressRange) -> Option<Self> {
-        Self::new(range.base(), range.len())
-    }
-
-    fn pages(self) -> Pages {
-        Pages {
-            next: self.first,
-            last: self.last,
+    fn segments(self) -> PageSegments {
+        PageSegments {
+            next_page: self.first.number,
+            end_page: self.end.number,
         }
     }
 }
@@ -88,22 +91,95 @@ impl Page {
     }
 }
 
-struct Pages {
-    next: Page,
-    last: Page,
+#[derive(Clone, Copy)]
+struct PageSegment {
+    l1: L1Index,
+    l2: L2Segment,
 }
 
-impl Iterator for Pages {
-    type Item = Page;
+#[derive(Clone, Copy)]
+struct L2Segment {
+    first: L2Index,
+    pages: PageCount,
+}
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.next.number >= self.last.number {
+impl L2Segment {
+    fn new(first: L2Index, pages: usize) -> Option<Self> {
+        let pages = PageCount::new(pages)?;
+        let end = first.get().checked_add(pages.get())?;
+
+        if end > L2_ENTRIES {
             return None;
         }
 
-        let page = self.next;
-        self.next.number = self.next.number.checked_add(1)?;
-        Some(page)
+        Some(Self { first, pages })
+    }
+
+    fn range(self) -> Range<usize> {
+        let start = self.first.get();
+        let end = start + self.pages.get();
+
+        start..end
+    }
+
+    fn contains(self, index: L2Index) -> bool {
+        self.range().contains(&index.get())
+    }
+
+    fn pages(self) -> u32 {
+        self.pages.get_u32()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PageCount {
+    value: NonZeroU16,
+}
+
+impl PageCount {
+    fn new(pages: usize) -> Option<Self> {
+        let pages = u16::try_from(pages).ok()?;
+        NonZeroU16::new(pages).map(|value| Self { value })
+    }
+
+    fn get(self) -> usize {
+        usize::from(self.value.get())
+    }
+
+    fn get_u32(self) -> u32 {
+        u32::from(self.value.get())
+    }
+}
+
+struct PageSegments {
+    next_page: usize,
+    end_page: usize,
+}
+
+impl Iterator for PageSegments {
+    type Item = PageSegment;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next_page >= self.end_page {
+            return None;
+        }
+
+        let l2 = self.next_page & (L2_ENTRIES - 1);
+        let l1 = self.next_page >> L2_BITS;
+        if l1 >= L1_ENTRIES {
+            return None;
+        }
+
+        let remaining = self.end_page - self.next_page;
+        let pages = remaining.min(L2_ENTRIES - l2);
+        let next_page = self.next_page.checked_add(pages)?;
+        let l2 = L2Segment::new(L2Index { index: l2 }, pages)?;
+        self.next_page = next_page;
+
+        Some(PageSegment {
+            l1: L1Index { index: l1 },
+            l2,
+        })
     }
 }
 
@@ -135,25 +211,38 @@ struct L1Table {
 }
 
 impl L1Table {
-    fn get(&self, index: L1Index) -> Option<NonNull<L2Table>> {
-        self.entries.get(index.get()).and_then(L1Entry::l2_table)
+    fn page_entry(&self, l1_index: L1Index, l2_index: L2Index) -> Option<MapEntry> {
+        self.entries.get(l1_index.get())?.page_entry(l2_index)
     }
 
-    fn get_or_create(&mut self, index: L1Index) -> Option<NonNull<L2Table>> {
-        let entry = self.entries.get_mut(index.get())?;
+    fn entry(&self, index: L1Index) -> Result<&L1Entry, PageMapError> {
+        self.entries
+            .get(index.get())
+            .ok_or(PageMapError::InvalidRange)
+    }
 
-        if let Some(table) = entry.l2_table() {
-            return Some(table);
+    fn entry_mut(&mut self, index: L1Index) -> Result<&mut L1Entry, PageMapError> {
+        self.entries
+            .get_mut(index.get())
+            .ok_or(PageMapError::InvalidRange)
+    }
+
+    fn ensure_l2_table(&mut self, index: L1Index) -> Result<(), PageMapError> {
+        let entry = self.entry_mut(index)?;
+
+        if entry.has_l2_table() {
+            return Ok(());
         }
 
-        let mapping = OsMemory::map(size_of::<L2Table>())?;
-        let table = mapping.base().cast::<L2Table>();
-        entry.set(mapping);
+        let Some(mapping) = OsMemory::map(size_of::<L2Table>()) else {
+            return Err(PageMapError::MetadataAllocFailed);
+        };
+        entry.install_l2_mapping(mapping);
 
-        Some(table)
+        Ok(())
     }
 
-    fn clear_empty_l2(&mut self, index: L1Index) -> bool {
+    fn release_empty_l2(&mut self, index: L1Index) -> bool {
         self.entries.get_mut(index.get()).is_some_and(|entry| {
             if !entry.is_empty_l2() {
                 return false;
@@ -161,33 +250,6 @@ impl L1Table {
 
             entry.clear_l2()
         })
-    }
-
-    fn set(&mut self, l1_index: L1Index, l2_index: L2Index, value: MapEntry) -> bool {
-        let Some(entry) = self.entries.get_mut(l1_index.get()) else {
-            return false;
-        };
-        let Some(mut table) = entry.l2_table() else {
-            return false;
-        };
-
-        // SAFETY: l2_table returns the live L2 table pointer owned by this L1 entry.
-        let table = unsafe { table.as_mut() };
-        let Some(previous) = table.get(l2_index) else {
-            return false;
-        };
-
-        if !table.set(l2_index, value) {
-            return false;
-        }
-
-        entry.record_transition(previous, value);
-
-        true
-    }
-
-    fn clear(&mut self, l1_index: L1Index, l2_index: L2Index) -> bool {
-        self.set(l1_index, l2_index, MapEntry::empty())
     }
 }
 
@@ -199,13 +261,31 @@ struct L1Entry {
 }
 
 impl L1Entry {
+    fn has_l2_table(&self) -> bool {
+        self.state.is_occupied()
+    }
+
     fn l2_table(&self) -> Option<NonNull<L2Table>> {
         self.mapping()
             .map(|mapping| mapping.base().cast::<L2Table>())
     }
 
+    fn l2_table_ref(&self) -> Option<&L2Table> {
+        let table = self.l2_table()?;
+
+        // SAFETY: l2_table returns the live L2 table pointer owned by this L1 entry.
+        Some(unsafe { table.as_ref() })
+    }
+
+    fn l2_table_mut(&mut self) -> Option<&mut L2Table> {
+        let mut table = self.l2_table()?;
+
+        // SAFETY: l2_table returns the live L2 table pointer owned by this L1 entry.
+        Some(unsafe { table.as_mut() })
+    }
+
     fn mapping(&self) -> Option<&Mapping> {
-        if !self.state.is_occupied() {
+        if !self.has_l2_table() {
             return None;
         }
 
@@ -213,7 +293,7 @@ impl L1Entry {
         Some(unsafe { self.mapping.assume_init_ref() })
     }
 
-    fn set(&mut self, mapping: Mapping) {
+    fn install_l2_mapping(&mut self, mapping: Mapping) {
         self.mapping.write(mapping);
         self.state = L1EntryState::occupied();
         self.occupied_pages = 0;
@@ -231,7 +311,7 @@ impl L1Entry {
     }
 
     fn is_empty_l2(&self) -> bool {
-        self.state.is_occupied() && self.occupied_pages == 0
+        self.has_l2_table() && self.occupied_pages == 0
     }
 
     fn clear_l2(&mut self) -> bool {
@@ -243,16 +323,63 @@ impl L1Entry {
         removed
     }
 
-    fn record_transition(&mut self, previous: MapEntry, next: MapEntry) {
-        match (previous.is_empty(), next.is_empty()) {
-            (true, false) => {
-                self.occupied_pages = self.occupied_pages.saturating_add(1);
-            }
-            (false, true) => {
-                self.occupied_pages = self.occupied_pages.saturating_sub(1);
-            }
-            _ => {}
+    fn owns_segment(&self, segment: L2Segment, expected: MapEntry) -> Result<bool, PageMapError> {
+        let Some(table) = self.l2_table_ref() else {
+            return Ok(expected.is_empty());
+        };
+
+        if expected.is_empty() && self.occupied_pages == 0 {
+            return Ok(true);
         }
+
+        table.owns_segment(segment, expected)
+    }
+
+    fn page_entry(&self, index: L2Index) -> Option<MapEntry> {
+        self.l2_table_ref()?.get(index)
+    }
+
+    fn assign_direct(&mut self, segment: L2Segment, value: MapEntry) -> Result<(), PageMapError> {
+        let occupied_pages = self
+            .occupied_pages
+            .checked_add(segment.pages())
+            .ok_or(PageMapError::InvalidRange)?;
+        let table = self
+            .l2_table_mut()
+            .ok_or(PageMapError::MetadataAllocFailed)?;
+
+        table.assign_direct(segment, value)?;
+        self.occupied_pages = occupied_pages;
+
+        Ok(())
+    }
+
+    fn assign_span(&mut self, segment: L2Segment, value: MapEntry) -> Result<(), PageMapError> {
+        let occupied_pages = self
+            .occupied_pages
+            .checked_add(segment.pages())
+            .ok_or(PageMapError::InvalidRange)?;
+        let table = self
+            .l2_table_mut()
+            .ok_or(PageMapError::MetadataAllocFailed)?;
+
+        table.assign_span(segment, value)?;
+        self.occupied_pages = occupied_pages;
+
+        Ok(())
+    }
+
+    fn clear_segment(&mut self, segment: L2Segment) -> Result<(), PageMapError> {
+        let occupied_pages = self
+            .occupied_pages
+            .checked_sub(segment.pages())
+            .ok_or(PageMapError::UnexpectedEntry)?;
+        let table = self.l2_table_mut().ok_or(PageMapError::UnexpectedEntry)?;
+
+        table.clear_segment(segment)?;
+        self.occupied_pages = occupied_pages;
+
+        Ok(())
     }
 }
 
@@ -283,25 +410,201 @@ impl L1EntryState {
 
 #[repr(C)]
 struct L2Table {
-    entries: [MapEntry; L2_ENTRIES],
+    pages: [MapEntry; L2_ENTRIES],
+    spans: [SpanSlot; SPAN_SLOTS],
 }
 
 impl L2Table {
     fn get(&self, index: L2Index) -> Option<MapEntry> {
-        self.entries.get(index.get()).copied()
+        let page = self.pages.get(index.get()).copied()?;
+        if !page.is_empty() {
+            return Some(page);
+        }
+
+        self.spans
+            .iter()
+            .find_map(|slot| slot.record_containing(index).map(SpanRecord::entry))
     }
 
-    fn set(&mut self, index: L2Index, value: MapEntry) -> bool {
-        let Some(entry) = self.entries.get_mut(index.get()) else {
+    fn owns_segment(&self, segment: L2Segment, expected: MapEntry) -> Result<bool, PageMapError> {
+        if expected.is_empty() {
+            return Ok(self.segment_is_free(segment));
+        }
+
+        let pages = self
+            .pages
+            .get(segment.range())
+            .ok_or(PageMapError::InvalidRange)?;
+        if pages.iter().all(|entry| *entry == expected) {
+            return Ok(true);
+        }
+
+        Ok(self
+            .spans
+            .iter()
+            .any(|slot| slot.matches(segment, expected)))
+    }
+
+    fn assign_direct(&mut self, segment: L2Segment, value: MapEntry) -> Result<(), PageMapError> {
+        self.write_pages(segment, value)
+    }
+
+    fn assign_span(&mut self, segment: L2Segment, value: MapEntry) -> Result<(), PageMapError> {
+        if self.install_span(segment, value) {
+            return Ok(());
+        }
+
+        self.write_pages(segment, value)
+    }
+
+    fn clear_segment(&mut self, segment: L2Segment) -> Result<(), PageMapError> {
+        if self.clear_span(segment) {
+            return Ok(());
+        }
+
+        self.write_pages(segment, MapEntry::empty())
+    }
+
+    fn segment_is_free(&self, segment: L2Segment) -> bool {
+        let Some(pages) = self.pages.get(segment.range()) else {
             return false;
         };
 
-        *entry = value;
+        pages.iter().all(|entry| entry.is_empty())
+            && self.spans.iter().all(|slot| !slot.overlaps(segment))
+    }
+
+    fn install_span(&mut self, segment: L2Segment, entry: MapEntry) -> bool {
+        let record = SpanRecord::new(segment, entry);
+        let Some(slot) = self.spans.iter_mut().find(|slot| slot.is_empty()) else {
+            return false;
+        };
+
+        slot.set(record);
         true
+    }
+
+    fn clear_span(&mut self, segment: L2Segment) -> bool {
+        let Some(slot) = self.spans.iter_mut().find(|slot| slot.covers(segment)) else {
+            return false;
+        };
+
+        slot.clear();
+        true
+    }
+
+    fn write_pages(&mut self, segment: L2Segment, value: MapEntry) -> Result<(), PageMapError> {
+        let entries = self
+            .pages
+            .get_mut(segment.range())
+            .ok_or(PageMapError::InvalidRange)?;
+
+        entries.fill(value);
+
+        Ok(())
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SpanRecord {
+    first: L2Index,
+    pages: PageCount,
+    entry: MapEntry,
+}
+
+impl SpanRecord {
+    const fn new(segment: L2Segment, entry: MapEntry) -> Self {
+        Self {
+            first: segment.first,
+            pages: segment.pages,
+            entry,
+        }
+    }
+
+    fn segment(self) -> L2Segment {
+        L2Segment {
+            first: self.first,
+            pages: self.pages,
+        }
+    }
+
+    fn entry(self) -> MapEntry {
+        self.entry
+    }
+
+    fn contains(self, index: L2Index) -> bool {
+        self.segment().contains(index)
+    }
+
+    fn overlaps(self, segment: L2Segment) -> bool {
+        let own = self.segment().range();
+        let other = segment.range();
+
+        own.start < other.end && other.start < own.end
+    }
+
+    fn matches(self, segment: L2Segment, entry: MapEntry) -> bool {
+        self.segment().range() == segment.range() && self.entry == entry
+    }
+}
+
+#[repr(C)]
+struct SpanSlot {
+    state: SpanSlotState,
+    record: MaybeUninit<SpanRecord>,
+}
+
+impl SpanSlot {
+    fn is_empty(&self) -> bool {
+        self.state == SpanSlotState::Empty
+    }
+
+    fn set(&mut self, record: SpanRecord) {
+        self.record.write(record);
+        self.state = SpanSlotState::Occupied;
+    }
+
+    fn clear(&mut self) {
+        self.state = SpanSlotState::Empty;
+    }
+
+    fn record(&self) -> Option<SpanRecord> {
+        if self.is_empty() {
+            return None;
+        }
+
+        // SAFETY: Occupied state is set only after record.write initializes this slot.
+        Some(unsafe { *self.record.assume_init_ref() })
+    }
+
+    fn record_containing(&self, index: L2Index) -> Option<SpanRecord> {
+        self.record().filter(|record| record.contains(index))
+    }
+
+    fn overlaps(&self, segment: L2Segment) -> bool {
+        self.record().is_some_and(|record| record.overlaps(segment))
+    }
+
+    fn covers(&self, segment: L2Segment) -> bool {
+        self.record()
+            .is_some_and(|record| record.segment().range() == segment.range())
+    }
+
+    fn matches(&self, segment: L2Segment, entry: MapEntry) -> bool {
+        self.record()
+            .is_some_and(|record| record.matches(segment, entry))
+    }
+}
+
+#[repr(u8)]
 #[derive(Clone, Copy, Eq, PartialEq)]
+enum SpanSlotState {
+    Empty = 0,
+    Occupied = 1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MapEntry {
     raw: u32,
 }
@@ -371,11 +674,8 @@ impl PageMap {
 
     pub(crate) fn get(&self, ptr: NonNull<u8>) -> Option<PageEntry> {
         let (l1_index, l2_index) = Page::containing(ptr).indexes()?;
-        let table = self.l1()?.get(l1_index)?;
 
-        // SAFETY: L1Entry only stores non-null L2 table pointers allocated by L1Table::get_or_create.
-        let entry = unsafe { table.as_ref() }.get(l2_index)?;
-        entry.page()
+        self.l1()?.page_entry(l1_index, l2_index)?.page()
     }
 
     pub(crate) fn insert(
@@ -388,13 +688,35 @@ impl PageMap {
         self.validate_insert(range)?;
         self.prepare_insert(range)?;
 
-        for page in range.pages() {
-            if let Err(error) = self.set_page(page, occupied) {
-                self.clear_matching(range, occupied);
-                self.clear_empty_l2_tables(range);
+        let result = if let Some(l1) = self.l1_mut() {
+            let mut result = Ok(());
 
-                return Err(error);
+            for segment in range.segments() {
+                let published = match entry {
+                    PageEntry::Run(_) => l1
+                        .entry_mut(segment.l1)?
+                        .assign_direct(segment.l2, occupied),
+                    PageEntry::Extent(_) => {
+                        l1.entry_mut(segment.l1)?.assign_span(segment.l2, occupied)
+                    }
+                };
+
+                if let Err(error) = published {
+                    result = Err(error);
+                    break;
+                }
             }
+
+            result
+        } else {
+            Err(PageMapError::MetadataAllocFailed)
+        };
+
+        if let Err(error) = result {
+            self.rollback_insert(range, occupied);
+            self.release_empty_l2_tables(range);
+
+            return Err(error);
         }
 
         Ok(())
@@ -404,47 +726,46 @@ impl PageMap {
         &mut self,
         range: PageRange,
         expected: PageEntry,
-        empty_l2_tables: EmptyL2Tables,
+        l2_table_policy: L2TablePolicy,
     ) -> Result<(), PageMapError> {
         self.validate_remove(range, expected)?;
 
-        for page in range.pages() {
-            self.clear_page(page)?;
+        let l1 = self.l1_mut().ok_or(PageMapError::UnexpectedEntry)?;
+        for segment in range.segments() {
+            l1.entry_mut(segment.l1)?.clear_segment(segment.l2)?;
         }
 
-        if empty_l2_tables == EmptyL2Tables::Release {
-            self.clear_empty_l2_tables(range);
+        if l2_table_policy == L2TablePolicy::ReleaseEmpty {
+            self.release_empty_l2_tables(range);
         }
 
         Ok(())
     }
 
-    fn clear_matching(&mut self, range: PageRange, entry: MapEntry) {
-        for page in range.pages() {
-            if self.entry_for_page(page).ok().flatten() != Some(entry) {
+    fn rollback_insert(&mut self, range: PageRange, entry: MapEntry) {
+        let Some(l1) = self.l1_mut() else {
+            return;
+        };
+
+        for segment in range.segments() {
+            if l1
+                .entry(segment.l1)
+                .and_then(|entry_slot| entry_slot.owns_segment(segment.l2, entry))
+                != Ok(true)
+            {
                 continue;
             }
 
-            let _ = self.clear_page(page);
+            let _ = l1
+                .entry_mut(segment.l1)
+                .and_then(|entry_slot| entry_slot.clear_segment(segment.l2));
         }
     }
 
-    fn clear_empty_l2_tables(&mut self, range: PageRange) {
-        let mut previous = None;
-
-        for page in range.pages() {
-            let Some((l1_index, _)) = page.indexes() else {
-                continue;
-            };
-
-            if previous == Some(l1_index) {
-                continue;
-            }
-
-            previous = Some(l1_index);
-
+    fn release_empty_l2_tables(&mut self, range: PageRange) {
+        for segment in range.segments() {
             if let Some(l1) = self.l1_mut() {
-                let _ = l1.clear_empty_l2(l1_index);
+                let _ = l1.release_empty_l2(segment.l1);
             }
         }
     }
@@ -474,10 +795,13 @@ impl PageMap {
     }
 
     fn validate_insert(&self, range: PageRange) -> Result<(), PageMapError> {
-        for page in range.pages() {
-            let existing = self.entry_for_page(page)?;
+        let Some(l1) = self.l1() else {
+            return Ok(());
+        };
 
-            if existing.is_some_and(|existing| !existing.is_empty()) {
+        let empty = MapEntry::empty();
+        for segment in range.segments() {
+            if !l1.entry(segment.l1)?.owns_segment(segment.l2, empty)? {
                 return Err(PageMapError::Overlap);
             }
         }
@@ -488,8 +812,12 @@ impl PageMap {
     fn validate_remove(&self, range: PageRange, expected: PageEntry) -> Result<(), PageMapError> {
         let expected = MapEntry::occupied(expected).ok_or(PageMapError::InvalidRange)?;
 
-        for page in range.pages() {
-            if self.entry_for_page(page)? != Some(expected) {
+        let Some(l1) = self.l1() else {
+            return Err(PageMapError::UnexpectedEntry);
+        };
+
+        for segment in range.segments() {
+            if !l1.entry(segment.l1)?.owns_segment(segment.l2, expected)? {
                 return Err(PageMapError::UnexpectedEntry);
             }
         }
@@ -497,55 +825,27 @@ impl PageMap {
         Ok(())
     }
 
-    fn entry_for_page(&self, page: Page) -> Result<Option<MapEntry>, PageMapError> {
-        let (l1_index, l2_index) = page.indexes().ok_or(PageMapError::InvalidRange)?;
-        let Some(table) = self.l1().and_then(|l1| l1.get(l1_index)) else {
-            return Ok(None);
+    fn prepare_insert(&mut self, range: PageRange) -> Result<(), PageMapError> {
+        let result = {
+            let l1 = self.l1_or_init()?;
+            let mut result = Ok(());
+
+            for segment in range.segments() {
+                if let Err(error) = l1.ensure_l2_table(segment.l1) {
+                    result = Err(error);
+                    break;
+                }
+            }
+
+            result
         };
 
-        // SAFETY: L1Entry only stores non-null L2 table pointers allocated by L1Table::get_or_create.
-        unsafe { table.as_ref() }
-            .get(l2_index)
-            .map(Some)
-            .ok_or(PageMapError::InvalidRange)
-    }
-
-    fn prepare_insert(&mut self, range: PageRange) -> Result<(), PageMapError> {
-        for page in range.pages() {
-            let (l1_index, _) = page.indexes().ok_or(PageMapError::InvalidRange)?;
-            if self.l1_or_init()?.get_or_create(l1_index).is_none() {
-                self.clear_empty_l2_tables(range);
-                return Err(PageMapError::MetadataAllocFailed);
-            }
+        if let Err(error) = result {
+            self.release_empty_l2_tables(range);
+            return Err(error);
         }
 
         Ok(())
-    }
-
-    fn set_page(&mut self, page: Page, entry: MapEntry) -> Result<(), PageMapError> {
-        let (l1_index, l2_index) = page.indexes().ok_or(PageMapError::InvalidRange)?;
-        let Some(l1) = self.l1_mut() else {
-            return Err(PageMapError::MetadataAllocFailed);
-        };
-
-        if l1.set(l1_index, l2_index, entry) {
-            Ok(())
-        } else {
-            Err(PageMapError::InvalidRange)
-        }
-    }
-
-    fn clear_page(&mut self, page: Page) -> Result<(), PageMapError> {
-        let (l1_index, l2_index) = page.indexes().ok_or(PageMapError::InvalidRange)?;
-        let Some(l1) = self.l1_mut() else {
-            return Err(PageMapError::UnexpectedEntry);
-        };
-
-        if l1.clear(l1_index, l2_index) {
-            Ok(())
-        } else {
-            Err(PageMapError::InvalidRange)
-        }
     }
 }
 
@@ -592,7 +892,27 @@ mod tests {
             return false;
         };
 
-        map.l1().and_then(|l1| l1.get(l1_index)).is_some()
+        map.l1()
+            .and_then(|l1| l1.entries.get(l1_index.get()))
+            .is_some_and(L1Entry::has_l2_table)
+    }
+
+    fn l2_table_for(map: &PageMap, ptr: NonNull<u8>) -> Option<&L2Table> {
+        let (l1_index, _) = Page::containing(ptr).indexes()?;
+
+        map.l1()?.entries.get(l1_index.get())?.l2_table_ref()
+    }
+
+    fn span_count(map: &PageMap, ptr: NonNull<u8>) -> usize {
+        l2_table_for(map, ptr).map_or(0, |table| {
+            table.spans.iter().filter(|slot| !slot.is_empty()).count()
+        })
+    }
+
+    fn direct_entry(map: &PageMap, ptr: NonNull<u8>) -> Option<MapEntry> {
+        let (_, l2_index) = Page::containing(ptr).indexes()?;
+
+        l2_table_for(map, ptr)?.pages.get(l2_index.get()).copied()
     }
 
     struct TestMapping {
@@ -616,6 +936,12 @@ mod tests {
 
         fn page_range(&self) -> PageRange {
             PageRange::new(self.base(), self.len()).unwrap()
+        }
+
+        fn first_l2_boundary_offset(&self) -> usize {
+            let (_, base_l2) = Page::containing(self.base()).indexes().unwrap();
+
+            (L2_ENTRIES - base_l2.get()) * PAGE_SIZE
         }
 
         fn ptr_at(&self, offset: usize) -> NonNull<u8> {
@@ -661,13 +987,51 @@ mod tests {
     }
 
     #[test]
+    fn page_map_insert_extent_range_uses_span_record() {
+        let mapping = TestMapping::new(PAGE_SIZE * 2);
+        let mut map = PageMap::new();
+        let range = mapping.page_range();
+
+        assert!(map.insert(range, extent(4)).is_ok());
+
+        assert_eq!(span_count(&map, mapping.base()), 1);
+        assert_eq!(direct_entry(&map, mapping.base()), Some(MapEntry::empty()));
+        assert_eq!(
+            direct_entry(&map, mapping.ptr_at(PAGE_SIZE)),
+            Some(MapEntry::empty())
+        );
+    }
+
+    #[test]
+    fn page_map_insert_run_range_uses_direct_entries() {
+        let mapping = TestMapping::new(PAGE_SIZE * 2);
+        let mut map = PageMap::new();
+        let range = mapping.page_range();
+
+        assert!(map.insert(range, run(4)).is_ok());
+
+        assert_eq!(span_count(&map, mapping.base()), 0);
+        assert_eq!(
+            direct_entry(&map, mapping.base()),
+            MapEntry::occupied(run(4))
+        );
+        assert_eq!(
+            direct_entry(&map, mapping.ptr_at(PAGE_SIZE)),
+            MapEntry::occupied(run(4))
+        );
+    }
+
+    #[test]
     fn page_map_remove_range_clears_mapped_pages() {
         let mapping = TestMapping::new(PAGE_SIZE * 2);
         let mut map = PageMap::new();
         let range = mapping.page_range();
 
         assert!(map.insert(range, run(8)).is_ok());
-        assert_eq!(map.remove(range, run(8), EmptyL2Tables::Release), Ok(()));
+        assert_eq!(
+            map.remove(range, run(8), L2TablePolicy::ReleaseEmpty),
+            Ok(())
+        );
 
         assert!(map.get(mapping.base()).is_none());
         let second = mapping.ptr_at(PAGE_SIZE);
@@ -683,10 +1047,31 @@ mod tests {
         assert!(map.insert(range, run(1)).is_ok());
         assert!(has_l2_table(&map, mapping.base()));
 
-        assert_eq!(map.remove(range, run(1), EmptyL2Tables::Release), Ok(()));
+        assert_eq!(
+            map.remove(range, run(1), L2TablePolicy::ReleaseEmpty),
+            Ok(())
+        );
 
         assert!(map.get(mapping.base()).is_none());
         assert!(!has_l2_table(&map, mapping.base()));
+    }
+
+    #[test]
+    fn page_map_remove_range_can_retain_empty_l2_table() {
+        let mapping = TestMapping::new(PAGE_SIZE);
+        let mut map = PageMap::new();
+        let range = mapping.page_range();
+
+        assert!(map.insert(range, run(1)).is_ok());
+        assert!(has_l2_table(&map, mapping.base()));
+
+        assert_eq!(
+            map.remove(range, run(1), L2TablePolicy::RetainEmpty),
+            Ok(())
+        );
+
+        assert!(map.get(mapping.base()).is_none());
+        assert!(has_l2_table(&map, mapping.base()));
     }
 
     #[test]
@@ -709,7 +1094,7 @@ mod tests {
             map.remove(
                 PageRange::new(first, PAGE_SIZE).unwrap(),
                 run(1),
-                EmptyL2Tables::Release,
+                L2TablePolicy::ReleaseEmpty,
             ),
             Ok(())
         );
@@ -744,7 +1129,7 @@ mod tests {
             map.remove(
                 PageRange::new(second, PAGE_SIZE).unwrap(),
                 run(2),
-                EmptyL2Tables::Release,
+                L2TablePolicy::ReleaseEmpty,
             ),
             Ok(())
         );
@@ -763,7 +1148,7 @@ mod tests {
         assert!(map.insert(range, run(1)).is_ok());
 
         assert_eq!(
-            map.remove(range, run(2), EmptyL2Tables::Release),
+            map.remove(range, run(2), L2TablePolicy::ReleaseEmpty),
             Err(PageMapError::UnexpectedEntry)
         );
         assert_eq!(map.get(mapping.base()), Some(run(1)));
@@ -782,7 +1167,7 @@ mod tests {
         );
 
         assert_eq!(
-            map.remove(mapping.page_range(), run(1), EmptyL2Tables::Release),
+            map.remove(mapping.page_range(), run(1), L2TablePolicy::ReleaseEmpty),
             Err(PageMapError::UnexpectedEntry)
         );
         assert_eq!(map.get(first), Some(run(1)));
@@ -806,7 +1191,7 @@ mod tests {
         );
 
         assert_eq!(
-            map.remove(mapping.page_range(), run(1), EmptyL2Tables::Release),
+            map.remove(mapping.page_range(), run(1), L2TablePolicy::ReleaseEmpty),
             Err(PageMapError::UnexpectedEntry)
         );
         assert_eq!(map.get(first), Some(run(1)));
@@ -814,25 +1199,33 @@ mod tests {
     }
 
     #[test]
-    fn page_map_clear_matching_preserves_other_owners() {
-        let mapping = TestMapping::new(PAGE_SIZE * 2);
+    fn page_map_remove_range_rejects_cross_l2_partial_mismatch_without_clearing() {
+        let mapping = TestMapping::new((L2_ENTRIES + 2) * PAGE_SIZE);
         let mut map = PageMap::new();
-        let first = mapping.base();
-        let second = mapping.ptr_at(PAGE_SIZE);
+        let boundary = mapping.first_l2_boundary_offset();
+        let before_boundary = mapping.ptr_at(boundary - PAGE_SIZE);
+        let after_boundary = mapping.ptr_at(boundary);
 
         assert!(
-            map.insert(PageRange::new(first, PAGE_SIZE).unwrap(), run(1))
+            map.insert(PageRange::new(before_boundary, PAGE_SIZE).unwrap(), run(1))
                 .is_ok()
         );
         assert!(
-            map.insert(PageRange::new(second, PAGE_SIZE).unwrap(), run(2))
+            map.insert(PageRange::new(after_boundary, PAGE_SIZE).unwrap(), run(2))
                 .is_ok()
         );
 
-        map.clear_matching(mapping.page_range(), MapEntry::occupied(run(1)).unwrap());
+        assert_eq!(
+            map.remove(
+                PageRange::new(before_boundary, PAGE_SIZE * 2).unwrap(),
+                run(1),
+                L2TablePolicy::ReleaseEmpty,
+            ),
+            Err(PageMapError::UnexpectedEntry)
+        );
 
-        assert!(map.get(first).is_none());
-        assert_eq!(map.get(second), Some(run(2)));
+        assert_eq!(map.get(before_boundary), Some(run(1)));
+        assert_eq!(map.get(after_boundary), Some(run(2)));
     }
 
     #[test]
@@ -912,5 +1305,82 @@ mod tests {
         let last = mapping.ptr_at(mapping.len() - 1);
         assert_eq!(map.get(mapping.base()), Some(run(10)));
         assert_eq!(map.get(last), Some(run(10)));
+    }
+
+    #[test]
+    fn page_map_insert_extent_range_crosses_l2_boundary_with_spans() {
+        let len = (L2_ENTRIES + 2) * PAGE_SIZE;
+        let mapping = TestMapping::new(len);
+        let mut map = PageMap::new();
+        let range = mapping.page_range();
+        let boundary = mapping.ptr_at(mapping.first_l2_boundary_offset());
+        let last = mapping.ptr_at(mapping.len() - 1);
+
+        assert!(map.insert(range, extent(10)).is_ok());
+
+        assert_eq!(map.get(mapping.base()), Some(extent(10)));
+        assert_eq!(map.get(boundary), Some(extent(10)));
+        assert_eq!(map.get(last), Some(extent(10)));
+        assert_eq!(span_count(&map, mapping.base()), 1);
+        assert_eq!(span_count(&map, boundary), 1);
+    }
+
+    #[test]
+    fn page_map_extent_span_exhaustion_falls_back_to_direct_entries() {
+        let mapping = TestMapping::new((SPAN_SLOTS + 1) * PAGE_SIZE);
+        let mut map = PageMap::new();
+
+        for index in 0..SPAN_SLOTS {
+            let ptr = mapping.ptr_at(index * PAGE_SIZE);
+            assert!(
+                map.insert(
+                    PageRange::new(ptr, PAGE_SIZE).unwrap(),
+                    extent(u32::try_from(index).unwrap()),
+                )
+                .is_ok()
+            );
+        }
+
+        let fallback = mapping.ptr_at(SPAN_SLOTS * PAGE_SIZE);
+        assert!(
+            map.insert(PageRange::new(fallback, PAGE_SIZE).unwrap(), extent(10_000),)
+                .is_ok()
+        );
+
+        assert_eq!(span_count(&map, mapping.base()), SPAN_SLOTS);
+        assert_eq!(map.get(fallback), Some(extent(10_000)));
+        assert_eq!(
+            direct_entry(&map, fallback),
+            MapEntry::occupied(extent(10_000))
+        );
+        assert_eq!(
+            map.remove(
+                PageRange::new(fallback, PAGE_SIZE).unwrap(),
+                extent(10_000),
+                L2TablePolicy::RetainEmpty,
+            ),
+            Ok(())
+        );
+        assert!(map.get(fallback).is_none());
+    }
+
+    #[test]
+    fn page_map_remove_range_crosses_l2_boundary() {
+        let len = (L2_ENTRIES + 2) * PAGE_SIZE;
+        let mapping = TestMapping::new(len);
+        let mut map = PageMap::new();
+        let range = mapping.page_range();
+        let boundary = mapping.ptr_at(mapping.first_l2_boundary_offset());
+        let last = mapping.ptr_at(mapping.len() - 1);
+
+        assert!(map.insert(range, run(10)).is_ok());
+        assert_eq!(
+            map.remove(range, run(10), L2TablePolicy::ReleaseEmpty),
+            Ok(())
+        );
+
+        assert!(map.get(mapping.base()).is_none());
+        assert!(map.get(boundary).is_none());
+        assert!(map.get(last).is_none());
     }
 }

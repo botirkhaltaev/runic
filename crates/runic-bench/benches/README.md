@@ -2,11 +2,18 @@
 
 Criterion benchmark entry points.
 
-## Targets
+## CodSpeed Targets
 
-- `explicit`: calls each allocator through `GlobalAlloc` directly in one Criterion report.
-- `threaded`: exercises global-lock contention and cross-thread frees.
+- `explicit`: Runic-only direct `GlobalAlloc` workloads.
+- `threaded`: Runic-only threaded workloads.
 - `global_runic`: process-global Runic allocator workloads.
+
+CodSpeed runs only these targets so PR checks measure Runic changes, not noise from external allocator comparison runs.
+
+## Manual Comparison Targets
+
+- `compare_explicit`: direct `GlobalAlloc` workloads across Runic and external allocators.
+- `compare_threaded`: threaded workloads across Runic and external allocators.
 - `global_system`: process-global system allocator workloads.
 - `global_mimalloc`: process-global mimalloc workloads.
 - `global_jemalloc`: process-global jemalloc workloads.
@@ -18,4 +25,5 @@ Criterion benchmark entry points.
 ```sh
 cargo bench -p runic-bench
 cargo bench -p runic-bench --bench global_runic
+cargo bench -p runic-bench --bench compare_explicit
 ```

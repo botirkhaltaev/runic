@@ -86,6 +86,8 @@ pub const TARGETS: &[AllocatorTarget] = &[
     AllocatorTarget::new("snmalloc", &SNMALLOC),
 ];
 
+pub const RUNIC_TARGETS: &[AllocatorTarget] = &[AllocatorTarget::new("runic", &RUNIC)];
+
 #[must_use]
 pub fn target_by_name(name: &str) -> Option<AllocatorTarget> {
     TARGETS.iter().copied().find(|target| target.name() == name)

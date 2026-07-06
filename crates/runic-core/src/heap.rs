@@ -9,7 +9,7 @@ use crate::{
     layout::LayoutSpec,
     mapping_cache::MappingCache,
     os_memory::OsMemory,
-    page_map::{EmptyL2Tables, PageEntry, PageMap, PageRange},
+    page_map::{L2TablePolicy, PageEntry, PageMap, PageRange},
     run::{RUN_SIZE, Run, RunError, RunId},
     run_table::{RunReservation, RunTable},
     size_class::{SizeClass, SizeClasses},
@@ -93,14 +93,14 @@ impl Heap {
                 };
 
                 let retain_mapping = self.mapping_cache.can_retain(mapping_len);
-                let Some(page_range) = PageRange::from_range(range) else {
+                let Some(page_range) = PageRange::new(range.base(), range.len()) else {
                     return Err(HeapError::InvalidMetadata);
                 };
 
                 let empty_l2_tables = if retain_mapping {
-                    EmptyL2Tables::Retain
+                    L2TablePolicy::RetainEmpty
                 } else {
-                    EmptyL2Tables::Release
+                    L2TablePolicy::ReleaseEmpty
                 };
                 self.pages
                     .remove(page_range, PageEntry::Extent(id), empty_l2_tables)
@@ -291,7 +291,7 @@ impl Heap {
             return Err(());
         }
 
-        let Some(page_range) = PageRange::from_range(range) else {
+        let Some(page_range) = PageRange::new(range.base(), range.len()) else {
             let _removed = self.runs.remove(id);
             return Err(());
         };
@@ -312,7 +312,7 @@ impl Heap {
             return Err(());
         }
 
-        let Some(page_range) = PageRange::from_range(range) else {
+        let Some(page_range) = PageRange::new(range.base(), range.len()) else {
             let _removed = self.extents.remove(id);
             return Err(());
         };
@@ -440,7 +440,7 @@ mod tests {
         let id = reservation.id();
         let run = reusable_run(id);
         let range = run.range();
-        let page_range = PageRange::from_range(range).unwrap();
+        let page_range = PageRange::new(range.base(), range.len()).unwrap();
         let existing = PageEntry::Run(RunId::from_index(900).unwrap());
 
         heap.pages.insert(page_range, existing).unwrap();
@@ -457,7 +457,7 @@ mod tests {
         let id = reservation.id();
         let extent = reusable_extent(id);
         let range = extent.range();
-        let page_range = PageRange::from_range(range).unwrap();
+        let page_range = PageRange::new(range.base(), range.len()).unwrap();
         let existing = PageEntry::Extent(ExtentId::from_index(900).unwrap());
 
         heap.pages.insert(page_range, existing).unwrap();
