@@ -1,5 +1,7 @@
 # Runic
 
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/botirkhaltaev/runic?utm_source=badge)
+
 Runic is a correctness-first Rust allocator with a small auditable unsafe core, out-of-line metadata, and explicit allocation invariants.
 
 The current release is an experimental v0.1 global-lock allocator for Linux x86_64. It is useful for allocator development, tests, and architecture work; it is not yet tuned for production performance.

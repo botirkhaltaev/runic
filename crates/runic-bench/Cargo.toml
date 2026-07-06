@@ -16,7 +16,7 @@ snmalloc-rs = "0.3"
 tikv-jemallocator = "0.6"
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = { version = "5.0.1", package = "codspeed-criterion-compat" }
 
 [[bench]]
 name = "explicit"
