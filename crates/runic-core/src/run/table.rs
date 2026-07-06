@@ -1,9 +1,5 @@
-use core::ptr::NonNull;
-
 use crate::{
-    layout::LayoutSpec,
     run::{Run, RunId},
-    size_class::SizeClass,
     slot_store::{SlotStore, SlotStoreError},
 };
 
@@ -82,27 +78,6 @@ impl RunTable {
 
     pub(crate) fn get_mut(&mut self, id: RunId) -> Option<&mut Run> {
         self.slots.get_mut(Self::index(id)?)
-    }
-
-    pub(crate) fn allocate(
-        &mut self,
-        class: SizeClass,
-        spec: LayoutSpec,
-    ) -> Option<(RunId, NonNull<u8>)> {
-        for (index, run) in self.slots.occupied_mut()? {
-            if run.class() != class.id() {
-                continue;
-            }
-
-            let Some(ptr) = run.allocate(spec) else {
-                continue;
-            };
-            let id = Self::id(index)?;
-
-            return Some((id, ptr));
-        }
-
-        None
     }
 
     pub(crate) fn remove(&mut self, id: RunId) -> Option<Run> {
