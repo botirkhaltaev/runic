@@ -6,7 +6,7 @@ use std::{
 use runic::RunicAlloc;
 
 #[global_allocator]
-static GLOBAL: RunicAlloc = RunicAlloc;
+static GLOBAL: RunicAlloc = RunicAlloc::new();
 
 fn main() {
     let Some(case) = env::args().nth(1) else {

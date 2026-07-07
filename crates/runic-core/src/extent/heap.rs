@@ -2,16 +2,17 @@ use core::ptr::NonNull;
 
 use crate::{
     allocation::{Allocation, ZeroStatus},
+    config::ExtentConfig,
     extent::{Extent, ExtentArena},
     layout::LayoutSpec,
     memory::{L2TablePolicy, OsMemory, PageMap, PageOwner, PageRange},
 };
 
-use super::{ExtentReservation, mapping_cache::MappingCache};
+use super::{ExtentReservation, cache::ExtentCache};
 
 pub(crate) struct ExtentHeap {
     extents: ExtentArena,
-    mapping_cache: MappingCache,
+    cache: ExtentCache,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,16 +23,16 @@ pub(crate) enum ExtentHeapError {
 }
 
 impl ExtentHeap {
-    pub(crate) const fn new(capacity: u32) -> Self {
+    pub(crate) const fn new(capacity: u32, config: ExtentConfig) -> Self {
         Self {
             extents: ExtentArena::new(capacity),
-            mapping_cache: MappingCache::new(),
+            cache: ExtentCache::new(config),
         }
     }
 
     pub(crate) fn allocate(&mut self, spec: LayoutSpec, pages: &mut PageMap) -> Option<Allocation> {
         let len = spec.mapping_len(OsMemory::page_size())?;
-        let (mapping, zero_status) = if let Some(mapping) = self.mapping_cache.take_exact(len) {
+        let (mapping, zero_status) = if let Some(mapping) = self.cache.take(len) {
             (mapping, ZeroStatus::NeedsZeroing)
         } else {
             (OsMemory::map(len)?, ZeroStatus::KnownZeroed)
@@ -68,7 +69,7 @@ impl ExtentHeap {
             (extent.id(), extent.range(), extent.mapping_len())
         };
 
-        let retain_mapping = self.mapping_cache.can_retain(mapping_len);
+        let retain_mapping = self.cache.will_retain(mapping_len);
         let Some(page_range) = PageRange::new(range.base(), range.len()) else {
             return Err(ExtentHeapError::InvalidMetadata);
         };
@@ -87,7 +88,7 @@ impl ExtentHeap {
         };
 
         let mapping = extent.into_mapping();
-        if let Err(mapping) = self.mapping_cache.insert(mapping) {
+        if let Err(mapping) = self.cache.insert(mapping) {
             drop(mapping);
         }
 
@@ -163,7 +164,7 @@ mod tests {
 
     #[test]
     fn failed_extent_page_publication_removes_table_entry() {
-        let mut allocator = ExtentHeap::new(4);
+        let mut allocator = ExtentHeap::new(4, ExtentConfig::new());
         let mut pages = PageMap::new();
         let reservation = allocator.extents.reserve().unwrap();
         let id = reservation.id();

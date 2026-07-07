@@ -2,7 +2,7 @@ use runic::RunicAlloc;
 use std::{collections::HashMap, sync::Arc};
 
 #[global_allocator]
-static GLOBAL: RunicAlloc = RunicAlloc;
+static GLOBAL: RunicAlloc = RunicAlloc::new();
 
 #[test]
 fn box_uses_runic() {

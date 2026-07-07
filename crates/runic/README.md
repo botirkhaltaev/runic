@@ -16,13 +16,27 @@ cargo add runic-alloc
 use runic::RunicAlloc;
 
 #[global_allocator]
-static GLOBAL: RunicAlloc = RunicAlloc;
+static GLOBAL: RunicAlloc = RunicAlloc::new();
+```
+
+Use the const builder for explicit retention policy experiments:
+
+```rust
+use runic::{Budget, ExtentPolicy, RunicAlloc};
+
+#[global_allocator]
+static GLOBAL: RunicAlloc = RunicAlloc::builder()
+    .extent()
+    .policy(ExtentPolicy::Lru)
+    .budget(Budget::new(32, 16 * 1024 * 1024))
+    .done()
+    .build();
 ```
 
 ## Crate Shape
 
 - `src/lib.rs`: public export surface.
-- `src/global.rs`: `RunicAlloc` implementation of `GlobalAlloc`.
+- `src/global.rs`: configured `RunicAlloc` implementation of `GlobalAlloc`.
 - `src/bin/abort_case.rs`: subprocess binary used by abort tests.
 - `tests/`: global allocator smoke and abort-case integration tests.
 

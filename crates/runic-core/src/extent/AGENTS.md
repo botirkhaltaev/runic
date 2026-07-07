@@ -6,5 +6,5 @@ Scope: `crates/runic-core/src/extent/`.
 - Keep dedicated allocation policy and mapping reuse on `ExtentHeap`.
 - Keep metadata storage and reservation behavior on `ExtentArena`.
 - Remove page-map ownership before removing extent metadata.
-- Avoid unbounded mapping retention; preserve `MappingCache` limits.
+- Avoid unbounded mapping retention; preserve `ExtentCache` slot and byte limits.
 - Add tests beside the extent entity that owns the changed invariant.

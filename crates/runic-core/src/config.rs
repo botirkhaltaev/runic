@@ -1,0 +1,140 @@
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AllocatorConfig {
+    extent: ExtentConfig,
+}
+
+impl AllocatorConfig {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            extent: ExtentConfig::new(),
+        }
+    }
+
+    #[must_use]
+    pub const fn extent(self) -> ExtentConfig {
+        self.extent
+    }
+
+    #[must_use]
+    pub const fn with_extent_policy(mut self, policy: ExtentPolicy) -> Self {
+        self.extent = self.extent.with_policy(policy);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_extent_reuse(mut self, reuse: Reuse) -> Self {
+        self.extent = self.extent.with_reuse(reuse);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_extent_budget(mut self, budget: Budget) -> Self {
+        self.extent = self.extent.with_budget(budget);
+        self
+    }
+}
+
+impl Default for AllocatorConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExtentConfig {
+    policy: ExtentPolicy,
+    reuse: Reuse,
+    budget: Budget,
+}
+
+impl ExtentConfig {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            policy: ExtentPolicy::Keep,
+            reuse: Reuse::Exact,
+            budget: Budget::new(32, 16 * 1024 * 1024),
+        }
+    }
+
+    #[must_use]
+    pub const fn policy(self) -> ExtentPolicy {
+        self.policy
+    }
+
+    #[must_use]
+    pub const fn reuse(self) -> Reuse {
+        self.reuse
+    }
+
+    #[must_use]
+    pub const fn budget(self) -> Budget {
+        self.budget
+    }
+
+    #[must_use]
+    pub const fn with_policy(mut self, policy: ExtentPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_reuse(mut self, reuse: Reuse) -> Self {
+        self.reuse = reuse;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_budget(mut self, budget: Budget) -> Self {
+        self.budget = budget;
+        self
+    }
+}
+
+impl Default for ExtentConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Budget {
+    slots: usize,
+    bytes: usize,
+}
+
+impl Budget {
+    #[must_use]
+    pub const fn new(slots: usize, bytes: usize) -> Self {
+        Self { slots, bytes }
+    }
+
+    #[must_use]
+    pub const fn slots(self) -> usize {
+        self.slots
+    }
+
+    #[must_use]
+    pub const fn bytes(self) -> usize {
+        self.bytes
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExtentPolicy {
+    Drop,
+    Keep,
+    Fifo,
+    Lifo,
+    Lru,
+    Largest,
+    Smallest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Reuse {
+    Exact,
+    BestFit,
+    SizeClass,
+}

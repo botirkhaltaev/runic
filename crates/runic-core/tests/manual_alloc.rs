@@ -9,57 +9,61 @@ const CLASS_SIZES: &[usize] = &[
 
 #[test]
 fn allocator_reallocates_after_freeing_small_block() {
+    let allocator = Allocator::new();
     let layout = Layout::from_size_align(64, 8).unwrap();
 
-    let first = unsafe { Allocator::alloc(layout) };
+    let first = unsafe { allocator.alloc(layout) };
     assert!(!first.is_null());
-    let second = unsafe { Allocator::alloc(layout) };
+    let second = unsafe { allocator.alloc(layout) };
     assert!(!second.is_null());
 
-    unsafe { Allocator::dealloc(second, layout) };
+    unsafe { allocator.dealloc(second, layout) };
 
-    let reused = unsafe { Allocator::alloc(layout) };
+    let reused = unsafe { allocator.alloc(layout) };
     assert!(!reused.is_null());
 
-    unsafe { Allocator::dealloc(reused, layout) };
-    unsafe { Allocator::dealloc(first, layout) };
+    unsafe { allocator.dealloc(reused, layout) };
+    unsafe { allocator.dealloc(first, layout) };
 }
 
 #[test]
 fn allocator_returns_aligned_pointer() {
+    let allocator = Allocator::new();
     let layout = Layout::from_size_align(1, 4096).unwrap();
 
-    let ptr = unsafe { Allocator::alloc(layout) };
+    let ptr = unsafe { allocator.alloc(layout) };
     assert!(!ptr.is_null());
     assert_eq!(ptr as usize % layout.align(), 0);
 
-    unsafe { Allocator::dealloc(ptr, layout) };
+    unsafe { allocator.dealloc(ptr, layout) };
 }
 
 #[test]
 fn allocator_zeroes_memory() {
+    let allocator = Allocator::new();
     let layout = Layout::from_size_align(256, 8).unwrap();
 
-    let ptr = unsafe { Allocator::alloc_zeroed(layout) };
+    let ptr = unsafe { allocator.alloc_zeroed(layout) };
     assert!(!ptr.is_null());
 
     let bytes = unsafe { core::slice::from_raw_parts(ptr, layout.size()) };
     assert!(bytes.iter().all(|&byte| byte == 0));
 
-    unsafe { Allocator::dealloc(ptr, layout) };
+    unsafe { allocator.dealloc(ptr, layout) };
 }
 
 #[test]
 fn allocator_realloc_preserves_prefix() {
+    let allocator = Allocator::new();
     let old = Layout::from_size_align(32, 8).unwrap();
-    let ptr = unsafe { Allocator::alloc(old) };
+    let ptr = unsafe { allocator.alloc(old) };
     assert!(!ptr.is_null());
 
     for index in 0..old.size() {
         unsafe { ptr.add(index).write(byte(index)) };
     }
 
-    let new_ptr = unsafe { Allocator::realloc(ptr, old, 128) };
+    let new_ptr = unsafe { allocator.realloc(ptr, old, 128) };
     assert!(!new_ptr.is_null());
 
     for index in 0..old.size() {
@@ -67,20 +71,21 @@ fn allocator_realloc_preserves_prefix() {
     }
 
     let new = Layout::from_size_align(128, 8).unwrap();
-    unsafe { Allocator::dealloc(new_ptr, new) };
+    unsafe { allocator.dealloc(new_ptr, new) };
 }
 
 #[test]
 fn allocator_realloc_uses_old_layout_size_for_copy_len() {
+    let allocator = Allocator::new();
     let old = Layout::from_size_align(17, 8).unwrap();
-    let ptr = unsafe { Allocator::alloc(old) };
+    let ptr = unsafe { allocator.alloc(old) };
     assert!(!ptr.is_null());
 
     for index in 0..old.size() {
         unsafe { ptr.add(index).write(byte(index + 1)) };
     }
 
-    let new_ptr = unsafe { Allocator::realloc(ptr, old, 128) };
+    let new_ptr = unsafe { allocator.realloc(ptr, old, 128) };
     assert!(!new_ptr.is_null());
 
     for index in 0..old.size() {
@@ -88,14 +93,15 @@ fn allocator_realloc_uses_old_layout_size_for_copy_len() {
     }
 
     let new = Layout::from_size_align(128, 8).unwrap();
-    unsafe { Allocator::dealloc(new_ptr, new) };
+    unsafe { allocator.dealloc(new_ptr, new) };
 }
 
 #[test]
 fn allocator_handles_large_allocation() {
+    let allocator = Allocator::new();
     let layout = Layout::from_size_align(128 * 1024, 4096).unwrap();
 
-    let ptr = unsafe { Allocator::alloc(layout) };
+    let ptr = unsafe { allocator.alloc(layout) };
     assert!(!ptr.is_null());
     assert_eq!(ptr as usize % layout.align(), 0);
 
@@ -104,16 +110,17 @@ fn allocator_handles_large_allocation() {
         ptr.add(layout.size() - 1).write(0xcd);
     }
 
-    unsafe { Allocator::dealloc(ptr, layout) };
+    unsafe { allocator.dealloc(ptr, layout) };
 }
 
 #[test]
 fn allocator_allocates_and_frees_each_size_class() {
+    let allocator = Allocator::new();
     let mut allocations = Vec::new();
 
     for &size in CLASS_SIZES {
         let layout = Layout::from_size_align(size, 8).unwrap();
-        let ptr = unsafe { Allocator::alloc(layout) };
+        let ptr = unsafe { allocator.alloc(layout) };
 
         assert!(!ptr.is_null(), "size {size}");
         unsafe {
@@ -124,12 +131,13 @@ fn allocator_allocates_and_frees_each_size_class() {
     }
 
     for (ptr, layout) in allocations {
-        unsafe { Allocator::dealloc(ptr, layout) };
+        unsafe { allocator.dealloc(ptr, layout) };
     }
 }
 
 #[test]
 fn allocator_returns_aligned_pointer_for_size_alignment_matrix() {
+    let allocator = Allocator::new();
     let sizes = [
         1, 7, 8, 9, 15, 16, 17, 23, 24, 25, 31, 32, 33, 63, 64, 65, 4097,
     ];
@@ -138,23 +146,24 @@ fn allocator_returns_aligned_pointer_for_size_alignment_matrix() {
     for size in sizes {
         for align in aligns {
             let layout = Layout::from_size_align(size, align).unwrap();
-            let ptr = unsafe { Allocator::alloc(layout) };
+            let ptr = unsafe { allocator.alloc(layout) };
 
             assert!(!ptr.is_null(), "size {size}, align {align}");
             assert_eq!(ptr as usize % align, 0, "size {size}, align {align}");
 
-            unsafe { Allocator::dealloc(ptr, layout) };
+            unsafe { allocator.dealloc(ptr, layout) };
         }
     }
 }
 
 #[test]
 fn allocator_handles_many_small_allocations_across_run_boundary() {
+    let allocator = Allocator::new();
     let layout = Layout::from_size_align(8, 8).unwrap();
     let mut allocations = Vec::new();
 
     for index in 0_usize..9000 {
-        let ptr = unsafe { Allocator::alloc(layout) };
+        let ptr = unsafe { allocator.alloc(layout) };
         assert!(!ptr.is_null(), "index {index}");
         unsafe { ptr.write(byte(index)) };
         allocations.push((ptr, index));
@@ -165,21 +174,22 @@ fn allocator_handles_many_small_allocations_across_run_boundary() {
     }
 
     for (ptr, _) in allocations {
-        unsafe { Allocator::dealloc(ptr, layout) };
+        unsafe { allocator.dealloc(ptr, layout) };
     }
 }
 
 #[test]
 fn allocator_realloc_small_to_large_preserves_prefix() {
+    let allocator = Allocator::new();
     let old = Layout::from_size_align(1024, 16).unwrap();
-    let ptr = unsafe { Allocator::alloc(old) };
+    let ptr = unsafe { allocator.alloc(old) };
     assert!(!ptr.is_null());
 
     for index in 0..old.size() {
         unsafe { ptr.add(index).write(byte(index)) };
     }
 
-    let new_ptr = unsafe { Allocator::realloc(ptr, old, 128 * 1024) };
+    let new_ptr = unsafe { allocator.realloc(ptr, old, 128 * 1024) };
     assert!(!new_ptr.is_null());
 
     for index in 0..old.size() {
@@ -187,20 +197,21 @@ fn allocator_realloc_small_to_large_preserves_prefix() {
     }
 
     let new = Layout::from_size_align(128 * 1024, 16).unwrap();
-    unsafe { Allocator::dealloc(new_ptr, new) };
+    unsafe { allocator.dealloc(new_ptr, new) };
 }
 
 #[test]
 fn allocator_realloc_large_to_small_preserves_prefix() {
+    let allocator = Allocator::new();
     let old = Layout::from_size_align(128 * 1024, 64).unwrap();
-    let ptr = unsafe { Allocator::alloc(old) };
+    let ptr = unsafe { allocator.alloc(old) };
     assert!(!ptr.is_null());
 
     for index in 0..4096 {
         unsafe { ptr.add(index).write(byte(index)) };
     }
 
-    let new_ptr = unsafe { Allocator::realloc(ptr, old, 4096) };
+    let new_ptr = unsafe { allocator.realloc(ptr, old, 4096) };
     assert!(!new_ptr.is_null());
 
     for index in 0..4096 {
@@ -208,19 +219,20 @@ fn allocator_realloc_large_to_small_preserves_prefix() {
     }
 
     let new = Layout::from_size_align(4096, 64).unwrap();
-    unsafe { Allocator::dealloc(new_ptr, new) };
+    unsafe { allocator.dealloc(new_ptr, new) };
 }
 
 #[test]
 fn allocator_zeroes_large_memory() {
+    let allocator = Allocator::new();
     let layout = Layout::from_size_align(96 * 1024, 4096).unwrap();
-    let ptr = unsafe { Allocator::alloc_zeroed(layout) };
+    let ptr = unsafe { allocator.alloc_zeroed(layout) };
     assert!(!ptr.is_null());
 
     let bytes = unsafe { core::slice::from_raw_parts(ptr, layout.size()) };
     assert!(bytes.iter().all(|&byte| byte == 0));
 
-    unsafe { Allocator::dealloc(ptr, layout) };
+    unsafe { allocator.dealloc(ptr, layout) };
 }
 
 #[test]
@@ -228,6 +240,7 @@ fn allocator_survives_deterministic_random_trace() {
     const OPS: usize = 10_000;
     const MAX_LIVE: usize = 512;
 
+    let allocator = Allocator::new();
     let mut rng = TraceRng::new(0xf3ee_a110_c001_cafe);
     let mut live = Vec::new();
     let mut next_id = 0_u64;
@@ -241,9 +254,9 @@ fn allocator_survives_deterministic_random_trace() {
             let layout = Layout::from_size_align(size, align).unwrap();
             let zeroed = rng.next_usize(4) == 0;
             let ptr = if zeroed {
-                unsafe { Allocator::alloc_zeroed(layout) }
+                unsafe { allocator.alloc_zeroed(layout) }
             } else {
-                unsafe { Allocator::alloc(layout) }
+                unsafe { allocator.alloc(layout) }
             };
 
             assert!(!ptr.is_null());
@@ -266,14 +279,14 @@ fn allocator_survives_deterministic_random_trace() {
             let index = rng.next_usize(live.len());
             let record = live.swap_remove(index);
             record.check_pattern();
-            unsafe { Allocator::dealloc(record.ptr, record.layout) };
+            unsafe { allocator.dealloc(record.ptr, record.layout) };
         } else {
             let index = rng.next_usize(live.len());
             live[index].check_pattern();
 
             let new_size = rng.biased_size(64 * 1024);
             let old = live[index].layout;
-            let new_ptr = unsafe { Allocator::realloc(live[index].ptr, old, new_size) };
+            let new_ptr = unsafe { allocator.realloc(live[index].ptr, old, new_size) };
             assert!(!new_ptr.is_null());
             assert_eq!(new_ptr as usize % old.align(), 0);
 
@@ -291,7 +304,7 @@ fn allocator_survives_deterministic_random_trace() {
 
     for record in live {
         record.check_pattern();
-        unsafe { Allocator::dealloc(record.ptr, record.layout) };
+        unsafe { allocator.dealloc(record.ptr, record.layout) };
     }
 }
 

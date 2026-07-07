@@ -8,7 +8,7 @@ use runic::RunicAlloc;
 use snmalloc_rs::SnMalloc;
 use tikv_jemallocator::Jemalloc;
 
-static RUNIC: RunicAlloc = RunicAlloc;
+static RUNIC: RunicAlloc = RunicAlloc::new();
 static SYSTEM: System = System;
 static MIMALLOC: MiMalloc = MiMalloc;
 static JEMALLOC: Jemalloc = Jemalloc;

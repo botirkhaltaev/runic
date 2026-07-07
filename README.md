@@ -22,7 +22,7 @@ Use `RunicAlloc` as a Rust global allocator:
 use runic::RunicAlloc;
 
 #[global_allocator]
-static GLOBAL: RunicAlloc = RunicAlloc;
+static GLOBAL: RunicAlloc = RunicAlloc::new();
 
 fn main() {
     let values = vec![1, 2, 3, 4];
@@ -42,6 +42,7 @@ Runic v0.3 implements:
 - page-indexed owner-pointer lookup
 - per-size-class available run lists
 - bitmap-backed run block state
+- configurable extent retention policies
 - run block-boundary checks
 - extent exact-pointer checks
 - basic `realloc`

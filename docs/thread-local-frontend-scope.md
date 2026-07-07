@@ -27,8 +27,8 @@ LocalHeap
 
 SharedHeap
   current Heap responsibilities that remain global
-  RunAllocator
-  ExtentAllocator
+  RunHeap
+  ExtentHeap
   PageMap
 
 HeapId

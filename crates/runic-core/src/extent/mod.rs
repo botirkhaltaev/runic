@@ -1,8 +1,8 @@
 use core::{num::NonZeroU32, ptr::NonNull};
 
 mod arena;
+mod cache;
 mod heap;
-mod mapping_cache;
 
 use crate::{
     layout::LayoutSpec,

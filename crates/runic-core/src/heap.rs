@@ -5,6 +5,7 @@ use core::{
 
 use crate::{
     allocation::{Allocation, ZeroStatus},
+    config::AllocatorConfig,
     extent::{ExtentHeap, ExtentHeapError},
     layout::LayoutSpec,
     memory::{PageMap, PageOwner},
@@ -31,10 +32,10 @@ pub(crate) enum HeapError {
 impl Heap {
     pub(crate) const DEFAULT_METADATA_CAPACITY: u32 = 65_536;
 
-    pub(crate) const fn new() -> Self {
+    pub(crate) const fn with_config(config: AllocatorConfig) -> Self {
         Self {
             runs: RunHeap::new(Self::DEFAULT_METADATA_CAPACITY),
-            extents: ExtentHeap::new(Self::DEFAULT_METADATA_CAPACITY),
+            extents: ExtentHeap::new(Self::DEFAULT_METADATA_CAPACITY, config.extent()),
             pages: PageMap::new(),
         }
     }
@@ -183,7 +184,7 @@ mod tests {
     fn test_heap() -> Heap {
         Heap {
             runs: RunHeap::new(4),
-            extents: ExtentHeap::new(4),
+            extents: ExtentHeap::new(4, AllocatorConfig::new().extent()),
             pages: PageMap::new(),
         }
     }

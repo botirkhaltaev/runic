@@ -8,7 +8,7 @@ Runic currently models mapped memory through separate domain entities:
 - `Extent` owns dedicated allocation metadata.
 - `PageMap` owns address lookup publication.
 - `RunArena` and `ExtentArena` own metadata slots.
-- `MappingCache` owns reusable extent mappings.
+- `ExtentCache` owns reusable extent mappings.
 - `Heap` coordinates lifecycle transitions.
 
 This split is explicit and worked for the v0.3 single-thread metadata milestone, but thread-local heaps, remote frees, decay policy, hardening, and hugepage-aware allocation will all increase ownership pressure.
@@ -21,7 +21,7 @@ The useful invariant would be:
 
 > one mapped address range is published in `PageMap` as exactly one owner and is backed by exactly one allocator metadata object during its live lifecycle.
 
-Today that invariant is spread across `Heap::insert_run`, `ExtentAllocator::insert_extent`, `PageMap::insert`, and the table insert/remove paths.
+Today that invariant is spread across `RunHeap::insert_run`, `ExtentHeap::insert_extent`, `PageMap::insert`, and arena insert/remove paths.
 
 ## Candidate Shape
 

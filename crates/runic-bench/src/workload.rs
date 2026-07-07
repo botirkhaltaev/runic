@@ -186,6 +186,63 @@ pub fn large_alloc_churn(target: AllocatorTarget, size: usize, ops: usize) -> us
     black_box(checksum)
 }
 
+/// Allocates and frees large allocations from Runic's large-size benchmark set.
+///
+/// # Panics
+///
+/// Panics if layout construction, allocation, alignment, or validation fails.
+#[must_use]
+pub fn mixed_large_churn(target: AllocatorTarget, ops: usize) -> usize {
+    let mut checksum = 0_usize;
+
+    for i in 0..ops {
+        let size = LARGE_SIZES[i % LARGE_SIZES.len()];
+        let layout = Layout::from_size_align(size, 4096).unwrap();
+        let ptr = target.alloc(black_box(layout));
+        assert_eq!(ptr.as_ptr() as usize % 4096, 0);
+        unsafe {
+            ptr.as_ptr().write(byte(i));
+            ptr.as_ptr().add(size - 1).write(byte(i >> 8));
+            checksum ^= ptr.as_ptr().read() as usize;
+            checksum ^= ptr.as_ptr().add(size - 1).read() as usize;
+        }
+        target.dealloc(ptr, layout);
+    }
+
+    black_box(checksum)
+}
+
+/// Repeatedly creates and empties small runs.
+///
+/// # Panics
+///
+/// Panics if allocation fails or validation fails.
+#[must_use]
+pub fn run_empty_churn(target: AllocatorTarget, rounds: usize) -> usize {
+    const LIVE: usize = 9000;
+
+    let layout = Layout::from_size_align(8, 8).unwrap();
+    let mut checksum = 0_usize;
+    let mut live = Vec::with_capacity(LIVE);
+
+    for round in 0..rounds {
+        for index in 0..LIVE {
+            let ptr = target.alloc(black_box(layout));
+            unsafe { ptr.as_ptr().write(byte(round ^ index)) };
+            live.push((ptr, index));
+        }
+
+        while let Some((ptr, index)) = live.pop() {
+            let value = unsafe { ptr.as_ptr().read() };
+            checksum ^= value as usize;
+            assert_eq!(value, byte(round ^ index));
+            target.dealloc(ptr, layout);
+        }
+    }
+
+    black_box(checksum)
+}
+
 /// Allocates zeroed memory and validates marker bytes.
 ///
 /// # Panics

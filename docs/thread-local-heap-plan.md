@@ -35,7 +35,7 @@ The first local heap should be narrow:
 
 - Small allocations only.
 - One local cache per size class.
-- Refill from shared `RunAllocator` under the global lock in fixed batches.
+- Refill from shared `RunHeap` under the global lock in fixed batches.
 - Return or drain blocks to shared run metadata through explicit operations.
 - No remote-free fast path in the first implementation unless #27 has defined the ownership protocol.
 
