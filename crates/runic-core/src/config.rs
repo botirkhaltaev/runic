@@ -1,6 +1,7 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AllocatorConfig {
     extent: ExtentConfig,
+    run: RunConfig,
 }
 
 impl AllocatorConfig {
@@ -8,12 +9,18 @@ impl AllocatorConfig {
     pub const fn new() -> Self {
         Self {
             extent: ExtentConfig::new(),
+            run: RunConfig::new(),
         }
     }
 
     #[must_use]
     pub const fn extent(self) -> ExtentConfig {
         self.extent
+    }
+
+    #[must_use]
+    pub const fn run(self) -> RunConfig {
+        self.run
     }
 
     #[must_use]
@@ -31,6 +38,18 @@ impl AllocatorConfig {
     #[must_use]
     pub const fn with_extent_budget(mut self, budget: Budget) -> Self {
         self.extent = self.extent.with_budget(budget);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_run_policy(mut self, policy: RunPolicy) -> Self {
+        self.run = self.run.with_policy(policy);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_run_budget(mut self, budget: Budget) -> Self {
+        self.run = self.run.with_budget(budget);
         self
     }
 }
@@ -99,6 +118,57 @@ impl Default for ExtentConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RunConfig {
+    policy: RunPolicy,
+    budget: Budget,
+}
+
+impl RunConfig {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            policy: RunPolicy::Keep,
+            budget: Budget::new(0, 0),
+        }
+    }
+
+    #[must_use]
+    pub const fn policy(self) -> RunPolicy {
+        self.policy
+    }
+
+    #[must_use]
+    pub const fn budget(self) -> Budget {
+        self.budget
+    }
+
+    pub(crate) const fn retains_empty_runs(self) -> bool {
+        matches!(
+            self.policy,
+            RunPolicy::RetainFifo | RunPolicy::RetainPerClass
+        )
+    }
+
+    #[must_use]
+    pub const fn with_policy(mut self, policy: RunPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_budget(mut self, budget: Budget) -> Self {
+        self.budget = budget;
+        self
+    }
+}
+
+impl Default for RunConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Budget {
     slots: usize,
     bytes: usize,
@@ -136,4 +206,12 @@ pub enum ExtentReuse {
     Exact,
     BestFit,
     SizeClass,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunPolicy {
+    Keep,
+    DropEmpty,
+    RetainFifo,
+    RetainPerClass,
 }

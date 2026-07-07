@@ -1,6 +1,7 @@
 use core::{num::NonZeroU32, ptr::NonNull};
 
 mod arena;
+mod cache;
 mod heap;
 
 use crate::{
@@ -211,6 +212,10 @@ impl Run {
         !self.has_available_blocks()
     }
 
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.live == 0
+    }
+
     pub(crate) fn set_available_next(&mut self, next: Option<NonNull<Run>>) {
         self.available_next = next;
     }
@@ -219,10 +224,18 @@ impl Run {
         self.available_next.take()
     }
 
+    pub(crate) const fn available_next(&self) -> Option<NonNull<Run>> {
+        self.available_next
+    }
+
     pub(crate) fn range(&self) -> AddressRange {
         debug_assert!(self.mapping.range().contains(self.range));
 
         self.range
+    }
+
+    pub(crate) fn into_mapping(self) -> Mapping {
+        self.mapping
     }
 
     pub(crate) fn allocate(&mut self) -> Option<RunBlock> {

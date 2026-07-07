@@ -2,17 +2,29 @@ use core::ptr::NonNull;
 
 use crate::{
     allocation::{Allocation, ZeroStatus},
+    config::{RunConfig, RunPolicy},
     layout::LayoutSpec,
-    memory::{PageMap, PageOwner, PageRange},
-    run::{RUN_SIZE, Run, RunArena, RunBlock, RunError},
+    memory::{AddressRange, L2TablePolicy, OsMemory, PageMap, PageOwner, PageRange},
+    run::{RUN_SIZE, Run, RunArena, RunBlock, RunError, RunId},
     size_class::{SizeClassId, SizeClasses},
 };
 
-use super::RunReservation;
+use super::{RunReservation, cache::RunCache};
 
 pub(crate) struct RunHeap {
     runs: RunArena,
     available: [Option<NonNull<Run>>; SizeClasses::COUNT],
+    cache: RunCache,
+    config: RunConfig,
+}
+
+struct FreedRun {
+    id: RunId,
+    class: SizeClassId,
+    range: AddressRange,
+    owner: NonNull<Run>,
+    was_full: bool,
+    is_empty: bool,
 }
 
 // SAFETY: RunHeap owns run metadata and available-list pointers into its own
@@ -28,10 +40,12 @@ pub(crate) enum RunHeapError {
 }
 
 impl RunHeap {
-    pub(crate) const fn new(capacity: u32) -> Self {
+    pub(crate) const fn new(capacity: u32, config: RunConfig) -> Self {
         Self {
             runs: RunArena::new(capacity),
             available: [None; SizeClasses::COUNT],
+            cache: RunCache::new(config),
+            config,
         }
     }
 
@@ -53,7 +67,10 @@ impl RunHeap {
     fn allocate_new_run(&mut self, class: SizeClassId, pages: &mut PageMap) -> Option<Allocation> {
         let class = SizeClasses::class(class)?;
         let class_index = class.id().index();
-        let mapping = crate::memory::OsMemory::map(RUN_SIZE)?;
+        let mapping = self
+            .cache
+            .take(class.id())
+            .or_else(|| OsMemory::map(RUN_SIZE))?;
         let reservation = self.runs.reserve()?;
         let id = reservation.id();
 
@@ -72,21 +89,69 @@ impl RunHeap {
 
     pub(crate) fn free(
         &mut self,
-        mut run_ptr: NonNull<Run>,
+        owner: NonNull<Run>,
         ptr: NonNull<u8>,
+        pages: &mut PageMap,
     ) -> Result<(), RunHeapError> {
-        let (class_index, run_ptr, was_full) = {
-            // SAFETY: PageMap stores only pointers published from this allocator's live RunArena.
-            let run = unsafe { run_ptr.as_mut() };
+        let freed = Self::free_block(owner, ptr)?;
 
-            let was_full = run.is_full();
-            run.free(ptr).map_err(RunHeapError::from)?;
+        if self.should_release_empty_run(&freed) {
+            return self.release_empty_run(freed, pages);
+        }
 
-            (run.class().index(), NonNull::from(&mut *run), was_full)
+        if freed.was_full {
+            self.push_available(freed.class.index(), freed.owner)?;
+        }
+
+        Ok(())
+    }
+
+    fn free_block(mut owner: NonNull<Run>, ptr: NonNull<u8>) -> Result<FreedRun, RunHeapError> {
+        // SAFETY: PageMap stores only pointers published from this allocator's live RunArena.
+        let run = unsafe { owner.as_mut() };
+
+        let was_full = run.is_full();
+        run.free(ptr).map_err(RunHeapError::from)?;
+
+        Ok(FreedRun {
+            id: run.id(),
+            class: run.class(),
+            range: run.range(),
+            owner: NonNull::from(&mut *run),
+            was_full,
+            is_empty: run.is_empty(),
+        })
+    }
+
+    fn should_release_empty_run(&self, freed: &FreedRun) -> bool {
+        freed.is_empty && self.config.policy() != RunPolicy::Keep
+    }
+
+    fn release_empty_run(
+        &mut self,
+        freed: FreedRun,
+        pages: &mut PageMap,
+    ) -> Result<(), RunHeapError> {
+        self.unlink_available(freed.class.index(), freed.owner)?;
+
+        let Some(page_range) = PageRange::new(freed.range.base(), freed.range.len()) else {
+            return Err(RunHeapError::InvalidMetadata);
         };
+        let empty_l2_tables = if self.cache.will_retain() {
+            L2TablePolicy::RetainEmpty
+        } else {
+            L2TablePolicy::ReleaseEmpty
+        };
+        pages
+            .remove(page_range, PageOwner::Run(freed.owner), empty_l2_tables)
+            .map_err(|_| RunHeapError::InvalidMetadata)?;
 
-        if was_full {
-            self.push_available(class_index, run_ptr)?;
+        let Some(run) = self.runs.remove(freed.id) else {
+            return Err(RunHeapError::InvalidMetadata);
+        };
+        let mapping = run.into_mapping();
+        if let Err(mapping) = self.cache.insert(mapping, freed.class) {
+            drop(mapping);
         }
 
         Ok(())
@@ -149,6 +214,40 @@ impl RunHeap {
         Ok(())
     }
 
+    fn unlink_available(
+        &mut self,
+        class_index: usize,
+        target: NonNull<Run>,
+    ) -> Result<(), RunHeapError> {
+        let Some(head) = self.available.get_mut(class_index) else {
+            return Err(RunHeapError::InvalidMetadata);
+        };
+        let mut current = *head;
+        let mut previous: Option<NonNull<Run>> = None;
+
+        while let Some(mut run_ptr) = current {
+            // SAFETY: available-list pointers are created only from live RunArena entries.
+            let run = unsafe { run_ptr.as_mut() };
+            let next = run.available_next();
+
+            if run_ptr == target {
+                let _ = run.take_available_next();
+                if let Some(mut previous_ptr) = previous {
+                    // SAFETY: previous_ptr was read from the same live available list.
+                    unsafe { previous_ptr.as_mut() }.set_available_next(next);
+                } else {
+                    *head = next;
+                }
+                return Ok(());
+            }
+
+            previous = Some(run_ptr);
+            current = next;
+        }
+
+        Ok(())
+    }
+
     fn insert_run(
         &mut self,
         reservation: RunReservation,
@@ -195,6 +294,7 @@ impl From<RunError> for RunHeapError {
 #[cfg(test)]
 mod tests {
     use crate::{
+        config::{Budget, RunPolicy},
         layout::LayoutSpec,
         memory::{OsMemory, PageMap, PageOwner, PageRange},
         run::{RUN_SIZE, Run, RunId},
@@ -220,7 +320,7 @@ mod tests {
 
     #[test]
     fn run_heap_relinks_previously_full_run_after_free() {
-        let mut allocator = RunHeap::new(2);
+        let mut allocator = RunHeap::new(2, RunConfig::new());
         let mut pages = PageMap::new();
         let spec = LayoutSpec::from_size_align(64, 8).unwrap();
         let class = SizeClasses::for_layout(spec).unwrap();
@@ -238,7 +338,7 @@ mod tests {
         }
 
         assert_eq!(available_run_id(&allocator, class_index), None);
-        assert_eq!(allocator.free(run_ptr, first), Ok(()));
+        assert_eq!(allocator.free(run_ptr, first, &mut pages), Ok(()));
         assert_eq!(available_run_id(&allocator, class_index), Some(id));
 
         let reused = allocator.allocate(class.id(), &mut pages).unwrap().ptr();
@@ -249,7 +349,7 @@ mod tests {
 
     #[test]
     fn failed_run_page_publication_removes_table_entry() {
-        let mut allocator = RunHeap::new(4);
+        let mut allocator = RunHeap::new(4, RunConfig::new());
         let mut pages = PageMap::new();
         let reservation = allocator.runs.reserve().unwrap();
         let id = reservation.id();
@@ -263,5 +363,42 @@ mod tests {
         assert_eq!(allocator.insert_run(reservation, run, &mut pages), None);
         assert!(allocator.runs.get_mut(id).is_none());
         assert_eq!(pages.get(range.base()), Some(existing));
+    }
+
+    #[test]
+    fn run_heap_drop_empty_removes_page_map_entry() {
+        let mut allocator = RunHeap::new(2, RunConfig::new().with_policy(RunPolicy::DropEmpty));
+        let mut pages = PageMap::new();
+        let spec = LayoutSpec::from_size_align(64, 8).unwrap();
+        let class = SizeClasses::for_layout(spec).unwrap();
+        let ptr = allocator.allocate(class.id(), &mut pages).unwrap().ptr();
+        let PageOwner::Run(run_ptr) = pages.get(ptr).unwrap() else {
+            panic!("small allocation should publish a run entry");
+        };
+
+        assert_eq!(allocator.free(run_ptr, ptr, &mut pages), Ok(()));
+        assert_eq!(pages.get(ptr), None);
+    }
+
+    #[test]
+    fn run_heap_reuses_empty_run_mapping_from_cache() {
+        let mut allocator = RunHeap::new(
+            2,
+            RunConfig::new()
+                .with_policy(RunPolicy::RetainFifo)
+                .with_budget(Budget::new(1, RUN_SIZE)),
+        );
+        let mut pages = PageMap::new();
+        let spec = LayoutSpec::from_size_align(64, 8).unwrap();
+        let class = SizeClasses::for_layout(spec).unwrap();
+        let first = allocator.allocate(class.id(), &mut pages).unwrap().ptr();
+        let PageOwner::Run(run_ptr) = pages.get(first).unwrap() else {
+            panic!("small allocation should publish a run entry");
+        };
+
+        assert_eq!(allocator.free(run_ptr, first, &mut pages), Ok(()));
+
+        let second = allocator.allocate(class.id(), &mut pages).unwrap().ptr();
+        assert_eq!(second, first);
     }
 }

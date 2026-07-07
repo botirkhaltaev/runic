@@ -1,6 +1,6 @@
 use std::{alloc::GlobalAlloc, env, process::Command};
 
-use runic::{Budget, ExtentPolicy, ExtentReuse, RunicAlloc};
+use runic::{Budget, ExtentPolicy, ExtentReuse, RunPolicy, RunicAlloc};
 use runic_bench::{allocator_target::AllocatorTarget, rss::RssReport, workload};
 
 static EXTENT_DROP: RunicAlloc = RunicAlloc::builder()
@@ -48,6 +48,23 @@ static EXTENT_FIFO_SIZE_CLASS_16M: RunicAlloc = RunicAlloc::builder()
     .budget(Budget::new(32, 16 * 1024 * 1024))
     .done()
     .build();
+static RUN_DROP_EMPTY: RunicAlloc = RunicAlloc::builder()
+    .run()
+    .policy(RunPolicy::DropEmpty)
+    .done()
+    .build();
+static RUN_RETAIN_FIFO_512K: RunicAlloc = RunicAlloc::builder()
+    .run()
+    .policy(RunPolicy::RetainFifo)
+    .budget(Budget::new(8, 512 * 1024))
+    .done()
+    .build();
+static RUN_RETAIN_PER_CLASS_512K: RunicAlloc = RunicAlloc::builder()
+    .run()
+    .policy(RunPolicy::RetainPerClass)
+    .budget(Budget::new(8, 512 * 1024))
+    .done()
+    .build();
 
 const CONFIGS: &[PolicyConfig] = &[
     PolicyConfig::new("extent_drop", &EXTENT_DROP),
@@ -58,6 +75,9 @@ const CONFIGS: &[PolicyConfig] = &[
     PolicyConfig::new("extent_smallest_16m", &EXTENT_SMALLEST_16M),
     PolicyConfig::new("extent_fifo_best_fit_16m", &EXTENT_FIFO_BEST_FIT_16M),
     PolicyConfig::new("extent_fifo_size_class_16m", &EXTENT_FIFO_SIZE_CLASS_16M),
+    PolicyConfig::new("run_drop_empty", &RUN_DROP_EMPTY),
+    PolicyConfig::new("run_retain_fifo_512k", &RUN_RETAIN_FIFO_512K),
+    PolicyConfig::new("run_retain_per_class_512k", &RUN_RETAIN_PER_CLASS_512K),
 ];
 
 const WORKLOADS: &[PolicyWorkload] = &[

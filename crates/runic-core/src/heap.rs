@@ -34,7 +34,7 @@ impl Heap {
 
     pub(crate) const fn with_config(config: AllocatorConfig) -> Self {
         Self {
-            runs: RunHeap::new(Self::DEFAULT_METADATA_CAPACITY),
+            runs: RunHeap::new(Self::DEFAULT_METADATA_CAPACITY, config.run()),
             extents: ExtentHeap::new(Self::DEFAULT_METADATA_CAPACITY, config.extent()),
             pages: PageMap::new(),
         }
@@ -57,7 +57,10 @@ impl Heap {
         };
 
         match entry {
-            PageOwner::Run(run) => self.runs.free(run, ptr).map_err(HeapError::from),
+            PageOwner::Run(run) => self
+                .runs
+                .free(run, ptr, &mut self.pages)
+                .map_err(HeapError::from),
             PageOwner::Extent(extent) => self
                 .extents
                 .free(extent, ptr, &mut self.pages)
@@ -183,7 +186,7 @@ mod tests {
 
     fn test_heap() -> Heap {
         Heap {
-            runs: RunHeap::new(4),
+            runs: RunHeap::new(4, AllocatorConfig::new().run()),
             extents: ExtentHeap::new(4, AllocatorConfig::new().extent()),
             pages: PageMap::new(),
         }

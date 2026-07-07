@@ -42,7 +42,7 @@ Runic v0.3 implements:
 - page-indexed owner-pointer lookup
 - per-size-class available run lists
 - bitmap-backed run block state
-- configurable extent retention policies
+- configurable extent and empty-run retention policies
 - run block-boundary checks
 - extent exact-pointer checks
 - basic `realloc`

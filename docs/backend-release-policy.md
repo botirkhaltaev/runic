@@ -4,7 +4,7 @@ Issue: #26
 
 Runic's backend release policy should be small and deterministic. It applies to cached dedicated extent mappings, where reuse improves large-allocation churn but unbounded retention would inflate RSS.
 
-The current implementation exposes deterministic extent policies through configured allocator instances. Defaults preserve the v0.3 behavior while policy-grid benchmarks compare alternatives.
+The current implementation exposes deterministic extent and empty-run policies through configured allocator instances. Defaults preserve the v0.3 behavior while policy-grid benchmarks compare alternatives.
 
 ## Policy
 
@@ -58,4 +58,4 @@ Use the policy grid for configured allocator comparisons:
 
 Thread-local heaps and hugepage-aware mappings may need separate policies. They should not reuse this cache as a passive wrapper; the backend entity that owns mmap/munmap lifecycle should own any additional retention, purge, or hugepage decisions.
 
-First policy-grid signal: extent retention preserves large-churn performance relative to dropping mappings.
+First policy-grid signal: extent retention preserves large-churn performance relative to dropping mappings; empty-run release policies regress single-block churn and should remain opt-in unless later workloads justify them.
