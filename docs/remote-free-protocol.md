@@ -2,7 +2,7 @@
 
 Issue: #27
 
-Remote frees become necessary once small allocations can be owned by thread-local heaps. A free on a non-owner thread must not mutate another heap's local metadata directly.
+Remote frees are part of the v0.5 thread-local heap milestone. A free on a non-owner thread must not mutate another heap's local metadata directly.
 
 ## Ownership Identity
 
@@ -12,11 +12,11 @@ Initial shape:
 
 ```text
 HeapId
-Run owner: HeapId
-PageMap lookup: Run(id, owner) | Extent(id)
+Run owner: Shared | Thread(HeapId)
+PageMap lookup: Run pointer | Extent pointer
 ```
 
-If a future `Region` entity is introduced, the owner should move to the region rather than being duplicated across run metadata and page-map entries.
+Run metadata remains stable in `RunArena`; owner identity lives on `Run` for v0.5. If a future `Region` entity owns publication and lifecycle, owner identity may move there directly.
 
 ## Free Routing
 
@@ -56,12 +56,12 @@ The first queue should be allocation-free and bounded.
 
 Recommended first version:
 
-- one bounded MPSC queue per owning heap
-- fixed capacity chosen at heap construction
-- producer does a non-blocking enqueue
-- owner drains on allocation slow path, deallocation slow path, and explicit maintenance points
+- one bounded inbox per owning heap in `HeapRegistry`
+- fixed capacity chosen at allocator construction
+- remote enqueue runs under the shared heap lock in v0.5
+- owner drains on allocation slow path, deallocation slow path, and thread exit
 
-If enqueue fails, the first implementation may fall back to the global heap lock and perform a validated shared free. That fallback must be documented as transitional and measured. It should not become the permanent design for thread-local heaps.
+If enqueue fails, drain the target inbox and retry once. If enqueue still fails, return an invalid-metadata error that aborts at the allocator boundary. A free must never be silently dropped.
 
 ## Synchronization Rules
 
@@ -84,7 +84,7 @@ Remote-free queue failure must not silently drop frees. The options are:
 - abort with a distinct invalid-metadata path
 - drain owner queues before retrying, if the current thread owns the target heap
 
-For the first implementation, use validated global-lock fallback because it preserves correctness while keeping the remote-free queue bounded.
+For v0.5, use shared-lock remote routing because it preserves correctness while keeping the remote-free queue bounded and auditable. Lock-free enqueue is a later optimization.
 
 ## Interaction With Thread-Local Heaps
 
@@ -114,4 +114,4 @@ An implementation PR should include:
 - How thread exit drains local caches and remote queues.
 - Whether a remote free should ever publish directly to a shared central list.
 
-These decisions should be resolved in #25 before implementing a thread-local fast path.
+These decisions should be resolved inside #25 before the v0.5 thread-local fast path is considered complete.

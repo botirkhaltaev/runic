@@ -276,83 +276,81 @@ RSS checks confirm bounded retention
 empty-run release stays opt-in unless workloads justify changing the default
 ```
 
-### v0.5 Next: Owner Identity For Local Heaps
-
-Goal:
-
-```text
-Introduce the minimum owner identity needed for thread-local heaps and remote
-free routing without adding local fast paths prematurely.
-```
-
-In scope:
-
-```text
-HeapId or equivalent non-zero owner identity
-run or future region ownership metadata
-page-map lookup that returns enough owner information for routing
-thread-exit and cleanup design
-tests for ownership lookup and invalid frees
-```
-
-Primary references:
-
-```text
-docs/span-ownership-evaluation.md
-docs/thread-local-frontend-scope.md
-docs/remote-free-protocol.md
-```
-
-### v0.6 Next: Thread-Local Small Allocation Frontend
+### v0.5 Next: Full Thread-Local Heaps
 
 Goal:
 
 ```text
 Make same-thread small allocation hits avoid global metadata work while preserving
-block-boundary, double-free, stale-free, and remote-free validation.
+block-boundary, double-free, stale-free, remote-free, and thread-exit correctness.
 ```
 
 In scope:
 
 ```text
+HeapId owner identity
+RunOwner::Shared and RunOwner::Thread
 LocalHeap for small allocations only
-fixed-size per-class local caches
-batch refill from shared run metadata
-validated local frees
-bounded remote-free enqueue or validated fallback
+local per-class run lists
+shared refill into thread-owned runs
+explicit block states for reusable, allocated, and remote-pending blocks
+shared-lock remote-free routing with fixed inboxes
+thread-exit drain and ownership transfer
 threaded benchmark reporting
 ```
 
 Out of scope:
 
 ```text
+local extents
 NUMA
 hugepages
 adaptive cache sizing
 hardening profiles
+lock-free remote-free queues
 unbounded queues
-```
-
-### v0.7 Later: Remote Free Protocol
-
-Goal:
-
-```text
-Route cross-thread frees to the owning heap without allowing one thread to mutate
-another thread's local metadata directly.
 ```
 
 Acceptance gate:
 
 ```text
-bounded allocation-free queue
+same-thread local small allocation/free improves threaded churn
+cross-thread frees remain validated and do not mutate owner-local metadata directly
+thread exit with live allocations remains valid
+existing abort tests pass
+randomized cross-thread traces pass
+no allocator-internal heap allocation is introduced
+```
+
+Primary references:
+
+```text
+docs/thread-local-frontend-scope.md
+docs/thread-local-heap-plan.md
+docs/remote-free-protocol.md
+docs/span-ownership-evaluation.md
+```
+
+### v0.6 Later: Remote Free Queue Optimization
+
+Goal:
+
+```text
+Optimize remote-free enqueue and drain behavior after v0.5 proves ownership and
+validation semantics.
+```
+
+Acceptance gate:
+
+```text
+bounded allocation-free queue remains mandatory
 owner-side validation of every remote free
 queue-full behavior that does not drop frees
 randomized cross-thread traces
 abort cases remain intact
 ```
 
-### v0.8 Later: Hardening
+### v0.7 Later: Hardening
 
 Goal:
 
@@ -372,7 +370,7 @@ randomized placement only after deterministic paths are stable
 
 Primary reference: `docs/allocator-hardening-policy.md`.
 
-### v0.9 Later: Backend Regions And Hugepage-Aware Allocation
+### v0.8 Later: Backend Regions And Hugepage-Aware Allocation
 
 Goal:
 
