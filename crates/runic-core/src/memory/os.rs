@@ -67,6 +67,15 @@ impl OsMemory {
         let mask = PAGE_SIZE - 1;
         len.checked_add(mask).map(|value| value & !mask)
     }
+
+    /// # Safety
+    ///
+    /// `base` and `len` must identify a live mapping returned by `OsMemory::map`
+    /// that is not owned by any `Mapping` value and will not be unmapped again.
+    pub(crate) unsafe fn unmap(base: NonNull<u8>, len: usize) {
+        // SAFETY: caller guarantees this is a live mmap allocation with unique ownership.
+        unsafe { libc::munmap(base.as_ptr().cast(), len) };
+    }
 }
 
 #[cfg(test)]

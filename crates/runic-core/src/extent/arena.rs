@@ -106,6 +106,7 @@ mod tests {
         extent::{Extent, ExtentId},
         layout::LayoutSpec,
         memory::OsMemory,
+        ownership::HeapOwner,
     };
 
     use super::*;
@@ -115,7 +116,7 @@ mod tests {
         let len = spec.mapping_len(OsMemory::page_size()).unwrap();
         let mapping = OsMemory::map(len).unwrap();
 
-        Extent::new(id, mapping, spec).unwrap()
+        Extent::new(id, HeapOwner::Shared, mapping, spec).unwrap()
     }
 
     fn arena_with_capacity(capacity: usize) -> ExtentArena {

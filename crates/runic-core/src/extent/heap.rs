@@ -6,6 +6,7 @@ use crate::{
     extent::{Extent, ExtentArena},
     layout::LayoutSpec,
     memory::{L2TablePolicy, OsMemory, PageMap, PageOwner, PageRange},
+    ownership::HeapOwner,
 };
 
 use super::{ExtentReservation, cache::ExtentCache};
@@ -30,7 +31,12 @@ impl ExtentHeap {
         }
     }
 
-    pub(crate) fn allocate(&mut self, spec: LayoutSpec, pages: &mut PageMap) -> Option<Allocation> {
+    pub(crate) fn allocate(
+        &mut self,
+        spec: LayoutSpec,
+        owner: HeapOwner,
+        pages: &mut PageMap,
+    ) -> Option<Allocation> {
         let len = spec.mapping_len(OsMemory::page_size())?;
         let (mapping, zero_status) = if let Some(mapping) = self.cache.take(len) {
             (mapping, ZeroStatus::NeedsZeroing)
@@ -40,7 +46,7 @@ impl ExtentHeap {
 
         let reservation = self.extents.reserve()?;
         let id = reservation.id();
-        let Some(extent) = Extent::new(id, mapping, spec) else {
+        let Some(extent) = Extent::new(id, owner, mapping, spec) else {
             self.extents.release(reservation);
             return None;
         };
@@ -159,7 +165,7 @@ mod tests {
         let len = spec.mapping_len(OsMemory::page_size()).unwrap();
         let mapping = OsMemory::map(len).unwrap();
 
-        Extent::new(id, mapping, spec).unwrap()
+        Extent::new(id, HeapOwner::Shared, mapping, spec).unwrap()
     }
 
     #[test]

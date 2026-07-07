@@ -9,7 +9,7 @@ mod heap;
 use crate::{
     layout::LayoutSpec,
     memory::{AddressRange, Mapping},
-    ownership::RunOwner,
+    ownership::HeapOwner,
     size_class::{SizeClass, SizeClassId},
 };
 
@@ -103,7 +103,6 @@ enum BlockStateError {
 
 struct BlockStates {
     reusable: [u64; BLOCK_STATE_WORDS],
-    remote_pending: [u64; BLOCK_STATE_WORDS],
 }
 
 impl BlockStates {
@@ -123,10 +122,7 @@ impl BlockStates {
             *word = (1_u64 << remainder) - 1;
         }
 
-        Self {
-            reusable,
-            remote_pending: [0; BLOCK_STATE_WORDS],
-        }
+        Self { reusable }
     }
 
     fn take_reusable(&mut self) -> Option<BlockIndex> {
@@ -153,11 +149,7 @@ impl BlockStates {
             return Err(BlockStateError::InvalidIndex);
         };
 
-        let Some(remote_pending) = self.remote_pending.get(index.word()) else {
-            return Err(BlockStateError::InvalidIndex);
-        };
-
-        Ok(*reusable & index.mask() == 0 && *remote_pending & index.mask() == 0)
+        Ok(*reusable & index.mask() == 0)
     }
 
     fn release(&mut self, index: BlockIndex) -> Result<(), BlockStateError> {
@@ -166,49 +158,10 @@ impl BlockStates {
         };
         let mask = index.mask();
 
-        let Some(remote_pending) = self.remote_pending.get(index.word()) else {
-            return Err(BlockStateError::InvalidIndex);
-        };
-
-        if *reusable & mask != 0 || *remote_pending & mask != 0 {
+        if *reusable & mask != 0 {
             return Err(BlockStateError::AlreadyFree);
         }
 
-        *reusable |= mask;
-        Ok(())
-    }
-
-    fn mark_remote_pending(&mut self, index: BlockIndex) -> Result<(), BlockStateError> {
-        let Some(reusable) = self.reusable.get(index.word()) else {
-            return Err(BlockStateError::InvalidIndex);
-        };
-        let Some(remote_pending) = self.remote_pending.get_mut(index.word()) else {
-            return Err(BlockStateError::InvalidIndex);
-        };
-        let mask = index.mask();
-
-        if *reusable & mask != 0 || *remote_pending & mask != 0 {
-            return Err(BlockStateError::AlreadyFree);
-        }
-
-        *remote_pending |= mask;
-        Ok(())
-    }
-
-    fn drain_remote_pending(&mut self, index: BlockIndex) -> Result<(), BlockStateError> {
-        let Some(reusable) = self.reusable.get_mut(index.word()) else {
-            return Err(BlockStateError::InvalidIndex);
-        };
-        let Some(remote_pending) = self.remote_pending.get_mut(index.word()) else {
-            return Err(BlockStateError::InvalidIndex);
-        };
-        let mask = index.mask();
-
-        if *remote_pending & mask == 0 || *reusable & mask != 0 {
-            return Err(BlockStateError::AlreadyFree);
-        }
-
-        *remote_pending &= !mask;
         *reusable |= mask;
         Ok(())
     }
@@ -226,15 +179,44 @@ pub(crate) struct Run {
 }
 
 struct RunState {
-    owner: RunOwner,
+    owner: HeapOwner,
     live: u32,
     available_next: Option<NonNull<Run>>,
-    owner_next: Option<NonNull<Run>>,
     blocks: BlockStates,
 }
 
+pub(crate) struct RunAllocation {
+    block: RunBlock,
+    has_available_blocks: bool,
+}
+
+impl RunAllocation {
+    pub(crate) const fn ptr(&self) -> NonNull<u8> {
+        self.block.ptr()
+    }
+
+    pub(crate) const fn has_available_blocks(&self) -> bool {
+        self.has_available_blocks
+    }
+}
+
+pub(crate) struct RunFreeStatus {
+    was_full: bool,
+    is_empty: bool,
+}
+
+impl RunFreeStatus {
+    pub(crate) const fn was_full(&self) -> bool {
+        self.was_full
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.is_empty
+    }
+}
+
 impl Run {
-    pub(crate) fn new(id: RunId, owner: RunOwner, mapping: Mapping, class: SizeClass) -> Self {
+    pub(crate) fn new(id: RunId, owner: HeapOwner, mapping: Mapping, class: SizeClass) -> Self {
         let range = mapping.range();
         let block_size = class.block_size();
         let capacity = range.len().checked_div(block_size).unwrap_or(0);
@@ -250,7 +232,6 @@ impl Run {
                 owner,
                 live: 0,
                 available_next: None,
-                owner_next: None,
                 blocks: BlockStates::new(u32::try_from(capacity).unwrap_or(u32::MAX)),
             }),
         }
@@ -260,12 +241,8 @@ impl Run {
         self.id
     }
 
-    pub(crate) fn owner(&self) -> RunOwner {
+    pub(crate) fn owner(&self) -> HeapOwner {
         self.state.lock().owner
-    }
-
-    pub(crate) fn assign_owner(&self, owner: RunOwner) {
-        self.state.lock().owner = owner;
     }
 
     pub(crate) const fn class(&self) -> SizeClassId {
@@ -274,14 +251,6 @@ impl Run {
 
     pub(crate) fn has_available_blocks(&self) -> bool {
         self.state.lock().live < self.capacity
-    }
-
-    pub(crate) fn is_full(&self) -> bool {
-        !self.has_available_blocks()
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.state.lock().live == 0
     }
 
     pub(crate) fn set_available_next(&self, next: Option<NonNull<Run>>) {
@@ -296,18 +265,6 @@ impl Run {
         self.state.lock().available_next
     }
 
-    pub(crate) fn set_owner_next(&self, next: Option<NonNull<Run>>) {
-        self.state.lock().owner_next = next;
-    }
-
-    pub(crate) fn take_owner_next(&self) -> Option<NonNull<Run>> {
-        self.state.lock().owner_next.take()
-    }
-
-    pub(crate) fn owner_next(&self) -> Option<NonNull<Run>> {
-        self.state.lock().owner_next
-    }
-
     pub(crate) fn range(&self) -> AddressRange {
         debug_assert!(self.mapping.range().contains(self.range));
 
@@ -318,19 +275,44 @@ impl Run {
         self.mapping
     }
 
-    pub(crate) fn allocate(&self) -> Option<RunBlock> {
+    pub(crate) fn allocate(&self) -> Option<RunAllocation> {
         let mut state = self.state.lock();
         let index = state.blocks.take_reusable()?;
         let block = RunBlock::at_offset(index, self.range.base(), self.block_size)?;
 
         state.live = state.live.checked_add(1)?;
-        Some(block)
+        Some(RunAllocation {
+            block,
+            has_available_blocks: state.live < self.capacity,
+        })
     }
 
-    pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
+    pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<RunFreeStatus, RunError> {
         let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
+        let mut state = self.state.lock();
+        let was_full = state.live == self.capacity;
 
-        self.return_block(block)
+        match state.blocks.release(block.index()) {
+            Ok(()) => {}
+            Err(BlockStateError::AlreadyFree) => return Err(RunError::DoubleFree),
+            Err(BlockStateError::InvalidIndex) => return Err(RunError::InvalidPointer),
+        }
+
+        let Some(live) = state.live.checked_sub(1) else {
+            return Err(RunError::FreeUnderflow);
+        };
+
+        state.live = live;
+
+        Ok(RunFreeStatus {
+            was_full,
+            is_empty: live == 0,
+        })
+    }
+
+    pub(crate) fn validate_free(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
+        self.allocated_block_at(ptr)?;
+        Ok(())
     }
 
     pub(crate) fn allocated_block_at(&self, ptr: NonNull<u8>) -> Result<RunBlock, RunError> {
@@ -382,54 +364,6 @@ impl Run {
 
         offset.checked_div(self.block_size)
     }
-
-    fn return_block(&self, block: RunBlock) -> Result<(), RunError> {
-        let mut state = self.state.lock();
-
-        match state.blocks.release(block.index()) {
-            Ok(()) => {}
-            Err(BlockStateError::AlreadyFree) => return Err(RunError::DoubleFree),
-            Err(BlockStateError::InvalidIndex) => return Err(RunError::InvalidPointer),
-        }
-
-        let Some(live) = state.live.checked_sub(1) else {
-            return Err(RunError::FreeUnderflow);
-        };
-
-        state.live = live;
-
-        Ok(())
-    }
-
-    pub(crate) fn mark_remote_pending(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
-        let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
-        let mut state = self.state.lock();
-
-        match state.blocks.mark_remote_pending(block.index()) {
-            Ok(()) => Ok(()),
-            Err(BlockStateError::AlreadyFree) => Err(RunError::DoubleFree),
-            Err(BlockStateError::InvalidIndex) => Err(RunError::InvalidPointer),
-        }
-    }
-
-    pub(crate) fn drain_remote_pending(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
-        let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
-        let mut state = self.state.lock();
-
-        match state.blocks.drain_remote_pending(block.index()) {
-            Ok(()) => {}
-            Err(BlockStateError::AlreadyFree) => return Err(RunError::DoubleFree),
-            Err(BlockStateError::InvalidIndex) => return Err(RunError::InvalidPointer),
-        }
-
-        let Some(live) = state.live.checked_sub(1) else {
-            return Err(RunError::FreeUnderflow);
-        };
-
-        state.live = live;
-
-        Ok(())
-    }
 }
 
 const fn block_size_shift(block_size: usize) -> Option<u32> {
@@ -443,7 +377,7 @@ const fn block_size_shift(block_size: usize) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        layout::LayoutSpec, memory::OsMemory, ownership::RunOwner, size_class::SizeClasses,
+        layout::LayoutSpec, memory::OsMemory, ownership::HeapOwner, size_class::SizeClasses,
     };
 
     use super::*;
@@ -459,7 +393,7 @@ mod tests {
         let class = class_for(64, 8);
         let run = Run::new(
             RunId::from_index(0).unwrap(),
-            RunOwner::Shared,
+            HeapOwner::Shared,
             mapping,
             class,
         );
@@ -467,7 +401,8 @@ mod tests {
         let mut seen = vec![false; capacity];
 
         for _ in 0..capacity {
-            let block = run.allocate().unwrap();
+            let allocation = run.allocate().unwrap();
+            let block = allocation.block;
             let ptr = block.ptr();
             let index = block.index().index;
 
@@ -488,16 +423,16 @@ mod tests {
         let class = class_for(128, 8);
         let run = Run::new(
             RunId::from_index(1).unwrap(),
-            RunOwner::Shared,
+            HeapOwner::Shared,
             mapping,
             class,
         );
 
         let ptr = run.allocate().unwrap().ptr();
 
-        assert_eq!(run.free(ptr), Ok(()));
+        assert!(run.free(ptr).is_ok());
 
-        assert_eq!(run.allocate().map(RunBlock::ptr), Some(ptr));
+        assert_eq!(run.allocate().map(|allocation| allocation.ptr()), Some(ptr));
     }
 
     #[test]
@@ -505,7 +440,7 @@ mod tests {
         let mapping = OsMemory::map(RUN_SIZE).unwrap();
         let run = Run::new(
             RunId::from_index(7).unwrap(),
-            RunOwner::Shared,
+            HeapOwner::Shared,
             mapping,
             class_for(64, 8),
         );
@@ -520,7 +455,7 @@ mod tests {
         let mapping = OsMemory::map(RUN_SIZE).unwrap();
         let run = Run::new(
             RunId::from_index(8).unwrap(),
-            RunOwner::Shared,
+            HeapOwner::Shared,
             mapping,
             class_for(64, 8),
         );
@@ -536,7 +471,7 @@ mod tests {
         let class = class_for(64, 8);
         let run = Run::new(
             RunId::from_index(2).unwrap(),
-            RunOwner::Shared,
+            HeapOwner::Shared,
             mapping,
             class,
         );
@@ -552,7 +487,7 @@ mod tests {
         let class = class_for(24, 8);
         let run = Run::new(
             RunId::from_index(2).unwrap(),
-            RunOwner::Shared,
+            HeapOwner::Shared,
             mapping,
             class,
         );
@@ -569,14 +504,14 @@ mod tests {
         let class = class_for(64, 8);
         let run = Run::new(
             RunId::from_index(7).unwrap(),
-            RunOwner::Shared,
+            HeapOwner::Shared,
             mapping,
             class,
         );
         let ptr = run.allocate().unwrap().ptr();
 
-        assert_eq!(run.free(ptr), Ok(()));
-        assert_eq!(run.free(ptr), Err(RunError::DoubleFree));
+        assert!(run.free(ptr).is_ok());
+        assert!(matches!(run.free(ptr), Err(RunError::DoubleFree)));
     }
 
     #[test]
@@ -585,12 +520,15 @@ mod tests {
         let class = class_for(64, 8);
         let run = Run::new(
             RunId::from_index(8).unwrap(),
-            RunOwner::Shared,
+            HeapOwner::Shared,
             mapping,
             class,
         );
 
-        assert_eq!(run.free(run.range().base()), Err(RunError::DoubleFree));
+        assert!(matches!(
+            run.free(run.range().base()),
+            Err(RunError::DoubleFree)
+        ));
     }
 
     #[test]
@@ -600,7 +538,7 @@ mod tests {
         let class = SizeClasses::for_layout(spec).unwrap();
         let run = Run::new(
             RunId::from_index(3).unwrap(),
-            RunOwner::Shared,
+            HeapOwner::Shared,
             mapping,
             class,
         );
@@ -618,7 +556,7 @@ mod tests {
         let range = mapping.range();
         let run = Run::new(
             RunId::from_index(5).unwrap(),
-            RunOwner::Shared,
+            HeapOwner::Shared,
             mapping,
             class_for(8, 8),
         );

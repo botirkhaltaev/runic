@@ -1,153 +1,346 @@
 use core::{
-    cell::{Cell, UnsafeCell},
+    cell::Cell,
+    num::NonZeroU32,
     ptr::NonNull,
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
+use spin::Mutex;
+
 use crate::{
-    heap::SharedHeap,
-    ownership::HeapId,
-    run::{Run, RunBlock, RunError},
-    size_class::{SizeClassId, SizeClasses},
+    allocation::Allocation,
+    allocator::{AllocatorCore, AllocatorState},
+    config::{AllocatorConfig, RunPolicy},
+    extent::{Extent, ExtentHeap, ExtentHeapError},
+    layout::LayoutSpec,
+    memory::PageMap,
+    ownership::{HeapId, HeapOwner},
+    run::{Run, RunHeap, RunHeapError},
+    size_class::SizeClassId,
+    slot_store::{SlotStore, SlotStoreError},
 };
 
 const MAX_LOCAL_HEAPS: usize = 32;
+const MAX_LOCAL_HEAPS_U32: u32 = 32;
 const REMOTE_INBOX_CAPACITY: usize = 16;
+const LOCAL_METADATA_CAPACITY: u32 = 1024;
+const THREAD_HEAP_CAPACITY: usize = 8;
 
-pub(crate) struct HeapRegistry {
-    slots: [HeapSlot; MAX_LOCAL_HEAPS],
+pub(crate) struct LocalHeapTable {
+    slots: SlotStore<LocalHeapSlot>,
+    generations: [NonZeroU32; MAX_LOCAL_HEAPS],
+    config: AllocatorConfig,
 }
 
-// SAFETY: HeapRegistry is owned by SharedHeap, and SharedHeap is accessed through the allocator's
-// global lock. Moving the registry between threads does not permit concurrent mutation.
-unsafe impl Send for HeapRegistry {}
+// SAFETY: LocalHeapTable is owned by AllocatorState. Slot mutation and remote routing are
+// coordinated by the allocator lock; local heap internals use their own locks for owner-thread
+// fast paths.
+unsafe impl Send for LocalHeapTable {}
 
-impl HeapRegistry {
-    pub(crate) const fn new() -> Self {
+impl LocalHeapTable {
+    pub(crate) const fn new(config: AllocatorConfig) -> Self {
         Self {
-            slots: [const { HeapSlot::new() }; MAX_LOCAL_HEAPS],
+            slots: SlotStore::new(MAX_LOCAL_HEAPS_U32),
+            generations: [NonZeroU32::MIN; MAX_LOCAL_HEAPS],
+            config,
         }
     }
 
-    pub(crate) fn acquire(&mut self) -> Option<HeapId> {
-        for (index, slot) in self.slots.iter_mut().enumerate() {
-            if slot.active {
-                continue;
-            }
-
-            slot.active = true;
-            slot.owned = None;
-            slot.inbox.clear();
-
-            return HeapId::from_index(u32::try_from(index).ok()?);
-        }
-
-        None
-    }
-
-    pub(crate) fn attach_run(&mut self, id: HeapId, run: NonNull<Run>) -> bool {
-        let Some(slot) = self.slot_mut(id) else {
-            return false;
+    pub(crate) fn acquire(&mut self) -> Option<LocalHeapHandle> {
+        let index = self.slots.reserve()?;
+        let generation = *self.generations.get(index)?;
+        let id = HeapId::new(u32::try_from(index).ok()?, generation)?;
+        let slot = LocalHeapSlot {
+            generation,
+            heap: LocalHeap::new(id, self.config),
         };
 
-        if !slot.active {
-            return false;
-        }
-
-        // SAFETY: caller supplies a stable RunArena pointer assigned to this heap id.
-        unsafe { run.as_ref() }.set_owner_next(slot.owned);
-        slot.owned = Some(run);
-
-        true
-    }
-
-    pub(crate) fn release(&mut self, id: HeapId) -> Option<NonNull<Run>> {
-        let slot = self.slot_mut(id)?;
-
-        if !slot.active {
+        if self.slots.insert(index, slot).is_err() {
+            let _ = self.slots.release(index);
             return None;
         }
 
-        slot.active = false;
-        slot.inbox.clear();
-
-        slot.owned.take()
+        let heap = NonNull::from(&mut self.slot_mut(id)?.heap);
+        Some(LocalHeapHandle::new(id, heap))
     }
 
-    pub(crate) fn enqueue_remote(
+    pub(crate) fn get_mut(&mut self, id: HeapId) -> Option<&mut LocalHeap> {
+        Some(&mut self.slot_mut(id)?.heap)
+    }
+
+    pub(crate) fn abandon(
         &mut self,
         id: HeapId,
-        free: RemoteFree,
-    ) -> Result<(), RemoteFree> {
-        let Some(slot) = self.slot_mut(id) else {
-            return Err(free);
-        };
+        pages: &mut PageMap,
+    ) -> Result<(), LocalHeapError> {
+        let heap = self.get_mut(id).ok_or(LocalHeapError::InvalidHeap)?;
+        heap.drain(pages)?;
+        heap.abandon();
+        Ok(())
+    }
 
-        if !slot.active {
-            return Err(free);
+    pub(crate) fn reclaim(&mut self, id: HeapId) -> Result<(), LocalHeapError> {
+        let index = usize::try_from(id.index()).map_err(|_| LocalHeapError::InvalidHeap)?;
+        let heap = self.get_mut(id).ok_or(LocalHeapError::InvalidHeap)?;
+
+        if !heap.is_abandoned() || heap.has_live_allocations() {
+            return Ok(());
         }
 
-        slot.inbox.push(free)
+        let _ = self
+            .slots
+            .remove(index)
+            .ok_or(LocalHeapError::InvalidHeap)?;
+        let generation = self
+            .generations
+            .get_mut(index)
+            .ok_or(LocalHeapError::InvalidHeap)?;
+        *generation = NonZeroU32::new(generation.get().wrapping_add(1)).unwrap_or(NonZeroU32::MIN);
+
+        Ok(())
     }
 
-    pub(crate) fn pop_remote(&mut self, id: HeapId) -> Option<RemoteFree> {
-        self.slot_mut(id)
-            .filter(|slot| slot.active)
-            .and_then(|slot| slot.inbox.pop())
-    }
-
-    pub(crate) fn has_remote(&self, id: HeapId) -> bool {
-        self.slot(id)
-            .filter(|slot| slot.active)
-            .is_some_and(|slot| !slot.inbox.is_empty())
-    }
-
-    fn slot(&self, id: HeapId) -> Option<&HeapSlot> {
-        self.slots.get(usize::try_from(id.index()).ok()?)
-    }
-
-    fn slot_mut(&mut self, id: HeapId) -> Option<&mut HeapSlot> {
-        self.slots.get_mut(usize::try_from(id.index()).ok()?)
+    fn slot_mut(&mut self, id: HeapId) -> Option<&mut LocalHeapSlot> {
+        let index = usize::try_from(id.index()).ok()?;
+        let slot = self.slots.get_mut(index)?;
+        (slot.generation == id.generation()).then_some(slot)
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct RemoteFree {
-    run: NonNull<Run>,
-    ptr: NonNull<u8>,
+struct LocalHeapSlot {
+    generation: NonZeroU32,
+    heap: LocalHeap,
 }
 
-impl RemoteFree {
-    pub(crate) const fn new(run: NonNull<Run>, ptr: NonNull<u8>) -> Self {
-        Self { run, ptr }
-    }
-
-    pub(crate) const fn run(self) -> NonNull<Run> {
-        self.run
-    }
-
-    pub(crate) const fn ptr(self) -> NonNull<u8> {
-        self.ptr
-    }
+pub(crate) struct LocalHeap {
+    id: HeapId,
+    abandoned: AtomicBool,
+    runs: Mutex<RunHeap>,
+    extents: Mutex<ExtentHeap>,
+    inbox: Mutex<RemoteInbox>,
+    remote_pending: AtomicBool,
+    live: AtomicU32,
 }
 
-#[derive(Clone, Copy)]
-struct HeapSlot {
-    active: bool,
-    owned: Option<NonNull<Run>>,
-    inbox: RemoteInbox,
-}
+// SAFETY: LocalHeap uses interior synchronization for mutable heap state that can be reached from
+// remote frees. The owner thread may use the run heap fast path while shared routing uses the inbox.
+unsafe impl Sync for LocalHeap {}
 
-impl HeapSlot {
-    const fn new() -> Self {
+impl LocalHeap {
+    fn new(id: HeapId, config: AllocatorConfig) -> Self {
         Self {
-            active: false,
-            owned: None,
-            inbox: RemoteInbox::new(),
+            id,
+            abandoned: AtomicBool::new(false),
+            runs: Mutex::new(RunHeap::new(
+                LOCAL_METADATA_CAPACITY,
+                config.with_run_policy(RunPolicy::DropEmpty).run(),
+            )),
+            extents: Mutex::new(ExtentHeap::new(LOCAL_METADATA_CAPACITY, config.extent())),
+            inbox: Mutex::new(RemoteInbox::new()),
+            remote_pending: AtomicBool::new(false),
+            live: AtomicU32::new(0),
+        }
+    }
+
+    pub(crate) fn allocate_run(&self, class: SizeClassId) -> Option<Allocation> {
+        let allocation = self.runs.lock().allocate_available(class)?;
+        self.retain_allocation();
+        Some(allocation)
+    }
+
+    pub(crate) fn allocate_run_slow(
+        &self,
+        class: SizeClassId,
+        pages: &mut PageMap,
+    ) -> Option<Allocation> {
+        let allocation = self
+            .runs
+            .lock()
+            .allocate(class, HeapOwner::Local(self.id), pages)?;
+        self.retain_allocation();
+        Some(allocation)
+    }
+
+    pub(crate) fn allocate_extent(
+        &self,
+        spec: LayoutSpec,
+        pages: &mut PageMap,
+    ) -> Option<Allocation> {
+        let allocation = self
+            .extents
+            .lock()
+            .allocate(spec, HeapOwner::Local(self.id), pages)?;
+        self.retain_allocation();
+        Some(allocation)
+    }
+
+    pub(crate) fn free_run(
+        &self,
+        run: NonNull<Run>,
+        ptr: NonNull<u8>,
+        pages: &mut PageMap,
+    ) -> Result<(), LocalHeapError> {
+        self.drain_if_pending(pages)?;
+        self.runs.lock().free(run, ptr, pages)?;
+        self.release_allocation();
+        Ok(())
+    }
+
+    pub(crate) fn free_extent(
+        &self,
+        extent: NonNull<Extent>,
+        ptr: NonNull<u8>,
+        pages: &mut PageMap,
+    ) -> Result<(), LocalHeapError> {
+        self.drain_if_pending(pages)?;
+        self.extents.lock().free(extent, ptr, pages)?;
+        self.release_allocation();
+        Ok(())
+    }
+
+    pub(crate) fn enqueue(
+        &self,
+        free: RemoteFree,
+        pages: &mut PageMap,
+    ) -> Result<(), LocalHeapError> {
+        match self.inbox.lock().enqueue(free) {
+            Ok(()) => {
+                self.remote_pending.store(true, Ordering::Release);
+                Ok(())
+            }
+            Err(RemoteError::Duplicate) => Err(LocalHeapError::DoubleFree),
+            Err(RemoteError::Full) => {
+                self.drain(pages)?;
+                self.inbox
+                    .lock()
+                    .enqueue(free)
+                    .map_err(LocalHeapError::from)?;
+                self.remote_pending.store(true, Ordering::Release);
+                Ok(())
+            }
+        }
+    }
+
+    fn drain_if_pending(&self, pages: &mut PageMap) -> Result<(), LocalHeapError> {
+        if self.remote_pending.load(Ordering::Acquire) {
+            self.drain(pages)?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn drain(&self, pages: &mut PageMap) -> Result<(), LocalHeapError> {
+        loop {
+            let free = {
+                let mut inbox = self.inbox.lock();
+                let Some(free) = inbox.pop() else {
+                    self.remote_pending.store(false, Ordering::Release);
+                    return Ok(());
+                };
+                free
+            };
+
+            match free {
+                RemoteFree::Run { run, ptr } => {
+                    self.runs.lock().free(run, ptr, pages)?;
+                }
+                RemoteFree::Extent { extent, ptr } => {
+                    self.extents.lock().free(extent, ptr, pages)?;
+                }
+            }
+
+            self.release_allocation();
+        }
+    }
+
+    fn abandon(&self) {
+        self.abandoned.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_abandoned(&self) -> bool {
+        self.abandoned.load(Ordering::Acquire)
+    }
+
+    fn has_live_allocations(&self) -> bool {
+        self.live.load(Ordering::Acquire) != 0
+    }
+
+    fn retain_allocation(&self) {
+        let previous = self.live.fetch_add(1, Ordering::AcqRel);
+        debug_assert!(previous < u32::MAX, "local heap live count overflow");
+    }
+
+    fn release_allocation(&self) {
+        let previous = self.live.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous != 0, "local heap live count underflow");
+        if previous == 0 {
+            self.live.store(0, Ordering::Release);
         }
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LocalHeapError {
+    InvalidHeap,
+    InvalidPointer,
+    DoubleFree,
+    InvalidMetadata,
+}
+
+impl From<RunHeapError> for LocalHeapError {
+    fn from(error: RunHeapError) -> Self {
+        match error {
+            RunHeapError::InvalidPointer => Self::InvalidPointer,
+            RunHeapError::DoubleFree => Self::DoubleFree,
+            RunHeapError::InvalidMetadata => Self::InvalidMetadata,
+        }
+    }
+}
+
+impl From<ExtentHeapError> for LocalHeapError {
+    fn from(error: ExtentHeapError) -> Self {
+        match error {
+            ExtentHeapError::MissingExtent | ExtentHeapError::InvalidMetadata => {
+                Self::InvalidMetadata
+            }
+            ExtentHeapError::InvalidPointer => Self::InvalidPointer,
+        }
+    }
+}
+
+impl From<RemoteError> for LocalHeapError {
+    fn from(error: RemoteError) -> Self {
+        match error {
+            RemoteError::Full => Self::InvalidMetadata,
+            RemoteError::Duplicate => Self::DoubleFree,
+        }
+    }
+}
+
+impl From<SlotStoreError> for LocalHeapError {
+    fn from(_: SlotStoreError) -> Self {
+        Self::InvalidMetadata
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RemoteFree {
+    Run {
+        run: NonNull<Run>,
+        ptr: NonNull<u8>,
+    },
+    Extent {
+        extent: NonNull<Extent>,
+        ptr: NonNull<u8>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RemoteError {
+    Full,
+    Duplicate,
+}
+
 struct RemoteInbox {
     entries: [Option<RemoteFree>; REMOTE_INBOX_CAPACITY],
     head: usize,
@@ -163,18 +356,20 @@ impl RemoteInbox {
         }
     }
 
-    fn push(&mut self, free: RemoteFree) -> Result<(), RemoteFree> {
+    fn enqueue(&mut self, free: RemoteFree) -> Result<(), RemoteError> {
+        if self.contains(free) {
+            return Err(RemoteError::Duplicate);
+        }
         if self.len == self.entries.len() {
-            return Err(free);
+            return Err(RemoteError::Full);
         }
 
         let index = (self.head + self.len) % self.entries.len();
         let Some(entry) = self.entries.get_mut(index) else {
-            return Err(free);
+            return Err(RemoteError::Full);
         };
         *entry = Some(free);
         self.len += 1;
-
         Ok(())
     }
 
@@ -186,248 +381,142 @@ impl RemoteInbox {
         let free = self.entries.get_mut(self.head)?.take()?;
         self.head = (self.head + 1) % self.entries.len();
         self.len -= 1;
-
         Some(free)
     }
 
-    fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    fn clear(&mut self) {
-        while self.pop().is_some() {}
-        self.head = 0;
+    fn contains(&self, free: RemoteFree) -> bool {
+        self.entries.iter().flatten().any(|entry| *entry == free)
     }
 }
 
-pub(crate) struct LocalHeap {
+#[derive(Clone, Copy)]
+pub(crate) struct LocalHeapHandle {
     id: HeapId,
-    owned: Option<NonNull<Run>>,
-    available: [Option<NonNull<Run>>; SizeClasses::COUNT],
+    heap: NonNull<LocalHeap>,
 }
 
-impl LocalHeap {
-    const fn new(id: HeapId) -> Self {
-        Self {
-            id,
-            owned: None,
-            available: [None; SizeClasses::COUNT],
-        }
+impl LocalHeapHandle {
+    fn new(id: HeapId, heap: NonNull<LocalHeap>) -> Self {
+        Self { id, heap }
     }
 
-    pub(crate) const fn id(&self) -> HeapId {
+    pub(crate) const fn id(self) -> HeapId {
         self.id
     }
 
-    pub(crate) fn allocate(&mut self, class: SizeClassId) -> Option<NonNull<u8>> {
-        let class_index = class.index();
+    const fn heap_ptr(self) -> NonNull<LocalHeap> {
+        self.heap
+    }
+}
 
-        loop {
-            if self.available.get(class_index)?.is_none() {
-                self.cache_available_owned_run(class)?;
-            }
+pub(crate) struct ThreadHeaps {
+    entries: [ThreadHeapEntry; THREAD_HEAP_CAPACITY],
+}
 
-            let run_ptr = *self.available.get(class_index)?.as_ref()?;
-            let (ptr, next) = {
-                // SAFETY: local available-list pointers are stable RunArena entries assigned to this LocalHeap.
-                let run = unsafe { run_ptr.as_ref() };
-                let ptr = run.allocate().map(RunBlock::ptr);
+struct ThreadHeapEntry {
+    core: Cell<*mut AllocatorCore>,
+    heap: Cell<Option<HeapId>>,
+    local: Cell<*mut LocalHeap>,
+}
 
-                if ptr.is_some() && run.has_available_blocks() {
-                    return ptr;
-                }
-
-                (ptr, run.take_available_next())
+impl Drop for ThreadHeaps {
+    fn drop(&mut self) {
+        for entry in &self.entries {
+            let Some((core, heap)) = entry.take() else {
+                continue;
             };
 
-            *self.available.get_mut(class_index)? = next;
+            // SAFETY: ThreadHeapEntry retains core while installed.
+            let mut state = unsafe { core.as_ref() }.state().lock();
+            let _ = state.abandon(heap);
+            drop(state);
 
-            if let Some(ptr) = ptr {
-                return Some(ptr);
-            }
+            AllocatorCore::release(core);
         }
-    }
-
-    fn cache_available_owned_run(&mut self, class: SizeClassId) -> Option<()> {
-        let mut current = self.owned;
-
-        while let Some(run) = current {
-            // SAFETY: owner-list pointers are stable RunArena entries.
-            let run_ref = unsafe { run.as_ref() };
-            current = run_ref.owner_next();
-
-            if run_ref.class() == class && run_ref.has_available_blocks() {
-                self.push_available(class, run);
-                return Some(());
-            }
-        }
-
-        None
-    }
-
-    pub(crate) fn push_available(&mut self, class: SizeClassId, run: NonNull<Run>) -> bool {
-        let Some(head) = self.available.get_mut(class.index()) else {
-            return false;
-        };
-
-        // SAFETY: caller supplies a stable RunArena pointer assigned to this LocalHeap.
-        unsafe { run.as_ref() }.set_available_next(*head);
-        *head = Some(run);
-
-        true
-    }
-
-    pub(crate) fn attach_registered_run(&mut self, run: NonNull<Run>) {
-        self.owned = Some(run);
-    }
-
-    pub(crate) fn free_local(
-        &mut self,
-        class: SizeClassId,
-        ptr: NonNull<u8>,
-    ) -> Result<bool, RunError> {
-        let Some(run) = self.find_owned_run(class, ptr) else {
-            return Ok(false);
-        };
-
-        // SAFETY: find_owned_run returns a stable RunArena pointer from this LocalHeap's owner list.
-        let run_ref = unsafe { run.as_ref() };
-        let was_full = run_ref.is_full();
-        run_ref.free(ptr)?;
-
-        if was_full {
-            self.push_available(class, run);
-        }
-
-        Ok(true)
-    }
-
-    fn find_owned_run(&self, class: SizeClassId, ptr: NonNull<u8>) -> Option<NonNull<Run>> {
-        let mut current = self.owned;
-
-        while let Some(run) = current {
-            // SAFETY: owner-list pointers are stable RunArena entries.
-            let run_ref = unsafe { run.as_ref() };
-            if run_ref.class() == class && run_ref.block_at(ptr).is_some() {
-                return Some(run);
-            }
-
-            current = run_ref.owner_next();
-        }
-
-        None
     }
 }
 
-impl Drop for LocalSlot {
-    fn drop(&mut self) {
-        let key = self.key.get();
-        if key == CellKey::NONE {
-            return;
-        }
-
-        // SAFETY: this slot is being destroyed on its owning thread, so no nested mutable access exists.
-        let Some(heap) = (unsafe { &mut *self.heap.get() }).take() else {
-            return;
-        };
-
-        // SAFETY: allocator Drop clears same-thread local state before the allocator storage is
-        // invalidated. Cross-thread local state can only exist while safe Rust keeps the allocator
-        // alive, or for the process-lifetime global allocator.
-        let shared = unsafe { &*key.0.cast::<spin::Mutex<SharedHeap>>() };
-        let mut shared = shared.lock();
-        shared.retire_local_heap(heap.id());
-    }
-}
-
-struct LocalSlot {
-    key: Cell<CellKey>,
-    heap: UnsafeCell<Option<LocalHeap>>,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-struct CellKey(*const ());
-
-impl CellKey {
-    const NONE: Self = Self(core::ptr::null());
-}
-
-// SAFETY: each LocalSlot is thread-local. Interior mutation is confined to the owning thread.
-unsafe impl Sync for LocalSlot {}
-
-impl LocalSlot {
+impl ThreadHeaps {
     const fn new() -> Self {
         Self {
-            key: Cell::new(CellKey::NONE),
-            heap: UnsafeCell::new(None),
+            entries: [const { ThreadHeapEntry::new() }; THREAD_HEAP_CAPACITY],
         }
     }
 
-    fn with<R>(&self, key: *const (), f: impl FnOnce(&mut LocalHeap) -> R) -> Option<R> {
-        if self.key.get() != CellKey(key) {
-            return None;
-        }
-
-        // SAFETY: this slot is thread-local and no nested mutable access is created by this method.
-        unsafe { &mut *self.heap.get() }.as_mut().map(f)
-    }
-
-    fn accepts(&self, key: *const ()) -> bool {
-        matches!(self.key.get(), CellKey::NONE) || self.key.get() == CellKey(key)
-    }
-
-    fn with_or_init<R>(
+    pub(crate) fn allocate_run(
         &self,
-        key: *const (),
-        id: HeapId,
-        f: impl FnOnce(&mut LocalHeap) -> R,
-    ) -> Option<R> {
-        // SAFETY: this slot is thread-local and no nested mutable access is created by this method.
-        let heap = unsafe { &mut *self.heap.get() };
+        core: NonNull<AllocatorCore>,
+        class: SizeClassId,
+    ) -> Option<Allocation> {
+        let entry = self.entry(core)?;
+        let local = NonNull::new(entry.local.get())?;
 
-        if self.key.get() == CellKey::NONE {
-            self.key.set(CellKey(key));
-            *heap = Some(LocalHeap::new(id));
-        }
-
-        if self.key.get() != CellKey(key) {
-            return None;
-        }
-
-        heap.as_mut().map(f)
+        // SAFETY: an installed entry retains core and points at an active local heap until take/drop.
+        unsafe { local.as_ref() }.allocate_run(class)
     }
 
-    fn take(&self, key: *const ()) -> Option<LocalHeap> {
-        if self.key.get() != CellKey(key) {
+    pub(crate) fn heap_id(&self, core: NonNull<AllocatorCore>) -> Option<HeapId> {
+        self.entry(core)?.heap.get()
+    }
+
+    pub(crate) fn get_or_acquire(
+        &self,
+        core: NonNull<AllocatorCore>,
+        state: &mut AllocatorState,
+    ) -> Option<HeapId> {
+        if let Some(heap) = self.heap_id(core) {
+            return Some(heap);
+        }
+
+        let entry = self.empty_entry()?;
+        if !AllocatorCore::retain(core) {
             return None;
         }
 
-        self.key.set(CellKey::NONE);
-        // SAFETY: this slot is thread-local and no nested mutable access is created by this method.
-        unsafe { &mut *self.heap.get() }.take()
+        let Some(handle) = state.acquire_local_heap() else {
+            AllocatorCore::release(core);
+            return None;
+        };
+        let heap = handle.id();
+        entry.install(core, handle);
+
+        Some(heap)
+    }
+
+    fn entry(&self, core: NonNull<AllocatorCore>) -> Option<&ThreadHeapEntry> {
+        self.entries
+            .iter()
+            .find(|entry| entry.core.get() == core.as_ptr())
+    }
+
+    fn empty_entry(&self) -> Option<&ThreadHeapEntry> {
+        self.entries.iter().find(|entry| entry.core.get().is_null())
+    }
+}
+
+impl ThreadHeapEntry {
+    const fn new() -> Self {
+        Self {
+            core: Cell::new(core::ptr::null_mut()),
+            heap: Cell::new(None),
+            local: Cell::new(core::ptr::null_mut()),
+        }
+    }
+
+    fn install(&self, core: NonNull<AllocatorCore>, handle: LocalHeapHandle) {
+        self.local.set(handle.heap_ptr().as_ptr());
+        self.heap.set(Some(handle.id()));
+        self.core.set(core.as_ptr());
+    }
+
+    fn take(&self) -> Option<(NonNull<AllocatorCore>, HeapId)> {
+        let core = NonNull::new(self.core.replace(core::ptr::null_mut()))?;
+        let heap = self.heap.replace(None)?;
+        self.local.set(core::ptr::null_mut());
+        Some((core, heap))
     }
 }
 
 std::thread_local! {
-    static LOCAL_HEAP: LocalSlot = const { LocalSlot::new() };
-}
-
-pub(crate) fn with_local<R>(key: *const (), f: impl FnOnce(&mut LocalHeap) -> R) -> Option<R> {
-    LOCAL_HEAP.with(|slot| slot.with(key, f))
-}
-
-pub(crate) fn accepts_local(key: *const ()) -> bool {
-    LOCAL_HEAP.with(|slot| slot.accepts(key))
-}
-
-pub(crate) fn with_local_or_init<R>(
-    key: *const (),
-    id: HeapId,
-    f: impl FnOnce(&mut LocalHeap) -> R,
-) -> Option<R> {
-    LOCAL_HEAP.with(|slot| slot.with_or_init(key, id, f))
-}
-
-pub(crate) fn take_local(key: *const ()) -> Option<LocalHeap> {
-    LOCAL_HEAP.with(|slot| slot.take(key))
+    pub(crate) static THREAD_HEAPS: ThreadHeaps = const { ThreadHeaps::new() };
 }
