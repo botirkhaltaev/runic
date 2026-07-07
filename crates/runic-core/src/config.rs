@@ -1,3 +1,4 @@
+/// Immutable allocator configuration shared by the run and extent heaps.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AllocatorConfig {
     extent: ExtentConfig,
@@ -60,6 +61,7 @@ impl Default for AllocatorConfig {
     }
 }
 
+/// Dedicated extent mapping cache configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExtentConfig {
     policy: ExtentPolicy,
@@ -117,6 +119,7 @@ impl Default for ExtentConfig {
     }
 }
 
+/// Empty run mapping cache configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RunConfig {
     policy: RunPolicy,
@@ -168,6 +171,10 @@ impl Default for RunConfig {
     }
 }
 
+/// Slot and byte limits for allocator mapping caches.
+///
+/// Cache implementations use fixed internal storage and clamp active slots to
+/// their internal maximum. The byte limit is still enforced exactly.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Budget {
     slots: usize,
@@ -191,27 +198,47 @@ impl Budget {
     }
 }
 
+/// Retention and eviction policy for freed dedicated extent mappings.
+///
+/// This controls which mappings remain cached after free and which cached
+/// mapping is evicted when space is needed. Allocation-side lookup order is
+/// controlled separately by [`ExtentReuse`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExtentPolicy {
+    /// Do not retain freed extent mappings.
     Drop,
+    /// Retain only while both slot and byte budget have free capacity.
     Keep,
+    /// Evict the oldest retained mapping when capacity is needed.
     Fifo,
+    /// Evict the newest retained mapping when capacity is needed.
     Lifo,
+    /// Evict the largest retained mapping when capacity is needed.
     Largest,
+    /// Evict the smallest retained mapping when capacity is needed.
     Smallest,
 }
 
+/// Allocation-side lookup strategy for cached extent mappings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExtentReuse {
+    /// Reuse only mappings with exactly the requested mapping length.
     Exact,
+    /// Reuse the smallest retained mapping that can satisfy the request.
     BestFit,
+    /// Reuse a sufficiently large mapping from the request's power-of-two size bucket.
     SizeClass,
 }
 
+/// Empty-run release and retention policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunPolicy {
+    /// Keep empty runs live in the run arena and page map.
     Keep,
+    /// Release empty runs immediately and unmap their mappings.
     DropEmpty,
+    /// Release empty runs and retain mappings, reusing the oldest first.
     RetainFifo,
+    /// Release empty runs and prefer retained mappings from the same size class.
     RetainPerClass,
 }

@@ -19,15 +19,19 @@ use runic::RunicAlloc;
 static GLOBAL: RunicAlloc = RunicAlloc::new();
 ```
 
-Use the const builder for explicit retention policy experiments:
+Use the const builder for explicit retention policy experiments. Extent policy
+controls free-side retention and eviction; extent reuse controls allocation-side
+lookup. Cache storage is fixed-size internally, so configured slot budgets above
+the implementation cap are clamped.
 
 ```rust
-use runic::{Budget, ExtentPolicy, RunicAlloc};
+use runic::{Budget, ExtentPolicy, ExtentReuse, RunicAlloc};
 
 #[global_allocator]
 static GLOBAL: RunicAlloc = RunicAlloc::builder()
     .extent()
     .policy(ExtentPolicy::Fifo)
+    .reuse(ExtentReuse::BestFit)
     .budget(Budget::new(32, 16 * 1024 * 1024))
     .done()
     .build();

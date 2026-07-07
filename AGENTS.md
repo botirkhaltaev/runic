@@ -12,8 +12,8 @@
 - Prefer entity-based architecture; put behavior on the type that owns the data, lifecycle, or invariant.
 - Model real domain concepts as explicit entity types when they own state, invariants, or behavior.
 - Prefer small cohesive types with clear responsibilities over broad manager APIs.
-- Prefer general, composable APIs over narrow methods tailored to one caller or one current call path.
-- Avoid overfit method names that encode implementation details, transient benchmark work, or a single use site.
+- Prefer clean, general, composable APIs over narrow methods tailored to one caller or one current call path.
+- Use simple, clear names for public and internal APIs; avoid names that encode implementation details, transient benchmark work, compatibility shims, or a single use site.
 - Make invalid states hard to express with `NonZero*`, `NonNull`, named domain types, and checked construction.
 - Avoid tuple structs with unnamed fields for domain entities; use named fields when field meaning matters.
 - Avoid free helper functions unless they remove real duplication or express a cross-entity operation.
@@ -23,8 +23,9 @@
 
 ## API Policy
 
-- No backward compatibility is required for public or internal APIs unless the user explicitly asks for it or a concrete persisted/external contract is the task.
-- Prefer direct API reshaping, renaming, deletion, or refactoring over compatibility shims.
+- No backward compatibility is required for public or internal APIs.
+- Prefer modifying existing APIs over adding new methods; reshape, rename, delete, or refactor directly instead of growing parallel surfaces.
+- Avoid compatibility shims throughout the codebase.
 - Review API shape repository-wide when architectural feedback applies; do not fix only the call site where the issue was noticed.
 - During planning and implementation, critique the design against idiomatic Rust, allocator invariants, composability, and overfitting before treating it as done.
 
@@ -69,6 +70,7 @@ GlobalAlloc
 - Avoid allocator-internal `Vec`, `Box`, `HashMap`, `String`, formatting, or panic paths unless recursion risk is addressed.
 - Abort on invalid frees in v0.1.
 - Do not unwind across allocator boundaries.
+- Do not add test-only methods to production `impl` blocks; tests inside the owning module can inspect private state directly.
 - Avoid lint workarounds that reduce code quality; do not use `#[allow]` or `#[expect]` when a cleaner design or refactor is reasonable.
 
 ## References
