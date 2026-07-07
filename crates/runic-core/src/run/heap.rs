@@ -58,13 +58,13 @@ impl RunHeap {
         let id = reservation.id();
 
         let run = Run::new(id, mapping, class);
-        let run_ptr = self.insert_run(reservation, run, pages).ok()?;
+        let run_ptr = self.insert_run(reservation, run, pages)?;
         // SAFETY: insert_run returns a pointer to the newly published live RunArena entry.
         let inserted_run = unsafe { &mut *run_ptr.as_ptr() };
         let ptr = inserted_run.allocate()?.ptr();
 
         if inserted_run.has_available_blocks() {
-            self.push_available_ptr(class_index, run_ptr).ok()?;
+            self.push_available(class_index, run_ptr).ok()?;
         }
 
         Some(Allocation::new(ptr, ZeroStatus::NeedsZeroing))
@@ -86,7 +86,7 @@ impl RunHeap {
         };
 
         if was_full {
-            self.push_available_ptr(class_index, run_ptr)?;
+            self.push_available(class_index, run_ptr)?;
         }
 
         Ok(())
@@ -127,7 +127,7 @@ impl RunHeap {
         }
     }
 
-    fn push_available_ptr(
+    fn push_available(
         &mut self,
         class_index: usize,
         mut run_ptr: NonNull<Run>,
@@ -154,31 +154,31 @@ impl RunHeap {
         reservation: RunReservation,
         run: Run,
         pages: &mut PageMap,
-    ) -> Result<NonNull<Run>, ()> {
+    ) -> Option<NonNull<Run>> {
         let id = reservation.id();
         let range = run.range();
 
         if self.runs.insert(reservation, run).is_err() {
-            return Err(());
+            return None;
         }
 
         let Some(page_range) = PageRange::new(range.base(), range.len()) else {
             let _removed = self.runs.remove(id);
-            return Err(());
+            return None;
         };
 
         let Some(inserted_run) = self.runs.get_mut(id) else {
             let _removed = self.runs.remove(id);
-            return Err(());
+            return None;
         };
         let run_ptr = NonNull::from(&mut *inserted_run);
 
         if pages.insert(page_range, PageOwner::Run(run_ptr)).is_err() {
             let _removed = self.runs.remove(id);
-            return Err(());
+            return None;
         }
 
-        Ok(run_ptr)
+        Some(run_ptr)
     }
 }
 
@@ -206,7 +206,7 @@ mod tests {
     fn reusable_run(id: RunId) -> Run {
         let mapping = OsMemory::map(RUN_SIZE).unwrap();
         let spec = LayoutSpec::from_size_align(64, 8).unwrap();
-        let class = SizeClasses::get(spec).unwrap();
+        let class = SizeClasses::for_layout(spec).unwrap();
 
         Run::new(id, mapping, class)
     }
@@ -223,7 +223,7 @@ mod tests {
         let mut allocator = RunHeap::new(2);
         let mut pages = PageMap::new();
         let spec = LayoutSpec::from_size_align(64, 8).unwrap();
-        let class = SizeClasses::get(spec).unwrap();
+        let class = SizeClasses::for_layout(spec).unwrap();
         let class_index = class.id().index();
         let capacity = RUN_SIZE / class.block_size();
         let first = allocator.allocate(class.id(), &mut pages).unwrap().ptr();
@@ -260,7 +260,7 @@ mod tests {
 
         pages.insert(page_range, existing).unwrap();
 
-        assert_eq!(allocator.insert_run(reservation, run, &mut pages), Err(()));
+        assert_eq!(allocator.insert_run(reservation, run, &mut pages), None);
         assert!(allocator.runs.get_mut(id).is_none());
         assert_eq!(pages.get(range.base()), Some(existing));
     }

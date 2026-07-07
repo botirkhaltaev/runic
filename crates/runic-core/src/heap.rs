@@ -29,12 +29,12 @@ pub(crate) enum HeapError {
 }
 
 impl Heap {
-    pub(crate) const DEFAULT_TABLE_CAPACITY: u32 = 65_536;
+    pub(crate) const DEFAULT_METADATA_CAPACITY: u32 = 65_536;
 
     pub(crate) const fn new() -> Self {
         Self {
-            runs: RunHeap::new(Self::DEFAULT_TABLE_CAPACITY),
-            extents: ExtentHeap::new(Self::DEFAULT_TABLE_CAPACITY),
+            runs: RunHeap::new(Self::DEFAULT_METADATA_CAPACITY),
+            extents: ExtentHeap::new(Self::DEFAULT_METADATA_CAPACITY),
             pages: PageMap::new(),
         }
     }
@@ -149,7 +149,7 @@ impl Heap {
     }
 
     fn allocate(&mut self, spec: LayoutSpec) -> Option<Allocation> {
-        match SizeClasses::get_id(spec) {
+        match SizeClasses::id_for(spec) {
             Some(class) => self.runs.allocate(class, &mut self.pages),
             None => self.extents.allocate(spec, &mut self.pages),
         }

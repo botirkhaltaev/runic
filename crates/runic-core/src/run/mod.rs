@@ -322,7 +322,7 @@ mod tests {
 
     fn class_for(size: usize, align: usize) -> SizeClass {
         let spec = LayoutSpec::from_size_align(size, align).unwrap();
-        SizeClasses::get(spec).unwrap()
+        SizeClasses::for_layout(spec).unwrap()
     }
 
     #[test]
@@ -429,7 +429,7 @@ mod tests {
     fn reusable_run_returns_aligned_blocks_for_alignment_sensitive_layout() {
         let mapping = OsMemory::map(RUN_SIZE).unwrap();
         let spec = LayoutSpec::from_size_align(17, 16).unwrap();
-        let class = SizeClasses::get(spec).unwrap();
+        let class = SizeClasses::for_layout(spec).unwrap();
         let mut run = Run::new(RunId::from_index(3).unwrap(), mapping, class);
         let capacity = RUN_SIZE / class.block_size();
 

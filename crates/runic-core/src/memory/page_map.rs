@@ -28,7 +28,9 @@ pub(crate) enum PageMapError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PageOwner {
+    // Pointers must refer to live arena entries until their page-map range is removed.
     Run(NonNull<Run>),
+    // Pointers must refer to live arena entries until their page-map range is removed.
     Extent(NonNull<Extent>),
 }
 
@@ -617,7 +619,7 @@ impl MapEntry {
         Self { raw: 0 }
     }
 
-    fn occupied(entry: PageOwner) -> Option<Self> {
+    fn from_owner(entry: PageOwner) -> Option<Self> {
         let (ptr, kind) = match entry {
             PageOwner::Run(ptr) => (ptr.cast::<()>().as_ptr().addr(), 0),
             PageOwner::Extent(ptr) => (ptr.cast::<()>().as_ptr().addr(), Self::KIND_EXTENT),
@@ -634,7 +636,7 @@ impl MapEntry {
         self.raw == 0
     }
 
-    fn page(self) -> Option<PageOwner> {
+    fn owner(self) -> Option<PageOwner> {
         if self.is_empty() {
             return None;
         }
@@ -670,7 +672,7 @@ impl PageMap {
     pub(crate) fn get(&self, ptr: NonNull<u8>) -> Option<PageOwner> {
         let (l1_index, l2_index) = Page::containing(ptr).indexes()?;
 
-        self.l1()?.page_entry(l1_index, l2_index)?.page()
+        self.l1()?.page_entry(l1_index, l2_index)?.owner()
     }
 
     pub(crate) fn insert(
@@ -678,7 +680,7 @@ impl PageMap {
         range: PageRange,
         entry: PageOwner,
     ) -> Result<(), PageMapError> {
-        let occupied = MapEntry::occupied(entry).ok_or(PageMapError::InvalidRange)?;
+        let occupied = MapEntry::from_owner(entry).ok_or(PageMapError::InvalidRange)?;
 
         self.validate_insert(range)?;
         self.prepare_insert(range)?;
@@ -805,7 +807,7 @@ impl PageMap {
     }
 
     fn validate_remove(&self, range: PageRange, expected: PageOwner) -> Result<(), PageMapError> {
-        let expected = MapEntry::occupied(expected).ok_or(PageMapError::InvalidRange)?;
+        let expected = MapEntry::from_owner(expected).ok_or(PageMapError::InvalidRange)?;
 
         let Some(l1) = self.l1() else {
             return Err(PageMapError::UnexpectedEntry);
@@ -1010,11 +1012,11 @@ mod tests {
         assert_eq!(span_count(&map, mapping.base()), 0);
         assert_eq!(
             direct_entry(&map, mapping.base()),
-            MapEntry::occupied(run(4))
+            MapEntry::from_owner(run(4))
         );
         assert_eq!(
             direct_entry(&map, mapping.ptr_at(PAGE_SIZE)),
-            MapEntry::occupied(run(4))
+            MapEntry::from_owner(run(4))
         );
     }
 
@@ -1348,7 +1350,7 @@ mod tests {
         assert_eq!(map.get(fallback), Some(extent(10_000)));
         assert_eq!(
             direct_entry(&map, fallback),
-            MapEntry::occupied(extent(10_000))
+            MapEntry::from_owner(extent(10_000))
         );
         assert_eq!(
             map.remove(

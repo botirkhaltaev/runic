@@ -46,9 +46,7 @@ impl ExtentHeap {
         debug_assert_eq!(extent.id(), id, "new extent should keep its reserved id");
         let ptr = extent.ptr();
 
-        if self.insert_extent(reservation, extent, pages).is_err() {
-            return None;
-        }
+        self.insert_extent(reservation, extent, pages)?;
 
         Some(Allocation::new(ptr, zero_status))
     }
@@ -114,22 +112,22 @@ impl ExtentHeap {
         reservation: ExtentReservation,
         extent: Extent,
         pages: &mut PageMap,
-    ) -> Result<NonNull<Extent>, ()> {
+    ) -> Option<NonNull<Extent>> {
         let id = reservation.id();
         let range = extent.range();
 
         if self.extents.insert(reservation, extent).is_err() {
-            return Err(());
+            return None;
         }
 
         let Some(page_range) = PageRange::new(range.base(), range.len()) else {
             let _removed = self.extents.remove(id);
-            return Err(());
+            return None;
         };
 
         let Some(inserted_extent) = self.extents.get_mut(id) else {
             let _removed = self.extents.remove(id);
-            return Err(());
+            return None;
         };
         let extent_ptr = NonNull::from(&mut *inserted_extent);
 
@@ -138,10 +136,10 @@ impl ExtentHeap {
             .is_err()
         {
             let _removed = self.extents.remove(id);
-            return Err(());
+            return None;
         }
 
-        Ok(extent_ptr)
+        Some(extent_ptr)
     }
 }
 
@@ -178,7 +176,7 @@ mod tests {
 
         assert_eq!(
             allocator.insert_extent(reservation, extent, &mut pages),
-            Err(())
+            None
         );
         assert!(allocator.extents.get_mut(id).is_none());
         assert_eq!(pages.get(range.base()), Some(existing));
