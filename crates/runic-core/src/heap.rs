@@ -182,12 +182,18 @@ impl From<ExtentHeapError> for HeapError {
 
 #[cfg(test)]
 mod tests {
+    use crate::config::ExtentReuse;
+
     use super::*;
 
     fn test_heap() -> Heap {
+        test_heap_with_config(AllocatorConfig::new())
+    }
+
+    fn test_heap_with_config(config: AllocatorConfig) -> Heap {
         Heap {
-            runs: RunHeap::new(4, AllocatorConfig::new().run()),
-            extents: ExtentHeap::new(4, AllocatorConfig::new().extent()),
+            runs: RunHeap::new(4, config.run()),
+            extents: ExtentHeap::new(4, config.extent()),
             pages: PageMap::new(),
         }
     }
@@ -226,6 +232,26 @@ mod tests {
         let second = heap.alloc(layout);
         assert_eq!(second, first);
         assert_eq!(heap.dealloc(second, layout), Ok(()));
+    }
+
+    #[test]
+    fn heap_realloc_grows_reused_extent_within_cached_mapping() {
+        let config = AllocatorConfig::new().with_extent_reuse(ExtentReuse::BestFit);
+        let mut heap = test_heap_with_config(config);
+        let large = Layout::from_size_align(512 * 1024, 4096).unwrap();
+        let small = Layout::from_size_align(128 * 1024, 4096).unwrap();
+        let grown_layout = Layout::from_size_align(256 * 1024, 4096).unwrap();
+        let large_ptr = heap.alloc(large);
+
+        assert!(!large_ptr.is_null());
+        assert_eq!(heap.dealloc(large_ptr, large), Ok(()));
+
+        let small_ptr = heap.alloc(small);
+        assert_eq!(small_ptr, large_ptr);
+
+        let grown = heap.realloc(small_ptr, small, 256 * 1024).unwrap();
+        assert_eq!(grown, small_ptr);
+        assert_eq!(heap.dealloc(grown, grown_layout), Ok(()));
     }
 
     #[test]

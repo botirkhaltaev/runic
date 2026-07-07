@@ -11,13 +11,14 @@ The current implementation exposes deterministic extent and empty-run policies t
 `ExtentCache` should own the policy because it owns retained extent mappings:
 
 - admit a freed mapping only if slot capacity and a hard byte budget allow it
-- retain exact-size mappings for fast reuse
-- optionally evict retained mappings by FIFO, LIFO, LRU, largest, or smallest policy
+- retain mappings for fast reuse
+- optionally evict retained mappings by FIFO, LIFO, largest, or smallest policy
+- choose allocation-side reuse independently: exact length, best fit, or size bucket
 - decay retained mappings to a soft byte target only after benchmarks show no latency regression
 - release selected cached mappings through a deterministic order, such as oldest first
 - retain at least one mapping that is larger than the soft target when it fits under the hard cap
 
-The current implementation has fixed-array slot storage and configured slot/byte caps. Any new decay behavior must be fixed, non-adaptive, and allocation-free until benchmark evidence justifies additional complexity.
+The current implementation has fixed-array slot storage, configured slot/byte caps, and an internal 64-slot maximum per cache. Configured slot budgets above the implementation cap are clamped by the cache. Any new decay behavior must be fixed, non-adaptive, and allocation-free until benchmark evidence justifies additional complexity.
 
 ## Current And Candidate Budgets
 

@@ -66,7 +66,7 @@ impl ExtentHeap {
                 return Err(ExtentHeapError::InvalidPointer);
             }
 
-            (extent.id(), extent.range(), extent.mapping_len())
+            (extent.id(), extent.mapping_range(), extent.mapping_len())
         };
 
         let retain_mapping = self.cache.will_retain(mapping_len);
@@ -115,7 +115,7 @@ impl ExtentHeap {
         pages: &mut PageMap,
     ) -> Option<NonNull<Extent>> {
         let id = reservation.id();
-        let range = extent.range();
+        let range = extent.mapping_range();
 
         if self.extents.insert(reservation, extent).is_err() {
             return None;
@@ -169,7 +169,7 @@ mod tests {
         let reservation = allocator.extents.reserve().unwrap();
         let id = reservation.id();
         let extent = reusable_extent(id);
-        let range = extent.range();
+        let range = extent.mapping_range();
         let page_range = PageRange::new(range.base(), range.len()).unwrap();
         let existing = PageOwner::Extent(NonNull::dangling());
 

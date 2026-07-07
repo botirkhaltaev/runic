@@ -133,7 +133,9 @@ impl RunHeap {
         freed: FreedRun,
         pages: &mut PageMap,
     ) -> Result<(), RunHeapError> {
-        self.unlink_available(freed.class.index(), freed.owner)?;
+        if !freed.was_full && !self.unlink_available(freed.class.index(), freed.owner)? {
+            return Err(RunHeapError::InvalidMetadata);
+        }
 
         let Some(page_range) = PageRange::new(freed.range.base(), freed.range.len()) else {
             return Err(RunHeapError::InvalidMetadata);
@@ -219,7 +221,7 @@ impl RunHeap {
         &mut self,
         class_index: usize,
         target: NonNull<Run>,
-    ) -> Result<(), RunHeapError> {
+    ) -> Result<bool, RunHeapError> {
         let Some(head) = self.available.get_mut(class_index) else {
             return Err(RunHeapError::InvalidMetadata);
         };
@@ -239,14 +241,14 @@ impl RunHeap {
                 } else {
                     *head = next;
                 }
-                return Ok(());
+                return Ok(true);
             }
 
             previous = Some(run_ptr);
             current = next;
         }
 
-        Ok(())
+        Ok(false)
     }
 
     fn insert_run(
