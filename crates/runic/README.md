@@ -27,7 +27,7 @@ use runic::{Budget, ExtentPolicy, RunicAlloc};
 #[global_allocator]
 static GLOBAL: RunicAlloc = RunicAlloc::builder()
     .extent()
-    .policy(ExtentPolicy::Lru)
+    .policy(ExtentPolicy::Fifo)
     .budget(Budget::new(32, 16 * 1024 * 1024))
     .done()
     .build();

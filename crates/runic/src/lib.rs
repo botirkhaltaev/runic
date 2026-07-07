@@ -3,4 +3,4 @@
 mod global;
 
 pub use global::{ExtentBuilder, RunicAlloc, RunicAllocBuilder};
-pub use runic_core::{AllocatorConfig, Budget, ExtentPolicy, Reuse};
+pub use runic_core::{AllocatorConfig, Budget, ExtentPolicy, ExtentReuse};

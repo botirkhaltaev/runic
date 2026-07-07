@@ -1,6 +1,6 @@
 use std::{alloc::GlobalAlloc, env, process::Command};
 
-use runic::{Budget, ExtentPolicy, Reuse, RunicAlloc};
+use runic::{Budget, ExtentPolicy, ExtentReuse, RunicAlloc};
 use runic_bench::{allocator_target::AllocatorTarget, rss::RssReport, workload};
 
 static EXTENT_DROP: RunicAlloc = RunicAlloc::builder()
@@ -22,12 +22,6 @@ static EXTENT_LIFO_16M: RunicAlloc = RunicAlloc::builder()
     .budget(Budget::new(32, 16 * 1024 * 1024))
     .done()
     .build();
-static EXTENT_LRU_16M: RunicAlloc = RunicAlloc::builder()
-    .extent()
-    .policy(ExtentPolicy::Lru)
-    .budget(Budget::new(32, 16 * 1024 * 1024))
-    .done()
-    .build();
 static EXTENT_LARGEST_16M: RunicAlloc = RunicAlloc::builder()
     .extent()
     .policy(ExtentPolicy::Largest)
@@ -40,17 +34,17 @@ static EXTENT_SMALLEST_16M: RunicAlloc = RunicAlloc::builder()
     .budget(Budget::new(32, 16 * 1024 * 1024))
     .done()
     .build();
-static EXTENT_LRU_BEST_FIT_16M: RunicAlloc = RunicAlloc::builder()
+static EXTENT_FIFO_BEST_FIT_16M: RunicAlloc = RunicAlloc::builder()
     .extent()
-    .policy(ExtentPolicy::Lru)
-    .reuse(Reuse::BestFit)
+    .policy(ExtentPolicy::Fifo)
+    .reuse(ExtentReuse::BestFit)
     .budget(Budget::new(32, 16 * 1024 * 1024))
     .done()
     .build();
-static EXTENT_LRU_SIZE_CLASS_16M: RunicAlloc = RunicAlloc::builder()
+static EXTENT_FIFO_SIZE_CLASS_16M: RunicAlloc = RunicAlloc::builder()
     .extent()
-    .policy(ExtentPolicy::Lru)
-    .reuse(Reuse::SizeClass)
+    .policy(ExtentPolicy::Fifo)
+    .reuse(ExtentReuse::SizeClass)
     .budget(Budget::new(32, 16 * 1024 * 1024))
     .done()
     .build();
@@ -60,11 +54,10 @@ const CONFIGS: &[PolicyConfig] = &[
     PolicyConfig::new("extent_keep_16m", &EXTENT_KEEP_16M),
     PolicyConfig::new("extent_fifo_16m", &EXTENT_FIFO_16M),
     PolicyConfig::new("extent_lifo_16m", &EXTENT_LIFO_16M),
-    PolicyConfig::new("extent_lru_16m", &EXTENT_LRU_16M),
     PolicyConfig::new("extent_largest_16m", &EXTENT_LARGEST_16M),
     PolicyConfig::new("extent_smallest_16m", &EXTENT_SMALLEST_16M),
-    PolicyConfig::new("extent_lru_best_fit_16m", &EXTENT_LRU_BEST_FIT_16M),
-    PolicyConfig::new("extent_lru_size_class_16m", &EXTENT_LRU_SIZE_CLASS_16M),
+    PolicyConfig::new("extent_fifo_best_fit_16m", &EXTENT_FIFO_BEST_FIT_16M),
+    PolicyConfig::new("extent_fifo_size_class_16m", &EXTENT_FIFO_SIZE_CLASS_16M),
 ];
 
 const WORKLOADS: &[PolicyWorkload] = &[

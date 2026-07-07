@@ -23,7 +23,7 @@ impl AllocatorConfig {
     }
 
     #[must_use]
-    pub const fn with_extent_reuse(mut self, reuse: Reuse) -> Self {
+    pub const fn with_extent_reuse(mut self, reuse: ExtentReuse) -> Self {
         self.extent = self.extent.with_reuse(reuse);
         self
     }
@@ -44,7 +44,7 @@ impl Default for AllocatorConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExtentConfig {
     policy: ExtentPolicy,
-    reuse: Reuse,
+    reuse: ExtentReuse,
     budget: Budget,
 }
 
@@ -53,7 +53,7 @@ impl ExtentConfig {
     pub const fn new() -> Self {
         Self {
             policy: ExtentPolicy::Keep,
-            reuse: Reuse::Exact,
+            reuse: ExtentReuse::Exact,
             budget: Budget::new(32, 16 * 1024 * 1024),
         }
     }
@@ -64,7 +64,7 @@ impl ExtentConfig {
     }
 
     #[must_use]
-    pub const fn reuse(self) -> Reuse {
+    pub const fn reuse(self) -> ExtentReuse {
         self.reuse
     }
 
@@ -80,7 +80,7 @@ impl ExtentConfig {
     }
 
     #[must_use]
-    pub const fn with_reuse(mut self, reuse: Reuse) -> Self {
+    pub const fn with_reuse(mut self, reuse: ExtentReuse) -> Self {
         self.reuse = reuse;
         self
     }
@@ -127,13 +127,12 @@ pub enum ExtentPolicy {
     Keep,
     Fifo,
     Lifo,
-    Lru,
     Largest,
     Smallest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Reuse {
+pub enum ExtentReuse {
     Exact,
     BestFit,
     SizeClass,

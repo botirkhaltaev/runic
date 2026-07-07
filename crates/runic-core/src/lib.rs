@@ -22,4 +22,4 @@ pub(crate) mod size_class;
 pub(crate) mod slot_store;
 
 pub use allocator::Allocator;
-pub use config::{AllocatorConfig, Budget, ExtentConfig, ExtentPolicy, Reuse};
+pub use config::{AllocatorConfig, Budget, ExtentConfig, ExtentPolicy, ExtentReuse};

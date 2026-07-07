@@ -1,7 +1,7 @@
 use core::mem::MaybeUninit;
 
 use crate::{
-    config::{ExtentConfig, ExtentPolicy, Reuse},
+    config::{ExtentConfig, ExtentPolicy, ExtentReuse},
     memory::Mapping,
 };
 
@@ -26,9 +26,9 @@ impl ExtentCache {
 
     pub(crate) fn take(&mut self, len: usize) -> Option<Mapping> {
         let index = match self.config.reuse() {
-            Reuse::Exact => self.find_exact(len),
-            Reuse::BestFit => self.find_best_fit(len),
-            Reuse::SizeClass => self.find_size_class(len),
+            ExtentReuse::Exact => self.find_exact(len),
+            ExtentReuse::BestFit => self.find_best_fit(len),
+            ExtentReuse::SizeClass => self.find_size_class(len),
         }?;
 
         let slot = self.slots.get_mut(index)?;
@@ -53,7 +53,6 @@ impl ExtentCache {
             }
             ExtentPolicy::Fifo
             | ExtentPolicy::Lifo
-            | ExtentPolicy::Lru
             | ExtentPolicy::Largest
             | ExtentPolicy::Smallest => true,
         }
@@ -156,7 +155,7 @@ impl ExtentCache {
     fn evict_index(&self) -> Option<usize> {
         match self.config.policy() {
             ExtentPolicy::Drop | ExtentPolicy::Keep => None,
-            ExtentPolicy::Fifo | ExtentPolicy::Lru => self.oldest_index(),
+            ExtentPolicy::Fifo => self.oldest_index(),
             ExtentPolicy::Lifo => self.newest_index(),
             ExtentPolicy::Largest => self.largest_index(),
             ExtentPolicy::Smallest => self.smallest_index(),
@@ -284,7 +283,7 @@ mod tests {
 
     use super::*;
 
-    fn cache(policy: ExtentPolicy, budget: Budget, reuse: Reuse) -> ExtentCache {
+    fn cache(policy: ExtentPolicy, budget: Budget, reuse: ExtentReuse) -> ExtentCache {
         ExtentCache::new(
             ExtentConfig::new()
                 .with_policy(policy)
@@ -323,7 +322,7 @@ mod tests {
         let mut cache = cache(
             ExtentPolicy::Keep,
             Budget::new(2, 1024 * 1024),
-            Reuse::Exact,
+            ExtentReuse::Exact,
         );
 
         assert!(cache.insert(mapping(4096)).is_ok());
@@ -333,7 +332,7 @@ mod tests {
 
     #[test]
     fn extent_cache_enforces_byte_capacity_for_keep_policy() {
-        let mut cache = cache(ExtentPolicy::Keep, Budget::new(4, 4096), Reuse::Exact);
+        let mut cache = cache(ExtentPolicy::Keep, Budget::new(4, 4096), ExtentReuse::Exact);
 
         assert!(cache.insert(mapping(4096)).is_ok());
         assert!(cache.insert(mapping(4096)).is_err());
@@ -344,7 +343,7 @@ mod tests {
         let mut cache = cache(
             ExtentPolicy::Drop,
             Budget::new(32, 1024 * 1024),
-            Reuse::Exact,
+            ExtentReuse::Exact,
         );
 
         assert!(cache.insert(mapping(4096)).is_err());
@@ -353,7 +352,7 @@ mod tests {
 
     #[test]
     fn extent_cache_fifo_evicts_oldest_mapping() {
-        let mut cache = cache(ExtentPolicy::Fifo, Budget::new(2, 8192), Reuse::Exact);
+        let mut cache = cache(ExtentPolicy::Fifo, Budget::new(2, 8192), ExtentReuse::Exact);
         let first = mapping(4096);
         let first_ptr = first.base();
         let second = mapping(4096);
@@ -372,7 +371,7 @@ mod tests {
 
     #[test]
     fn extent_cache_lifo_evicts_newest_mapping() {
-        let mut cache = cache(ExtentPolicy::Lifo, Budget::new(2, 8192), Reuse::Exact);
+        let mut cache = cache(ExtentPolicy::Lifo, Budget::new(2, 8192), ExtentReuse::Exact);
         let first = mapping(4096);
         let first_ptr = first.base();
         let second = mapping(4096);
@@ -396,7 +395,7 @@ mod tests {
         let mut cache = cache(
             ExtentPolicy::Keep,
             Budget::new(4, 1024 * 1024),
-            Reuse::BestFit,
+            ExtentReuse::BestFit,
         );
         let large = mapping(512 * 1024);
         let small = mapping(256 * 1024);
@@ -414,7 +413,7 @@ mod tests {
         let mut cache = cache(
             ExtentPolicy::Keep,
             Budget::new(4, 1024 * 1024),
-            Reuse::SizeClass,
+            ExtentReuse::SizeClass,
         );
         let matching = mapping(256 * 1024);
         let matching_ptr = matching.base();
