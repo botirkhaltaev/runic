@@ -24,7 +24,8 @@
 ## API Policy
 
 - No backward compatibility is required for public or internal APIs.
-- Prefer direct API reshaping, renaming, deletion, or refactoring over compatibility shims throughout the codebase.
+- Prefer modifying existing APIs over adding new methods; reshape, rename, delete, or refactor directly instead of growing parallel surfaces.
+- Avoid compatibility shims throughout the codebase.
 - Review API shape repository-wide when architectural feedback applies; do not fix only the call site where the issue was noticed.
 - During planning and implementation, critique the design against idiomatic Rust, allocator invariants, composability, and overfitting before treating it as done.
 
