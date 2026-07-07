@@ -12,7 +12,7 @@ Runic currently models mapped memory through separate domain entities:
 - `RunCache` owns optional retained empty-run mappings.
 - `Heap` coordinates lifecycle transitions.
 
-This split is explicit and worked for the v0.3 single-thread metadata milestone, but thread-local heaps, remote frees, decay policy, hardening, and hugepage-aware allocation will all increase ownership pressure.
+This split is explicit and worked for the v0.4 global-lock and retention-policy milestone, but thread-local heaps, remote frees, decay policy, hardening, and hugepage-aware allocation will all increase ownership pressure.
 
 ## Evaluation
 

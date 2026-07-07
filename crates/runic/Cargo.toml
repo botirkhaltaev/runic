@@ -13,4 +13,4 @@ name = "runic"
 workspace = true
 
 [dependencies]
-runic-core = { version = "0.3.0", path = "../runic-core" }
+runic-core = { version = "0.4.0", path = "../runic-core" }

@@ -2,7 +2,7 @@
 
 Runic is a correctness-first Rust allocator with a small auditable unsafe core, out-of-line metadata, and explicit allocation invariants.
 
-The current release is an experimental v0.3 global-lock allocator for Linux x86_64. It is useful for allocator development, single-thread performance work, tests, and architecture iteration; it is not yet a production allocator.
+The current release is an experimental v0.4 global-lock allocator for Linux x86_64. It is useful for allocator development, single-thread performance work, retention-policy experiments, tests, and architecture iteration; it is not yet a production allocator.
 
 ## Install
 
@@ -32,7 +32,7 @@ fn main() {
 
 ## Status
 
-Runic v0.3 implements:
+Runic v0.4 implements:
 
 - `GlobalAlloc`
 - one global heap lock
@@ -42,7 +42,8 @@ Runic v0.3 implements:
 - page-indexed owner-pointer lookup
 - per-size-class available run lists
 - bitmap-backed run block state
-- configurable extent and empty-run retention policies
+- configurable extent mapping retention and reuse policies
+- optional empty-run release and mapping retention policies
 - run block-boundary checks
 - extent exact-pointer checks
 - basic `realloc`
@@ -85,7 +86,7 @@ perf stat -r 3 -e task-clock,cycles,instructions,branches,branch-misses,cache-mi
 
 ## Release
 
-Release tags use plain semver, for example `0.3.0`.
+Release tags use plain semver, for example `0.4.0`.
 
 Release `runic-core` before `runic-alloc`, because `runic-alloc` depends on the published `runic-core` version during package verification.
 

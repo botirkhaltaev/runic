@@ -2,7 +2,7 @@
 
 Issue: #8
 
-Runic v0.3 still uses one global heap lock. That is correct for the current correctness and single-thread optimization milestone, but threaded benchmarks show the expected ceiling for this architecture.
+Runic v0.4 still uses one global heap lock. That is correct for the current correctness, single-thread optimization, and retention-policy milestone, but threaded benchmarks show the expected ceiling for this architecture.
 
 ## Current Signal
 
