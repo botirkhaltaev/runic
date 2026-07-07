@@ -5,6 +5,7 @@ use crate::{
     config::{RunConfig, RunPolicy},
     layout::LayoutSpec,
     memory::{AddressRange, L2TablePolicy, OsMemory, PageMap, PageOwner, PageRange},
+    ownership::RunOwner,
     run::{RUN_SIZE, Run, RunArena, RunBlock, RunError, RunId},
     size_class::{SizeClassId, SizeClasses},
 };
@@ -53,19 +54,28 @@ impl RunHeap {
     pub(crate) fn allocate(
         &mut self,
         class: SizeClassId,
+        owner: RunOwner,
         pages: &mut PageMap,
     ) -> Option<Allocation> {
         let class_index = class.index();
 
-        if let Some(allocation) = self.allocate_from_available(class_index) {
+        if owner == RunOwner::Shared
+            && let Some(allocation) = self.allocate_from_available(class_index)
+        {
             return Some(allocation);
         }
 
-        self.allocate_new_run(class, pages)
+        self.allocate_run(class, owner, pages)
+            .map(|(_, allocation)| allocation)
     }
 
     #[cold]
-    fn allocate_new_run(&mut self, class: SizeClassId, pages: &mut PageMap) -> Option<Allocation> {
+    pub(crate) fn allocate_run(
+        &mut self,
+        class: SizeClassId,
+        owner: RunOwner,
+        pages: &mut PageMap,
+    ) -> Option<(NonNull<Run>, Allocation)> {
         let class = SizeClasses::class(class)?;
         let class_index = class.id().index();
         let mapping = self
@@ -75,17 +85,17 @@ impl RunHeap {
         let reservation = self.runs.reserve()?;
         let id = reservation.id();
 
-        let run = Run::new(id, mapping, class);
+        let run = Run::new(id, owner, mapping, class);
         let run_ptr = self.insert_run(reservation, run, pages)?;
         // SAFETY: insert_run returns a pointer to the newly published live RunArena entry.
         let inserted_run = unsafe { &mut *run_ptr.as_ptr() };
         let ptr = inserted_run.allocate()?.ptr();
 
-        if inserted_run.has_available_blocks() {
+        if owner == RunOwner::Shared && inserted_run.has_available_blocks() {
             self.push_available(class_index, run_ptr).ok()?;
         }
 
-        Some(Allocation::new(ptr, ZeroStatus::NeedsZeroing))
+        Some((run_ptr, Allocation::new(ptr, ZeroStatus::NeedsZeroing)))
     }
 
     pub(crate) fn free(
@@ -217,6 +227,14 @@ impl RunHeap {
         Ok(())
     }
 
+    pub(crate) fn push_shared_available(
+        &mut self,
+        class: SizeClassId,
+        run_ptr: NonNull<Run>,
+    ) -> Result<(), RunHeapError> {
+        self.push_available(class.index(), run_ptr)
+    }
+
     fn unlink_available(
         &mut self,
         class_index: usize,
@@ -311,7 +329,7 @@ mod tests {
         let spec = LayoutSpec::from_size_align(64, 8).unwrap();
         let class = SizeClasses::for_layout(spec).unwrap();
 
-        Run::new(id, mapping, class)
+        Run::new(id, RunOwner::Shared, mapping, class)
     }
 
     fn available_run_id(allocator: &RunHeap, class_index: usize) -> Option<RunId> {
@@ -329,7 +347,10 @@ mod tests {
         let class = SizeClasses::for_layout(spec).unwrap();
         let class_index = class.id().index();
         let capacity = RUN_SIZE / class.block_size();
-        let first = allocator.allocate(class.id(), &mut pages).unwrap().ptr();
+        let first = allocator
+            .allocate(class.id(), RunOwner::Shared, &mut pages)
+            .unwrap()
+            .ptr();
         let PageOwner::Run(run_ptr) = pages.get(first).unwrap() else {
             panic!("small allocation should publish a run entry");
         };
@@ -337,14 +358,21 @@ mod tests {
         let id = unsafe { run_ptr.as_ref().id() };
 
         for _ in 1..capacity {
-            assert!(allocator.allocate(class.id(), &mut pages).is_some());
+            assert!(
+                allocator
+                    .allocate(class.id(), RunOwner::Shared, &mut pages)
+                    .is_some()
+            );
         }
 
         assert_eq!(available_run_id(&allocator, class_index), None);
         assert_eq!(allocator.free(run_ptr, first, &mut pages), Ok(()));
         assert_eq!(available_run_id(&allocator, class_index), Some(id));
 
-        let reused = allocator.allocate(class.id(), &mut pages).unwrap().ptr();
+        let reused = allocator
+            .allocate(class.id(), RunOwner::Shared, &mut pages)
+            .unwrap()
+            .ptr();
 
         assert_eq!(reused, first);
         assert_eq!(available_run_id(&allocator, class_index), None);
@@ -374,7 +402,10 @@ mod tests {
         let mut pages = PageMap::new();
         let spec = LayoutSpec::from_size_align(64, 8).unwrap();
         let class = SizeClasses::for_layout(spec).unwrap();
-        let ptr = allocator.allocate(class.id(), &mut pages).unwrap().ptr();
+        let ptr = allocator
+            .allocate(class.id(), RunOwner::Shared, &mut pages)
+            .unwrap()
+            .ptr();
         let PageOwner::Run(run_ptr) = pages.get(ptr).unwrap() else {
             panic!("small allocation should publish a run entry");
         };
@@ -394,14 +425,20 @@ mod tests {
         let mut pages = PageMap::new();
         let spec = LayoutSpec::from_size_align(64, 8).unwrap();
         let class = SizeClasses::for_layout(spec).unwrap();
-        let first = allocator.allocate(class.id(), &mut pages).unwrap().ptr();
+        let first = allocator
+            .allocate(class.id(), RunOwner::Shared, &mut pages)
+            .unwrap()
+            .ptr();
         let PageOwner::Run(run_ptr) = pages.get(first).unwrap() else {
             panic!("small allocation should publish a run entry");
         };
 
         assert_eq!(allocator.free(run_ptr, first, &mut pages), Ok(()));
 
-        let second = allocator.allocate(class.id(), &mut pages).unwrap().ptr();
+        let second = allocator
+            .allocate(class.id(), RunOwner::Shared, &mut pages)
+            .unwrap()
+            .ptr();
         assert_eq!(second, first);
     }
 }
