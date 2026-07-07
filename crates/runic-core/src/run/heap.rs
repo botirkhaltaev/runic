@@ -18,6 +18,7 @@ pub(crate) struct RunHeap {
     config: RunConfig,
 }
 
+#[derive(Clone, Copy)]
 struct FreedRun {
     id: RunId,
     class: SizeClassId,
