@@ -5,23 +5,22 @@ use core::{
 
 use crate::{
     allocation::{Allocation, ZeroStatus},
-    extent::{ExtentAllocator, ExtentAllocatorError},
+    extent::{ExtentHeap, ExtentHeapError},
     layout::LayoutSpec,
-    memory::{PageEntry, PageMap},
-    run::{RunAllocator, RunAllocatorError},
+    memory::{PageMap, PageOwner},
+    run::{RunHeap, RunHeapError},
     size_class::SizeClasses,
 };
 
 pub(crate) struct Heap {
-    runs: RunAllocator,
-    extents: ExtentAllocator,
+    runs: RunHeap,
+    extents: ExtentHeap,
     pages: PageMap,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HeapError {
     UnknownPointer,
-    MissingRun,
     MissingExtent,
     InvalidRunPointer,
     InvalidExtentPointer,
@@ -30,12 +29,12 @@ pub(crate) enum HeapError {
 }
 
 impl Heap {
-    pub(crate) const DEFAULT_TABLE_CAPACITY: u32 = 65_536;
+    pub(crate) const DEFAULT_METADATA_CAPACITY: u32 = 65_536;
 
     pub(crate) const fn new() -> Self {
         Self {
-            runs: RunAllocator::new(Self::DEFAULT_TABLE_CAPACITY),
-            extents: ExtentAllocator::new(Self::DEFAULT_TABLE_CAPACITY),
+            runs: RunHeap::new(Self::DEFAULT_METADATA_CAPACITY),
+            extents: ExtentHeap::new(Self::DEFAULT_METADATA_CAPACITY),
             pages: PageMap::new(),
         }
     }
@@ -57,10 +56,10 @@ impl Heap {
         };
 
         match entry {
-            PageEntry::Run(id) => self.runs.free(id, ptr).map_err(HeapError::from),
-            PageEntry::Extent(id) => self
+            PageOwner::Run(run) => self.runs.free(run, ptr).map_err(HeapError::from),
+            PageOwner::Extent(extent) => self
                 .extents
-                .free(id, ptr, &mut self.pages)
+                .free(extent, ptr, &mut self.pages)
                 .map_err(HeapError::from),
         }
     }
@@ -100,19 +99,13 @@ impl Heap {
         let new_spec = LayoutSpec::from_layout(new_layout);
 
         match entry {
-            PageEntry::Run(id) => {
-                if self
-                    .runs
-                    .resize_in_place(id, old_ptr, new_spec)
-                    .map_err(HeapError::from)?
-                {
+            PageOwner::Run(run) => {
+                if RunHeap::resize_in_place(run, old_ptr, new_spec).map_err(HeapError::from)? {
                     return Ok(ptr);
                 }
             }
-            PageEntry::Extent(id) => {
-                if self
-                    .extents
-                    .resize_in_place(id, old_ptr, new_spec)
+            PageOwner::Extent(extent) => {
+                if ExtentHeap::resize_in_place(extent, old_ptr, new_spec)
                     .map_err(HeapError::from)?
                 {
                     return Ok(ptr);
@@ -128,8 +121,8 @@ impl Heap {
             return Ok(null_mut());
         }
 
-        // SAFETY: new_ptr is a fresh allocation of at least new_size bytes; ptr is valid for old.size().
-        unsafe { copy_nonoverlapping(ptr, new_ptr, old.size().min(new_size)) };
+        // SAFETY: new_ptr is a fresh allocation of at least new_layout.size() bytes; ptr is valid for old.size().
+        unsafe { copy_nonoverlapping(ptr, new_ptr, old.size().min(new_layout.size())) };
 
         if let Err(error) = self.dealloc(ptr, old) {
             let _ = self.dealloc(new_ptr, new_layout);
@@ -156,30 +149,29 @@ impl Heap {
     }
 
     fn allocate(&mut self, spec: LayoutSpec) -> Option<Allocation> {
-        match SizeClasses::get(spec) {
-            Some(class) => self.runs.allocate(spec, class, &mut self.pages),
+        match SizeClasses::id_for(spec) {
+            Some(class) => self.runs.allocate(class, &mut self.pages),
             None => self.extents.allocate(spec, &mut self.pages),
         }
     }
 }
 
-impl From<RunAllocatorError> for HeapError {
-    fn from(error: RunAllocatorError) -> Self {
+impl From<RunHeapError> for HeapError {
+    fn from(error: RunHeapError) -> Self {
         match error {
-            RunAllocatorError::MissingRun => Self::MissingRun,
-            RunAllocatorError::InvalidPointer => Self::InvalidRunPointer,
-            RunAllocatorError::DoubleFree => Self::DoubleFree,
-            RunAllocatorError::InvalidMetadata => Self::InvalidMetadata,
+            RunHeapError::InvalidPointer => Self::InvalidRunPointer,
+            RunHeapError::DoubleFree => Self::DoubleFree,
+            RunHeapError::InvalidMetadata => Self::InvalidMetadata,
         }
     }
 }
 
-impl From<ExtentAllocatorError> for HeapError {
-    fn from(error: ExtentAllocatorError) -> Self {
+impl From<ExtentHeapError> for HeapError {
+    fn from(error: ExtentHeapError) -> Self {
         match error {
-            ExtentAllocatorError::MissingExtent => Self::MissingExtent,
-            ExtentAllocatorError::InvalidPointer => Self::InvalidExtentPointer,
-            ExtentAllocatorError::InvalidMetadata => Self::InvalidMetadata,
+            ExtentHeapError::MissingExtent => Self::MissingExtent,
+            ExtentHeapError::InvalidPointer => Self::InvalidExtentPointer,
+            ExtentHeapError::InvalidMetadata => Self::InvalidMetadata,
         }
     }
 }
@@ -190,8 +182,8 @@ mod tests {
 
     fn test_heap() -> Heap {
         Heap {
-            runs: RunAllocator::new(4),
-            extents: ExtentAllocator::new(4),
+            runs: RunHeap::new(4),
+            extents: ExtentHeap::new(4),
             pages: PageMap::new(),
         }
     }

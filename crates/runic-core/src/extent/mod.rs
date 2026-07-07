@@ -1,16 +1,16 @@
 use core::{num::NonZeroU32, ptr::NonNull};
 
-mod allocator;
+mod arena;
+mod heap;
 mod mapping_cache;
-mod table;
 
 use crate::{
     layout::LayoutSpec,
     memory::{AddressRange, Mapping, PageRange},
 };
 
-pub(crate) use allocator::{ExtentAllocator, ExtentAllocatorError};
-pub(crate) use table::{ExtentReservation, ExtentTable};
+pub(crate) use arena::{ExtentArena, ExtentReservation};
+pub(crate) use heap::{ExtentHeap, ExtentHeapError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ExtentId {
@@ -72,7 +72,7 @@ impl Extent {
             return Err(ExtentError::InvalidPointer);
         }
 
-        if !ptr.as_ptr().addr().is_multiple_of(spec.align()) {
+        if !spec.is_addr_aligned(ptr.as_ptr().addr()) {
             return Ok(false);
         }
 

@@ -65,10 +65,6 @@ impl<T> SlotStore<T> {
             .insert(value)
     }
 
-    pub(crate) fn get(&self, index: usize) -> Option<&T> {
-        self.slot(index)?.get()
-    }
-
     pub(crate) fn get_mut(&mut self, index: usize) -> Option<&mut T> {
         self.slot_mut(index)?.get_mut()
     }
@@ -87,10 +83,6 @@ impl<T> SlotStore<T> {
         }
 
         self.slots.as_mut()
-    }
-
-    fn slot(&self, index: usize) -> Option<&Slot<T>> {
-        self.slots.as_ref()?.get(index)
     }
 
     fn slot_mut(&mut self, index: usize) -> Option<&mut Slot<T>> {
@@ -117,19 +109,8 @@ impl<T> Slots<T> {
         Some(Self { mapping, base, len })
     }
 
-    fn get(&self, index: usize) -> Option<&Slot<T>> {
-        self.slots().get(index)
-    }
-
     fn get_mut(&mut self, index: usize) -> Option<&mut Slot<T>> {
         self.slots_mut().get_mut(index)
-    }
-
-    fn slots(&self) -> &[Slot<T>] {
-        debug_assert!(self.len <= self.mapping.range().len() / core::mem::size_of::<Slot<T>>());
-
-        // SAFETY: slots points to mmap storage sized for at least self.len Slot<T> entries.
-        unsafe { slice::from_raw_parts(self.base.as_ptr(), self.len) }
     }
 
     fn slots_mut(&mut self) -> &mut [Slot<T>] {
@@ -185,15 +166,6 @@ impl<T> Slot<T> {
         self.state = SlotState::occupied();
 
         Ok(())
-    }
-
-    fn get(&self) -> Option<&T> {
-        if !self.state.is_occupied() {
-            return None;
-        }
-
-        // SAFETY: occupied state is set only after value.write initializes the slot.
-        Some(unsafe { self.value.assume_init_ref() })
     }
 
     fn get_mut(&mut self) -> Option<&mut T> {
@@ -322,9 +294,9 @@ mod tests {
         let index = store.reserve().unwrap();
 
         assert_eq!(store.insert(index, 42), Ok(()));
-        assert_eq!(store.get(index), Some(&42));
+        assert_eq!(store.get_mut(index).copied(), Some(42));
         assert_eq!(store.remove(index), Some(42));
-        assert_eq!(store.get(index), None);
+        assert_eq!(store.get_mut(index), None);
     }
 
     #[test]
@@ -335,7 +307,7 @@ mod tests {
 
         *store.get_mut(index).unwrap() = 7;
 
-        assert_eq!(store.get(index), Some(&7));
+        assert_eq!(store.get_mut(index).copied(), Some(7));
     }
 
     #[test]
@@ -345,7 +317,7 @@ mod tests {
         assert_eq!(store.insert(index, 1), Ok(()));
 
         assert_eq!(store.insert(index, 2), Err(SlotStoreError::Occupied));
-        assert_eq!(store.get(index), Some(&1));
+        assert_eq!(store.get_mut(index).copied(), Some(1));
     }
 
     #[test]
@@ -354,7 +326,7 @@ mod tests {
         assert_eq!(store.reserve(), Some(0));
 
         assert_eq!(store.insert(1, 2), Err(SlotStoreError::NotReserved));
-        assert_eq!(store.get(1), None);
+        assert_eq!(store.get_mut(1), None);
     }
 
     #[test]

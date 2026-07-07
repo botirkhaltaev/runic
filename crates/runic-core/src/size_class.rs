@@ -1,4 +1,4 @@
-use crate::layout::LayoutSpec;
+use crate::{layout::LayoutSpec, memory::PAGE_SIZE};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SizeClassId {
@@ -33,23 +33,38 @@ impl SizeClasses {
     pub(crate) const COUNT: usize = 27;
     pub(crate) const SMALL_MAX: usize = 32 * 1024;
 
-    pub(crate) fn get(spec: LayoutSpec) -> Option<SizeClass> {
+    #[cfg(test)]
+    pub(crate) fn for_layout(spec: LayoutSpec) -> Option<SizeClass> {
+        Self::class(Self::id_for(spec)?)
+    }
+
+    pub(crate) fn id_for(spec: LayoutSpec) -> Option<SizeClassId> {
         let required = spec.minimum_block_size();
 
         if required > Self::SMALL_MAX {
             return None;
         }
 
+        if spec.align() > PAGE_SIZE {
+            return None;
+        }
+
+        let lower_bound = lower_bound_class(required)?;
+        if spec.align() <= 8 {
+            return Some(SizeClassId { index: lower_bound });
+        }
+
         let align_power = usize::try_from(spec.align().trailing_zeros()).ok()?;
-        let index = *ALIGNED_CLASS_BY_START
-            .get(align_power)?
-            .get(lower_bound_class(required))?;
+        let index = *ALIGNED_CLASS_BY_START.get(align_power)?.get(lower_bound)?;
+
+        Some(SizeClassId { index })
+    }
+
+    pub(crate) fn class(id: SizeClassId) -> Option<SizeClass> {
+        let index = id.index();
         let block_size = *SIZES.get(index)?;
 
-        Some(SizeClass {
-            id: SizeClassId { index },
-            block_size,
-        })
+        Some(SizeClass { id, block_size })
     }
 }
 
@@ -119,36 +134,31 @@ const IDENTITY_CLASS_MAP: [usize; SizeClasses::COUNT] = [
     26,
 ];
 
-const fn lower_bound_class(size: usize) -> usize {
+const fn lower_bound_class(size: usize) -> Option<usize> {
     match size {
-        0..=8 => 0,
-        9..=16 => 1,
-        17..=24 => 2,
-        25..=32 => 3,
-        33..=48 => 4,
-        49..=64 => 5,
-        65..=80 => 6,
-        81..=96 => 7,
-        97..=128 => 8,
-        129..=160 => 9,
-        161..=192 => 10,
-        193..=256 => 11,
-        257..=320 => 12,
-        321..=384 => 13,
-        385..=512 => 14,
-        513..=768 => 15,
-        769..=1024 => 16,
-        1025..=1536 => 17,
-        1537..=2048 => 18,
-        2049..=3072 => 19,
-        3073..=4096 => 20,
-        4097..=6144 => 21,
-        6145..=8192 => 22,
-        8193..=12288 => 23,
-        12289..=16384 => 24,
-        16385..=24576 => 25,
-        _ => 26,
+        1..=32 => Some(class_in_tier(size, 1, 0, 8)),
+        33..=96 => Some(class_in_tier(size, 33, 4, 16)),
+        97..=128 => Some(8),
+        129..=192 => Some(class_in_tier(size, 129, 9, 32)),
+        193..=384 => Some(class_in_tier(size, 193, 11, 64)),
+        385..=512 => Some(14),
+        513..=1024 => Some(class_in_tier(size, 513, 15, 256)),
+        1025..=2048 => Some(class_in_tier(size, 1025, 17, 512)),
+        2049..=4096 => Some(class_in_tier(size, 2049, 19, 1024)),
+        4097..=8192 => Some(class_in_tier(size, 4097, 21, 2048)),
+        8193..=16384 => Some(class_in_tier(size, 8193, 23, 4096)),
+        16385..=32768 => Some(class_in_tier(size, 16385, 25, 8192)),
+        _ => None,
     }
+}
+
+const fn class_in_tier(
+    size: usize,
+    first_size: usize,
+    first_class: usize,
+    quantum: usize,
+) -> usize {
+    first_class + ((size - first_size) / quantum)
 }
 
 #[cfg(test)]
@@ -160,7 +170,7 @@ mod tests {
     #[test]
     fn size_classes_map_one_byte_to_eight() {
         let spec = LayoutSpec::from_size_align(1, 1).unwrap();
-        let class = SizeClasses::get(spec).unwrap();
+        let class = SizeClasses::for_layout(spec).unwrap();
 
         assert_eq!(class.block_size(), 8);
     }
@@ -169,7 +179,7 @@ mod tests {
     fn size_classes_map_exact_boundaries_to_themselves() {
         for &size in &SIZES {
             let spec = LayoutSpec::from_size_align(size, 1).unwrap();
-            let class = SizeClasses::get(spec).unwrap();
+            let class = SizeClasses::for_layout(spec).unwrap();
 
             assert_eq!(class.block_size(), size);
         }
@@ -179,13 +189,20 @@ mod tests {
     fn size_classes_reject_larger_than_small_max() {
         let spec = LayoutSpec::from_size_align(SizeClasses::SMALL_MAX + 1, 1).unwrap();
 
-        assert!(SizeClasses::get(spec).is_none());
+        assert!(SizeClasses::for_layout(spec).is_none());
+    }
+
+    #[test]
+    fn size_classes_reject_over_page_alignment() {
+        let spec = LayoutSpec::from_size_align(1, PAGE_SIZE * 2).unwrap();
+
+        assert!(SizeClasses::for_layout(spec).is_none());
     }
 
     #[test]
     fn size_classes_choose_naturally_aligned_block() {
         let spec = LayoutSpec::from_size_align(17, 16).unwrap();
-        let class = SizeClasses::get(spec).unwrap();
+        let class = SizeClasses::for_layout(spec).unwrap();
 
         assert_eq!(class.block_size(), 32);
     }
@@ -196,7 +213,7 @@ mod tests {
             for align in [1, 2, 4, 8, 16, 32, 64, 128, 4096] {
                 let layout = Layout::from_size_align(size, align).unwrap();
                 let spec = LayoutSpec::from_layout(layout);
-                let Some(class) = SizeClasses::get(spec) else {
+                let Some(class) = SizeClasses::for_layout(spec) else {
                     continue;
                 };
 
@@ -213,11 +230,15 @@ mod tests {
                 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
             ] {
                 let spec = LayoutSpec::from_size_align(size, align).unwrap();
-                let class = SizeClasses::get(spec).map(SizeClass::block_size);
-                let reference = SIZES
-                    .iter()
-                    .copied()
-                    .find(|block_size| *block_size >= size && block_size.is_multiple_of(align));
+                let class = SizeClasses::for_layout(spec).map(SizeClass::block_size);
+                let reference = if align > PAGE_SIZE {
+                    None
+                } else {
+                    SIZES
+                        .iter()
+                        .copied()
+                        .find(|block_size| *block_size >= size && block_size.is_multiple_of(align))
+                };
 
                 assert_eq!(class, reference);
             }

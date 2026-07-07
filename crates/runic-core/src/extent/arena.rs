@@ -4,7 +4,7 @@ use crate::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ExtentTableError {
+pub(crate) enum ExtentArenaError {
     InvalidReservation,
     Occupied,
 }
@@ -20,15 +20,15 @@ impl ExtentReservation {
     }
 }
 
-pub(crate) struct ExtentTable {
+pub(crate) struct ExtentArena {
     slots: SlotStore<Extent>,
 }
 
-// SAFETY: ExtentTable owns allocator metadata accessed through the global heap lock.
+// SAFETY: ExtentArena owns allocator metadata accessed through the global heap lock.
 // Moving ownership to another thread does not permit concurrent metadata mutation.
-unsafe impl Send for ExtentTable {}
+unsafe impl Send for ExtentArena {}
 
-impl ExtentTable {
+impl ExtentArena {
     pub(crate) const fn new(capacity: u32) -> Self {
         Self {
             slots: SlotStore::new(capacity),
@@ -57,25 +57,21 @@ impl ExtentTable {
         &mut self,
         reservation: ExtentReservation,
         extent: Extent,
-    ) -> Result<ExtentId, ExtentTableError> {
+    ) -> Result<ExtentId, ExtentArenaError> {
         if reservation.id != extent.id() {
             self.release(reservation);
-            return Err(ExtentTableError::InvalidReservation);
+            return Err(ExtentArenaError::InvalidReservation);
         }
 
         let Some(index) = Self::index(reservation.id) else {
-            return Err(ExtentTableError::InvalidReservation);
+            return Err(ExtentArenaError::InvalidReservation);
         };
 
         self.slots
             .insert(index, extent)
-            .map_err(ExtentTableError::from)?;
+            .map_err(ExtentArenaError::from)?;
 
         Ok(reservation.id)
-    }
-
-    pub(crate) fn get(&self, id: ExtentId) -> Option<&Extent> {
-        self.slots.get(Self::index(id)?)
     }
 
     pub(crate) fn get_mut(&mut self, id: ExtentId) -> Option<&mut Extent> {
@@ -95,7 +91,7 @@ impl ExtentTable {
     }
 }
 
-impl From<SlotStoreError> for ExtentTableError {
+impl From<SlotStoreError> for ExtentArenaError {
     fn from(error: SlotStoreError) -> Self {
         match error {
             SlotStoreError::InvalidIndex | SlotStoreError::NotReserved => Self::InvalidReservation,
@@ -122,55 +118,55 @@ mod tests {
         Extent::new(id, mapping, spec).unwrap()
     }
 
-    fn table_with_capacity(capacity: usize) -> ExtentTable {
-        ExtentTable::new(u32::try_from(capacity).unwrap())
+    fn arena_with_capacity(capacity: usize) -> ExtentArena {
+        ExtentArena::new(u32::try_from(capacity).unwrap())
     }
 
     #[test]
-    fn extent_table_zero_capacity_reserves_none() {
-        let mut table = ExtentTable::new(0);
+    fn extent_arena_zero_capacity_reserves_none() {
+        let mut arena = ExtentArena::new(0);
 
-        assert_eq!(table.reserve(), None);
+        assert_eq!(arena.reserve(), None);
     }
 
     #[test]
-    fn extent_table_respects_injected_capacity() {
-        let mut table = table_with_capacity(2);
+    fn extent_arena_respects_injected_capacity() {
+        let mut arena = arena_with_capacity(2);
 
-        assert_eq!(table.reserve().unwrap().id().index(), 0);
-        assert_eq!(table.reserve().unwrap().id().index(), 1);
-        assert_eq!(table.reserve(), None);
+        assert_eq!(arena.reserve().unwrap().id().index(), 0);
+        assert_eq!(arena.reserve().unwrap().id().index(), 1);
+        assert_eq!(arena.reserve(), None);
     }
 
     #[test]
-    fn extent_table_insert_get_round_trip() {
-        let mut table = table_with_capacity(4);
-        let reservation = table.reserve().unwrap();
+    fn extent_arena_insert_get_round_trip() {
+        let mut arena = arena_with_capacity(4);
+        let reservation = arena.reserve().unwrap();
         let extent = reusable_extent(reservation.id());
 
-        let id = table.insert(reservation, extent).unwrap();
-        assert_eq!(table.get(id).unwrap().id(), id);
+        let id = arena.insert(reservation, extent).unwrap();
+        assert_eq!(arena.get_mut(id).unwrap().id(), id);
 
-        let extent = table.remove(id).unwrap();
+        let extent = arena.remove(id).unwrap();
         assert_eq!(extent.id(), id);
     }
 
     #[test]
-    fn extent_table_invalid_insert_releases_reservation() {
-        let mut table = table_with_capacity(4);
-        let reservation = table.reserve().unwrap();
+    fn extent_arena_invalid_insert_releases_reservation() {
+        let mut arena = arena_with_capacity(4);
+        let reservation = arena.reserve().unwrap();
         let released = reservation.id();
         let wrong_id = ExtentId::from_index(released.index() + 1).unwrap();
         let extent = reusable_extent(wrong_id);
 
         assert_eq!(
-            table.insert(reservation, extent),
-            Err(ExtentTableError::InvalidReservation)
+            arena.insert(reservation, extent),
+            Err(ExtentArenaError::InvalidReservation)
         );
 
         for expected in 1..4 {
-            assert_eq!(table.reserve().unwrap().id().index(), expected);
+            assert_eq!(arena.reserve().unwrap().id().index(), expected);
         }
-        assert_eq!(table.reserve().unwrap().id(), released);
+        assert_eq!(arena.reserve().unwrap().id(), released);
     }
 }

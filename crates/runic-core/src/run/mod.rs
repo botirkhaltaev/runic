@@ -1,8 +1,7 @@
 use core::{num::NonZeroU32, ptr::NonNull};
 
-mod allocator;
-mod free_list;
-mod table;
+mod arena;
+mod heap;
 
 use crate::{
     layout::LayoutSpec,
@@ -10,10 +9,8 @@ use crate::{
     size_class::{SizeClass, SizeClassId},
 };
 
-use free_list::{FreeBlock, FreeList};
-
-pub(crate) use allocator::{RunAllocator, RunAllocatorError};
-pub(crate) use table::{RunReservation, RunTable};
+pub(crate) use arena::{RunArena, RunReservation};
+pub(crate) use heap::{RunHeap, RunHeapError};
 
 pub(crate) const RUN_SIZE: usize = 64 * 1024;
 const MIN_BLOCK_SIZE: usize = 8;
@@ -38,22 +35,24 @@ impl RunId {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BlockIndex {
-    index: u32,
+    index: usize,
 }
 
 impl BlockIndex {
-    const fn new(index: u32) -> Self {
+    const fn new(index: usize) -> Self {
         Self { index }
     }
 
-    fn word(self) -> Option<usize> {
-        usize::try_from(self.index)
-            .ok()
-            .map(|index| index / BLOCK_STATE_WORD_BITS)
+    fn word(self) -> usize {
+        self.index / BLOCK_STATE_WORD_BITS
     }
 
     fn mask(self) -> u64 {
-        1_u64 << (self.index % u64::BITS)
+        1_u64 << (self.index % BLOCK_STATE_WORD_BITS)
+    }
+
+    fn offset(self, block_size: usize) -> Option<usize> {
+        self.index.checked_mul(block_size)
     }
 }
 
@@ -76,24 +75,12 @@ impl RunBlock {
         self.ptr
     }
 
-    unsafe fn free_block(self) -> FreeBlock {
-        // SAFETY: caller guarantees this run block is currently free-list eligible.
-        unsafe { FreeBlock::new_unchecked(self.ptr) }
-    }
-}
+    fn at_offset(index: BlockIndex, base: NonNull<u8>, block_size: usize) -> Option<Self> {
+        let offset = index.offset(block_size)?;
+        // SAFETY: caller constructs indexes from this run's capacity, so offset is in range.
+        let ptr = unsafe { NonNull::new_unchecked(base.as_ptr().add(offset)) };
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct AllocatedBlock {
-    block: RunBlock,
-}
-
-impl AllocatedBlock {
-    const fn new(block: RunBlock) -> Self {
-        Self { block }
-    }
-
-    const fn block(self) -> RunBlock {
-        self.block
+        Some(Self::new(index, ptr))
     }
 }
 
@@ -105,61 +92,74 @@ pub(crate) enum RunError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BlockStateError {
-    AlreadyAllocated,
+enum FreeBitmapError {
     AlreadyFree,
     InvalidIndex,
 }
 
-struct BlockStates {
+struct FreeBitmap {
     words: [u64; BLOCK_STATE_WORDS],
 }
 
-impl BlockStates {
-    const fn new() -> Self {
-        Self {
-            words: [0; BLOCK_STATE_WORDS],
+impl FreeBitmap {
+    fn new(capacity: u32) -> Self {
+        let mut words = [0; BLOCK_STATE_WORDS];
+        let capacity = usize::try_from(capacity).unwrap_or(0).min(MAX_BLOCKS);
+        let full_words = capacity / BLOCK_STATE_WORD_BITS;
+        let remainder = capacity % BLOCK_STATE_WORD_BITS;
+
+        for word in words.iter_mut().take(full_words) {
+            *word = u64::MAX;
         }
+
+        if remainder != 0
+            && let Some(word) = words.get_mut(full_words)
+        {
+            *word = (1_u64 << remainder) - 1;
+        }
+
+        Self { words }
     }
 
-    fn mark_allocated(&mut self, index: BlockIndex) -> Result<(), BlockStateError> {
-        let word = self.word_mut(index)?;
+    fn take_free(&mut self) -> Option<BlockIndex> {
+        for word_index in 0..self.words.len() {
+            let word = self.words.get_mut(word_index)?;
+            if *word == 0 {
+                continue;
+            }
+
+            let bit = word.trailing_zeros();
+            *word &= !(1_u64 << bit);
+            let index = word_index
+                .checked_mul(BLOCK_STATE_WORD_BITS)?
+                .checked_add(usize::try_from(bit).ok()?)?;
+
+            return Some(BlockIndex::new(index));
+        }
+
+        None
+    }
+
+    fn is_allocated(&self, index: BlockIndex) -> Result<bool, FreeBitmapError> {
+        let Some(word) = self.words.get(index.word()) else {
+            return Err(FreeBitmapError::InvalidIndex);
+        };
+
+        Ok(*word & index.mask() == 0)
+    }
+
+    fn release(&mut self, index: BlockIndex) -> Result<(), FreeBitmapError> {
+        let Some(word) = self.words.get_mut(index.word()) else {
+            return Err(FreeBitmapError::InvalidIndex);
+        };
         let mask = index.mask();
 
         if *word & mask != 0 {
-            return Err(BlockStateError::AlreadyAllocated);
+            return Err(FreeBitmapError::AlreadyFree);
         }
 
         *word |= mask;
         Ok(())
-    }
-
-    fn mark_free(&mut self, index: BlockIndex) -> Result<(), BlockStateError> {
-        let word = self.word_mut(index)?;
-        let mask = index.mask();
-
-        if *word & mask == 0 {
-            return Err(BlockStateError::AlreadyFree);
-        }
-
-        *word &= !mask;
-        Ok(())
-    }
-
-    fn is_allocated(&self, index: BlockIndex) -> Result<bool, BlockStateError> {
-        let Some(word) = index.word().and_then(|word| self.words.get(word)) else {
-            return Err(BlockStateError::InvalidIndex);
-        };
-
-        Ok(*word & index.mask() != 0)
-    }
-
-    fn word_mut(&mut self, index: BlockIndex) -> Result<&mut u64, BlockStateError> {
-        let Some(word) = index.word().and_then(|word| self.words.get_mut(word)) else {
-            return Err(BlockStateError::InvalidIndex);
-        };
-
-        Ok(word)
     }
 }
 
@@ -169,11 +169,11 @@ pub(crate) struct Run {
     range: AddressRange,
     class: SizeClassId,
     block_size: usize,
+    block_shift: Option<u32>,
     capacity: u32,
     live: u32,
-    available_next: Option<RunId>,
-    states: BlockStates,
-    free: FreeList,
+    available_next: Option<NonNull<Run>>,
+    free: FreeBitmap,
 }
 
 impl Run {
@@ -181,36 +181,18 @@ impl Run {
         let range = mapping.range();
         let block_size = class.block_size();
         let capacity = range.len().checked_div(block_size).unwrap_or(0);
-        let mut run = Self {
+        Self {
             id,
             mapping,
             range,
             class: class.id(),
             block_size,
+            block_shift: block_size_shift(block_size),
             capacity: u32::try_from(capacity).unwrap_or(u32::MAX),
             live: 0,
             available_next: None,
-            states: BlockStates::new(),
-            free: FreeList::new(),
-        };
-
-        for index in 0..capacity {
-            let Some(offset) = index.checked_mul(block_size) else {
-                break;
-            };
-            // SAFETY: offset is within the run because index < range.len() / block_size.
-            let raw_ptr = unsafe { range.base().as_ptr().add(offset) };
-            // SAFETY: raw_ptr is derived from a non-null mapping base plus an in-bounds offset.
-            let block_ptr = unsafe { NonNull::new_unchecked(raw_ptr) };
-            let Some(block_index) = u32::try_from(index).ok().map(BlockIndex::new) else {
-                break;
-            };
-            let block = RunBlock::new(block_index, block_ptr);
-            // SAFETY: newly created run blocks start free and are valid free-list storage.
-            unsafe { run.free.push(block.free_block()) };
+            free: FreeBitmap::new(u32::try_from(capacity).unwrap_or(u32::MAX)),
         }
-
-        run
     }
 
     pub(crate) const fn id(&self) -> RunId {
@@ -229,15 +211,11 @@ impl Run {
         !self.has_available_blocks()
     }
 
-    pub(crate) const fn available_next(&self) -> Option<RunId> {
-        self.available_next
-    }
-
-    pub(crate) fn set_available_next(&mut self, next: Option<RunId>) {
+    pub(crate) fn set_available_next(&mut self, next: Option<NonNull<Run>>) {
         self.available_next = next;
     }
 
-    pub(crate) fn take_available_next(&mut self) -> Option<RunId> {
+    pub(crate) fn take_available_next(&mut self) -> Option<NonNull<Run>> {
         self.available_next.take()
     }
 
@@ -247,35 +225,27 @@ impl Run {
         self.range
     }
 
-    pub(crate) fn allocate(&mut self, spec: LayoutSpec) -> Option<NonNull<u8>> {
-        let free = self.free.pop()?;
-        let block = self.block_at(free.ptr())?;
+    pub(crate) fn allocate(&mut self) -> Option<RunBlock> {
+        let index = self.free.take_free()?;
+        let block = RunBlock::at_offset(index, self.range.base(), self.block_size)?;
 
-        if !block.ptr().as_ptr().addr().is_multiple_of(spec.align()) {
-            // SAFETY: block was just popped from this run's free list and is being restored unchanged.
-            unsafe { self.free.push(block.free_block()) };
-            return None;
-        }
-
-        self.states.mark_allocated(block.index()).ok()?;
         self.live = self.live.checked_add(1)?;
-        Some(block.ptr())
+        Some(block)
     }
 
     pub(crate) fn free(&mut self, ptr: NonNull<u8>) -> Result<(), RunError> {
-        let block = self.allocated_block_at(ptr)?;
-
-        self.return_allocated_block(block)
-    }
-
-    pub(crate) fn allocated_block_at(&self, ptr: NonNull<u8>) -> Result<AllocatedBlock, RunError> {
         let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
 
-        match self.states.is_allocated(block.index()) {
-            Ok(true) => Ok(AllocatedBlock::new(block)),
+        self.return_block(block)
+    }
+
+    pub(crate) fn allocated_block_at(&self, ptr: NonNull<u8>) -> Result<RunBlock, RunError> {
+        let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
+
+        match self.free.is_allocated(block.index()) {
+            Ok(true) => Ok(block),
             Ok(false) => Err(RunError::DoubleFree),
-            Err(BlockStateError::InvalidIndex) => Err(RunError::InvalidPointer),
-            Err(BlockStateError::AlreadyAllocated | BlockStateError::AlreadyFree) => {
+            Err(FreeBitmapError::InvalidIndex | FreeBitmapError::AlreadyFree) => {
                 Err(RunError::InvalidPointer)
             }
         }
@@ -288,38 +258,42 @@ impl Run {
     ) -> Result<bool, RunError> {
         self.allocated_block_at(ptr)?;
 
-        Ok(self.block_size >= spec.size() && ptr.as_ptr().addr().is_multiple_of(spec.align()))
+        Ok(self.block_size >= spec.size() && spec.is_addr_aligned(ptr.as_ptr().addr()))
     }
 
     pub(crate) fn block_at(&self, ptr: NonNull<u8>) -> Option<RunBlock> {
         let offset = self.range.offset_of(ptr)?;
-
-        if !offset.is_multiple_of(self.block_size) {
-            return None;
-        }
-
-        let index = offset.checked_div(self.block_size)?;
+        let index = self.block_index(offset)?;
         let capacity = usize::try_from(self.capacity).ok()?;
 
         if index >= capacity {
             return None;
         }
 
-        Some(RunBlock::new(
-            BlockIndex::new(u32::try_from(index).ok()?),
-            ptr,
-        ))
+        Some(RunBlock::new(BlockIndex::new(index), ptr))
     }
 
-    fn return_allocated_block(&mut self, allocated: AllocatedBlock) -> Result<(), RunError> {
-        let block = allocated.block();
-
-        match self.states.mark_free(block.index()) {
-            Ok(()) => {}
-            Err(BlockStateError::AlreadyFree) => return Err(RunError::DoubleFree),
-            Err(BlockStateError::InvalidIndex | BlockStateError::AlreadyAllocated) => {
-                return Err(RunError::InvalidPointer);
+    fn block_index(&self, offset: usize) -> Option<usize> {
+        if let Some(shift) = self.block_shift {
+            if offset & (self.block_size - 1) != 0 {
+                return None;
             }
+
+            return Some(offset >> shift);
+        }
+
+        if !offset.is_multiple_of(self.block_size) {
+            return None;
+        }
+
+        offset.checked_div(self.block_size)
+    }
+
+    fn return_block(&mut self, block: RunBlock) -> Result<(), RunError> {
+        match self.free.release(block.index()) {
+            Ok(()) => {}
+            Err(FreeBitmapError::AlreadyFree) => return Err(RunError::DoubleFree),
+            Err(FreeBitmapError::InvalidIndex) => return Err(RunError::InvalidPointer),
         }
 
         let Some(live) = self.live.checked_sub(1) else {
@@ -328,9 +302,15 @@ impl Run {
 
         self.live = live;
 
-        // SAFETY: state transition above made this validated block free-list eligible.
-        unsafe { self.free.push(block.free_block()) };
         Ok(())
+    }
+}
+
+const fn block_size_shift(block_size: usize) -> Option<u32> {
+    if block_size.is_power_of_two() {
+        Some(block_size.trailing_zeros())
+    } else {
+        None
     }
 }
 
@@ -342,7 +322,7 @@ mod tests {
 
     fn class_for(size: usize, align: usize) -> SizeClass {
         let spec = LayoutSpec::from_size_align(size, align).unwrap();
-        SizeClasses::get(spec).unwrap()
+        SizeClasses::for_layout(spec).unwrap()
     }
 
     #[test]
@@ -350,13 +330,13 @@ mod tests {
         let mapping = OsMemory::map(RUN_SIZE).unwrap();
         let class = class_for(64, 8);
         let mut run = Run::new(RunId::from_index(0).unwrap(), mapping, class);
-        let spec = LayoutSpec::from_size_align(64, 8).unwrap();
         let capacity = RUN_SIZE / class.block_size();
         let mut seen = vec![false; capacity];
 
         for _ in 0..capacity {
-            let ptr = run.allocate(spec).unwrap();
-            let index = usize::try_from(run.block_at(ptr).unwrap().index().index).unwrap();
+            let block = run.allocate().unwrap();
+            let ptr = block.ptr();
+            let index = block.index().index;
 
             assert!(!seen[index]);
             assert!(index < capacity);
@@ -365,7 +345,7 @@ mod tests {
             seen[index] = true;
         }
 
-        assert!(run.allocate(spec).is_none());
+        assert!(run.allocate().is_none());
         assert!(seen.into_iter().all(|value| value));
     }
 
@@ -374,23 +354,20 @@ mod tests {
         let mapping = OsMemory::map(RUN_SIZE).unwrap();
         let class = class_for(128, 8);
         let mut run = Run::new(RunId::from_index(1).unwrap(), mapping, class);
-        let spec = LayoutSpec::from_size_align(128, 8).unwrap();
 
-        let ptr = run.allocate(spec).unwrap();
-        let block = run.allocated_block_at(ptr).unwrap();
+        let ptr = run.allocate().unwrap().ptr();
 
-        assert_eq!(run.return_allocated_block(block), Ok(()));
+        assert_eq!(run.free(ptr), Ok(()));
 
-        assert_eq!(run.allocate(spec), Some(ptr));
+        assert_eq!(run.allocate().map(RunBlock::ptr), Some(ptr));
     }
 
     #[test]
     fn reusable_run_resizes_block_in_place_for_same_class_layout() {
         let mapping = OsMemory::map(RUN_SIZE).unwrap();
         let mut run = Run::new(RunId::from_index(7).unwrap(), mapping, class_for(64, 8));
-        let old = LayoutSpec::from_size_align(48, 8).unwrap();
         let new = LayoutSpec::from_size_align(64, 8).unwrap();
-        let ptr = run.allocate(old).unwrap();
+        let ptr = run.allocate().unwrap().ptr();
 
         assert_eq!(run.resize_in_place(ptr, new), Ok(true));
     }
@@ -399,9 +376,8 @@ mod tests {
     fn reusable_run_rejects_allocated_block_that_needs_larger_class() {
         let mapping = OsMemory::map(RUN_SIZE).unwrap();
         let mut run = Run::new(RunId::from_index(8).unwrap(), mapping, class_for(64, 8));
-        let old = LayoutSpec::from_size_align(64, 8).unwrap();
         let new = LayoutSpec::from_size_align(80, 8).unwrap();
-        let ptr = run.allocate(old).unwrap();
+        let ptr = run.allocate().unwrap().ptr();
 
         assert_eq!(run.resize_in_place(ptr, new), Ok(false));
     }
@@ -411,10 +387,21 @@ mod tests {
         let mapping = OsMemory::map(RUN_SIZE).unwrap();
         let class = class_for(64, 8);
         let mut run = Run::new(RunId::from_index(2).unwrap(), mapping, class);
-        let spec = LayoutSpec::from_size_align(64, 8).unwrap();
-        let ptr = run.allocate(spec).unwrap();
+        let ptr = run.allocate().unwrap().ptr();
         let interior = unsafe { NonNull::new_unchecked(ptr.as_ptr().add(1)) };
 
+        assert!(run.block_at(interior).is_none());
+    }
+
+    #[test]
+    fn reusable_run_rejects_interior_pointer_for_non_power_of_two_class() {
+        let mapping = OsMemory::map(RUN_SIZE).unwrap();
+        let class = class_for(24, 8);
+        let mut run = Run::new(RunId::from_index(2).unwrap(), mapping, class);
+        let ptr = run.allocate().unwrap().ptr();
+        let interior = unsafe { NonNull::new_unchecked(ptr.as_ptr().add(1)) };
+
+        assert!(run.block_at(ptr).is_some());
         assert!(run.block_at(interior).is_none());
     }
 
@@ -423,8 +410,7 @@ mod tests {
         let mapping = OsMemory::map(RUN_SIZE).unwrap();
         let class = class_for(64, 8);
         let mut run = Run::new(RunId::from_index(7).unwrap(), mapping, class);
-        let spec = LayoutSpec::from_size_align(64, 8).unwrap();
-        let ptr = run.allocate(spec).unwrap();
+        let ptr = run.allocate().unwrap().ptr();
 
         assert_eq!(run.free(ptr), Ok(()));
         assert_eq!(run.free(ptr), Err(RunError::DoubleFree));
@@ -443,12 +429,12 @@ mod tests {
     fn reusable_run_returns_aligned_blocks_for_alignment_sensitive_layout() {
         let mapping = OsMemory::map(RUN_SIZE).unwrap();
         let spec = LayoutSpec::from_size_align(17, 16).unwrap();
-        let class = SizeClasses::get(spec).unwrap();
+        let class = SizeClasses::for_layout(spec).unwrap();
         let mut run = Run::new(RunId::from_index(3).unwrap(), mapping, class);
         let capacity = RUN_SIZE / class.block_size();
 
         for _ in 0..capacity {
-            let ptr = run.allocate(spec).unwrap();
+            let ptr = run.allocate().unwrap().ptr();
             assert_eq!(ptr.as_ptr() as usize % 16, 0);
         }
     }

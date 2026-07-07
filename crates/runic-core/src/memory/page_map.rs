@@ -6,9 +6,9 @@ use core::{
 };
 
 use crate::{
-    extent::ExtentId,
+    extent::Extent,
     memory::{Mapping, OsMemory, PAGE_SIZE},
-    run::RunId,
+    run::Run,
 };
 
 const PAGE_SHIFT: usize = 12;
@@ -27,9 +27,11 @@ pub(crate) enum PageMapError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PageEntry {
-    Run(RunId),
-    Extent(ExtentId),
+pub(crate) enum PageOwner {
+    // Pointers must refer to live arena entries until their page-map range is removed.
+    Run(NonNull<Run>),
+    // Pointers must refer to live arena entries until their page-map range is removed.
+    Extent(NonNull<Extent>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -606,51 +608,46 @@ enum SpanSlotState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MapEntry {
-    raw: u32,
+    raw: usize,
 }
 
 impl MapEntry {
-    const KIND_EXTENT: u32 = 1 << 31;
-    const ID_MASK: u32 = !Self::KIND_EXTENT;
+    const KIND_EXTENT: usize = 1;
+    const POINTER_MASK: usize = !Self::KIND_EXTENT;
 
     const fn empty() -> Self {
         Self { raw: 0 }
     }
 
-    fn occupied(entry: PageEntry) -> Option<Self> {
-        match entry {
-            PageEntry::Run(id) => Self::encode(id.index(), 0),
-            PageEntry::Extent(id) => Self::encode(id.index(), Self::KIND_EXTENT),
-        }
-    }
+    fn from_owner(entry: PageOwner) -> Option<Self> {
+        let (ptr, kind) = match entry {
+            PageOwner::Run(ptr) => (ptr.cast::<()>().as_ptr().addr(), 0),
+            PageOwner::Extent(ptr) => (ptr.cast::<()>().as_ptr().addr(), Self::KIND_EXTENT),
+        };
 
-    fn encode(id: u32, kind: u32) -> Option<Self> {
-        let encoded = id.checked_add(1)?;
-
-        if encoded > Self::ID_MASK {
+        if ptr & Self::KIND_EXTENT != 0 {
             return None;
         }
 
-        Some(Self {
-            raw: kind | encoded,
-        })
+        Some(Self { raw: ptr | kind })
     }
 
     const fn is_empty(self) -> bool {
         self.raw == 0
     }
 
-    fn page(self) -> Option<PageEntry> {
+    fn owner(self) -> Option<PageOwner> {
         if self.is_empty() {
             return None;
         }
 
-        let raw = (self.raw & Self::ID_MASK).checked_sub(1)?;
+        let raw = self.raw & Self::POINTER_MASK;
+        let ptr = NonNull::new(core::ptr::with_exposed_provenance_mut::<()>(raw))?;
 
         if self.raw & Self::KIND_EXTENT == 0 {
-            RunId::from_index(raw).map(PageEntry::Run)
+            Some(PageOwner::Run(ptr.cast()))
         } else {
-            ExtentId::from_index(raw).map(PageEntry::Extent)
+            Some(PageOwner::Extent(ptr.cast()))
         }
     }
 }
@@ -672,18 +669,18 @@ impl PageMap {
         Self { l1: None }
     }
 
-    pub(crate) fn get(&self, ptr: NonNull<u8>) -> Option<PageEntry> {
+    pub(crate) fn get(&self, ptr: NonNull<u8>) -> Option<PageOwner> {
         let (l1_index, l2_index) = Page::containing(ptr).indexes()?;
 
-        self.l1()?.page_entry(l1_index, l2_index)?.page()
+        self.l1()?.page_entry(l1_index, l2_index)?.owner()
     }
 
     pub(crate) fn insert(
         &mut self,
         range: PageRange,
-        entry: PageEntry,
+        entry: PageOwner,
     ) -> Result<(), PageMapError> {
-        let occupied = MapEntry::occupied(entry).ok_or(PageMapError::InvalidRange)?;
+        let occupied = MapEntry::from_owner(entry).ok_or(PageMapError::InvalidRange)?;
 
         self.validate_insert(range)?;
         self.prepare_insert(range)?;
@@ -693,10 +690,10 @@ impl PageMap {
 
             for segment in range.segments() {
                 let published = match entry {
-                    PageEntry::Run(_) => l1
+                    PageOwner::Run(_) => l1
                         .entry_mut(segment.l1)?
                         .assign_direct(segment.l2, occupied),
-                    PageEntry::Extent(_) => {
+                    PageOwner::Extent(_) => {
                         l1.entry_mut(segment.l1)?.assign_span(segment.l2, occupied)
                     }
                 };
@@ -725,7 +722,7 @@ impl PageMap {
     pub(crate) fn remove(
         &mut self,
         range: PageRange,
-        expected: PageEntry,
+        expected: PageOwner,
         l2_table_policy: L2TablePolicy,
     ) -> Result<(), PageMapError> {
         self.validate_remove(range, expected)?;
@@ -809,8 +806,8 @@ impl PageMap {
         Ok(())
     }
 
-    fn validate_remove(&self, range: PageRange, expected: PageEntry) -> Result<(), PageMapError> {
-        let expected = MapEntry::occupied(expected).ok_or(PageMapError::InvalidRange)?;
+    fn validate_remove(&self, range: PageRange, expected: PageOwner) -> Result<(), PageMapError> {
+        let expected = MapEntry::from_owner(expected).ok_or(PageMapError::InvalidRange)?;
 
         let Some(l1) = self.l1() else {
             return Err(PageMapError::UnexpectedEntry);
@@ -875,16 +872,18 @@ const _: () = assert!(
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn id(raw: u32) -> RunId {
-        RunId::from_index(raw).unwrap()
+
+    fn owner_ptr<T>(raw: u32) -> NonNull<T> {
+        let addr = (usize::try_from(raw).unwrap() + 1) << 4;
+        NonNull::new(core::ptr::with_exposed_provenance_mut(addr)).unwrap()
     }
 
-    fn run(raw: u32) -> PageEntry {
-        PageEntry::Run(id(raw))
+    fn run(raw: u32) -> PageOwner {
+        PageOwner::Run(owner_ptr(raw))
     }
 
-    fn extent(raw: u32) -> PageEntry {
-        PageEntry::Extent(ExtentId::from_index(raw).unwrap())
+    fn extent(raw: u32) -> PageOwner {
+        PageOwner::Extent(owner_ptr(raw))
     }
 
     fn has_l2_table(map: &PageMap, ptr: NonNull<u8>) -> bool {
@@ -1013,11 +1012,11 @@ mod tests {
         assert_eq!(span_count(&map, mapping.base()), 0);
         assert_eq!(
             direct_entry(&map, mapping.base()),
-            MapEntry::occupied(run(4))
+            MapEntry::from_owner(run(4))
         );
         assert_eq!(
             direct_entry(&map, mapping.ptr_at(PAGE_SIZE)),
-            MapEntry::occupied(run(4))
+            MapEntry::from_owner(run(4))
         );
     }
 
@@ -1351,7 +1350,7 @@ mod tests {
         assert_eq!(map.get(fallback), Some(extent(10_000)));
         assert_eq!(
             direct_entry(&map, fallback),
-            MapEntry::occupied(extent(10_000))
+            MapEntry::from_owner(extent(10_000))
         );
         assert_eq!(
             map.remove(

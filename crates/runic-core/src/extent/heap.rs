@@ -2,29 +2,29 @@ use core::ptr::NonNull;
 
 use crate::{
     allocation::{Allocation, ZeroStatus},
-    extent::{Extent, ExtentId, ExtentTable},
+    extent::{Extent, ExtentArena},
     layout::LayoutSpec,
-    memory::{L2TablePolicy, OsMemory, PageEntry, PageMap, PageRange},
+    memory::{L2TablePolicy, OsMemory, PageMap, PageOwner, PageRange},
 };
 
 use super::{ExtentReservation, mapping_cache::MappingCache};
 
-pub(crate) struct ExtentAllocator {
-    extents: ExtentTable,
+pub(crate) struct ExtentHeap {
+    extents: ExtentArena,
     mapping_cache: MappingCache,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ExtentAllocatorError {
+pub(crate) enum ExtentHeapError {
     MissingExtent,
     InvalidPointer,
     InvalidMetadata,
 }
 
-impl ExtentAllocator {
+impl ExtentHeap {
     pub(crate) const fn new(capacity: u32) -> Self {
         Self {
-            extents: ExtentTable::new(capacity),
+            extents: ExtentArena::new(capacity),
             mapping_cache: MappingCache::new(),
         }
     }
@@ -46,34 +46,31 @@ impl ExtentAllocator {
         debug_assert_eq!(extent.id(), id, "new extent should keep its reserved id");
         let ptr = extent.ptr();
 
-        if self.insert_extent(reservation, extent, pages).is_err() {
-            return None;
-        }
+        self.insert_extent(reservation, extent, pages)?;
 
         Some(Allocation::new(ptr, zero_status))
     }
 
     pub(crate) fn free(
         &mut self,
-        id: ExtentId,
+        extent_ptr: NonNull<Extent>,
         ptr: NonNull<u8>,
         pages: &mut PageMap,
-    ) -> Result<(), ExtentAllocatorError> {
-        let (range, mapping_len) = {
-            let Some(extent) = self.extents.get(id) else {
-                return Err(ExtentAllocatorError::MissingExtent);
-            };
+    ) -> Result<(), ExtentHeapError> {
+        let (id, range, mapping_len) = {
+            // SAFETY: PageMap stores only pointers published from this allocator's live ExtentArena.
+            let extent = unsafe { extent_ptr.as_ref() };
 
             if extent.free(ptr).is_err() {
-                return Err(ExtentAllocatorError::InvalidPointer);
+                return Err(ExtentHeapError::InvalidPointer);
             }
 
-            (extent.range(), extent.mapping_len())
+            (extent.id(), extent.range(), extent.mapping_len())
         };
 
         let retain_mapping = self.mapping_cache.can_retain(mapping_len);
         let Some(page_range) = PageRange::new(range.base(), range.len()) else {
-            return Err(ExtentAllocatorError::InvalidMetadata);
+            return Err(ExtentHeapError::InvalidMetadata);
         };
 
         let empty_l2_tables = if retain_mapping {
@@ -82,11 +79,11 @@ impl ExtentAllocator {
             L2TablePolicy::ReleaseEmpty
         };
         pages
-            .remove(page_range, PageEntry::Extent(id), empty_l2_tables)
-            .map_err(|_| ExtentAllocatorError::InvalidMetadata)?;
+            .remove(page_range, PageOwner::Extent(extent_ptr), empty_l2_tables)
+            .map_err(|_| ExtentHeapError::InvalidMetadata)?;
 
         let Some(extent) = self.extents.remove(id) else {
-            return Err(ExtentAllocatorError::MissingExtent);
+            return Err(ExtentHeapError::MissingExtent);
         };
 
         let mapping = extent.into_mapping();
@@ -98,18 +95,16 @@ impl ExtentAllocator {
     }
 
     pub(crate) fn resize_in_place(
-        &mut self,
-        id: ExtentId,
+        mut extent: NonNull<Extent>,
         ptr: NonNull<u8>,
         spec: LayoutSpec,
-    ) -> Result<bool, ExtentAllocatorError> {
-        let Some(extent) = self.extents.get_mut(id) else {
-            return Err(ExtentAllocatorError::MissingExtent);
-        };
+    ) -> Result<bool, ExtentHeapError> {
+        // SAFETY: PageMap stores only pointers published from this allocator's live ExtentArena.
+        let extent = unsafe { extent.as_mut() };
 
         extent
             .resize_in_place(ptr, spec)
-            .map_err(|_| ExtentAllocatorError::InvalidPointer)
+            .map_err(|_| ExtentHeapError::InvalidPointer)
     }
 
     fn insert_extent(
@@ -117,25 +112,34 @@ impl ExtentAllocator {
         reservation: ExtentReservation,
         extent: Extent,
         pages: &mut PageMap,
-    ) -> Result<(), ()> {
+    ) -> Option<NonNull<Extent>> {
         let id = reservation.id();
         let range = extent.range();
 
         if self.extents.insert(reservation, extent).is_err() {
-            return Err(());
+            return None;
         }
 
         let Some(page_range) = PageRange::new(range.base(), range.len()) else {
             let _removed = self.extents.remove(id);
-            return Err(());
+            return None;
         };
 
-        if pages.insert(page_range, PageEntry::Extent(id)).is_err() {
+        let Some(inserted_extent) = self.extents.get_mut(id) else {
             let _removed = self.extents.remove(id);
-            return Err(());
+            return None;
+        };
+        let extent_ptr = NonNull::from(&mut *inserted_extent);
+
+        if pages
+            .insert(page_range, PageOwner::Extent(extent_ptr))
+            .is_err()
+        {
+            let _removed = self.extents.remove(id);
+            return None;
         }
 
-        Ok(())
+        Some(extent_ptr)
     }
 }
 
@@ -144,7 +148,7 @@ mod tests {
     use crate::{
         extent::{Extent, ExtentId},
         layout::LayoutSpec,
-        memory::{OsMemory, PageEntry, PageMap, PageRange},
+        memory::{OsMemory, PageMap, PageOwner, PageRange},
     };
 
     use super::*;
@@ -159,22 +163,22 @@ mod tests {
 
     #[test]
     fn failed_extent_page_publication_removes_table_entry() {
-        let mut allocator = ExtentAllocator::new(4);
+        let mut allocator = ExtentHeap::new(4);
         let mut pages = PageMap::new();
         let reservation = allocator.extents.reserve().unwrap();
         let id = reservation.id();
         let extent = reusable_extent(id);
         let range = extent.range();
         let page_range = PageRange::new(range.base(), range.len()).unwrap();
-        let existing = PageEntry::Extent(ExtentId::from_index(900).unwrap());
+        let existing = PageOwner::Extent(NonNull::dangling());
 
         pages.insert(page_range, existing).unwrap();
 
         assert_eq!(
             allocator.insert_extent(reservation, extent, &mut pages),
-            Err(())
+            None
         );
-        assert!(allocator.extents.get(id).is_none());
+        assert!(allocator.extents.get_mut(id).is_none());
         assert_eq!(pages.get(range.base()), Some(existing));
     }
 }

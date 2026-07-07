@@ -39,6 +39,12 @@ impl LayoutSpec {
         addr.checked_add(mask).map(|value| value & !mask)
     }
 
+    pub(crate) fn is_addr_aligned(self, addr: usize) -> bool {
+        debug_assert!(self.align.is_power_of_two());
+
+        addr & (self.align - 1) == 0
+    }
+
     pub(crate) fn mapping_len(self, page_size: usize) -> Option<usize> {
         let len = self.size.checked_add(self.align)?;
         let mask = page_size.checked_sub(1)?;
@@ -86,6 +92,14 @@ mod tests {
         let spec = LayoutSpec::from_size_align(1, 16).unwrap();
 
         assert_eq!(spec.align_addr(32), Some(32));
+    }
+
+    #[test]
+    fn layout_spec_detects_aligned_address() {
+        let spec = LayoutSpec::from_size_align(1, 16).unwrap();
+
+        assert!(spec.is_addr_aligned(32));
+        assert!(!spec.is_addr_aligned(33));
     }
 
     #[test]
