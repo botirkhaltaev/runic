@@ -112,7 +112,7 @@ mod tests {
     fn reusable_run(id: RunId) -> Run {
         let mapping = OsMemory::map(RUN_SIZE).unwrap();
         let spec = LayoutSpec::from_size_align(64, 8).unwrap();
-        let class = SizeClasses::get(spec).unwrap();
+        let class = SizeClasses::for_layout(spec).unwrap();
 
         Run::new(id, mapping, class)
     }
@@ -123,125 +123,125 @@ mod tests {
 
     #[test]
     fn run_arena_zero_capacity_reserves_none() {
-        let mut table = RunArena::new(0);
+        let mut arena = RunArena::new(0);
 
-        assert_eq!(table.reserve(), None);
+        assert_eq!(arena.reserve(), None);
     }
 
     #[test]
     fn run_arena_reserves_ids_from_zero() {
-        let mut table = arena_with_capacity(4);
+        let mut arena = arena_with_capacity(4);
 
-        assert_eq!(table.reserve().unwrap().id().index(), 0);
-        assert_eq!(table.reserve().unwrap().id().index(), 1);
+        assert_eq!(arena.reserve().unwrap().id().index(), 0);
+        assert_eq!(arena.reserve().unwrap().id().index(), 1);
     }
 
     #[test]
     fn run_arena_respects_injected_capacity() {
-        let mut table = arena_with_capacity(2);
+        let mut arena = arena_with_capacity(2);
 
-        assert_eq!(table.reserve().unwrap().id().index(), 0);
-        assert_eq!(table.reserve().unwrap().id().index(), 1);
-        assert_eq!(table.reserve(), None);
+        assert_eq!(arena.reserve().unwrap().id().index(), 0);
+        assert_eq!(arena.reserve().unwrap().id().index(), 1);
+        assert_eq!(arena.reserve(), None);
     }
 
     #[test]
     fn run_arena_release_makes_reserved_slot_available() {
-        let mut table = arena_with_capacity(4);
-        let first = table.reserve().unwrap();
-        let second = table.reserve().unwrap();
+        let mut arena = arena_with_capacity(4);
+        let first = arena.reserve().unwrap();
+        let second = arena.reserve().unwrap();
 
-        table.release(first);
+        arena.release(first);
 
         assert_eq!(second.id().index(), 1);
         for expected in 2..4 {
-            assert_eq!(table.reserve().unwrap().id().index(), expected);
+            assert_eq!(arena.reserve().unwrap().id().index(), expected);
         }
-        assert_eq!(table.reserve().unwrap().id(), first.id());
+        assert_eq!(arena.reserve().unwrap().id(), first.id());
     }
 
     #[test]
     fn run_arena_insert_get_round_trip() {
-        let mut table = arena_with_capacity(4);
-        let reservation = table.reserve().unwrap();
+        let mut arena = arena_with_capacity(4);
+        let reservation = arena.reserve().unwrap();
         let run = reusable_run(reservation.id());
 
-        let id = table.insert(reservation, run).unwrap();
-        assert_eq!(table.get_mut(id).unwrap().id(), id);
+        let id = arena.insert(reservation, run).unwrap();
+        assert_eq!(arena.get_mut(id).unwrap().id(), id);
 
-        let run = table.remove(id).unwrap();
+        let run = arena.remove(id).unwrap();
         assert_eq!(run.id(), id);
     }
 
     #[test]
     fn run_arena_rejects_occupied_slot() {
-        let mut table = arena_with_capacity(4);
-        let reservation = table.reserve().unwrap();
+        let mut arena = arena_with_capacity(4);
+        let reservation = arena.reserve().unwrap();
         let first = reusable_run(reservation.id());
         let second = reusable_run(reservation.id());
 
-        let id = table.insert(reservation, first).unwrap();
+        let id = arena.insert(reservation, first).unwrap();
         assert_eq!(
-            table.insert(RunReservation { id }, second),
+            arena.insert(RunReservation { id }, second),
             Err(RunArenaError::Occupied)
         );
 
-        let _removed = table.remove(id);
+        let _removed = arena.remove(id);
     }
 
     #[test]
     fn run_arena_rejects_unreserved_insert() {
-        let mut table = arena_with_capacity(4);
+        let mut arena = arena_with_capacity(4);
         let id = RunId::from_index(0).unwrap();
         let run = reusable_run(id);
 
         assert_eq!(
-            table.insert(RunReservation { id }, run),
+            arena.insert(RunReservation { id }, run),
             Err(RunArenaError::InvalidReservation)
         );
     }
 
     #[test]
     fn run_arena_invalid_insert_releases_reservation() {
-        let mut table = arena_with_capacity(4);
-        let reservation = table.reserve().unwrap();
+        let mut arena = arena_with_capacity(4);
+        let reservation = arena.reserve().unwrap();
         let released = reservation.id();
         let wrong_id = RunId::from_index(released.index() + 1).unwrap();
         let run = reusable_run(wrong_id);
 
         assert_eq!(
-            table.insert(reservation, run),
+            arena.insert(reservation, run),
             Err(RunArenaError::InvalidReservation)
         );
 
         for expected in 1..4 {
-            assert_eq!(table.reserve().unwrap().id().index(), expected);
+            assert_eq!(arena.reserve().unwrap().id().index(), expected);
         }
-        assert_eq!(table.reserve().unwrap().id(), released);
+        assert_eq!(arena.reserve().unwrap().id(), released);
     }
 
     #[test]
     fn run_arena_get_mut_allows_run_mutation() {
-        let mut table = arena_with_capacity(4);
-        let reservation = table.reserve().unwrap();
+        let mut arena = arena_with_capacity(4);
+        let reservation = arena.reserve().unwrap();
         let run = reusable_run(reservation.id());
 
-        let id = table.insert(reservation, run).unwrap();
-        let ptr = table.get_mut(id).unwrap().allocate().unwrap().ptr();
+        let id = arena.insert(reservation, run).unwrap();
+        let ptr = arena.get_mut(id).unwrap().allocate().unwrap().ptr();
 
-        assert!(table.get_mut(id).unwrap().free(ptr).is_ok());
+        assert!(arena.get_mut(id).unwrap().free(ptr).is_ok());
 
-        let _removed = table.remove(id);
+        let _removed = arena.remove(id);
     }
 
     #[test]
     fn run_arena_remove_clears_slot() {
-        let mut table = arena_with_capacity(4);
-        let reservation = table.reserve().unwrap();
+        let mut arena = arena_with_capacity(4);
+        let reservation = arena.reserve().unwrap();
         let run = reusable_run(reservation.id());
 
-        let id = table.insert(reservation, run).unwrap();
-        assert!(table.remove(id).is_some());
-        assert!(table.get_mut(id).is_none());
+        let id = arena.insert(reservation, run).unwrap();
+        assert!(arena.remove(id).is_some());
+        assert!(arena.get_mut(id).is_none());
     }
 }

@@ -124,49 +124,49 @@ mod tests {
 
     #[test]
     fn extent_arena_zero_capacity_reserves_none() {
-        let mut table = ExtentArena::new(0);
+        let mut arena = ExtentArena::new(0);
 
-        assert_eq!(table.reserve(), None);
+        assert_eq!(arena.reserve(), None);
     }
 
     #[test]
     fn extent_arena_respects_injected_capacity() {
-        let mut table = arena_with_capacity(2);
+        let mut arena = arena_with_capacity(2);
 
-        assert_eq!(table.reserve().unwrap().id().index(), 0);
-        assert_eq!(table.reserve().unwrap().id().index(), 1);
-        assert_eq!(table.reserve(), None);
+        assert_eq!(arena.reserve().unwrap().id().index(), 0);
+        assert_eq!(arena.reserve().unwrap().id().index(), 1);
+        assert_eq!(arena.reserve(), None);
     }
 
     #[test]
     fn extent_arena_insert_get_round_trip() {
-        let mut table = arena_with_capacity(4);
-        let reservation = table.reserve().unwrap();
+        let mut arena = arena_with_capacity(4);
+        let reservation = arena.reserve().unwrap();
         let extent = reusable_extent(reservation.id());
 
-        let id = table.insert(reservation, extent).unwrap();
-        assert_eq!(table.get_mut(id).unwrap().id(), id);
+        let id = arena.insert(reservation, extent).unwrap();
+        assert_eq!(arena.get_mut(id).unwrap().id(), id);
 
-        let extent = table.remove(id).unwrap();
+        let extent = arena.remove(id).unwrap();
         assert_eq!(extent.id(), id);
     }
 
     #[test]
     fn extent_arena_invalid_insert_releases_reservation() {
-        let mut table = arena_with_capacity(4);
-        let reservation = table.reserve().unwrap();
+        let mut arena = arena_with_capacity(4);
+        let reservation = arena.reserve().unwrap();
         let released = reservation.id();
         let wrong_id = ExtentId::from_index(released.index() + 1).unwrap();
         let extent = reusable_extent(wrong_id);
 
         assert_eq!(
-            table.insert(reservation, extent),
+            arena.insert(reservation, extent),
             Err(ExtentArenaError::InvalidReservation)
         );
 
         for expected in 1..4 {
-            assert_eq!(table.reserve().unwrap().id().index(), expected);
+            assert_eq!(arena.reserve().unwrap().id().index(), expected);
         }
-        assert_eq!(table.reserve().unwrap().id(), released);
+        assert_eq!(arena.reserve().unwrap().id(), released);
     }
 }

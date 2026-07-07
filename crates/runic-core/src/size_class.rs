@@ -34,11 +34,11 @@ impl SizeClasses {
     pub(crate) const SMALL_MAX: usize = 32 * 1024;
 
     #[cfg(test)]
-    pub(crate) fn get(spec: LayoutSpec) -> Option<SizeClass> {
-        Self::class(Self::get_id(spec)?)
+    pub(crate) fn for_layout(spec: LayoutSpec) -> Option<SizeClass> {
+        Self::class(Self::id_for(spec)?)
     }
 
-    pub(crate) fn get_id(spec: LayoutSpec) -> Option<SizeClassId> {
+    pub(crate) fn id_for(spec: LayoutSpec) -> Option<SizeClassId> {
         let required = spec.minimum_block_size();
 
         if required > Self::SMALL_MAX {
@@ -170,7 +170,7 @@ mod tests {
     #[test]
     fn size_classes_map_one_byte_to_eight() {
         let spec = LayoutSpec::from_size_align(1, 1).unwrap();
-        let class = SizeClasses::get(spec).unwrap();
+        let class = SizeClasses::for_layout(spec).unwrap();
 
         assert_eq!(class.block_size(), 8);
     }
@@ -179,7 +179,7 @@ mod tests {
     fn size_classes_map_exact_boundaries_to_themselves() {
         for &size in &SIZES {
             let spec = LayoutSpec::from_size_align(size, 1).unwrap();
-            let class = SizeClasses::get(spec).unwrap();
+            let class = SizeClasses::for_layout(spec).unwrap();
 
             assert_eq!(class.block_size(), size);
         }
@@ -189,20 +189,20 @@ mod tests {
     fn size_classes_reject_larger_than_small_max() {
         let spec = LayoutSpec::from_size_align(SizeClasses::SMALL_MAX + 1, 1).unwrap();
 
-        assert!(SizeClasses::get(spec).is_none());
+        assert!(SizeClasses::for_layout(spec).is_none());
     }
 
     #[test]
     fn size_classes_reject_over_page_alignment() {
         let spec = LayoutSpec::from_size_align(1, PAGE_SIZE * 2).unwrap();
 
-        assert!(SizeClasses::get(spec).is_none());
+        assert!(SizeClasses::for_layout(spec).is_none());
     }
 
     #[test]
     fn size_classes_choose_naturally_aligned_block() {
         let spec = LayoutSpec::from_size_align(17, 16).unwrap();
-        let class = SizeClasses::get(spec).unwrap();
+        let class = SizeClasses::for_layout(spec).unwrap();
 
         assert_eq!(class.block_size(), 32);
     }
@@ -213,7 +213,7 @@ mod tests {
             for align in [1, 2, 4, 8, 16, 32, 64, 128, 4096] {
                 let layout = Layout::from_size_align(size, align).unwrap();
                 let spec = LayoutSpec::from_layout(layout);
-                let Some(class) = SizeClasses::get(spec) else {
+                let Some(class) = SizeClasses::for_layout(spec) else {
                     continue;
                 };
 
@@ -230,7 +230,7 @@ mod tests {
                 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
             ] {
                 let spec = LayoutSpec::from_size_align(size, align).unwrap();
-                let class = SizeClasses::get(spec).map(SizeClass::block_size);
+                let class = SizeClasses::for_layout(spec).map(SizeClass::block_size);
                 let reference = if align > PAGE_SIZE {
                     None
                 } else {
