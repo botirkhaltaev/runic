@@ -9,7 +9,7 @@ Runic currently models mapped memory through separate domain entities:
 - `PageMap` owns address lookup publication.
 - `RunArena` and `ExtentArena` own metadata slots.
 - `ExtentCache` owns reusable extent mappings.
-- `RunCache` owns optional retained empty-run mappings.
+- `RunHeap` owns empty-run release behavior.
 - `Heap` coordinates lifecycle transitions.
 
 This split is explicit and worked for the v0.4 global-lock and retention-policy milestone, but thread-local heaps, remote frees, decay policy, hardening, and hugepage-aware allocation will all increase ownership pressure.

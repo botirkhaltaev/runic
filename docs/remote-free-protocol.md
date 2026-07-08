@@ -12,7 +12,7 @@ Initial shape:
 
 ```text
 HeapId
-Run owner: Shared | Thread(HeapId)
+Run owner: Central | Thread(HeapId)
 PageMap lookup: Run pointer | Extent pointer
 ```
 
@@ -27,9 +27,9 @@ On free:
 3. For extents, keep exact-pointer validation on shared metadata.
 4. For runs, compare the current heap id to the run owner id.
 5. If local, validate and free through local run/cache metadata.
-6. If remote, enqueue a remote-free message for the owner heap.
+6. If remote, mark the block `RemotePending` and enqueue a remote-free message for the owner heap.
 
-The freeing thread must not directly touch the owner heap's local cache or reusable block state.
+The freeing thread must not complete the free directly into the owner heap's reusable block state.
 
 ## Remote-Free Message
 
@@ -37,7 +37,7 @@ The minimum message is:
 
 ```text
 RemoteFree
-  run id
+  run pointer to stable RunArena metadata
   pointer
 ```
 
@@ -46,7 +46,7 @@ The receiving heap already owns the run metadata and can validate:
 - pointer belongs to the run
 - pointer is a block boundary
 - block is currently allocated
-- block is not already cached or free
+- block is not already remote-pending or free
 
 Do not trust remote-free messages as prevalidated frees.
 
@@ -56,7 +56,7 @@ The first queue should be allocation-free and bounded.
 
 Recommended first version:
 
-- one bounded inbox per owning heap in `HeapRegistry`
+- one bounded inbox per owning heap in `HeapTable`
 - fixed capacity chosen at allocator construction
 - remote enqueue runs under the shared heap lock in v0.5
 - owner drains on allocation slow path, deallocation slow path, and thread exit
@@ -69,7 +69,7 @@ Keep memory ordering minimal and explicit:
 
 - Producer writes the message before publishing the queue slot.
 - Consumer acquires the published slot before reading the message.
-- Run block-state mutation happens only on the owner side.
+- Remote producers may only perform `Allocated -> RemotePending`; the owner completes `RemotePending -> Reusable`.
 - Queue slot reuse happens only after the consumer marks the slot empty.
 
 No allocator-internal dynamic allocation is allowed for queue growth.
@@ -107,11 +107,8 @@ An implementation PR should include:
 - queue-full fallback does not lose the free
 - randomized cross-thread allocation/free traces
 
-## Open Decisions
+## Deferred Decisions
 
-- Exact queue capacity and whether it is per heap or per size class.
-- Whether owner identity should live directly on `Run` first or wait for a `Region` entity.
-- How thread exit drains local caches and remote queues.
-- Whether a remote free should ever publish directly to a shared central list.
-
-These decisions should be resolved inside #25 before the v0.5 thread-local fast path is considered complete.
+- Lock-free or batched remote-free messages.
+- Moving owner identity from `Run` to a future region/span entity.
+- Per-CPU/RSEQ frontends.

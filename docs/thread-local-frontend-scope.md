@@ -8,44 +8,54 @@ routing, and thread-exit cleanup in one correctness-focused milestone.
 
 ## Design Boundary
 
-Use explicit shared and local entities:
+Use explicit core, heap table, and thread-heap entities:
 
 ```text
 Allocator
-  -> SharedHeap
+  -> AllocatorCore
       -> PageMap
-      -> RunHeap
-      -> ExtentHeap
-      -> HeapRegistry
-  -> LocalHeap
-      -> HeapId
-      -> local available run lists
+      -> Heap
+          -> RunHeap
+          -> ExtentHeap
+      -> HeapTable
+          -> ThreadHeap
+
+Heap
+  -> RunHeap
+  -> ExtentHeap
+
+ThreadHeap
+  -> HeapId
+  -> HeapSlot pointer
+  -> small-run frontend only
 ```
 
-Do not clone the current global heap per thread. `PageMap`, `RunArena`, and
-`ExtentHeap` stay shared because they own global pointer routing, stable metadata
-lifetime, and dedicated allocation policy.
+Do not clone the full allocator backend per thread. `PageMap` stays core-owned,
+extents remain central, and thread heaps only front small-run allocation.
 
 ## Entities
 
 ```text
-SharedHeap
-  owns PageMap, RunHeap, ExtentHeap, HeapRegistry
+AllocatorCore
+  owns PageMap and locked AllocatorState
 
-LocalHeap
-  owns one HeapId and per-class local run lists
+HeapTable
+  owns HeapId slots, HeapSlot storage, and fixed remote-free inboxes
+
+ThreadHeap
+  owns one retained AllocatorCore reference and current HeapId for one thread
 
 RunHeap
-  owns RunArena, shared available lists, and run mapping cache
+  owns RunArena and per-size-class available run lists
 
 Run
   owns one mapping, one size class, block states, owner, and list links
 
-HeapRegistry
-  owns HeapId slots, owner run lists, and fixed remote-free inboxes
+ExtentHeap
+  owns central dedicated allocation policy and mapping reuse
 ```
 
-`Run` metadata remains in `RunArena`. A `LocalHeap` owns permission to allocate
+`Run` metadata remains in `RunArena`. A `ThreadHeap` owns permission to allocate
 from runs assigned to its `HeapId`, not the physical metadata object. This keeps
 `PageMap` pointers stable after thread exit.
 
@@ -78,13 +88,13 @@ pub(crate) struct Run {
 
 ```rust
 pub(crate) enum RunOwner {
-    Shared,
+    Central,
     Thread(HeapId),
 }
 ```
 
 Do not add `Retired` as an owner state. Removed runs leave `RunArena`; live runs
-owned by an exiting thread transfer back to `RunOwner::Shared`.
+owned by an exiting thread remain in stable metadata until freed or reclaimed.
 
 ## Block States
 
@@ -126,16 +136,15 @@ Small allocation:
 ```text
 Allocator::alloc
   -> classify layout with SizeClasses
-  -> LocalHeap::allocate(class)
-  -> local run hit: allocate without shared lock
-  -> local miss: lock SharedHeap and refill a thread-owned run
+  -> ThreadHeap current run hit: allocate without AllocatorState lock
+  -> local miss: lock AllocatorState and allocate/refill a thread-owned run
 ```
 
 Large allocation:
 
 ```text
 Allocator::alloc
-  -> SharedHeap::allocate_extent
+  -> central Heap::allocate_extent
   -> ExtentHeap
 ```
 
@@ -150,18 +159,17 @@ Small free:
 ```text
 Allocator::dealloc
   -> classify layout with SizeClasses
-  -> LocalHeap::free_local(class, ptr)
-  -> local hit: validate and free without shared lock
-  -> local miss: lock SharedHeap and route through PageMap
+  -> current ThreadHeap local hit: validate and free without AllocatorState lock
+  -> local miss: lock AllocatorState and route through PageMap
 ```
 
 Shared routed free:
 
 ```text
-SharedHeap::free_routed
+AllocatorState::dealloc
   -> PageMap lookup
   -> Extent: exact-pointer free through ExtentHeap
-  -> RunOwner::Shared: shared run free
+  -> RunOwner::Central: central run free
   -> RunOwner::Thread(current): local fallback or metadata error
   -> RunOwner::Thread(other): mark remote pending and enqueue RemoteFree
 ```
@@ -176,12 +184,12 @@ queues.
 Remote free steps:
 
 ```text
-lock SharedHeap
+lock AllocatorState
 PageMap lookup
 validate target Run
 validate target owner HeapId
 mark block Allocated -> RemotePending
-enqueue RemoteFree { run, ptr } into HeapRegistry inbox
+enqueue RemoteFree { run, ptr } into HeapTable inbox
 ```
 
 The inbox must be fixed-capacity and allocation-free. If enqueue fails, drain the
@@ -200,26 +208,13 @@ RemotePending -> Reusable
 
 Thread exit is required for v0.5.
 
-`HeapRegistry` should track all runs assigned to each `HeapId`, not only runs in
-local available lists. Full local runs are not available but still need ownership
-transfer on thread exit.
-
-Use explicit list names:
-
-```text
-available_next: per-class allocation list
-owner_next: per-heap ownership list
-```
-
 Thread exit steps:
 
 ```text
-LocalHeap::drop
-  -> lock SharedHeap
+ThreadHeap::drop
+  -> lock AllocatorState
   -> drain remote inbox for HeapId
-  -> walk owner run list
-  -> RunOwner::Thread(id) -> RunOwner::Shared
-  -> move reusable runs to shared available lists
+  -> release empty thread-owned runs
   -> release HeapId
 ```
 
@@ -242,38 +237,36 @@ The fallback must preserve correctness, even if it misses the local fast path.
 
 ## Implementation Order
 
-1. Rename current `Heap` to `SharedHeap`.
-2. Add `HeapId`, `RunOwner`, and `HeapRegistry`.
-3. Add `owner` and `owner_next` to `Run`.
+1. Keep `AllocatorCore` as owner of `PageMap` and locked `AllocatorState`.
+2. Keep `Heap` as the owner of `RunHeap` and central `ExtentHeap` policy.
+3. Add `HeapId`, `HeapTable`, `HeapSlot`, and thread-local `ThreadHeap` handles.
 4. Keep `PageOwner::Run(NonNull<Run>)` pointing at stable run metadata.
-5. Replace `FreeBitmap` behavior with explicit block-state transitions.
-6. Add `LocalHeap` with fixed per-class run lists.
-7. Add guarded TLS access in `Allocator`.
-8. Implement shared refill into `RunOwner::Thread(heap_id)`.
-9. Implement local small allocation fast path.
-10. Implement local small free fast path.
-11. Implement remote-free marking and inbox enqueue.
-12. Implement remote drain.
-13. Implement thread-exit ownership transfer.
-14. Add cross-thread tests and benchmark reporting.
-15. Update README and roadmap for the v0.5 release.
+5. Represent run ownership as `RunOwner::Central | RunOwner::Thread(HeapId)`.
+6. Represent reusable, allocated, and remote-pending block states explicitly.
+7. Implement same-thread small allocation and free fast paths.
+8. Route large allocations through central extents.
+9. Implement remote-free marking and inbox enqueue.
+10. Implement owner-side remote drain.
+11. Release empty thread-owned runs on thread exit/reclaim.
+12. Add cross-thread tests and benchmark reporting.
+13. Update README and roadmap for the v0.5 release.
 
 ## Tests
 
 Required unit and integration coverage:
 
 ```text
-HeapRegistry reserves and releases HeapId
-HeapRegistry tracks all runs assigned to a heap
-Run rejects invalid owner transitions
+HeapTable reserves and releases HeapId generations
+ThreadHeap retains and releases AllocatorCore ownership
+Run reports explicit owner identity
 Run block states detect double free
 Run block states detect double remote free
 RemotePending drains to Reusable
-LocalHeap allocates from local run
-LocalHeap frees local pointer
-LocalHeap rejects interior pointer
-SharedHeap routes remote free to target inbox
-thread retirement transfers all owned runs to Shared
+ThreadHeap allocates from thread-owned run
+ThreadHeap frees local pointer
+ThreadHeap rejects interior pointer
+AllocatorState routes remote free to target inbox
+thread retirement drains remote frees and releases empty runs
 same-thread local double free aborts
 same-thread local interior free aborts
 cross-thread free succeeds
