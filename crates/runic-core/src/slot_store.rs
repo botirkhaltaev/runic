@@ -30,24 +30,18 @@ impl<T> SlotStore<T> {
             return None;
         }
         let start = usize::try_from(self.next).ok()?;
+        let slots = self.slots_mut()?.slots_mut();
 
-        for offset in 0..capacity {
-            let sum = start.checked_add(offset)?;
-            let index = if sum >= capacity {
-                sum.checked_sub(capacity)?
-            } else {
-                sum
-            };
+        for index in start..capacity {
+            if slots.get_mut(index)?.reserve() {
+                self.next = Self::next_index(index, capacity)?;
+                return Some(index);
+            }
+        }
 
-            let slot = self.slots_mut()?.get_mut(index)?;
-            if slot.reserve() {
-                let next = if index + 1 == capacity {
-                    0
-                } else {
-                    index.checked_add(1)?
-                };
-                self.next = u32::try_from(next).ok()?;
-
+        for index in 0..start {
+            if slots.get_mut(index)?.reserve() {
+                self.next = Self::next_index(index, capacity)?;
                 return Some(index);
             }
         }
@@ -96,6 +90,16 @@ impl<T> SlotStore<T> {
     fn slot(&self, index: usize) -> Option<&Slot<T>> {
         self.slots.as_ref()?.get(index)
     }
+
+    fn next_index(index: usize, capacity: usize) -> Option<u32> {
+        let next = if index + 1 == capacity {
+            0
+        } else {
+            index.checked_add(1)?
+        };
+
+        u32::try_from(next).ok()
+    }
 }
 
 struct Slots<T> {
@@ -125,18 +129,18 @@ impl<T> Slots<T> {
         self.slots().get(index)
     }
 
-    fn slots(&self) -> &[Slot<T>] {
-        debug_assert!(self.len <= self.mapping.range().len() / core::mem::size_of::<Slot<T>>());
-
-        // SAFETY: Slots owns a live mmap storage range for len Slot<T> entries.
-        unsafe { slice::from_raw_parts(self.base.as_ptr(), self.len) }
-    }
-
     fn slots_mut(&mut self) -> &mut [Slot<T>] {
         debug_assert!(self.len <= self.mapping.range().len() / core::mem::size_of::<Slot<T>>());
 
         // SAFETY: Slots has unique access to the mmap storage here.
         unsafe { slice::from_raw_parts_mut(self.base.as_ptr(), self.len) }
+    }
+
+    fn slots(&self) -> &[Slot<T>] {
+        debug_assert!(self.len <= self.mapping.range().len() / core::mem::size_of::<Slot<T>>());
+
+        // SAFETY: Slots owns this initialized mmap storage and shared access only returns shared refs.
+        unsafe { slice::from_raw_parts(self.base.as_ptr(), self.len) }
     }
 }
 
