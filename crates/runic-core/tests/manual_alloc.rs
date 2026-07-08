@@ -1,5 +1,5 @@
 use core::alloc::Layout;
-use std::thread;
+use std::{sync::mpsc, thread};
 
 use runic_core::Allocator;
 
@@ -51,6 +51,24 @@ fn allocator_zeroes_memory() {
     assert!(bytes.iter().all(|&byte| byte == 0));
 
     unsafe { allocator.dealloc(ptr, layout) };
+}
+
+#[test]
+fn allocator_zeroes_memory_after_local_small_fast_path_is_ready() {
+    let allocator = Allocator::new();
+    let layout = Layout::from_size_align(64, 8).unwrap();
+
+    let seed = unsafe { allocator.alloc(layout) };
+    assert!(!seed.is_null());
+
+    let ptr = unsafe { allocator.alloc_zeroed(layout) };
+    assert!(!ptr.is_null());
+
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, layout.size()) };
+    assert!(bytes.iter().all(|&byte| byte == 0));
+
+    unsafe { allocator.dealloc(ptr, layout) };
+    unsafe { allocator.dealloc(seed, layout) };
 }
 
 #[test]
@@ -310,19 +328,22 @@ fn allocator_survives_deterministic_random_trace() {
 }
 
 #[test]
-fn allocator_supports_multiple_instances_in_one_thread() {
+fn allocator_cold_switches_between_instances_in_one_thread() {
     let first = Allocator::new();
     let second = Allocator::new();
     let layout = Layout::from_size_align(64, 8).unwrap();
 
     let first_ptr = unsafe { first.alloc(layout) };
     let second_ptr = unsafe { second.alloc(layout) };
+    let first_again = unsafe { first.alloc(layout) };
 
     assert!(!first_ptr.is_null());
     assert!(!second_ptr.is_null());
+    assert!(!first_again.is_null());
 
     unsafe { first.dealloc(first_ptr, layout) };
     unsafe { second.dealloc(second_ptr, layout) };
+    unsafe { first.dealloc(first_again, layout) };
 }
 
 #[test]
@@ -362,6 +383,73 @@ fn allocator_supports_scoped_threaded_use() {
                 }
             });
         }
+    });
+}
+
+#[test]
+fn allocator_frees_thread_owned_small_allocation_after_owner_thread_exits() {
+    let allocator = Allocator::new();
+    let layout = Layout::from_size_align(64, 8).unwrap();
+
+    let ptr = thread::scope(|scope| {
+        let allocator = &allocator;
+        scope
+            .spawn(move || {
+                let ptr = unsafe { allocator.alloc(layout) };
+                assert!(!ptr.is_null());
+                unsafe { ptr.write(0x5a) };
+                ptr.addr()
+            })
+            .join()
+            .unwrap()
+    });
+
+    let ptr = ptr as *mut u8;
+    assert_eq!(unsafe { ptr.read() }, 0x5a);
+    unsafe { allocator.dealloc(ptr, layout) };
+}
+
+#[test]
+fn allocator_drains_remote_free_when_owner_thread_exits() {
+    let allocator = Allocator::new();
+    let layout = Layout::from_size_align(64, 8).unwrap();
+    let (ptr_tx, ptr_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+
+    thread::scope(|scope| {
+        let allocator = &allocator;
+        scope.spawn(move || {
+            let ptr = unsafe { allocator.alloc(layout) };
+            assert!(!ptr.is_null());
+            ptr_tx.send(ptr.addr()).unwrap();
+            done_rx.recv().unwrap();
+        });
+
+        let ptr = ptr_rx.recv().unwrap() as *mut u8;
+        unsafe { allocator.dealloc(ptr, layout) };
+        done_tx.send(()).unwrap();
+    });
+}
+
+#[test]
+fn allocator_frees_large_allocation_from_non_owner_thread() {
+    let allocator = Allocator::new();
+    let layout = Layout::from_size_align(128 * 1024, 4096).unwrap();
+    let (ptr_tx, ptr_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+
+    thread::scope(|scope| {
+        let allocator = &allocator;
+        scope.spawn(move || {
+            let ptr = unsafe { allocator.alloc(layout) };
+            assert!(!ptr.is_null());
+            ptr_tx.send(ptr.addr()).unwrap();
+            done_rx.recv().unwrap();
+        });
+
+        let ptr = ptr_rx.recv().unwrap() as *mut u8;
+        unsafe { allocator.dealloc(ptr, layout) };
+        done_tx.send(()).unwrap();
     });
 }
 

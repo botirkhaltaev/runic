@@ -1,5 +1,5 @@
 use crate::{
-    extent::{Extent, ExtentId},
+    heap::{Extent, ExtentId},
     slot_store::{SlotStore, SlotStoreError},
 };
 
@@ -103,10 +103,9 @@ impl From<SlotStoreError> for ExtentArenaError {
 #[cfg(test)]
 mod tests {
     use crate::{
-        extent::{Extent, ExtentId},
+        heap::{Extent, ExtentId, HeapId},
         layout::LayoutSpec,
         memory::OsMemory,
-        ownership::HeapOwner,
     };
 
     use super::*;
@@ -116,7 +115,7 @@ mod tests {
         let len = spec.mapping_len(OsMemory::page_size()).unwrap();
         let mapping = OsMemory::map(len).unwrap();
 
-        Extent::new(id, HeapOwner::Shared, mapping, spec).unwrap()
+        Extent::new(id, HeapId::ROOT, mapping, spec).unwrap()
     }
 
     fn arena_with_capacity(capacity: usize) -> ExtentArena {

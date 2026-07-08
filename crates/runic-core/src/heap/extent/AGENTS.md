@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Scope: `crates/runic-core/src/extent/`.
+Scope: `crates/runic-core/src/heap/extent/`.
 
 - Keep exact-pointer validation on `Extent`.
 - Keep dedicated allocation policy and mapping reuse on `ExtentHeap`.
