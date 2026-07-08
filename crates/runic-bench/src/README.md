@@ -14,4 +14,6 @@ Shared benchmark machinery for Criterion benchmarks and RSS reports.
 - `threaded`: threaded workload definitions.
 - `workload`: common workload shapes and validation.
 
-Benchmark entry points live in `../benches/`; the RSS binary lives in `bin/`.
+Benchmark entry points live in `../benches/`; RSS and policy binaries live in
+`bin/`. `policy_grid` is extent-policy-only; small and threaded frontend work
+belongs in the Criterion benchmark targets.
