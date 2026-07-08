@@ -2,7 +2,7 @@
 
 Issue: #8
 
-Runic v0.4 still uses one global heap lock. That is correct for the current correctness, single-thread optimization, and retention-policy milestone, but threaded benchmarks show the expected ceiling for this architecture.
+Runic v0.5 keeps one locked `AllocatorState` for slow paths but adds a per-thread small-run frontend for same-thread hits.
 
 ## Current Signal
 
@@ -31,23 +31,23 @@ Thread-local heaps should therefore be introduced only when a local hit can avoi
 
 ## v0.5 Shape
 
-The local heap should be narrow but complete:
+The thread heap should be narrow but complete:
 
 - Small allocations only.
-- One local cache per size class.
-- Refill from shared `RunHeap` under the global lock in fixed batches.
-- Return or drain blocks to shared run metadata through explicit operations.
-- Route remote frees through the shared heap with owner-side validation.
+- Per-thread ownership for small runs.
+- Refill through `HeapTable` under the global lock into thread-owned runs.
+- Return or drain blocks through explicit `Run` state transitions.
+- Route remote frees through `HeapTable` inboxes with owner-side validation.
 
-The shared allocator remains responsible for:
+The central allocator state remains responsible for:
 
 - mmap-backed run creation
 - page-map publication
-- run table ownership
+- heap table ownership and remote inboxes
 - extent allocation
 - invalid free policy
 
-The local heap owns only cached small blocks that are safe to allocate without touching shared metadata on every hit.
+The thread heap owns only the frontend handle for small runs; it does not own extents, page-map publication, or OS mappings.
 
 ## Required Ownership Rules
 

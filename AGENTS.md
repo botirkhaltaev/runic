@@ -3,7 +3,7 @@
 ## Project Truth
 
 - Runic is a Rust-native allocator project; build a correct allocator core with explicit, auditable invariants rather than porting another allocator line-for-line.
-- Current milestone: a global-lock allocator with optimized single-thread small allocation paths, stable run/extent metadata ownership, and randomized trace coverage.
+- Current milestone: v0.5 owner-local heap frontend with heap-owned runs and extents, explicit ownership, remote-free correctness, retained/reused metadata, bounded caches, and profile-backed optimization.
 - Use `ROADMAP.md` as the source of truth for thesis, scope, architecture, testing direction, and later milestones.
 - Treat this file as a non-deterministic test suite for agents: each bullet is an assertion about acceptable work; if code or plans violate it, refactor instead of working around it.
 
@@ -17,9 +17,15 @@
 - Make invalid states hard to express with `NonZero*`, `NonNull`, named domain types, and checked construction.
 - Avoid tuple structs with unnamed fields for domain entities; use named fields when field meaning matters.
 - Avoid free helper functions unless they remove real duplication or express a cross-entity operation.
+- Prefer entity methods over free helper functions; helper code must not become an adapter layer around ownership or lifecycle behavior.
 - Avoid passive adapter, wrapper, or compatibility layers unless they encode a real invariant or remove meaningful duplication.
 - Avoid callback-style helper patterns for ordinary control flow; prefer direct calls and explicit results.
 - Keep code and architecture simple; introduce abstractions only when they reduce complexity or clarify invariants.
+- Optimize for the best allocator architecture rather than backward compatibility or temporary migration paths.
+- Keep hot paths simple, direct, and minimal-instruction while preserving explicit correctness invariants.
+- Separate owner-local, shared/central, and remote-free paths in type APIs; do not hide cross-thread behavior behind broad manager methods.
+- Do not model small or large allocation ownership as a shared heap; sharing should happen through ownership transfer, remote-free coordination, or backend reuse.
+- Treat caches as allocator-domain ownership structures, not benchmark-specific shortcuts.
 
 ## API Policy
 
@@ -28,12 +34,13 @@
 - Avoid compatibility shims throughout the codebase.
 - Review API shape repository-wide when architectural feedback applies; do not fix only the call site where the issue was noticed.
 - During planning and implementation, critique the design against idiomatic Rust, allocator invariants, composability, and overfitting before treating it as done.
+- Use profiling to choose optimization order; do not add benchmark-specific hacks.
 
-## v0.1 Scope
+## v0.5 Scope
 
-- Build only: Linux x86_64, Rust stable, `GlobalAlloc`, one global lock around `Heap`.
-- Include mmap-backed runs for small size classes, mmap-backed extents for dedicated allocations, out-of-line metadata, page-indexed pointer lookup, run block-boundary checks, extent exact-pointer checks, basic `realloc`, basic `alloc_zeroed`, and randomized tests.
-- Do not add profiles, thread-local heaps, remote frees, quarantine, canaries, hugepages, NUMA, C ABI support, ML placement, or dashboards yet.
+- Build only: Linux x86_64, Rust stable, `GlobalAlloc`, owner-local heaps, heap-owned small runs, and heap-local extent caches backed by global OS/page coordination.
+- Include mmap-backed runs, mmap-backed extents, out-of-line metadata, page-indexed pointer lookup, run block-boundary checks, extent exact-pointer checks, owner-local small hot paths, remote-free coordination, bounded run/extent retention, `realloc`, `alloc_zeroed`, randomized tests, and benchmarks.
+- Do not add per-CPU/RSEQ frontends, quarantine, canaries, hugepages, NUMA, C ABI support, ML placement, dashboards, or background purge yet.
 
 ## Core Invariants
 
@@ -50,16 +57,19 @@ Use this first:
 ```text
 GlobalAlloc
   -> Allocator
-      -> Heap
+      -> AllocatorCore
       -> PageMap
-      -> RunHeap
-          -> RunArena
-      -> ExtentHeap
-          -> ExtentArena
-      -> Run
-          -> FreeBitmap
-      -> Extent
-      -> OsMemory
+      -> PageBackend / OsMemory
+      -> Heap
+          -> RunHeap
+              -> RunArena
+          -> ExtentHeap
+              -> ExtentArena
+      -> HeapTable
+          -> ThreadHeap
+          -> HeapSlot
+      -> Run -> BlockStates
+      -> Extent -> OsMemory
 ```
 
 ## Rust Rules
