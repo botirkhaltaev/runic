@@ -1,6 +1,6 @@
 use core::{num::NonZeroU32, ptr::NonNull};
 
-use spin::Mutex;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 mod arena;
 mod cache;
@@ -19,8 +19,6 @@ pub(crate) use heap::{RunHeap, RunHeapError};
 pub(crate) const RUN_SIZE: usize = 64 * 1024;
 const MIN_BLOCK_SIZE: usize = 8;
 const MAX_BLOCKS: usize = RUN_SIZE / MIN_BLOCK_SIZE;
-const BLOCK_STATE_WORD_BITS: usize = 64;
-const BLOCK_STATE_WORDS: usize = MAX_BLOCKS.div_ceil(BLOCK_STATE_WORD_BITS);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RunId {
@@ -37,7 +35,7 @@ impl RunId {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BlockIndex {
     index: usize,
 }
@@ -45,14 +43,6 @@ pub(crate) struct BlockIndex {
 impl BlockIndex {
     const fn new(index: usize) -> Self {
         Self { index }
-    }
-
-    fn word(self) -> usize {
-        self.index / BLOCK_STATE_WORD_BITS
-    }
-
-    fn mask(self) -> u64 {
-        1_u64 << (self.index % BLOCK_STATE_WORD_BITS)
     }
 
     fn offset(self, block_size: usize) -> Option<usize> {
@@ -101,69 +91,72 @@ enum BlockStateError {
     InvalidIndex,
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlockState {
+    Free = 0,
+    Allocated = 1,
+}
+
+impl BlockState {
+    const fn raw(self) -> u8 {
+        match self {
+            Self::Free => 0,
+            Self::Allocated => 1,
+        }
+    }
+
+    const fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            value if value == Self::Free.raw() => Some(Self::Free),
+            value if value == Self::Allocated.raw() => Some(Self::Allocated),
+            _ => None,
+        }
+    }
+}
+
 struct BlockStates {
-    reusable: [u64; BLOCK_STATE_WORDS],
+    states: [AtomicU8; MAX_BLOCKS],
 }
 
 impl BlockStates {
-    fn new(capacity: u32) -> Self {
-        let mut reusable = [0; BLOCK_STATE_WORDS];
-        let capacity = usize::try_from(capacity).unwrap_or(0).min(MAX_BLOCKS);
-        let full_words = capacity / BLOCK_STATE_WORD_BITS;
-        let remainder = capacity % BLOCK_STATE_WORD_BITS;
-
-        for word in reusable.iter_mut().take(full_words) {
-            *word = u64::MAX;
+    fn new() -> Self {
+        Self {
+            states: [const { AtomicU8::new(BlockState::Free.raw()) }; MAX_BLOCKS],
         }
-
-        if remainder != 0
-            && let Some(word) = reusable.get_mut(full_words)
-        {
-            *word = (1_u64 << remainder) - 1;
-        }
-
-        Self { reusable }
     }
 
-    fn take_reusable(&mut self) -> Option<BlockIndex> {
-        for word_index in 0..self.reusable.len() {
-            let word = self.reusable.get_mut(word_index)?;
-            if *word == 0 {
-                continue;
-            }
-
-            let bit = word.trailing_zeros();
-            *word &= !(1_u64 << bit);
-            let index = word_index
-                .checked_mul(BLOCK_STATE_WORD_BITS)?
-                .checked_add(usize::try_from(bit).ok()?)?;
-
-            return Some(BlockIndex::new(index));
-        }
-
-        None
+    fn allocate(&self, index: BlockIndex) -> Result<(), BlockStateError> {
+        let state = self.state(index)?;
+        debug_assert_eq!(self.load(index)?, BlockState::Free);
+        state.store(BlockState::Allocated.raw(), Ordering::Relaxed);
+        Ok(())
     }
 
     fn is_allocated(&self, index: BlockIndex) -> Result<bool, BlockStateError> {
-        let Some(reusable) = self.reusable.get(index.word()) else {
-            return Err(BlockStateError::InvalidIndex);
-        };
-
-        Ok(*reusable & index.mask() == 0)
+        Ok(self.load(index)? == BlockState::Allocated)
     }
 
-    fn release(&mut self, index: BlockIndex) -> Result<(), BlockStateError> {
-        let Some(reusable) = self.reusable.get_mut(index.word()) else {
-            return Err(BlockStateError::InvalidIndex);
-        };
-        let mask = index.mask();
-
-        if *reusable & mask != 0 {
-            return Err(BlockStateError::AlreadyFree);
+    fn release(&self, index: BlockIndex) -> Result<(), BlockStateError> {
+        let state = self.state(index)?;
+        match self.load(index)? {
+            BlockState::Allocated => {
+                state.store(BlockState::Free.raw(), Ordering::Relaxed);
+                Ok(())
+            }
+            BlockState::Free => Err(BlockStateError::AlreadyFree),
         }
+    }
 
-        *reusable |= mask;
-        Ok(())
+    fn load(&self, index: BlockIndex) -> Result<BlockState, BlockStateError> {
+        let raw = self.state(index)?.load(Ordering::Relaxed);
+        BlockState::from_raw(raw).ok_or(BlockStateError::InvalidIndex)
+    }
+
+    fn state(&self, index: BlockIndex) -> Result<&AtomicU8, BlockStateError> {
+        self.states
+            .get(index.index)
+            .ok_or(BlockStateError::InvalidIndex)
     }
 }
 
@@ -174,15 +167,21 @@ pub(crate) struct Run {
     class: SizeClassId,
     block_size: usize,
     block_shift: Option<u32>,
-    capacity: u32,
-    state: Mutex<RunState>,
+    capacity: usize,
+    state: std::cell::UnsafeCell<RunState>,
+    blocks: BlockStates,
 }
+
+// SAFETY: owner-local methods are externally synchronized by the owning heap in the current
+// architecture. Remote methods only touch atomic block state.
+unsafe impl Sync for Run {}
 
 struct RunState {
     owner: HeapOwner,
-    live: u32,
+    live: usize,
+    bump: usize,
     available_next: Option<NonNull<Run>>,
-    blocks: BlockStates,
+    free: Option<NonNull<u8>>,
 }
 
 pub(crate) struct RunAllocation {
@@ -227,13 +226,15 @@ impl Run {
             class: class.id(),
             block_size,
             block_shift: block_size_shift(block_size),
-            capacity: u32::try_from(capacity).unwrap_or(u32::MAX),
-            state: Mutex::new(RunState {
+            capacity: capacity.min(MAX_BLOCKS),
+            state: std::cell::UnsafeCell::new(RunState {
                 owner,
                 live: 0,
+                bump: 0,
                 available_next: None,
-                blocks: BlockStates::new(u32::try_from(capacity).unwrap_or(u32::MAX)),
+                free: None,
             }),
+            blocks: BlockStates::new(),
         }
     }
 
@@ -242,7 +243,8 @@ impl Run {
     }
 
     pub(crate) fn owner(&self) -> HeapOwner {
-        self.state.lock().owner
+        // SAFETY: owner-local methods are externally synchronized by the owning heap.
+        unsafe { &*self.state.get() }.owner
     }
 
     pub(crate) const fn class(&self) -> SizeClassId {
@@ -250,19 +252,23 @@ impl Run {
     }
 
     pub(crate) fn has_available_blocks(&self) -> bool {
-        self.state.lock().live < self.capacity
+        // SAFETY: owner-local methods are externally synchronized by the owning heap.
+        unsafe { &*self.state.get() }.live < self.capacity
     }
 
     pub(crate) fn set_available_next(&self, next: Option<NonNull<Run>>) {
-        self.state.lock().available_next = next;
+        // SAFETY: owner-local methods are externally synchronized by the owning heap.
+        unsafe { &mut *self.state.get() }.available_next = next;
     }
 
     pub(crate) fn take_available_next(&self) -> Option<NonNull<Run>> {
-        self.state.lock().available_next.take()
+        // SAFETY: owner-local methods are externally synchronized by the owning heap.
+        unsafe { &mut *self.state.get() }.available_next.take()
     }
 
     pub(crate) fn available_next(&self) -> Option<NonNull<Run>> {
-        self.state.lock().available_next
+        // SAFETY: owner-local methods are externally synchronized by the owning heap.
+        unsafe { &*self.state.get() }.available_next
     }
 
     pub(crate) fn range(&self) -> AddressRange {
@@ -276,9 +282,18 @@ impl Run {
     }
 
     pub(crate) fn allocate(&self) -> Option<RunAllocation> {
-        let mut state = self.state.lock();
-        let index = state.blocks.take_reusable()?;
-        let block = RunBlock::at_offset(index, self.range.base(), self.block_size)?;
+        // SAFETY: owner-local methods are externally synchronized by the owning heap.
+        let state = unsafe { &mut *self.state.get() };
+        let (index, ptr) = if let Some(ptr) = state.pop_free() {
+            let block = self.block_at(ptr)?;
+            (block.index(), ptr)
+        } else {
+            let index = state.allocate_fresh(self.capacity)?;
+            (index, self.block_ptr(index)?)
+        };
+        let block = RunBlock::new(index, ptr);
+
+        self.blocks.allocate(index).ok()?;
 
         state.live = state.live.checked_add(1)?;
         Some(RunAllocation {
@@ -289,10 +304,11 @@ impl Run {
 
     pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<RunFreeStatus, RunError> {
         let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
-        let mut state = self.state.lock();
+        // SAFETY: owner-local methods are externally synchronized by the owning heap.
+        let state = unsafe { &mut *self.state.get() };
         let was_full = state.live == self.capacity;
 
-        match state.blocks.release(block.index()) {
+        match self.blocks.release(block.index()) {
             Ok(()) => {}
             Err(BlockStateError::AlreadyFree) => return Err(RunError::DoubleFree),
             Err(BlockStateError::InvalidIndex) => return Err(RunError::InvalidPointer),
@@ -303,6 +319,7 @@ impl Run {
         };
 
         state.live = live;
+        state.push_free(ptr);
 
         Ok(RunFreeStatus {
             was_full,
@@ -318,7 +335,7 @@ impl Run {
     pub(crate) fn allocated_block_at(&self, ptr: NonNull<u8>) -> Result<RunBlock, RunError> {
         let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
 
-        match self.state.lock().blocks.is_allocated(block.index()) {
+        match self.blocks.is_allocated(block.index()) {
             Ok(true) => Ok(block),
             Ok(false) => Err(RunError::DoubleFree),
             Err(BlockStateError::InvalidIndex | BlockStateError::AlreadyFree) => {
@@ -340,13 +357,19 @@ impl Run {
     pub(crate) fn block_at(&self, ptr: NonNull<u8>) -> Option<RunBlock> {
         let offset = self.range.offset_of(ptr)?;
         let index = self.block_index(offset)?;
-        let capacity = usize::try_from(self.capacity).ok()?;
-
-        if index >= capacity {
+        if index >= self.capacity {
             return None;
         }
 
         Some(RunBlock::new(BlockIndex::new(index), ptr))
+    }
+
+    fn block_ptr(&self, index: BlockIndex) -> Option<NonNull<u8>> {
+        if index.index >= self.capacity {
+            return None;
+        }
+
+        RunBlock::at_offset(index, self.range.base(), self.block_size).map(RunBlock::ptr)
     }
 
     fn block_index(&self, offset: usize) -> Option<usize> {
@@ -363,6 +386,43 @@ impl Run {
         }
 
         offset.checked_div(self.block_size)
+    }
+}
+
+impl RunState {
+    fn allocate_fresh(&mut self, capacity: usize) -> Option<BlockIndex> {
+        if self.bump >= capacity {
+            return None;
+        }
+
+        let index = BlockIndex::new(self.bump);
+        self.bump += 1;
+        Some(index)
+    }
+
+    fn pop_free(&mut self) -> Option<NonNull<u8>> {
+        let ptr = self.free?;
+        self.free = Self::read_next(ptr);
+        Some(ptr)
+    }
+
+    fn push_free(&mut self, ptr: NonNull<u8>) {
+        Self::write_next(ptr, self.free);
+        self.free = Some(ptr);
+    }
+
+    fn read_next(ptr: NonNull<u8>) -> Option<NonNull<u8>> {
+        // SAFETY: free-list links are stored only in reusable blocks owned by this run.
+        NonNull::new(unsafe { ptr.cast::<*mut u8>().as_ptr().read() })
+    }
+
+    fn write_next(ptr: NonNull<u8>, next: Option<NonNull<u8>>) {
+        // SAFETY: free-list links are stored only in reusable blocks owned by this run.
+        unsafe {
+            ptr.cast::<*mut u8>()
+                .as_ptr()
+                .write(next.map_or(core::ptr::null_mut(), NonNull::as_ptr));
+        }
     }
 }
 
