@@ -13,15 +13,15 @@
 pub(crate) mod allocation;
 pub(crate) mod allocator;
 pub mod config;
-pub(crate) mod extent;
 pub(crate) mod heap;
 pub(crate) mod layout;
 pub(crate) mod local;
 pub(crate) mod memory;
 pub(crate) mod ownership;
-pub(crate) mod run;
 pub(crate) mod size_class;
 pub(crate) mod slot_store;
+
+pub(crate) use heap::{extent, run};
 
 pub use allocator::Allocator;
 pub use config::{

@@ -3,12 +3,18 @@ use core::ptr::NonNull;
 use crate::{
     allocation::Allocation,
     config::AllocatorConfig,
-    extent::{Extent, ExtentHeap, ExtentHeapError},
     layout::LayoutSpec,
     memory::PageMap,
     ownership::HeapOwner,
-    run::{Run, RunHeap, RunHeapError},
     size_class::SizeClasses,
+};
+
+pub(crate) mod extent;
+pub(crate) mod run;
+
+use self::{
+    extent::{Extent, ExtentHeap, ExtentHeapError},
+    run::{Run, RunHeap, RunHeapError},
 };
 
 pub(crate) struct SharedHeap {
