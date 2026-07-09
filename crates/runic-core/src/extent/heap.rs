@@ -124,10 +124,7 @@ impl ExtentHeap {
         };
         let extent_ptr = NonNull::from(&mut *inserted_extent);
 
-        if pages
-            .publish_extent(range, extent_ptr)
-            .is_err()
-        {
+        if pages.publish_extent(range, extent_ptr).is_err() {
             let _removed = self.extents.remove(id);
             return None;
         }
