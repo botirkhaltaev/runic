@@ -1,12 +1,8 @@
 use core::ptr::NonNull;
 
 use crate::{
-    allocation::Allocation,
-    config::AllocatorConfig,
-    layout::LayoutSpec,
-    memory::PageMap,
-    ownership::HeapOwner,
-    size_class::SizeClasses,
+    allocation::Allocation, config::AllocatorConfig, layout::LayoutSpec, memory::PageMap,
+    ownership::HeapOwner, size_class::SizeClasses,
 };
 
 pub(crate) mod extent;
