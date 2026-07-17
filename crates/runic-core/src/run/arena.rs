@@ -103,6 +103,7 @@ mod tests {
     use crate::{
         layout::LayoutSpec,
         memory::OsMemory,
+        ownership::HeapOwner,
         run::{RUN_SIZE, Run, RunId},
         size_class::SizeClasses,
     };
@@ -114,7 +115,7 @@ mod tests {
         let spec = LayoutSpec::from_size_align(64, 8).unwrap();
         let class = SizeClasses::for_layout(spec).unwrap();
 
-        Run::new(id, mapping, class)
+        Run::new(id, HeapOwner::Shared, mapping, class)
     }
 
     fn arena_with_capacity(capacity: usize) -> RunArena {

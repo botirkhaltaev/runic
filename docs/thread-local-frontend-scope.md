@@ -1,124 +1,296 @@
-# Thread-Local Frontend Scope
+# Thread-Local Heap Implementation Scope
 
 Issue: #25
 
-This document defines the first thread-local heap frontend implementation boundary. It intentionally does not implement the frontend yet because the required ownership protocol is still in stacked design PRs.
+Runic v0.5 should implement full thread-local heaps for small allocations. This
+includes owner identity, local small allocation and free paths, remote-free
+routing, and thread-exit cleanup in one correctness-focused milestone.
 
-## Why Not Implement Immediately
+## Design Boundary
 
-A thread-local heap changes allocator ownership. Implementing it before owner identity and remote-free routing are represented in code would either:
-
-- route remote frees through the global lock permanently
-- let one thread mutate another thread's local metadata
-- weaken invalid-free and double-free checks
-- add a cache that does not improve the target workloads
-
-The rejected #16 cache attempts show that moving blocks between global structures is not enough. The local path must avoid global metadata work on hits while still preserving validated frees.
-
-## First Entities
-
-The first implementation should introduce explicit entities rather than broad manager methods:
+Use explicit core, heap table, and thread-heap entities:
 
 ```text
-LocalHeap
-  id: HeapId
-  small caches by SizeClassId
-  remote-free inbox
+Allocator
+  -> AllocatorCore
+      -> PageMap
+      -> Heap
+          -> RunHeap
+          -> ExtentHeap
+      -> HeapTable
+          -> ThreadHeap
 
-SharedHeap
-  current Heap responsibilities that remain global
-  RunHeap
-  ExtentHeap
-  PageMap
+Heap
+  -> RunHeap
+  -> ExtentHeap
 
-HeapId
-  non-zero owner identity
+ThreadHeap
+  -> HeapId
+  -> HeapSlot pointer
+  -> small-run frontend only
 ```
 
-`Allocator` should route through thread-local `LocalHeap` for small allocations and fall back to `SharedHeap` for extents and uncommon paths.
+Do not clone the full allocator backend per thread. `PageMap` stays core-owned,
+extents remain central, and thread heaps only front small-run allocation.
 
-## First Small Allocation Path
+## Entities
 
-On small allocation:
+```text
+AllocatorCore
+  owns PageMap and locked AllocatorState
 
-1. Classify the layout with `SizeClasses`.
-2. Try the local cache for that class.
-3. If hit, mark the cached block user-allocated and return it.
-4. If miss, refill a fixed batch from `SharedHeap` under the global lock.
-5. Return one block and keep the rest local.
+HeapTable
+  owns HeapId slots, HeapSlot storage, and fixed remote-free inboxes
 
-The local cache must not allocate internally.
+ThreadHeap
+  owns one retained AllocatorCore reference and current HeapId for one thread
 
-## First Free Path
+RunHeap
+  owns RunArena and per-size-class available run lists
 
-On free:
+Run
+  owns one mapping, one size class, block states, owner, and list links
 
-1. Look up the pointer in `PageMap`.
-2. Determine run owner identity.
-3. If local, validate block state and return to local cache or owner run state.
-4. If remote, enqueue a `RemoteFree` message as defined by #27.
-5. If queue enqueue fails in the first implementation, use a validated global-lock fallback.
+ExtentHeap
+  owns central dedicated allocation policy and mapping reuse
+```
 
-The page map remains the source of truth for unknown pointer detection.
+`Run` metadata remains in `RunArena`. A `ThreadHeap` owns permission to allocate
+from runs assigned to its `HeapId`, not the physical metadata object. This keeps
+`PageMap` pointers stable after thread exit.
 
-## Required Block States
+## Core Types
 
-The local cache requires block state beyond a single allocated/free bit:
+Use tuple newtypes for opaque scalar IDs:
 
-- free in run block bitmap
-- owned by local cache
-- user allocated
-- optionally pending remote free
+```rust
+pub(crate) struct HeapId(NonZeroU32);
+```
 
-This must be encoded in run-owned state or a future region/span-owned state. It must not be inferred from comments or cache membership alone.
+Use named fields for entities that own multiple invariants:
+
+```rust
+pub(crate) struct Run {
+    id: RunId,
+    owner: RunOwner,
+    mapping: Mapping,
+    range: AddressRange,
+    class: SizeClassId,
+    block_size: usize,
+    block_shift: Option<u32>,
+    capacity: u32,
+    live: u32,
+    available_next: Option<NonNull<Run>>,
+    owner_next: Option<NonNull<Run>>,
+    blocks: BlockStates,
+}
+```
+
+```rust
+pub(crate) enum RunOwner {
+    Central,
+    Thread(HeapId),
+}
+```
+
+Do not add `Retired` as an owner state. Removed runs leave `RunArena`; live runs
+owned by an exiting thread remain in stable metadata until freed or reclaimed.
+
+## Block States
+
+The current free/allocated bitmap is not enough for remote frees. v0.5 needs
+explicit block-state transitions:
+
+```text
+Reusable
+Allocated
+RemotePending
+```
+
+Valid transitions:
+
+```text
+Reusable -> Allocated          allocation
+Allocated -> Reusable          local or shared free
+Allocated -> RemotePending     remote free accepted
+RemotePending -> Reusable      owner drains remote free
+```
+
+Invalid transitions must report domain errors that abort at the allocator
+boundary:
+
+```text
+Reusable -> free
+RemotePending -> free
+RemotePending -> remote pending
+```
+
+The representation can remain bitmap-backed, but the API should expose domain
+transitions directly. Reshape `Run::allocate` and `Run::free` instead of adding
+parallel compatibility methods.
+
+## Allocation Path
+
+Small allocation:
+
+```text
+Allocator::alloc
+  -> classify layout with SizeClasses
+  -> ThreadHeap current run hit: allocate without AllocatorState lock
+  -> local miss: lock AllocatorState and allocate/refill a thread-owned run
+```
+
+Large allocation:
+
+```text
+Allocator::alloc
+  -> central Heap::allocate_extent
+  -> ExtentHeap
+```
+
+Local heaps must not own extents. Extents remain shared because dedicated
+allocation policy, exact-pointer validation, and mapping retention belong to
+`ExtentHeap` and `ExtentCache`.
+
+## Free Path
+
+Small free:
+
+```text
+Allocator::dealloc
+  -> classify layout with SizeClasses
+  -> current ThreadHeap local hit: validate and free without AllocatorState lock
+  -> local miss: lock AllocatorState and route through PageMap
+```
+
+Shared routed free:
+
+```text
+AllocatorState::dealloc
+  -> PageMap lookup
+  -> Extent: exact-pointer free through ExtentHeap
+  -> RunOwner::Central: central run free
+  -> RunOwner::Thread(current): local fallback or metadata error
+  -> RunOwner::Thread(other): mark remote pending and enqueue RemoteFree
+```
+
+The page map remains the source of truth for unknown pointers.
+
+## Remote Frees
+
+v0.5 should use shared-lock remote routing first. Do not start with lock-free
+queues.
+
+Remote free steps:
+
+```text
+lock AllocatorState
+PageMap lookup
+validate target Run
+validate target owner HeapId
+mark block Allocated -> RemotePending
+enqueue RemoteFree { run, ptr } into HeapTable inbox
+```
+
+The inbox must be fixed-capacity and allocation-free. If enqueue fails, drain the
+target inbox and retry once. If it still fails, return a metadata error that
+aborts at the allocator boundary. Never drop a free.
+
+Remote drains happen on owner slow paths and thread exit:
+
+```text
+pop RemoteFree
+authenticate RunId and pointer against stable Run metadata
+RemotePending -> Reusable
+```
 
 ## Thread Exit
 
-The first implementation must define thread-exit behavior before enabling local caches:
+Thread exit is required for v0.5.
 
-- drain local caches to the shared owner metadata
-- drain outbound remote frees if possible
-- make any remaining remote-free inbox reachable by shared cleanup
+Thread exit steps:
 
-If Rust TLS destructor behavior is used, the allocator must not allocate while draining.
+```text
+ThreadHeap::drop
+  -> lock AllocatorState
+  -> drain remote inbox for HeapId
+  -> release empty thread-owned runs
+  -> release HeapId
+```
 
-## Minimal Milestone
+Live allocations remain valid because run metadata stays in `RunArena` and
+`PageMap` still points to stable `Run` records.
 
-The first code PR for this feature should implement only:
+## TLS Rules
 
-- `HeapId`
-- owner identity on runs or regions
-- one thread-local `LocalHeap`
-- small allocation cache hits and batch refill
-- local free for local-owned blocks
-- remote-free enqueue or validated fallback
+Allocator TLS initialization can recurse. Use an explicit TLS state guard:
 
-Do not include:
+```text
+Uninitialized
+Initializing
+Ready
+Dropping
+```
 
-- NUMA policy
-- hugepages
-- hardening policy
-- adaptive cache sizing
-- lock-free queues beyond the minimal bounded queue needed for remote frees
+If the current TLS state is `Initializing` or `Dropping`, use the shared path.
+The fallback must preserve correctness, even if it misses the local fast path.
+
+## Implementation Order
+
+1. Keep `AllocatorCore` as owner of `PageMap` and locked `AllocatorState`.
+2. Keep `Heap` as the owner of `RunHeap` and central `ExtentHeap` policy.
+3. Add `HeapId`, `HeapTable`, `HeapSlot`, and thread-local `ThreadHeap` handles.
+4. Keep `PageOwner::Run(NonNull<Run>)` pointing at stable run metadata.
+5. Represent run ownership as `RunOwner::Central | RunOwner::Thread(HeapId)`.
+6. Represent reusable, allocated, and remote-pending block states explicitly.
+7. Implement same-thread small allocation and free fast paths.
+8. Route large allocations through central extents.
+9. Implement remote-free marking and inbox enqueue.
+10. Implement owner-side remote drain.
+11. Release empty thread-owned runs on thread exit/reclaim.
+12. Add cross-thread tests and benchmark reporting.
+13. Update README and roadmap for the v0.5 release.
+
+## Tests
+
+Required unit and integration coverage:
+
+```text
+HeapTable reserves and releases HeapId generations
+ThreadHeap retains and releases AllocatorCore ownership
+Run reports explicit owner identity
+Run block states detect double free
+Run block states detect double remote free
+RemotePending drains to Reusable
+ThreadHeap allocates from thread-owned run
+ThreadHeap frees local pointer
+ThreadHeap rejects interior pointer
+AllocatorState routes remote free to target inbox
+thread retirement drains remote frees and releases empty runs
+same-thread local double free aborts
+same-thread local interior free aborts
+cross-thread free succeeds
+double cross-thread free aborts
+free after allocating thread exits succeeds
+realloc after remote free aborts
+large extent behavior remains shared
+randomized cross-thread traces pass
+```
 
 ## Benchmarks
 
 The implementation must report:
 
-- `threaded/thread_local_churn/runic/2`
-- `threaded/thread_local_churn/runic/4`
-- `threaded/mixed_thread_random/runic/2`
-- `threaded/mixed_thread_random/runic/4`
-- abort-case tests for invalid free and double free
+```text
+threaded/thread_local_churn/runic/2
+threaded/thread_local_churn/runic/4
+threaded/mixed_thread_random/runic/2
+threaded/mixed_thread_random/runic/4
+threaded/cross_thread_free_ring/runic/2
+threaded/cross_thread_free_ring/runic/4
+explicit/single_size_churn/runic/64
+explicit/small_biased_random/runic
+```
 
-The feature is not ready if it improves thread-local churn by weakening remote-free behavior or invalid-free checks.
-
-## Acceptance Gate
-
-Before implementation, merge or directly incorporate the decisions from:
-
-- #24 span ownership evaluation
-- #27 remote-free protocol
-- #16 cache constraints
-
-This keeps the first thread-local heap implementation narrow, measurable, and compatible with Runic's correctness-first allocator invariants.
+The feature is not ready if it improves threaded churn by weakening invalid-free,
+double-free, stale-free, remote-free, or thread-exit behavior.

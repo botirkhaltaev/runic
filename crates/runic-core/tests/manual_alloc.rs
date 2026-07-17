@@ -1,4 +1,5 @@
 use core::alloc::Layout;
+use std::thread;
 
 use runic_core::Allocator;
 
@@ -306,6 +307,62 @@ fn allocator_survives_deterministic_random_trace() {
         record.check_pattern();
         unsafe { allocator.dealloc(record.ptr, record.layout) };
     }
+}
+
+#[test]
+fn allocator_supports_multiple_instances_in_one_thread() {
+    let first = Allocator::new();
+    let second = Allocator::new();
+    let layout = Layout::from_size_align(64, 8).unwrap();
+
+    let first_ptr = unsafe { first.alloc(layout) };
+    let second_ptr = unsafe { second.alloc(layout) };
+
+    assert!(!first_ptr.is_null());
+    assert!(!second_ptr.is_null());
+
+    unsafe { first.dealloc(first_ptr, layout) };
+    unsafe { second.dealloc(second_ptr, layout) };
+}
+
+#[test]
+fn allocator_drop_before_thread_local_teardown_is_safe() {
+    let layout = Layout::from_size_align(64, 8).unwrap();
+
+    let thread = thread::spawn(move || {
+        let allocator = Allocator::new();
+        let ptr = unsafe { allocator.alloc(layout) };
+
+        assert!(!ptr.is_null());
+
+        unsafe { allocator.dealloc(ptr, layout) };
+        drop(allocator);
+    });
+
+    thread.join().unwrap();
+}
+
+#[test]
+fn allocator_supports_scoped_threaded_use() {
+    let allocator = Allocator::new();
+    let layout = Layout::from_size_align(128, 8).unwrap();
+
+    thread::scope(|scope| {
+        for byte in 0_u8..4 {
+            let allocator = &allocator;
+            scope.spawn(move || {
+                let ptr = unsafe { allocator.alloc(layout) };
+
+                assert!(!ptr.is_null());
+
+                unsafe {
+                    ptr.write(byte);
+                    assert_eq!(ptr.read(), byte);
+                    allocator.dealloc(ptr, layout);
+                }
+            });
+        }
+    });
 }
 
 struct AllocationRecord {

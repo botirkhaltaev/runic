@@ -5,7 +5,8 @@ use crate::{
     config::{RunConfig, RunPolicy},
     layout::LayoutSpec,
     memory::{AddressRange, L2TablePolicy, OsMemory, PageMap, PageOwner, PageRange},
-    run::{RUN_SIZE, Run, RunArena, RunBlock, RunError, RunId},
+    ownership::HeapOwner,
+    run::{RUN_SIZE, Run, RunArena, RunError, RunId},
     size_class::{SizeClassId, SizeClasses},
 };
 
@@ -53,19 +54,32 @@ impl RunHeap {
     pub(crate) fn allocate(
         &mut self,
         class: SizeClassId,
+        owner: HeapOwner,
         pages: &mut PageMap,
     ) -> Option<Allocation> {
         let class_index = class.index();
 
-        if let Some(allocation) = self.allocate_from_available(class_index) {
+        if owner == HeapOwner::Shared
+            && let Some(allocation) = self.allocate_from_available(class_index)
+        {
             return Some(allocation);
         }
 
-        self.allocate_new_run(class, pages)
+        self.allocate_run(class, owner, pages)
+            .map(|(_, allocation)| allocation)
+    }
+
+    pub(crate) fn allocate_available(&mut self, class: SizeClassId) -> Option<Allocation> {
+        self.allocate_from_available(class.index())
     }
 
     #[cold]
-    fn allocate_new_run(&mut self, class: SizeClassId, pages: &mut PageMap) -> Option<Allocation> {
+    pub(crate) fn allocate_run(
+        &mut self,
+        class: SizeClassId,
+        owner: HeapOwner,
+        pages: &mut PageMap,
+    ) -> Option<(NonNull<Run>, Allocation)> {
         let class = SizeClasses::class(class)?;
         let class_index = class.id().index();
         let mapping = self
@@ -75,7 +89,7 @@ impl RunHeap {
         let reservation = self.runs.reserve()?;
         let id = reservation.id();
 
-        let run = Run::new(id, mapping, class);
+        let run = Run::new(id, owner, mapping, class);
         let run_ptr = self.insert_run(reservation, run, pages)?;
         // SAFETY: insert_run returns a pointer to the newly published live RunArena entry.
         let inserted_run = unsafe { &mut *run_ptr.as_ptr() };
@@ -85,7 +99,7 @@ impl RunHeap {
             self.push_available(class_index, run_ptr).ok()?;
         }
 
-        Some(Allocation::new(ptr, ZeroStatus::NeedsZeroing))
+        Some((run_ptr, Allocation::new(ptr, ZeroStatus::NeedsZeroing)))
     }
 
     pub(crate) fn free(
@@ -111,16 +125,15 @@ impl RunHeap {
         // SAFETY: PageMap stores only pointers published from this allocator's live RunArena.
         let run = unsafe { owner.as_mut() };
 
-        let was_full = run.is_full();
-        run.free(ptr).map_err(RunHeapError::from)?;
+        let status = run.free(ptr).map_err(RunHeapError::from)?;
 
         Ok(FreedRun {
             id: run.id(),
             class: run.class(),
             range: run.range(),
             owner: NonNull::from(&mut *run),
-            was_full,
-            is_empty: run.is_empty(),
+            was_full: status.was_full(),
+            is_empty: status.is_empty(),
         })
     }
 
@@ -174,23 +187,23 @@ impl RunHeap {
     fn allocate_from_available(&mut self, class_index: usize) -> Option<Allocation> {
         loop {
             let mut run_ptr = *self.available.get(class_index)?.as_ref()?;
-            let (ptr, next) = {
+            let (allocation, next) = {
                 // SAFETY: available-list pointers are created only from live RunArena entries.
                 let run = unsafe { run_ptr.as_mut() };
-                let ptr = run.allocate().map(RunBlock::ptr);
-
-                if ptr.is_some() && run.has_available_blocks() {
-                    return ptr.map(|ptr| Allocation::new(ptr, ZeroStatus::NeedsZeroing));
+                match run.allocate() {
+                    Some(allocation) if allocation.has_available_blocks() => {
+                        return Some(Allocation::new(allocation.ptr(), ZeroStatus::NeedsZeroing));
+                    }
+                    Some(allocation) => (Some(allocation), run.take_available_next()),
+                    None => (None, run.take_available_next()),
                 }
-
-                (ptr, run.take_available_next())
             };
 
             let available = self.available.get_mut(class_index)?;
             *available = next;
 
-            if let Some(ptr) = ptr {
-                return Some(Allocation::new(ptr, ZeroStatus::NeedsZeroing));
+            if let Some(allocation) = allocation {
+                return Some(Allocation::new(allocation.ptr(), ZeroStatus::NeedsZeroing));
             }
         }
     }
@@ -311,7 +324,7 @@ mod tests {
         let spec = LayoutSpec::from_size_align(64, 8).unwrap();
         let class = SizeClasses::for_layout(spec).unwrap();
 
-        Run::new(id, mapping, class)
+        Run::new(id, HeapOwner::Shared, mapping, class)
     }
 
     fn available_run_id(allocator: &RunHeap, class_index: usize) -> Option<RunId> {
@@ -329,7 +342,10 @@ mod tests {
         let class = SizeClasses::for_layout(spec).unwrap();
         let class_index = class.id().index();
         let capacity = RUN_SIZE / class.block_size();
-        let first = allocator.allocate(class.id(), &mut pages).unwrap().ptr();
+        let first = allocator
+            .allocate(class.id(), HeapOwner::Shared, &mut pages)
+            .unwrap()
+            .ptr();
         let PageOwner::Run(run_ptr) = pages.get(first).unwrap() else {
             panic!("small allocation should publish a run entry");
         };
@@ -337,14 +353,21 @@ mod tests {
         let id = unsafe { run_ptr.as_ref().id() };
 
         for _ in 1..capacity {
-            assert!(allocator.allocate(class.id(), &mut pages).is_some());
+            assert!(
+                allocator
+                    .allocate(class.id(), HeapOwner::Shared, &mut pages)
+                    .is_some()
+            );
         }
 
         assert_eq!(available_run_id(&allocator, class_index), None);
         assert_eq!(allocator.free(run_ptr, first, &mut pages), Ok(()));
         assert_eq!(available_run_id(&allocator, class_index), Some(id));
 
-        let reused = allocator.allocate(class.id(), &mut pages).unwrap().ptr();
+        let reused = allocator
+            .allocate(class.id(), HeapOwner::Shared, &mut pages)
+            .unwrap()
+            .ptr();
 
         assert_eq!(reused, first);
         assert_eq!(available_run_id(&allocator, class_index), None);
@@ -374,7 +397,10 @@ mod tests {
         let mut pages = PageMap::new();
         let spec = LayoutSpec::from_size_align(64, 8).unwrap();
         let class = SizeClasses::for_layout(spec).unwrap();
-        let ptr = allocator.allocate(class.id(), &mut pages).unwrap().ptr();
+        let ptr = allocator
+            .allocate(class.id(), HeapOwner::Shared, &mut pages)
+            .unwrap()
+            .ptr();
         let PageOwner::Run(run_ptr) = pages.get(ptr).unwrap() else {
             panic!("small allocation should publish a run entry");
         };
@@ -394,14 +420,20 @@ mod tests {
         let mut pages = PageMap::new();
         let spec = LayoutSpec::from_size_align(64, 8).unwrap();
         let class = SizeClasses::for_layout(spec).unwrap();
-        let first = allocator.allocate(class.id(), &mut pages).unwrap().ptr();
+        let first = allocator
+            .allocate(class.id(), HeapOwner::Shared, &mut pages)
+            .unwrap()
+            .ptr();
         let PageOwner::Run(run_ptr) = pages.get(first).unwrap() else {
             panic!("small allocation should publish a run entry");
         };
 
         assert_eq!(allocator.free(run_ptr, first, &mut pages), Ok(()));
 
-        let second = allocator.allocate(class.id(), &mut pages).unwrap().ptr();
+        let second = allocator
+            .allocate(class.id(), HeapOwner::Shared, &mut pages)
+            .unwrap()
+            .ptr();
         assert_eq!(second, first);
     }
 }

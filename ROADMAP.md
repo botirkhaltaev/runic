@@ -31,15 +31,15 @@ entity owns a real lifecycle, invariant, or policy.
 
 Latest published release: `0.4.0`.
 
-Current `master` is ready for v0.5 planning. It has the v0.4 global-lock
-allocator with configurable extent and empty-run retention policy work.
+Current v0.5 development adds the per-thread small-run frontend while keeping
+extents central and preserving explicit page-map ownership.
 
 The current milestone is:
 
 ```text
-A global-lock allocator with optimized single-thread small allocation paths,
+A global-lock allocator core with optimized per-thread small-run frontend paths,
 stable run/extent metadata ownership, deterministic mapping retention policy,
-and randomized trace coverage.
+remote-free validation, and randomized trace coverage.
 ```
 
 ## Supported Scope
@@ -70,8 +70,6 @@ Do not build yet:
 
 ```text
 profiles
-thread-local heaps
-remote frees
 quarantine
 canaries
 hugepages
@@ -108,37 +106,40 @@ Use this architecture first:
 GlobalAlloc
   -> RunicAlloc
       -> Allocator
-          -> Heap
+          -> AllocatorCore
               -> PageMap
-              -> RunHeap
-                  -> RunArena
-                  -> RunCache
-              -> ExtentHeap
-                  -> ExtentArena
-                  -> ExtentCache
+              -> Heap
+                  -> RunHeap
+                      -> RunArena
+                  -> ExtentHeap
+                      -> ExtentArena
+                      -> ExtentCache
+              -> HeapTable
+                  -> ThreadHeap
               -> Run
-                  -> FreeBitmap
               -> Extent
               -> OsMemory
 ```
 
-Keep one global lock around `Heap` until the thread-local heap milestone.
+Keep one global lock around `AllocatorState` for v0.5 slow paths; same-thread
+small-run hits may use thread-owned heap metadata without entering that lock.
 
 ## Entity Responsibilities
 
 ```text
 RunicAlloc     owns the Rust GlobalAlloc boundary.
 Allocator      owns the core public allocator API and abort boundary.
-Heap           owns global allocation routing and shared allocator state.
+AllocatorCore  owns PageMap and locked shared allocator state.
+Heap           owns run and extent allocation policy for one heap identity.
+HeapTable      owns thread heap slots, generation identity, and remote inboxes.
 LayoutSpec     owns normalized layout semantics.
 SizeClasses    owns size-class selection.
 OsMemory       owns mmap and munmap.
 PageMap        owns page-indexed owner-pointer lookup.
 RunHeap        owns small-allocation policy and per-class available run lists.
 RunArena       owns out-of-line run metadata storage.
-RunCache       owns retained empty-run mappings.
 Run            owns fixed-block allocation metadata and block bitmap state.
-FreeBitmap     owns block availability bits.
+BlockStates    owns reusable, allocated, and remote-pending block state.
 ExtentHeap     owns dedicated allocation policy and mapping reuse.
 ExtentArena    owns out-of-line extent metadata storage.
 ExtentCache    owns retained extent mappings, eviction, and reuse lookup.
@@ -256,10 +257,10 @@ keeping the global-lock architecture simple.
 In scope:
 
 ```text
-AllocatorConfig, ExtentConfig, RunConfig
+AllocatorConfig and ExtentConfig
 ExtentPolicy and ExtentReuse
-RunPolicy for empty-run release experiments
-ExtentCache and RunCache fixed-slot storage
+empty-run release behavior through RunHeap
+ExtentCache fixed-slot storage
 policy_grid benchmark coverage
 page-map publication/removal invariants for cached mappings
 clear API documentation for policy and reuse semantics
@@ -276,83 +277,81 @@ RSS checks confirm bounded retention
 empty-run release stays opt-in unless workloads justify changing the default
 ```
 
-### v0.5 Next: Owner Identity For Local Heaps
-
-Goal:
-
-```text
-Introduce the minimum owner identity needed for thread-local heaps and remote
-free routing without adding local fast paths prematurely.
-```
-
-In scope:
-
-```text
-HeapId or equivalent non-zero owner identity
-run or future region ownership metadata
-page-map lookup that returns enough owner information for routing
-thread-exit and cleanup design
-tests for ownership lookup and invalid frees
-```
-
-Primary references:
-
-```text
-docs/span-ownership-evaluation.md
-docs/thread-local-frontend-scope.md
-docs/remote-free-protocol.md
-```
-
-### v0.6 Next: Thread-Local Small Allocation Frontend
+### v0.5 Next: Full Thread-Local Heaps
 
 Goal:
 
 ```text
 Make same-thread small allocation hits avoid global metadata work while preserving
-block-boundary, double-free, stale-free, and remote-free validation.
+block-boundary, double-free, stale-free, remote-free, and thread-exit correctness.
 ```
 
 In scope:
 
 ```text
-LocalHeap for small allocations only
-fixed-size per-class local caches
-batch refill from shared run metadata
-validated local frees
-bounded remote-free enqueue or validated fallback
+HeapId owner identity
+RunOwner::Central and RunOwner::Thread
+ThreadHeap frontend for small allocations only
+per-thread run ownership through HeapTable slots
+central refill into thread-owned runs
+explicit block states for reusable, allocated, and remote-pending blocks
+global-lock remote-free routing with fixed inboxes
+thread-exit drain and ownership transfer
 threaded benchmark reporting
 ```
 
 Out of scope:
 
 ```text
+local extents
 NUMA
 hugepages
 adaptive cache sizing
 hardening profiles
+lock-free remote-free queues
 unbounded queues
-```
-
-### v0.7 Later: Remote Free Protocol
-
-Goal:
-
-```text
-Route cross-thread frees to the owning heap without allowing one thread to mutate
-another thread's local metadata directly.
 ```
 
 Acceptance gate:
 
 ```text
-bounded allocation-free queue
+same-thread local small allocation/free improves threaded churn
+cross-thread frees remain validated and do not mutate owner-local metadata directly
+thread exit with live allocations remains valid
+existing abort tests pass
+randomized cross-thread traces pass
+no allocator-internal heap allocation is introduced
+```
+
+Primary references:
+
+```text
+docs/thread-local-frontend-scope.md
+docs/thread-local-heap-plan.md
+docs/remote-free-protocol.md
+docs/span-ownership-evaluation.md
+```
+
+### v0.6 Later: Remote Free Queue Optimization
+
+Goal:
+
+```text
+Optimize remote-free enqueue and drain behavior after v0.5 proves ownership and
+validation semantics.
+```
+
+Acceptance gate:
+
+```text
+bounded allocation-free queue remains mandatory
 owner-side validation of every remote free
 queue-full behavior that does not drop frees
 randomized cross-thread traces
 abort cases remain intact
 ```
 
-### v0.8 Later: Hardening
+### v0.7 Later: Hardening
 
 Goal:
 
@@ -372,7 +371,7 @@ randomized placement only after deterministic paths are stable
 
 Primary reference: `docs/allocator-hardening-policy.md`.
 
-### v0.9 Later: Backend Regions And Hugepage-Aware Allocation
+### v0.8 Later: Backend Regions And Hugepage-Aware Allocation
 
 Goal:
 

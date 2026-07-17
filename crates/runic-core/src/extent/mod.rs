@@ -7,6 +7,7 @@ mod heap;
 use crate::{
     layout::LayoutSpec,
     memory::{AddressRange, Mapping},
+    ownership::HeapOwner,
 };
 
 pub(crate) use arena::{ExtentArena, ExtentReservation};
@@ -34,18 +35,29 @@ pub(crate) enum ExtentError {
 
 pub(crate) struct Extent {
     id: ExtentId,
+    owner: HeapOwner,
     mapping: Mapping,
     range: AddressRange,
 }
 
 impl Extent {
-    pub(crate) fn new(id: ExtentId, mapping: Mapping, spec: LayoutSpec) -> Option<Self> {
+    pub(crate) fn new(
+        id: ExtentId,
+        owner: HeapOwner,
+        mapping: Mapping,
+        spec: LayoutSpec,
+    ) -> Option<Self> {
         let user_addr = spec.align_addr(mapping.base().as_ptr().addr())?;
         let user_ptr = NonNull::new(core::ptr::with_exposed_provenance_mut(user_addr))?;
         let range = AddressRange::new(user_ptr, spec.size());
 
         if mapping.range().contains(range) {
-            Some(Self { id, mapping, range })
+            Some(Self {
+                id,
+                owner,
+                mapping,
+                range,
+            })
         } else {
             None
         }
@@ -53,6 +65,10 @@ impl Extent {
 
     pub(crate) const fn id(&self) -> ExtentId {
         self.id
+    }
+
+    pub(crate) const fn owner(&self) -> HeapOwner {
+        self.owner
     }
 
     pub(crate) const fn ptr(&self) -> NonNull<u8> {
@@ -99,6 +115,10 @@ impl Extent {
     }
 
     pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<(), ExtentError> {
+        self.validate_free(ptr)
+    }
+
+    pub(crate) fn validate_free(&self, ptr: NonNull<u8>) -> Result<(), ExtentError> {
         if self.starts_at(ptr) {
             Ok(())
         } else {
@@ -118,7 +138,13 @@ mod tests {
         let spec = LayoutSpec::from_size_align(128 * 1024, 4096).unwrap();
         let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
         let mapping_range = mapping.range();
-        let extent = Extent::new(ExtentId::from_index(0).unwrap(), mapping, spec).unwrap();
+        let extent = Extent::new(
+            ExtentId::from_index(0).unwrap(),
+            HeapOwner::Shared,
+            mapping,
+            spec,
+        )
+        .unwrap();
 
         assert_eq!(extent.ptr().as_ptr() as usize % spec.align(), 0);
         assert_eq!(extent.range.len(), spec.size());
@@ -129,7 +155,13 @@ mod tests {
     fn extent_rejects_interior_pointer() {
         let spec = LayoutSpec::from_size_align(128 * 1024, 4096).unwrap();
         let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
-        let extent = Extent::new(ExtentId::from_index(1).unwrap(), mapping, spec).unwrap();
+        let extent = Extent::new(
+            ExtentId::from_index(1).unwrap(),
+            HeapOwner::Shared,
+            mapping,
+            spec,
+        )
+        .unwrap();
         // SAFETY: adding one stays within the mapped extent for this non-zero allocation.
         let interior = unsafe { NonNull::new_unchecked(extent.ptr().as_ptr().add(1)) };
 
@@ -141,7 +173,13 @@ mod tests {
     fn extent_accepts_exact_pointer() {
         let spec = LayoutSpec::from_size_align(128 * 1024, 4096).unwrap();
         let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
-        let extent = Extent::new(ExtentId::from_index(2).unwrap(), mapping, spec).unwrap();
+        let extent = Extent::new(
+            ExtentId::from_index(2).unwrap(),
+            HeapOwner::Shared,
+            mapping,
+            spec,
+        )
+        .unwrap();
 
         assert!(extent.starts_at(extent.ptr()));
         assert_eq!(extent.free(extent.ptr()), Ok(()));
@@ -151,7 +189,13 @@ mod tests {
     fn extent_resizes_in_place_for_smaller_layout() {
         let spec = LayoutSpec::from_size_align(128 * 1024, 4096).unwrap();
         let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
-        let mut extent = Extent::new(ExtentId::from_index(3).unwrap(), mapping, spec).unwrap();
+        let mut extent = Extent::new(
+            ExtentId::from_index(3).unwrap(),
+            HeapOwner::Shared,
+            mapping,
+            spec,
+        )
+        .unwrap();
         let smaller = LayoutSpec::from_size_align(64 * 1024, 4096).unwrap();
 
         assert_eq!(extent.resize_in_place(extent.ptr(), smaller), Ok(true));
@@ -161,7 +205,13 @@ mod tests {
     fn extent_does_not_resize_in_place_beyond_mapping() {
         let spec = LayoutSpec::from_size_align(128 * 1024, 4096).unwrap();
         let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
-        let mut extent = Extent::new(ExtentId::from_index(4).unwrap(), mapping, spec).unwrap();
+        let mut extent = Extent::new(
+            ExtentId::from_index(4).unwrap(),
+            HeapOwner::Shared,
+            mapping,
+            spec,
+        )
+        .unwrap();
         let larger = LayoutSpec::from_size_align(256 * 1024, 4096).unwrap();
 
         assert_eq!(extent.resize_in_place(extent.ptr(), larger), Ok(false));
@@ -171,7 +221,13 @@ mod tests {
     fn extent_grows_in_place_within_larger_mapping() {
         let spec = LayoutSpec::from_size_align(128 * 1024, 4096).unwrap();
         let mapping = OsMemory::map(512 * 1024).unwrap();
-        let mut extent = Extent::new(ExtentId::from_index(5).unwrap(), mapping, spec).unwrap();
+        let mut extent = Extent::new(
+            ExtentId::from_index(5).unwrap(),
+            HeapOwner::Shared,
+            mapping,
+            spec,
+        )
+        .unwrap();
         let larger = LayoutSpec::from_size_align(256 * 1024, 4096).unwrap();
 
         assert_eq!(extent.resize_in_place(extent.ptr(), larger), Ok(true));
@@ -182,7 +238,13 @@ mod tests {
     fn extent_grows_in_place_when_page_range_does_not_change() {
         let spec = LayoutSpec::from_size_align(4095, 8).unwrap();
         let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
-        let mut extent = Extent::new(ExtentId::from_index(6).unwrap(), mapping, spec).unwrap();
+        let mut extent = Extent::new(
+            ExtentId::from_index(6).unwrap(),
+            HeapOwner::Shared,
+            mapping,
+            spec,
+        )
+        .unwrap();
         let larger = LayoutSpec::from_size_align(4096, 8).unwrap();
 
         assert_eq!(extent.resize_in_place(extent.ptr(), larger), Ok(true));
