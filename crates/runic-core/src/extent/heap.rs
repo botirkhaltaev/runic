@@ -5,7 +5,7 @@ use crate::{
     config::ExtentConfig,
     extent::{Extent, ExtentArena},
     layout::LayoutSpec,
-    memory::{L2TablePolicy, OsMemory, PageMap, PageOwner, PageRange},
+    memory::{OsMemory, PageMap},
     ownership::HeapOwner,
 };
 
@@ -75,18 +75,9 @@ impl ExtentHeap {
             (extent.id(), extent.mapping_range(), extent.mapping_len())
         };
 
-        let retain_mapping = self.cache.will_retain(mapping_len);
-        let Some(page_range) = PageRange::new(range.base(), range.len()) else {
-            return Err(ExtentHeapError::InvalidMetadata);
-        };
-
-        let empty_l2_tables = if retain_mapping {
-            L2TablePolicy::RetainEmpty
-        } else {
-            L2TablePolicy::ReleaseEmpty
-        };
+        let _retain_mapping = self.cache.will_retain(mapping_len);
         pages
-            .remove(page_range, PageOwner::Extent(extent_ptr), empty_l2_tables)
+            .unpublish_extent(range, extent_ptr)
             .map_err(|_| ExtentHeapError::InvalidMetadata)?;
 
         let Some(extent) = self.extents.remove(id) else {
@@ -127,21 +118,13 @@ impl ExtentHeap {
             return None;
         }
 
-        let Some(page_range) = PageRange::new(range.base(), range.len()) else {
-            let _removed = self.extents.remove(id);
-            return None;
-        };
-
         let Some(inserted_extent) = self.extents.get_mut(id) else {
             let _removed = self.extents.remove(id);
             return None;
         };
         let extent_ptr = NonNull::from(&mut *inserted_extent);
 
-        if pages
-            .insert(page_range, PageOwner::Extent(extent_ptr))
-            .is_err()
-        {
+        if pages.publish_extent(range, extent_ptr).is_err() {
             let _removed = self.extents.remove(id);
             return None;
         }
@@ -155,7 +138,7 @@ mod tests {
     use crate::{
         extent::{Extent, ExtentId},
         layout::LayoutSpec,
-        memory::{OsMemory, PageMap, PageOwner, PageRange},
+        memory::{OsMemory, PageMap, PageOwner},
     };
 
     use super::*;
@@ -176,10 +159,10 @@ mod tests {
         let id = reservation.id();
         let extent = reusable_extent(id);
         let range = extent.mapping_range();
-        let page_range = PageRange::new(range.base(), range.len()).unwrap();
-        let existing = PageOwner::Extent(NonNull::dangling());
+        let existing_extent = NonNull::dangling();
+        let existing = PageOwner::Extent(existing_extent);
 
-        pages.insert(page_range, existing).unwrap();
+        pages.publish_extent(range, existing_extent).unwrap();
 
         assert_eq!(
             allocator.insert_extent(reservation, extent, &mut pages),

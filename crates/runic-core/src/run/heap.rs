@@ -4,7 +4,7 @@ use crate::{
     allocation::{Allocation, ZeroStatus},
     config::{RunConfig, RunPolicy},
     layout::LayoutSpec,
-    memory::{AddressRange, L2TablePolicy, OsMemory, PageMap, PageOwner, PageRange},
+    memory::{AddressRange, OsMemory, PageMap},
     ownership::HeapOwner,
     run::{RUN_SIZE, Run, RunArena, RunError, RunId},
     size_class::{SizeClassId, SizeClasses},
@@ -150,16 +150,9 @@ impl RunHeap {
             return Err(RunHeapError::InvalidMetadata);
         }
 
-        let Some(page_range) = PageRange::new(freed.range.base(), freed.range.len()) else {
-            return Err(RunHeapError::InvalidMetadata);
-        };
-        let empty_l2_tables = if self.cache.will_retain() {
-            L2TablePolicy::RetainEmpty
-        } else {
-            L2TablePolicy::ReleaseEmpty
-        };
+        let _retain_mapping = self.cache.will_retain();
         pages
-            .remove(page_range, PageOwner::Run(freed.owner), empty_l2_tables)
+            .unpublish_run(freed.range, freed.owner)
             .map_err(|_| RunHeapError::InvalidMetadata)?;
 
         let Some(run) = self.runs.remove(freed.id) else {
@@ -277,18 +270,13 @@ impl RunHeap {
             return None;
         }
 
-        let Some(page_range) = PageRange::new(range.base(), range.len()) else {
-            let _removed = self.runs.remove(id);
-            return None;
-        };
-
         let Some(inserted_run) = self.runs.get_mut(id) else {
             let _removed = self.runs.remove(id);
             return None;
         };
         let run_ptr = NonNull::from(&mut *inserted_run);
 
-        if pages.insert(page_range, PageOwner::Run(run_ptr)).is_err() {
+        if pages.publish_run(range, run_ptr).is_err() {
             let _removed = self.runs.remove(id);
             return None;
         }
@@ -312,7 +300,7 @@ mod tests {
     use crate::{
         config::{Budget, RunPolicy},
         layout::LayoutSpec,
-        memory::{OsMemory, PageMap, PageOwner, PageRange},
+        memory::{OsMemory, PageMap, PageOwner},
         run::{RUN_SIZE, Run, RunId},
         size_class::SizeClasses,
     };
@@ -381,10 +369,10 @@ mod tests {
         let id = reservation.id();
         let run = reusable_run(id);
         let range = run.range();
-        let page_range = PageRange::new(range.base(), range.len()).unwrap();
-        let existing = PageOwner::Run(NonNull::dangling());
+        let existing_run = NonNull::dangling();
+        let existing = PageOwner::Run(existing_run);
 
-        pages.insert(page_range, existing).unwrap();
+        pages.publish_run(range, existing_run).unwrap();
 
         assert_eq!(allocator.insert_run(reservation, run, &mut pages), None);
         assert!(allocator.runs.get_mut(id).is_none());
