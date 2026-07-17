@@ -8,9 +8,8 @@ use core::{
 use spin::Mutex;
 
 use crate::{
-    extent::Extent,
+    heap::{Extent, Run},
     memory::{AddressRange, Mapping, OsMemory, PAGE_SIZE},
-    run::Run,
 };
 
 mod entry;
@@ -101,16 +100,6 @@ impl PageMap {
         let _writer = self.writer.lock();
         let range = PageRange::new(range.base(), range.len()).ok_or(PageMapError::InvalidRange)?;
         self.remove(range, PageOwner::Extent(extent))
-    }
-
-    pub(crate) fn unpublish_run(
-        &self,
-        range: AddressRange,
-        run: NonNull<Run>,
-    ) -> Result<(), PageMapError> {
-        let _writer = self.writer.lock();
-        let range = PageRange::new(range.base(), range.len()).ok_or(PageMapError::InvalidRange)?;
-        self.remove(range, PageOwner::Run(run))
     }
 
     fn insert(&self, range: PageRange, entry: PageOwner) -> Result<(), PageMapError> {

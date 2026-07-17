@@ -1,12 +1,10 @@
-use core::ptr::NonNull;
+use core::ptr::{NonNull, write_bytes};
 
 use crate::{
-    allocation::{Allocation, ZeroStatus},
     config::ExtentConfig,
-    extent::{Extent, ExtentArena},
+    heap::{Extent, ExtentArena, HeapId},
     layout::LayoutSpec,
     memory::{OsMemory, PageMap},
-    ownership::HeapOwner,
 };
 
 use super::{ExtentReservation, cache::ExtentCache};
@@ -34,16 +32,45 @@ impl ExtentHeap {
     pub(crate) fn allocate(
         &mut self,
         spec: LayoutSpec,
-        owner: HeapOwner,
-        pages: &mut PageMap,
-    ) -> Option<Allocation> {
+        owner: HeapId,
+        pages: &PageMap,
+    ) -> Option<NonNull<u8>> {
         let len = spec.mapping_len(OsMemory::page_size())?;
-        let (mapping, zero_status) = if let Some(mapping) = self.cache.take(len) {
-            (mapping, ZeroStatus::NeedsZeroing)
+        let mapping = self.cache.take(len).or_else(|| OsMemory::map(len))?;
+
+        self.allocate_mapping(spec, owner, mapping, pages)
+    }
+
+    pub(crate) fn allocate_zeroed(
+        &mut self,
+        spec: LayoutSpec,
+        requested_size: usize,
+        owner: HeapId,
+        pages: &PageMap,
+    ) -> Option<NonNull<u8>> {
+        let len = spec.mapping_len(OsMemory::page_size())?;
+        let (mapping, needs_zeroing) = if let Some(mapping) = self.cache.take(len) {
+            (mapping, true)
         } else {
-            (OsMemory::map(len)?, ZeroStatus::KnownZeroed)
+            (OsMemory::map(len)?, false)
         };
 
+        let ptr = self.allocate_mapping(spec, owner, mapping, pages)?;
+        if needs_zeroing {
+            // SAFETY: ptr was just allocated for spec and is valid for the requested layout size.
+            unsafe { write_bytes(ptr.as_ptr(), 0, requested_size) };
+        }
+
+        Some(ptr)
+    }
+
+    fn allocate_mapping(
+        &mut self,
+        spec: LayoutSpec,
+        owner: HeapId,
+        mapping: crate::memory::Mapping,
+        pages: &PageMap,
+    ) -> Option<NonNull<u8>> {
         let reservation = self.extents.reserve()?;
         let id = reservation.id();
         let Some(extent) = Extent::new(id, owner, mapping, spec) else {
@@ -55,16 +82,16 @@ impl ExtentHeap {
 
         self.insert_extent(reservation, extent, pages)?;
 
-        Some(Allocation::new(ptr, zero_status))
+        Some(ptr)
     }
 
     pub(crate) fn free(
         &mut self,
         extent_ptr: NonNull<Extent>,
         ptr: NonNull<u8>,
-        pages: &mut PageMap,
+        pages: &PageMap,
     ) -> Result<(), ExtentHeapError> {
-        let (id, range, mapping_len) = {
+        let (id, range) = {
             // SAFETY: PageMap stores only pointers published from this allocator's live ExtentArena.
             let extent = unsafe { extent_ptr.as_ref() };
 
@@ -72,10 +99,9 @@ impl ExtentHeap {
                 return Err(ExtentHeapError::InvalidPointer);
             }
 
-            (extent.id(), extent.mapping_range(), extent.mapping_len())
+            (extent.id(), extent.mapping_range())
         };
 
-        let _retain_mapping = self.cache.will_retain(mapping_len);
         pages
             .unpublish_extent(range, extent_ptr)
             .map_err(|_| ExtentHeapError::InvalidMetadata)?;
@@ -109,7 +135,7 @@ impl ExtentHeap {
         &mut self,
         reservation: ExtentReservation,
         extent: Extent,
-        pages: &mut PageMap,
+        pages: &PageMap,
     ) -> Option<NonNull<Extent>> {
         let id = reservation.id();
         let range = extent.mapping_range();
@@ -136,7 +162,7 @@ impl ExtentHeap {
 #[cfg(test)]
 mod tests {
     use crate::{
-        extent::{Extent, ExtentId},
+        heap::{Extent, ExtentId},
         layout::LayoutSpec,
         memory::{OsMemory, PageMap, PageOwner},
     };
@@ -148,27 +174,23 @@ mod tests {
         let len = spec.mapping_len(OsMemory::page_size()).unwrap();
         let mapping = OsMemory::map(len).unwrap();
 
-        Extent::new(id, HeapOwner::Shared, mapping, spec).unwrap()
+        Extent::new(id, HeapId::ROOT, mapping, spec).unwrap()
     }
 
     #[test]
     fn failed_extent_page_publication_removes_table_entry() {
         let mut allocator = ExtentHeap::new(4, ExtentConfig::new());
-        let mut pages = PageMap::new();
+        let pages = PageMap::new();
         let reservation = allocator.extents.reserve().unwrap();
         let id = reservation.id();
         let extent = reusable_extent(id);
         let range = extent.mapping_range();
-        let existing_extent = NonNull::dangling();
-        let existing = PageOwner::Extent(existing_extent);
+        let existing = NonNull::dangling();
 
-        pages.publish_extent(range, existing_extent).unwrap();
+        pages.publish_extent(range, existing).unwrap();
 
-        assert_eq!(
-            allocator.insert_extent(reservation, extent, &mut pages),
-            None
-        );
+        assert_eq!(allocator.insert_extent(reservation, extent, &pages), None);
         assert!(allocator.extents.get_mut(id).is_none());
-        assert_eq!(pages.get(range.base()), Some(existing));
+        assert_eq!(pages.get(range.base()), Some(PageOwner::Extent(existing)));
     }
 }

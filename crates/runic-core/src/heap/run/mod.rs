@@ -1,15 +1,14 @@
-use core::{num::NonZeroU32, ptr::NonNull};
+use core::{cell::UnsafeCell, mem::size_of, num::NonZeroU32, ptr::NonNull};
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
 mod arena;
-mod cache;
 mod heap;
 
 use crate::{
+    heap::HeapId,
     layout::LayoutSpec,
     memory::{AddressRange, Mapping},
-    ownership::HeapOwner,
     size_class::{SizeClass, SizeClassId},
 };
 
@@ -23,6 +22,22 @@ const MAX_BLOCKS: usize = RUN_SIZE / MIN_BLOCK_SIZE;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RunId {
     index: NonZeroU32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RunOwner {
+    Central,
+    Thread(HeapId),
+}
+
+impl RunOwner {
+    pub(crate) const fn for_heap(heap: HeapId) -> Self {
+        if heap.is_root() {
+            Self::Central
+        } else {
+            Self::Thread(heap)
+        }
+    }
 }
 
 impl RunId {
@@ -88,6 +103,8 @@ pub(crate) enum RunError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BlockStateError {
     AlreadyFree,
+    AlreadyAllocated,
+    AlreadyPending,
     InvalidIndex,
 }
 
@@ -96,6 +113,7 @@ enum BlockStateError {
 enum BlockState {
     Free = 0,
     Allocated = 1,
+    RemotePending = 2,
 }
 
 impl BlockState {
@@ -103,6 +121,7 @@ impl BlockState {
         match self {
             Self::Free => 0,
             Self::Allocated => 1,
+            Self::RemotePending => 2,
         }
     }
 
@@ -110,6 +129,7 @@ impl BlockState {
         match raw {
             value if value == Self::Free.raw() => Some(Self::Free),
             value if value == Self::Allocated.raw() => Some(Self::Allocated),
+            value if value == Self::RemotePending.raw() => Some(Self::RemotePending),
             _ => None,
         }
     }
@@ -145,12 +165,48 @@ impl BlockStates {
                 Ok(())
             }
             BlockState::Free => Err(BlockStateError::AlreadyFree),
+            BlockState::RemotePending => Err(BlockStateError::AlreadyPending),
+        }
+    }
+
+    fn mark_remote_pending(&self, index: BlockIndex) -> Result<(), BlockStateError> {
+        let state = self.state(index)?;
+        match state.compare_exchange(
+            BlockState::Allocated.raw(),
+            BlockState::RemotePending.raw(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => Ok(()),
+            Err(observed) => Self::state_error(observed),
+        }
+    }
+
+    fn release_remote_pending(&self, index: BlockIndex) -> Result<(), BlockStateError> {
+        let state = self.state(index)?;
+        match state.compare_exchange(
+            BlockState::RemotePending.raw(),
+            BlockState::Free.raw(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => Ok(()),
+            Err(observed) => Self::state_error(observed),
         }
     }
 
     fn load(&self, index: BlockIndex) -> Result<BlockState, BlockStateError> {
         let raw = self.state(index)?.load(Ordering::Relaxed);
         BlockState::from_raw(raw).ok_or(BlockStateError::InvalidIndex)
+    }
+
+    fn state_error(raw: u8) -> Result<(), BlockStateError> {
+        match BlockState::from_raw(raw) {
+            Some(BlockState::Free) => Err(BlockStateError::AlreadyFree),
+            Some(BlockState::Allocated) => Err(BlockStateError::AlreadyAllocated),
+            Some(BlockState::RemotePending) => Err(BlockStateError::AlreadyPending),
+            None => Err(BlockStateError::InvalidIndex),
+        }
     }
 
     fn state(&self, index: BlockIndex) -> Result<&AtomicU8, BlockStateError> {
@@ -162,78 +218,57 @@ impl BlockStates {
 
 pub(crate) struct Run {
     id: RunId,
+    owner: RunOwner,
     mapping: Mapping,
     range: AddressRange,
     class: SizeClassId,
     block_size: usize,
     block_shift: Option<u32>,
     capacity: usize,
-    state: std::cell::UnsafeCell<RunState>,
+    state: UnsafeCell<RunState>,
     blocks: BlockStates,
 }
 
-// SAFETY: owner-local methods are externally synchronized by the owning heap in the current
-// architecture. Remote methods only touch atomic block state.
+// SAFETY: owner-local methods are called only by the owning heap. Remote methods only touch atomic
+// block state and never mutate RunState.
 unsafe impl Sync for Run {}
 
 struct RunState {
-    owner: HeapOwner,
     live: usize,
     bump: usize,
     available_next: Option<NonNull<Run>>,
     free: Option<NonNull<u8>>,
 }
 
-pub(crate) struct RunAllocation {
-    block: RunBlock,
-    has_available_blocks: bool,
-}
-
-impl RunAllocation {
-    pub(crate) const fn ptr(&self) -> NonNull<u8> {
-        self.block.ptr()
-    }
-
-    pub(crate) const fn has_available_blocks(&self) -> bool {
-        self.has_available_blocks
-    }
-}
-
 pub(crate) struct RunFreeStatus {
     was_full: bool,
-    is_empty: bool,
 }
 
 impl RunFreeStatus {
     pub(crate) const fn was_full(&self) -> bool {
         self.was_full
     }
-
-    pub(crate) const fn is_empty(&self) -> bool {
-        self.is_empty
-    }
 }
 
 impl Run {
-    pub(crate) fn new(id: RunId, owner: HeapOwner, mapping: Mapping, class: SizeClass) -> Self {
+    pub(crate) fn new(id: RunId, owner: RunOwner, mapping: Mapping, class: SizeClass) -> Self {
         let range = mapping.range();
         let block_size = class.block_size();
-        let capacity = range.len().checked_div(block_size).unwrap_or(0);
+        let capacity = range
+            .len()
+            .checked_div(block_size)
+            .unwrap_or(0)
+            .min(MAX_BLOCKS);
         Self {
             id,
+            owner,
             mapping,
             range,
             class: class.id(),
             block_size,
             block_shift: block_size_shift(block_size),
-            capacity: capacity.min(MAX_BLOCKS),
-            state: std::cell::UnsafeCell::new(RunState {
-                owner,
-                live: 0,
-                bump: 0,
-                available_next: None,
-                free: None,
-            }),
+            capacity,
+            state: UnsafeCell::new(RunState::new(block_size)),
             blocks: BlockStates::new(),
         }
     }
@@ -242,9 +277,8 @@ impl Run {
         self.id
     }
 
-    pub(crate) fn owner(&self) -> HeapOwner {
-        // SAFETY: owner-local methods are externally synchronized by the owning heap.
-        unsafe { &*self.state.get() }.owner
+    pub(crate) const fn owner(&self) -> RunOwner {
+        self.owner
     }
 
     pub(crate) const fn class(&self) -> SizeClassId {
@@ -252,23 +286,18 @@ impl Run {
     }
 
     pub(crate) fn has_available_blocks(&self) -> bool {
-        // SAFETY: owner-local methods are externally synchronized by the owning heap.
+        // SAFETY: owner-local methods are called only by the owning heap.
         unsafe { &*self.state.get() }.live < self.capacity
     }
 
     pub(crate) fn set_available_next(&self, next: Option<NonNull<Run>>) {
-        // SAFETY: owner-local methods are externally synchronized by the owning heap.
+        // SAFETY: owner-local methods are called only by the owning heap.
         unsafe { &mut *self.state.get() }.available_next = next;
     }
 
     pub(crate) fn take_available_next(&self) -> Option<NonNull<Run>> {
-        // SAFETY: owner-local methods are externally synchronized by the owning heap.
+        // SAFETY: owner-local methods are called only by the owning heap.
         unsafe { &mut *self.state.get() }.available_next.take()
-    }
-
-    pub(crate) fn available_next(&self) -> Option<NonNull<Run>> {
-        // SAFETY: owner-local methods are externally synchronized by the owning heap.
-        unsafe { &*self.state.get() }.available_next
     }
 
     pub(crate) fn range(&self) -> AddressRange {
@@ -277,12 +306,8 @@ impl Run {
         self.range
     }
 
-    pub(crate) fn into_mapping(self) -> Mapping {
-        self.mapping
-    }
-
-    pub(crate) fn allocate(&self) -> Option<RunAllocation> {
-        // SAFETY: owner-local methods are externally synchronized by the owning heap.
+    pub(crate) fn allocate(&self) -> Option<NonNull<u8>> {
+        // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
         let (index, ptr) = if let Some(ptr) = state.pop_free() {
             let block = self.block_at(ptr)?;
@@ -291,26 +316,27 @@ impl Run {
             let index = state.allocate_fresh(self.capacity)?;
             (index, self.block_ptr(index)?)
         };
-        let block = RunBlock::new(index, ptr);
-
+        debug_assert_eq!(self.block_at(ptr).map(RunBlock::index), Some(index));
         self.blocks.allocate(index).ok()?;
 
-        state.live = state.live.checked_add(1)?;
-        Some(RunAllocation {
-            block,
-            has_available_blocks: state.live < self.capacity,
-        })
+        debug_assert!(state.live < self.capacity);
+        state.live += 1;
+        Some(ptr)
     }
 
-    pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<RunFreeStatus, RunError> {
+    pub(crate) fn free_local(&self, ptr: NonNull<u8>) -> Result<RunFreeStatus, RunError> {
         let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
-        // SAFETY: owner-local methods are externally synchronized by the owning heap.
+        // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
         let was_full = state.live == self.capacity;
 
         match self.blocks.release(block.index()) {
             Ok(()) => {}
-            Err(BlockStateError::AlreadyFree) => return Err(RunError::DoubleFree),
+            Err(
+                BlockStateError::AlreadyFree
+                | BlockStateError::AlreadyAllocated
+                | BlockStateError::AlreadyPending,
+            ) => return Err(RunError::DoubleFree),
             Err(BlockStateError::InvalidIndex) => return Err(RunError::InvalidPointer),
         }
 
@@ -321,15 +347,47 @@ impl Run {
         state.live = live;
         state.push_free(ptr);
 
-        Ok(RunFreeStatus {
-            was_full,
-            is_empty: live == 0,
-        })
+        Ok(RunFreeStatus { was_full })
     }
 
-    pub(crate) fn validate_free(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
-        self.allocated_block_at(ptr)?;
-        Ok(())
+    pub(crate) fn mark_remote_pending(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
+        let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
+
+        match self.blocks.mark_remote_pending(block.index()) {
+            Ok(()) => Ok(()),
+            Err(
+                BlockStateError::AlreadyFree
+                | BlockStateError::AlreadyAllocated
+                | BlockStateError::AlreadyPending,
+            ) => Err(RunError::DoubleFree),
+            Err(BlockStateError::InvalidIndex) => Err(RunError::InvalidPointer),
+        }
+    }
+
+    pub(crate) fn complete_remote_free(&self, ptr: NonNull<u8>) -> Result<RunFreeStatus, RunError> {
+        let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
+        // SAFETY: owner-local methods are called only by the owning heap.
+        let state = unsafe { &mut *self.state.get() };
+        let was_full = state.live == self.capacity;
+
+        match self.blocks.release_remote_pending(block.index()) {
+            Ok(()) => {}
+            Err(
+                BlockStateError::AlreadyFree
+                | BlockStateError::AlreadyAllocated
+                | BlockStateError::AlreadyPending,
+            ) => return Err(RunError::DoubleFree),
+            Err(BlockStateError::InvalidIndex) => return Err(RunError::InvalidPointer),
+        }
+
+        let Some(live) = state.live.checked_sub(1) else {
+            return Err(RunError::FreeUnderflow);
+        };
+
+        state.live = live;
+        state.push_free(ptr);
+
+        Ok(RunFreeStatus { was_full })
     }
 
     pub(crate) fn allocated_block_at(&self, ptr: NonNull<u8>) -> Result<RunBlock, RunError> {
@@ -338,9 +396,12 @@ impl Run {
         match self.blocks.is_allocated(block.index()) {
             Ok(true) => Ok(block),
             Ok(false) => Err(RunError::DoubleFree),
-            Err(BlockStateError::InvalidIndex | BlockStateError::AlreadyFree) => {
-                Err(RunError::InvalidPointer)
-            }
+            Err(
+                BlockStateError::InvalidIndex
+                | BlockStateError::AlreadyFree
+                | BlockStateError::AlreadyAllocated
+                | BlockStateError::AlreadyPending,
+            ) => Err(RunError::InvalidPointer),
         }
     }
 
@@ -357,6 +418,7 @@ impl Run {
     pub(crate) fn block_at(&self, ptr: NonNull<u8>) -> Option<RunBlock> {
         let offset = self.range.offset_of(ptr)?;
         let index = self.block_index(offset)?;
+
         if index >= self.capacity {
             return None;
         }
@@ -390,6 +452,17 @@ impl Run {
 }
 
 impl RunState {
+    fn new(block_size: usize) -> Self {
+        debug_assert!(block_size >= size_of::<usize>());
+
+        Self {
+            live: 0,
+            bump: 0,
+            available_next: None,
+            free: None,
+        }
+    }
+
     fn allocate_fresh(&mut self, capacity: usize) -> Option<BlockIndex> {
         if self.bump >= capacity {
             return None;
@@ -436,9 +509,7 @@ const fn block_size_shift(block_size: usize) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        layout::LayoutSpec, memory::OsMemory, ownership::HeapOwner, size_class::SizeClasses,
-    };
+    use crate::{layout::LayoutSpec, memory::OsMemory, size_class::SizeClasses};
 
     use super::*;
 
@@ -453,7 +524,7 @@ mod tests {
         let class = class_for(64, 8);
         let run = Run::new(
             RunId::from_index(0).unwrap(),
-            HeapOwner::Shared,
+            RunOwner::Central,
             mapping,
             class,
         );
@@ -461,9 +532,8 @@ mod tests {
         let mut seen = vec![false; capacity];
 
         for _ in 0..capacity {
-            let allocation = run.allocate().unwrap();
-            let block = allocation.block;
-            let ptr = block.ptr();
+            let ptr = run.allocate().unwrap();
+            let block = run.block_at(ptr).unwrap();
             let index = block.index().index;
 
             assert!(!seen[index]);
@@ -483,16 +553,16 @@ mod tests {
         let class = class_for(128, 8);
         let run = Run::new(
             RunId::from_index(1).unwrap(),
-            HeapOwner::Shared,
+            RunOwner::Central,
             mapping,
             class,
         );
 
-        let ptr = run.allocate().unwrap().ptr();
+        let ptr = run.allocate().unwrap();
 
-        assert!(run.free(ptr).is_ok());
+        assert!(run.free_local(ptr).is_ok());
 
-        assert_eq!(run.allocate().map(|allocation| allocation.ptr()), Some(ptr));
+        assert_eq!(run.allocate(), Some(ptr));
     }
 
     #[test]
@@ -500,12 +570,12 @@ mod tests {
         let mapping = OsMemory::map(RUN_SIZE).unwrap();
         let run = Run::new(
             RunId::from_index(7).unwrap(),
-            HeapOwner::Shared,
+            RunOwner::Central,
             mapping,
             class_for(64, 8),
         );
         let new = LayoutSpec::from_size_align(64, 8).unwrap();
-        let ptr = run.allocate().unwrap().ptr();
+        let ptr = run.allocate().unwrap();
 
         assert_eq!(run.resize_in_place(ptr, new), Ok(true));
     }
@@ -515,12 +585,12 @@ mod tests {
         let mapping = OsMemory::map(RUN_SIZE).unwrap();
         let run = Run::new(
             RunId::from_index(8).unwrap(),
-            HeapOwner::Shared,
+            RunOwner::Central,
             mapping,
             class_for(64, 8),
         );
         let new = LayoutSpec::from_size_align(80, 8).unwrap();
-        let ptr = run.allocate().unwrap().ptr();
+        let ptr = run.allocate().unwrap();
 
         assert_eq!(run.resize_in_place(ptr, new), Ok(false));
     }
@@ -531,11 +601,11 @@ mod tests {
         let class = class_for(64, 8);
         let run = Run::new(
             RunId::from_index(2).unwrap(),
-            HeapOwner::Shared,
+            RunOwner::Central,
             mapping,
             class,
         );
-        let ptr = run.allocate().unwrap().ptr();
+        let ptr = run.allocate().unwrap();
         let interior = unsafe { NonNull::new_unchecked(ptr.as_ptr().add(1)) };
 
         assert!(run.block_at(interior).is_none());
@@ -547,11 +617,11 @@ mod tests {
         let class = class_for(24, 8);
         let run = Run::new(
             RunId::from_index(2).unwrap(),
-            HeapOwner::Shared,
+            RunOwner::Central,
             mapping,
             class,
         );
-        let ptr = run.allocate().unwrap().ptr();
+        let ptr = run.allocate().unwrap();
         let interior = unsafe { NonNull::new_unchecked(ptr.as_ptr().add(1)) };
 
         assert!(run.block_at(ptr).is_some());
@@ -564,14 +634,63 @@ mod tests {
         let class = class_for(64, 8);
         let run = Run::new(
             RunId::from_index(7).unwrap(),
-            HeapOwner::Shared,
+            RunOwner::Central,
             mapping,
             class,
         );
-        let ptr = run.allocate().unwrap().ptr();
+        let ptr = run.allocate().unwrap();
 
-        assert!(run.free(ptr).is_ok());
-        assert!(matches!(run.free(ptr), Err(RunError::DoubleFree)));
+        assert!(run.free_local(ptr).is_ok());
+        assert!(matches!(run.free_local(ptr), Err(RunError::DoubleFree)));
+    }
+
+    #[test]
+    fn remote_pending_run_reports_duplicate_remote_free() {
+        let mapping = OsMemory::map(RUN_SIZE).unwrap();
+        let class = class_for(64, 8);
+        let run = Run::new(
+            RunId::from_index(9).unwrap(),
+            RunOwner::Central,
+            mapping,
+            class,
+        );
+        let ptr = run.allocate().unwrap();
+
+        assert_eq!(run.mark_remote_pending(ptr), Ok(()));
+        assert_eq!(run.mark_remote_pending(ptr), Err(RunError::DoubleFree));
+    }
+
+    #[test]
+    fn remote_pending_run_reports_local_free_as_double_free() {
+        let mapping = OsMemory::map(RUN_SIZE).unwrap();
+        let class = class_for(64, 8);
+        let run = Run::new(
+            RunId::from_index(10).unwrap(),
+            RunOwner::Central,
+            mapping,
+            class,
+        );
+        let ptr = run.allocate().unwrap();
+
+        assert_eq!(run.mark_remote_pending(ptr), Ok(()));
+        assert!(matches!(run.free_local(ptr), Err(RunError::DoubleFree)));
+    }
+
+    #[test]
+    fn remote_pending_run_completes_to_reusable() {
+        let mapping = OsMemory::map(RUN_SIZE).unwrap();
+        let class = class_for(64, 8);
+        let run = Run::new(
+            RunId::from_index(11).unwrap(),
+            RunOwner::Central,
+            mapping,
+            class,
+        );
+        let ptr = run.allocate().unwrap();
+
+        assert_eq!(run.mark_remote_pending(ptr), Ok(()));
+        assert!(run.complete_remote_free(ptr).is_ok());
+        assert_eq!(run.allocate(), Some(ptr));
     }
 
     #[test]
@@ -580,13 +699,13 @@ mod tests {
         let class = class_for(64, 8);
         let run = Run::new(
             RunId::from_index(8).unwrap(),
-            HeapOwner::Shared,
+            RunOwner::Central,
             mapping,
             class,
         );
 
         assert!(matches!(
-            run.free(run.range().base()),
+            run.free_local(run.range().base()),
             Err(RunError::DoubleFree)
         ));
     }
@@ -598,14 +717,14 @@ mod tests {
         let class = SizeClasses::for_layout(spec).unwrap();
         let run = Run::new(
             RunId::from_index(3).unwrap(),
-            HeapOwner::Shared,
+            RunOwner::Central,
             mapping,
             class,
         );
         let capacity = RUN_SIZE / class.block_size();
 
         for _ in 0..capacity {
-            let ptr = run.allocate().unwrap().ptr();
+            let ptr = run.allocate().unwrap();
             assert_eq!(ptr.as_ptr() as usize % 16, 0);
         }
     }
@@ -616,7 +735,7 @@ mod tests {
         let range = mapping.range();
         let run = Run::new(
             RunId::from_index(5).unwrap(),
-            HeapOwner::Shared,
+            RunOwner::Central,
             mapping,
             class_for(8, 8),
         );

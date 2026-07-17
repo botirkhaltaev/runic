@@ -1,5 +1,5 @@
 use crate::{
-    run::{Run, RunId},
+    heap::{Run, RunId},
     slot_store::{SlotStore, SlotStoreError},
 };
 
@@ -101,10 +101,9 @@ impl From<SlotStoreError> for RunArenaError {
 #[cfg(test)]
 mod tests {
     use crate::{
+        heap::{RUN_SIZE, Run, RunId, RunOwner},
         layout::LayoutSpec,
         memory::OsMemory,
-        ownership::HeapOwner,
-        run::{RUN_SIZE, Run, RunId},
         size_class::SizeClasses,
     };
 
@@ -115,7 +114,7 @@ mod tests {
         let spec = LayoutSpec::from_size_align(64, 8).unwrap();
         let class = SizeClasses::for_layout(spec).unwrap();
 
-        Run::new(id, HeapOwner::Shared, mapping, class)
+        Run::new(id, RunOwner::Central, mapping, class)
     }
 
     fn arena_with_capacity(capacity: usize) -> RunArena {
@@ -228,9 +227,9 @@ mod tests {
         let run = reusable_run(reservation.id());
 
         let id = arena.insert(reservation, run).unwrap();
-        let ptr = arena.get_mut(id).unwrap().allocate().unwrap().ptr();
+        let ptr = arena.get_mut(id).unwrap().allocate().unwrap();
 
-        assert!(arena.get_mut(id).unwrap().free(ptr).is_ok());
+        assert!(arena.get_mut(id).unwrap().free_local(ptr).is_ok());
 
         let _removed = arena.remove(id);
     }

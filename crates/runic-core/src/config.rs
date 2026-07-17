@@ -1,8 +1,7 @@
-/// Immutable allocator configuration shared by the run and extent heaps.
+/// Immutable allocator configuration for tunable allocator behavior.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AllocatorConfig {
     extent: ExtentConfig,
-    run: RunConfig,
 }
 
 impl AllocatorConfig {
@@ -10,18 +9,12 @@ impl AllocatorConfig {
     pub const fn new() -> Self {
         Self {
             extent: ExtentConfig::new(),
-            run: RunConfig::new(),
         }
     }
 
     #[must_use]
     pub const fn extent(self) -> ExtentConfig {
         self.extent
-    }
-
-    #[must_use]
-    pub const fn run(self) -> RunConfig {
-        self.run
     }
 
     #[must_use]
@@ -39,18 +32,6 @@ impl AllocatorConfig {
     #[must_use]
     pub const fn with_extent_budget(mut self, budget: Budget) -> Self {
         self.extent = self.extent.with_budget(budget);
-        self
-    }
-
-    #[must_use]
-    pub const fn with_run_policy(mut self, policy: RunPolicy) -> Self {
-        self.run = self.run.with_policy(policy);
-        self
-    }
-
-    #[must_use]
-    pub const fn with_run_budget(mut self, budget: Budget) -> Self {
-        self.run = self.run.with_budget(budget);
         self
     }
 }
@@ -119,58 +100,6 @@ impl Default for ExtentConfig {
     }
 }
 
-/// Empty run mapping cache configuration.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RunConfig {
-    policy: RunPolicy,
-    budget: Budget,
-}
-
-impl RunConfig {
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            policy: RunPolicy::Keep,
-            budget: Budget::new(0, 0),
-        }
-    }
-
-    #[must_use]
-    pub const fn policy(self) -> RunPolicy {
-        self.policy
-    }
-
-    #[must_use]
-    pub const fn budget(self) -> Budget {
-        self.budget
-    }
-
-    pub(crate) const fn retains_empty_runs(self) -> bool {
-        matches!(
-            self.policy,
-            RunPolicy::RetainFifo | RunPolicy::RetainPerClass
-        )
-    }
-
-    #[must_use]
-    pub const fn with_policy(mut self, policy: RunPolicy) -> Self {
-        self.policy = policy;
-        self
-    }
-
-    #[must_use]
-    pub const fn with_budget(mut self, budget: Budget) -> Self {
-        self.budget = budget;
-        self
-    }
-}
-
-impl Default for RunConfig {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Slot and byte limits for allocator mapping caches.
 ///
 /// Cache implementations use fixed internal storage and clamp active slots to
@@ -228,17 +157,4 @@ pub enum ExtentReuse {
     BestFit,
     /// Reuse a sufficiently large mapping from the request's power-of-two size bucket.
     SizeClass,
-}
-
-/// Empty-run release and retention policy.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RunPolicy {
-    /// Keep empty runs live in the run arena and page map.
-    Keep,
-    /// Release empty runs immediately and unmap their mappings.
-    DropEmpty,
-    /// Release empty runs and retain mappings, reusing the oldest first.
-    RetainFifo,
-    /// Release empty runs and prefer retained mappings from the same size class.
-    RetainPerClass,
 }
