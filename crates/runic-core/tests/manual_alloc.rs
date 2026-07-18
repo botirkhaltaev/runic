@@ -1,5 +1,13 @@
 use core::alloc::Layout;
-use std::{sync::mpsc, thread};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
+    time::Duration,
+};
 
 use runic_core::Allocator;
 
@@ -451,6 +459,71 @@ fn allocator_frees_large_allocation_from_non_owner_thread() {
         unsafe { allocator.dealloc(ptr, layout) };
         done_tx.send(()).unwrap();
     });
+}
+
+#[test]
+fn allocator_completes_remote_free_burst_without_owner_progress() {
+    // Regression test for the remote-free livelock (#61): a burst of remote
+    // frees far larger than any internal remote-free queue capacity must
+    // return without deadlock even while the owner thread makes no allocator
+    // progress of its own.
+    const BURST: usize = 4 * 1024;
+    const WATCHDOG_SECONDS: u64 = 60;
+
+    let allocator = Allocator::new();
+    let layout = Layout::from_size_align(64, 8).unwrap();
+    let (ptr_tx, ptr_rx) = mpsc::channel();
+    let (park_tx, park_rx) = mpsc::channel();
+    let disarmed = Arc::new(AtomicBool::new(false));
+
+    // A deadlock in the free path must abort the test process quickly instead
+    // of hanging the suite until the CI job timeout (see issue #60).
+    thread::spawn({
+        let disarmed = Arc::clone(&disarmed);
+        move || {
+            thread::sleep(Duration::from_secs(WATCHDOG_SECONDS));
+            if !disarmed.load(Ordering::Acquire) {
+                std::process::abort();
+            }
+        }
+    });
+
+    thread::scope(|scope| {
+        let allocator = &allocator;
+        let owner = scope.spawn(move || {
+            for _ in 0..BURST {
+                let ptr = unsafe { allocator.alloc(layout) };
+                assert!(!ptr.is_null());
+                unsafe { ptr.write(0x5a) };
+                ptr_tx.send(ptr.addr()).unwrap();
+            }
+            // Stay parked so every free below arrives remotely while the
+            // owner performs no local allocation or free of its own.
+            park_rx.recv().unwrap();
+        });
+
+        let mut pointers = Vec::with_capacity(BURST);
+        for _ in 0..BURST {
+            pointers.push(ptr_rx.recv().unwrap() as *mut u8);
+        }
+
+        for ptr in pointers {
+            assert_eq!(unsafe { ptr.read() }, 0x5a);
+            unsafe { allocator.dealloc(ptr, layout) };
+        }
+
+        // The allocator must still make forward progress after the burst.
+        let ptr = unsafe { allocator.alloc(layout) };
+        assert!(!ptr.is_null());
+        unsafe { ptr.write(0xa5) };
+        assert_eq!(unsafe { ptr.read() }, 0xa5);
+        unsafe { allocator.dealloc(ptr, layout) };
+
+        park_tx.send(()).unwrap();
+        owner.join().unwrap();
+    });
+
+    disarmed.store(true, Ordering::Release);
 }
 
 struct AllocationRecord {
