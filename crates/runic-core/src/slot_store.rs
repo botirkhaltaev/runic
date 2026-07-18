@@ -30,24 +30,18 @@ impl<T> SlotStore<T> {
             return None;
         }
         let start = usize::try_from(self.next).ok()?;
+        let slots = self.slots_mut()?.slots_mut();
 
-        for offset in 0..capacity {
-            let sum = start.checked_add(offset)?;
-            let index = if sum >= capacity {
-                sum.checked_sub(capacity)?
-            } else {
-                sum
-            };
+        for index in start..capacity {
+            if slots.get_mut(index)?.reserve() {
+                self.next = Self::next_index(index, capacity)?;
+                return Some(index);
+            }
+        }
 
-            let slot = self.slots_mut()?.get_mut(index)?;
-            if slot.reserve() {
-                let next = if index + 1 == capacity {
-                    0
-                } else {
-                    index.checked_add(1)?
-                };
-                self.next = u32::try_from(next).ok()?;
-
+        for index in 0..start {
+            if slots.get_mut(index)?.reserve() {
+                self.next = Self::next_index(index, capacity)?;
                 return Some(index);
             }
         }
@@ -69,6 +63,10 @@ impl<T> SlotStore<T> {
         self.slot_mut(index)?.get_mut()
     }
 
+    pub(crate) fn get(&self, index: usize) -> Option<&T> {
+        self.slot(index)?.get()
+    }
+
     pub(crate) fn remove(&mut self, index: usize) -> Option<T> {
         self.slot_mut(index)?.remove()
     }
@@ -87,6 +85,20 @@ impl<T> SlotStore<T> {
 
     fn slot_mut(&mut self, index: usize) -> Option<&mut Slot<T>> {
         self.slots.as_mut()?.get_mut(index)
+    }
+
+    fn slot(&self, index: usize) -> Option<&Slot<T>> {
+        self.slots.as_ref()?.get(index)
+    }
+
+    fn next_index(index: usize, capacity: usize) -> Option<u32> {
+        let next = if index + 1 == capacity {
+            0
+        } else {
+            index.checked_add(1)?
+        };
+
+        u32::try_from(next).ok()
     }
 }
 
@@ -113,11 +125,22 @@ impl<T> Slots<T> {
         self.slots_mut().get_mut(index)
     }
 
+    fn get(&self, index: usize) -> Option<&Slot<T>> {
+        self.slots().get(index)
+    }
+
     fn slots_mut(&mut self) -> &mut [Slot<T>] {
         debug_assert!(self.len <= self.mapping.range().len() / core::mem::size_of::<Slot<T>>());
 
         // SAFETY: Slots has unique access to the mmap storage here.
         unsafe { slice::from_raw_parts_mut(self.base.as_ptr(), self.len) }
+    }
+
+    fn slots(&self) -> &[Slot<T>] {
+        debug_assert!(self.len <= self.mapping.range().len() / core::mem::size_of::<Slot<T>>());
+
+        // SAFETY: Slots owns this initialized mmap storage and shared access only returns shared refs.
+        unsafe { slice::from_raw_parts(self.base.as_ptr(), self.len) }
     }
 }
 
@@ -175,6 +198,15 @@ impl<T> Slot<T> {
 
         // SAFETY: occupied state is set only after value.write initializes the slot.
         Some(unsafe { self.value.assume_init_mut() })
+    }
+
+    fn get(&self) -> Option<&T> {
+        if !self.state.is_occupied() {
+            return None;
+        }
+
+        // SAFETY: occupied state is set only after value.write initializes the slot.
+        Some(unsafe { self.value.assume_init_ref() })
     }
 
     fn remove(&mut self) -> Option<T> {

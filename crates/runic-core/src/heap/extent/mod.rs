@@ -5,9 +5,9 @@ mod cache;
 mod heap;
 
 use crate::{
+    heap::HeapId,
     layout::LayoutSpec,
     memory::{AddressRange, Mapping},
-    ownership::HeapOwner,
 };
 
 pub(crate) use arena::{ExtentArena, ExtentReservation};
@@ -35,7 +35,7 @@ pub(crate) enum ExtentError {
 
 pub(crate) struct Extent {
     id: ExtentId,
-    owner: HeapOwner,
+    owner: HeapId,
     mapping: Mapping,
     range: AddressRange,
 }
@@ -43,7 +43,7 @@ pub(crate) struct Extent {
 impl Extent {
     pub(crate) fn new(
         id: ExtentId,
-        owner: HeapOwner,
+        owner: HeapId,
         mapping: Mapping,
         spec: LayoutSpec,
     ) -> Option<Self> {
@@ -67,7 +67,7 @@ impl Extent {
         self.id
     }
 
-    pub(crate) const fn owner(&self) -> HeapOwner {
+    pub(crate) const fn owner(&self) -> HeapId {
         self.owner
     }
 
@@ -106,10 +106,6 @@ impl Extent {
         self.mapping.range()
     }
 
-    pub(crate) fn mapping_len(&self) -> usize {
-        self.mapping.range().len()
-    }
-
     pub(crate) fn into_mapping(self) -> Mapping {
         self.mapping
     }
@@ -129,7 +125,7 @@ impl Extent {
 
 #[cfg(test)]
 mod tests {
-    use crate::{layout::LayoutSpec, memory::OsMemory};
+    use crate::{heap::HeapId, layout::LayoutSpec, memory::OsMemory};
 
     use super::*;
 
@@ -140,7 +136,7 @@ mod tests {
         let mapping_range = mapping.range();
         let extent = Extent::new(
             ExtentId::from_index(0).unwrap(),
-            HeapOwner::Shared,
+            HeapId::ROOT,
             mapping,
             spec,
         )
@@ -157,7 +153,7 @@ mod tests {
         let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
         let extent = Extent::new(
             ExtentId::from_index(1).unwrap(),
-            HeapOwner::Shared,
+            HeapId::ROOT,
             mapping,
             spec,
         )
@@ -175,7 +171,7 @@ mod tests {
         let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
         let extent = Extent::new(
             ExtentId::from_index(2).unwrap(),
-            HeapOwner::Shared,
+            HeapId::ROOT,
             mapping,
             spec,
         )
@@ -191,7 +187,7 @@ mod tests {
         let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
         let mut extent = Extent::new(
             ExtentId::from_index(3).unwrap(),
-            HeapOwner::Shared,
+            HeapId::ROOT,
             mapping,
             spec,
         )
@@ -207,7 +203,7 @@ mod tests {
         let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
         let mut extent = Extent::new(
             ExtentId::from_index(4).unwrap(),
-            HeapOwner::Shared,
+            HeapId::ROOT,
             mapping,
             spec,
         )
@@ -223,7 +219,7 @@ mod tests {
         let mapping = OsMemory::map(512 * 1024).unwrap();
         let mut extent = Extent::new(
             ExtentId::from_index(5).unwrap(),
-            HeapOwner::Shared,
+            HeapId::ROOT,
             mapping,
             spec,
         )
@@ -240,7 +236,7 @@ mod tests {
         let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
         let mut extent = Extent::new(
             ExtentId::from_index(6).unwrap(),
-            HeapOwner::Shared,
+            HeapId::ROOT,
             mapping,
             spec,
         )

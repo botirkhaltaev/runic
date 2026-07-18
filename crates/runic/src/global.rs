@@ -1,6 +1,6 @@
 use core::alloc::{GlobalAlloc, Layout};
 
-use runic_core::{Allocator, AllocatorConfig, Budget, ExtentPolicy, ExtentReuse, RunPolicy};
+use runic_core::{Allocator, AllocatorConfig, Budget, ExtentPolicy, ExtentReuse};
 
 pub struct RunicAlloc {
     allocator: Allocator,
@@ -49,11 +49,6 @@ impl RunicAllocBuilder {
     }
 
     #[must_use]
-    pub const fn run(self) -> RunBuilder {
-        RunBuilder { builder: self }
-    }
-
-    #[must_use]
     pub const fn build(self) -> RunicAlloc {
         RunicAlloc::with_config(self.config)
     }
@@ -85,29 +80,6 @@ impl ExtentBuilder {
     #[must_use]
     pub const fn budget(mut self, budget: Budget) -> Self {
         self.builder.config = self.builder.config.with_extent_budget(budget);
-        self
-    }
-
-    #[must_use]
-    pub const fn done(self) -> RunicAllocBuilder {
-        self.builder
-    }
-}
-
-pub struct RunBuilder {
-    builder: RunicAllocBuilder,
-}
-
-impl RunBuilder {
-    #[must_use]
-    pub const fn policy(mut self, policy: RunPolicy) -> Self {
-        self.builder.config = self.builder.config.with_run_policy(policy);
-        self
-    }
-
-    #[must_use]
-    pub const fn budget(mut self, budget: Budget) -> Self {
-        self.builder.config = self.builder.config.with_run_budget(budget);
         self
     }
 

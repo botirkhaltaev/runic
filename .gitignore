@@ -19,3 +19,8 @@
 # Local logs and scratch output
 *.log
 /tmp/
+
+# Local profiling artifacts
+perf.data
+perf.data.*
+*.perf.data

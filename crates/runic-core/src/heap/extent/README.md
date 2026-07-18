@@ -1,4 +1,4 @@
-# extent
+# heap/extent
 
 Extent metadata owns dedicated large allocations.
 
