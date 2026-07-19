@@ -16,24 +16,6 @@ static EXTENT_FIFO_16M: RunicAlloc = RunicAlloc::builder()
     .budget(Budget::new(32, 16 * 1024 * 1024))
     .done()
     .build();
-static EXTENT_LIFO_16M: RunicAlloc = RunicAlloc::builder()
-    .extent()
-    .policy(ExtentPolicy::Lifo)
-    .budget(Budget::new(32, 16 * 1024 * 1024))
-    .done()
-    .build();
-static EXTENT_LARGEST_16M: RunicAlloc = RunicAlloc::builder()
-    .extent()
-    .policy(ExtentPolicy::Largest)
-    .budget(Budget::new(32, 16 * 1024 * 1024))
-    .done()
-    .build();
-static EXTENT_SMALLEST_16M: RunicAlloc = RunicAlloc::builder()
-    .extent()
-    .policy(ExtentPolicy::Smallest)
-    .budget(Budget::new(32, 16 * 1024 * 1024))
-    .done()
-    .build();
 static EXTENT_FIFO_BEST_FIT_16M: RunicAlloc = RunicAlloc::builder()
     .extent()
     .policy(ExtentPolicy::Fifo)
@@ -41,22 +23,11 @@ static EXTENT_FIFO_BEST_FIT_16M: RunicAlloc = RunicAlloc::builder()
     .budget(Budget::new(32, 16 * 1024 * 1024))
     .done()
     .build();
-static EXTENT_FIFO_SIZE_CLASS_16M: RunicAlloc = RunicAlloc::builder()
-    .extent()
-    .policy(ExtentPolicy::Fifo)
-    .reuse(ExtentReuse::SizeClass)
-    .budget(Budget::new(32, 16 * 1024 * 1024))
-    .done()
-    .build();
 const CONFIGS: &[PolicyConfig] = &[
     PolicyConfig::new("extent_drop", &EXTENT_DROP),
     PolicyConfig::new("extent_keep_16m", &EXTENT_KEEP_16M),
     PolicyConfig::new("extent_fifo_16m", &EXTENT_FIFO_16M),
-    PolicyConfig::new("extent_lifo_16m", &EXTENT_LIFO_16M),
-    PolicyConfig::new("extent_largest_16m", &EXTENT_LARGEST_16M),
-    PolicyConfig::new("extent_smallest_16m", &EXTENT_SMALLEST_16M),
     PolicyConfig::new("extent_fifo_best_fit_16m", &EXTENT_FIFO_BEST_FIT_16M),
-    PolicyConfig::new("extent_fifo_size_class_16m", &EXTENT_FIFO_SIZE_CLASS_16M),
 ];
 
 const WORKLOADS: &[PolicyWorkload] = &[
