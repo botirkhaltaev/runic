@@ -134,7 +134,7 @@ impl Allocator {
             }
         }
 
-        if Self::dealloc_slow(core, core_ref, entry, ptr).is_err() {
+        if Self::dealloc_slow(core, core_ref, ptr).is_err() {
             Self::abort();
         }
     }
@@ -226,12 +226,11 @@ impl Allocator {
     fn dealloc_slow(
         core: NonNull<AllocatorCore>,
         core_ref: &AllocatorCore,
-        entry: PageOwner,
         ptr: NonNull<u8>,
     ) -> Result<(), AllocatorError> {
         let current_heap = THREAD_HEAP.with(|heap| heap.heap_id(core));
         let mut state = core_ref.state().lock();
-        state.dealloc_owner(entry, ptr, current_heap, core_ref.pages())
+        state.dealloc(ptr, current_heap, core_ref.pages())
     }
 }
 
@@ -368,29 +367,14 @@ impl AllocatorState {
 
     fn dealloc(
         &mut self,
-        raw_ptr: *mut u8,
-        _layout: Layout,
-        current_heap: Option<HeapId>,
-        pages: &PageMap,
-    ) -> Result<(), AllocatorError> {
-        let Some(ptr) = NonNull::new(raw_ptr) else {
-            return Ok(());
-        };
-
-        let Some(entry) = pages.get(ptr) else {
-            return Err(AllocatorError::UnknownPointer);
-        };
-
-        self.dealloc_owner(entry, ptr, current_heap, pages)
-    }
-
-    fn dealloc_owner(
-        &mut self,
-        entry: PageOwner,
         ptr: NonNull<u8>,
         current_heap: Option<HeapId>,
         pages: &PageMap,
     ) -> Result<(), AllocatorError> {
+        let Some(entry) = pages.get(ptr) else {
+            return Err(AllocatorError::UnknownPointer);
+        };
+
         match entry {
             PageOwner::Run(run) => self.dealloc_run(run, ptr, current_heap, pages)?,
             PageOwner::Extent(extent) => {
@@ -465,7 +449,10 @@ impl AllocatorState {
         }
 
         if new_size == 0 {
-            self.dealloc(ptr, old, current_heap, pages)?;
+            let Some(ptr) = NonNull::new(ptr) else {
+                return Ok(null_mut());
+            };
+            self.dealloc(ptr, current_heap, pages)?;
             return Ok(null_mut());
         }
 
@@ -508,8 +495,10 @@ impl AllocatorState {
         // SAFETY: new_ptr is a fresh allocation of at least new_layout.size() bytes; ptr is valid for old.size().
         unsafe { copy_nonoverlapping(ptr, new_ptr, old.size().min(new_layout.size())) };
 
-        if let Err(error) = self.dealloc(ptr, old, current_heap, pages) {
-            let _ = self.dealloc(new_ptr, new_layout, current_heap, pages);
+        if let Err(error) = self.dealloc(old_ptr, current_heap, pages) {
+            if let Some(new_ptr) = NonNull::new(new_ptr) {
+                let _ = self.dealloc(new_ptr, current_heap, pages);
+            }
 
             return Err(error);
         }
@@ -579,9 +568,9 @@ mod tests {
             .allocate(None, SizeClasses::id_for(spec), spec, &pages)
             .unwrap();
 
-        assert_eq!(state.dealloc(ptr.as_ptr(), layout, None, &pages), Ok(()));
+        assert_eq!(state.dealloc(ptr, None, &pages), Ok(()));
         assert_eq!(
-            state.dealloc(ptr.as_ptr(), layout, None, &pages),
+            state.dealloc(ptr, None, &pages),
             Err(AllocatorError::DoubleFree)
         );
     }
@@ -596,7 +585,7 @@ mod tests {
             .allocate(None, SizeClasses::id_for(spec), spec, &pages)
             .unwrap();
 
-        assert_eq!(state.dealloc(ptr.as_ptr(), layout, None, &pages), Ok(()));
+        assert_eq!(state.dealloc(ptr, None, &pages), Ok(()));
         assert_eq!(
             state.realloc(ptr.as_ptr(), layout, 128, None, &pages),
             Err(AllocatorError::DoubleFree)
@@ -613,9 +602,9 @@ mod tests {
             .allocate(None, SizeClasses::id_for(spec), spec, &pages)
             .unwrap();
 
-        assert_eq!(state.dealloc(ptr.as_ptr(), layout, None, &pages), Ok(()));
+        assert_eq!(state.dealloc(ptr, None, &pages), Ok(()));
         assert_eq!(
-            state.dealloc(ptr.as_ptr(), layout, None, &pages),
+            state.dealloc(ptr, None, &pages),
             Err(AllocatorError::UnknownPointer)
         );
     }
@@ -636,10 +625,7 @@ mod tests {
 
         // SAFETY: PageMap stores only live run pointers.
         assert_eq!(unsafe { run.as_ref() }.owner(), Owner::Thread(handle.id()));
-        assert_eq!(
-            state.dealloc(ptr.as_ptr(), layout, Some(handle.id()), &pages),
-            Ok(())
-        );
+        assert_eq!(state.dealloc(ptr, Some(handle.id()), &pages), Ok(()));
     }
 
     #[test]
@@ -658,10 +644,7 @@ mod tests {
 
         // SAFETY: PageMap stores only live extent pointers.
         assert_eq!(unsafe { extent.as_ref() }.owner(), Owner::Central);
-        assert_eq!(
-            state.dealloc(ptr.as_ptr(), layout, Some(handle.id()), &pages),
-            Ok(())
-        );
+        assert_eq!(state.dealloc(ptr, Some(handle.id()), &pages), Ok(()));
     }
 
     #[test]
@@ -675,9 +658,9 @@ mod tests {
             .allocate(Some(handle.id()), SizeClasses::id_for(spec), spec, &pages)
             .unwrap();
 
-        assert_eq!(state.dealloc(ptr.as_ptr(), layout, None, &pages), Ok(()));
+        assert_eq!(state.dealloc(ptr, None, &pages), Ok(()));
         assert_eq!(
-            state.dealloc(ptr.as_ptr(), layout, None, &pages),
+            state.dealloc(ptr, None, &pages),
             Err(AllocatorError::DoubleFree)
         );
     }
@@ -701,8 +684,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(state.abandon(handle.id(), &pages), Ok(()));
-        assert_eq!(state.dealloc(first.as_ptr(), layout, None, &pages), Ok(()));
-        assert_eq!(state.dealloc(second.as_ptr(), layout, None, &pages), Ok(()));
+        assert_eq!(state.dealloc(first, None, &pages), Ok(()));
+        assert_eq!(state.dealloc(second, None, &pages), Ok(()));
     }
 
     #[test]
@@ -718,7 +701,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(state.abandon(heap, &pages), Ok(()));
-        assert_eq!(state.dealloc(ptr.as_ptr(), layout, None, &pages), Ok(()));
+        assert_eq!(state.dealloc(ptr, None, &pages), Ok(()));
         assert!(pages.get(ptr).is_some());
         assert_eq!(state.heaps.acquire().unwrap().id(), heap);
     }
@@ -735,10 +718,7 @@ mod tests {
             .allocate(Some(heap), SizeClasses::id_for(spec), spec, &pages)
             .unwrap();
 
-        assert_eq!(
-            state.dealloc(ptr.as_ptr(), layout, Some(heap), &pages),
-            Ok(())
-        );
+        assert_eq!(state.dealloc(ptr, Some(heap), &pages), Ok(()));
         assert!(pages.get(ptr).is_some());
         assert_eq!(state.abandon(heap, &pages), Ok(()));
         assert!(pages.get(ptr).is_some());
@@ -749,10 +729,7 @@ mod tests {
             .allocate(Some(reused.id()), SizeClasses::id_for(spec), spec, &pages)
             .unwrap();
         assert_eq!(reused_ptr, ptr);
-        assert_eq!(
-            state.dealloc(reused_ptr.as_ptr(), layout, Some(reused.id()), &pages),
-            Ok(())
-        );
+        assert_eq!(state.dealloc(reused_ptr, Some(reused.id()), &pages), Ok(()));
     }
 
     #[test]
@@ -773,10 +750,7 @@ mod tests {
 
         // SAFETY: PageMap stores only live extent pointers.
         assert_eq!(unsafe { extent.as_ref() }.owner(), Owner::Central);
-        assert_eq!(
-            state.dealloc(ptr.as_ptr(), layout, Some(handle.id()), &pages),
-            Ok(())
-        );
+        assert_eq!(state.dealloc(ptr, Some(handle.id()), &pages), Ok(()));
     }
 
     #[test]
@@ -803,9 +777,6 @@ mod tests {
 
         // SAFETY: PageMap stores only live extent pointers.
         assert_eq!(unsafe { extent.as_ref() }.owner(), Owner::Central);
-        assert_eq!(
-            state.dealloc(grown.as_ptr(), large, Some(handle.id()), &pages),
-            Ok(())
-        );
+        assert_eq!(state.dealloc(grown, Some(handle.id()), &pages), Ok(()));
     }
 }

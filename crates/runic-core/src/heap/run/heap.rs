@@ -1,7 +1,7 @@
 use core::ptr::NonNull;
 
 use crate::{
-    heap::{Owner, RUN_SIZE, Run, RunArena, RunError, RunId},
+    heap::{Owner, RUN_SIZE, Run, RunArena, RunError, RunId, run::RunFreeStatus},
     layout::LayoutSpec,
     memory::{OsMemory, PageMap},
     size_class::{SizeClassId, SizeClasses},
@@ -98,27 +98,26 @@ impl RunHeap {
         self.finish_free(freed)
     }
 
-    fn free_block(mut owner: NonNull<Run>, ptr: NonNull<u8>) -> Result<FreedRun, RunHeapError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live RunArena.
-        let run = unsafe { owner.as_mut() };
-
-        let status = run.free_local(ptr).map_err(RunHeapError::from)?;
-
-        Ok(FreedRun {
-            class: run.class(),
-            owner: NonNull::from(&mut *run),
-            was_full: status.was_full(),
-        })
+    fn free_block(owner: NonNull<Run>, ptr: NonNull<u8>) -> Result<FreedRun, RunHeapError> {
+        Self::free_block_with(owner, ptr, Run::free_local)
     }
 
     fn complete_remote_block(
+        owner: NonNull<Run>,
+        ptr: NonNull<u8>,
+    ) -> Result<FreedRun, RunHeapError> {
+        Self::free_block_with(owner, ptr, Run::complete_remote_free)
+    }
+
+    fn free_block_with(
         mut owner: NonNull<Run>,
         ptr: NonNull<u8>,
+        free_fn: fn(&Run, NonNull<u8>) -> Result<RunFreeStatus, RunError>,
     ) -> Result<FreedRun, RunHeapError> {
         // SAFETY: PageMap stores only pointers published from this allocator's live RunArena.
         let run = unsafe { owner.as_mut() };
 
-        let status = run.complete_remote_free(ptr).map_err(RunHeapError::from)?;
+        let status = free_fn(run, ptr).map_err(RunHeapError::from)?;
 
         Ok(FreedRun {
             class: run.class(),

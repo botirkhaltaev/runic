@@ -140,12 +140,6 @@ pub enum ExtentPolicy {
     Keep,
     /// Evict the oldest retained mapping when capacity is needed.
     Fifo,
-    /// Evict the newest retained mapping when capacity is needed.
-    Lifo,
-    /// Evict the largest retained mapping when capacity is needed.
-    Largest,
-    /// Evict the smallest retained mapping when capacity is needed.
-    Smallest,
 }
 
 /// Allocation-side lookup strategy for cached extent mappings.
@@ -155,6 +149,4 @@ pub enum ExtentReuse {
     Exact,
     /// Reuse the smallest retained mapping that can satisfy the request.
     BestFit,
-    /// Reuse a sufficiently large mapping from the request's power-of-two size bucket.
-    SizeClass,
 }
