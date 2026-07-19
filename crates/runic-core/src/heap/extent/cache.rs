@@ -28,7 +28,6 @@ impl ExtentCache {
         let index = match self.config.reuse() {
             ExtentReuse::Exact => self.find_exact(len),
             ExtentReuse::BestFit => self.find_best_fit(len),
-            ExtentReuse::SizeClass => self.find_size_class(len),
         }?;
 
         let slot = self.slots.get_mut(index)?;
@@ -51,10 +50,7 @@ impl ExtentCache {
             ExtentPolicy::Keep => {
                 self.has_empty_slot() && self.retained_bytes <= budget.bytes() - len
             }
-            ExtentPolicy::Fifo
-            | ExtentPolicy::Lifo
-            | ExtentPolicy::Largest
-            | ExtentPolicy::Smallest => true,
+            ExtentPolicy::Fifo => true,
         }
     }
 
@@ -137,28 +133,10 @@ impl ExtentCache {
             .map(|(index, _)| index)
     }
 
-    fn find_size_class(&self, len: usize) -> Option<usize> {
-        let class = size_class_len(len)?;
-
-        self.slots()
-            .iter()
-            .enumerate()
-            .filter_map(|(index, slot)| {
-                let slot_len = slot.len()?;
-                (size_class_len(slot_len) == Some(class) && slot_len >= len)
-                    .then_some((index, slot_len))
-            })
-            .min_by_key(|&(_, slot_len)| slot_len)
-            .map(|(index, _)| index)
-    }
-
     fn evict_index(&self) -> Option<usize> {
         match self.config.policy() {
             ExtentPolicy::Drop | ExtentPolicy::Keep => None,
             ExtentPolicy::Fifo => self.oldest_index(),
-            ExtentPolicy::Lifo => self.newest_index(),
-            ExtentPolicy::Largest => self.largest_index(),
-            ExtentPolicy::Smallest => self.smallest_index(),
         }
     }
 
@@ -168,33 +146,6 @@ impl ExtentCache {
             .enumerate()
             .filter(|(_, slot)| slot.is_occupied())
             .min_by_key(|(_, slot)| slot.epoch())
-            .map(|(index, _)| index)
-    }
-
-    fn newest_index(&self) -> Option<usize> {
-        self.slots()
-            .iter()
-            .enumerate()
-            .filter(|(_, slot)| slot.is_occupied())
-            .max_by_key(|(_, slot)| slot.epoch())
-            .map(|(index, _)| index)
-    }
-
-    fn largest_index(&self) -> Option<usize> {
-        self.slots()
-            .iter()
-            .enumerate()
-            .filter_map(|(index, slot)| slot.len().map(|len| (index, len)))
-            .max_by_key(|&(_, len)| len)
-            .map(|(index, _)| index)
-    }
-
-    fn smallest_index(&self) -> Option<usize> {
-        self.slots()
-            .iter()
-            .enumerate()
-            .filter_map(|(index, slot)| slot.len().map(|len| (index, len)))
-            .min_by_key(|&(_, len)| len)
             .map(|(index, _)| index)
     }
 
@@ -268,10 +219,6 @@ impl ExtentSlot {
         // SAFETY: occupied was true on entry, so mapping is initialized.
         Some(unsafe { self.mapping.assume_init_read() })
     }
-}
-
-fn size_class_len(len: usize) -> Option<usize> {
-    len.checked_next_power_of_two()
 }
 
 #[cfg(test)]
@@ -370,27 +317,6 @@ mod tests {
     }
 
     #[test]
-    fn extent_cache_lifo_evicts_newest_mapping() {
-        let mut cache = cache(ExtentPolicy::Lifo, Budget::new(2, 8192), ExtentReuse::Exact);
-        let first = mapping(4096);
-        let first_ptr = first.base();
-        let second = mapping(4096);
-        let second_ptr = second.base();
-        let third = mapping(4096);
-
-        assert!(cache.insert(first).is_ok());
-        assert!(cache.insert(second).is_ok());
-        assert!(cache.insert(third).is_ok());
-
-        let first_reused = cache.take(4096).unwrap().base();
-        let second_reused = cache.take(4096).unwrap().base();
-
-        assert!(first_reused == first_ptr || second_reused == first_ptr);
-        assert_ne!(first_reused, second_ptr);
-        assert_ne!(second_reused, second_ptr);
-    }
-
-    #[test]
     fn extent_cache_best_fit_reuses_smallest_sufficient_mapping() {
         let mut cache = cache(
             ExtentPolicy::Keep,
@@ -406,22 +332,5 @@ mod tests {
 
         let reused = cache.take(128 * 1024).unwrap();
         assert_eq!(reused.base(), small_ptr);
-    }
-
-    #[test]
-    fn extent_cache_size_class_reuses_mapping_in_requested_class() {
-        let mut cache = cache(
-            ExtentPolicy::Keep,
-            Budget::new(4, 1024 * 1024),
-            ExtentReuse::SizeClass,
-        );
-        let matching = mapping(256 * 1024);
-        let matching_ptr = matching.base();
-
-        assert!(cache.insert(mapping(512 * 1024)).is_ok());
-        assert!(cache.insert(matching).is_ok());
-
-        let reused = cache.take(128 * 1024 + 1).unwrap();
-        assert_eq!(reused.base(), matching_ptr);
     }
 }
