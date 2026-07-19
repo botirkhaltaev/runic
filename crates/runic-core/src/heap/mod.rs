@@ -9,14 +9,16 @@ use crate::{
 pub(crate) mod arena;
 pub(crate) mod extent;
 pub(crate) mod id;
+pub(crate) mod owner;
 pub(crate) mod run;
 pub(crate) mod table;
 
 pub(crate) use extent::heap::{ExtentHeap, ExtentHeapError};
 pub(crate) use extent::{Extent, ExtentArena};
 pub(crate) use id::HeapId;
+pub(crate) use owner::Owner;
 pub(crate) use run::arena::RunArena;
-pub(crate) use run::{RUN_SIZE, Run, RunError, RunHeap, RunHeapError, RunId, RunOwner};
+pub(crate) use run::{RUN_SIZE, Run, RunError, RunHeap, RunHeapError, RunId};
 pub(crate) use table::{HeapError, HeapHandle, HeapTable, THREAD_HEAP};
 
 pub(crate) struct Heap {
@@ -56,7 +58,7 @@ impl Heap {
         pages: &PageMap,
     ) -> Option<NonNull<u8>> {
         let mut runs = self.runs.lock();
-        let mut run = runs.allocate(class, self.id, pages)?;
+        let mut run = runs.allocate(class, Owner::for_heap(self.id), pages)?;
         // SAFETY: RunHeap returns pointers to live runs from this heap's arena.
         let ptr = unsafe { run.as_mut() }.allocate()?;
         // SAFETY: RunHeap returns pointers to live runs from this heap's arena.
@@ -98,7 +100,10 @@ impl Heap {
     }
 
     pub(crate) fn allocate_extent(&self, spec: LayoutSpec, pages: &PageMap) -> Option<NonNull<u8>> {
-        let ptr = self.extents.lock().allocate(spec, self.id, pages)?;
+        let ptr = self
+            .extents
+            .lock()
+            .allocate(spec, Owner::for_heap(self.id), pages)?;
         self.retain_allocation();
         Some(ptr)
     }
@@ -109,10 +114,12 @@ impl Heap {
         requested_size: usize,
         pages: &PageMap,
     ) -> Option<NonNull<u8>> {
-        let ptr = self
-            .extents
-            .lock()
-            .allocate_zeroed(spec, requested_size, self.id, pages)?;
+        let ptr = self.extents.lock().allocate_zeroed(
+            spec,
+            requested_size,
+            Owner::for_heap(self.id),
+            pages,
+        )?;
         self.retain_allocation();
         Some(ptr)
     }

@@ -2,7 +2,7 @@ use core::ptr::{NonNull, write_bytes};
 
 use crate::{
     config::ExtentConfig,
-    heap::{Extent, ExtentArena, HeapId},
+    heap::{Extent, ExtentArena, Owner},
     layout::LayoutSpec,
     memory::{OsMemory, PageMap},
 };
@@ -32,7 +32,7 @@ impl ExtentHeap {
     pub(crate) fn allocate(
         &mut self,
         spec: LayoutSpec,
-        owner: HeapId,
+        owner: Owner,
         pages: &PageMap,
     ) -> Option<NonNull<u8>> {
         let len = spec.mapping_len(OsMemory::page_size())?;
@@ -45,7 +45,7 @@ impl ExtentHeap {
         &mut self,
         spec: LayoutSpec,
         requested_size: usize,
-        owner: HeapId,
+        owner: Owner,
         pages: &PageMap,
     ) -> Option<NonNull<u8>> {
         let len = spec.mapping_len(OsMemory::page_size())?;
@@ -67,7 +67,7 @@ impl ExtentHeap {
     fn allocate_mapping(
         &mut self,
         spec: LayoutSpec,
-        owner: HeapId,
+        owner: Owner,
         mapping: crate::memory::Mapping,
         pages: &PageMap,
     ) -> Option<NonNull<u8>> {
@@ -162,7 +162,7 @@ impl ExtentHeap {
 #[cfg(test)]
 mod tests {
     use crate::{
-        heap::{Extent, extent::ExtentId},
+        heap::{Extent, HeapId, extent::ExtentId},
         layout::LayoutSpec,
         memory::{OsMemory, PageMap, PageOwner},
     };
@@ -174,7 +174,7 @@ mod tests {
         let len = spec.mapping_len(OsMemory::page_size()).unwrap();
         let mapping = OsMemory::map(len).unwrap();
 
-        Extent::new(id, HeapId::ROOT, mapping, spec).unwrap()
+        Extent::new(id, Owner::for_heap(HeapId::ROOT), mapping, spec).unwrap()
     }
 
     #[test]

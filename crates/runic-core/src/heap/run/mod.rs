@@ -6,13 +6,13 @@ pub(crate) mod arena;
 pub(crate) mod heap;
 
 use crate::{
-    heap::HeapId,
     layout::LayoutSpec,
     memory::{AddressRange, Mapping},
     size_class::{SizeClass, SizeClassId},
 };
 
 use super::arena::ArenaValue;
+use super::owner::Owner;
 
 pub(crate) use heap::{RunHeap, RunHeapError};
 
@@ -23,22 +23,6 @@ const MAX_BLOCKS: usize = RUN_SIZE / MIN_BLOCK_SIZE;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RunId {
     index: NonZeroU32,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RunOwner {
-    Central,
-    Thread(HeapId),
-}
-
-impl RunOwner {
-    pub(crate) const fn for_heap(heap: HeapId) -> Self {
-        if heap.is_root() {
-            Self::Central
-        } else {
-            Self::Thread(heap)
-        }
-    }
 }
 
 impl RunId {
@@ -229,7 +213,7 @@ impl BlockStates {
 
 pub(crate) struct Run {
     id: RunId,
-    owner: RunOwner,
+    owner: Owner,
     mapping: Mapping,
     range: AddressRange,
     class: SizeClassId,
@@ -268,7 +252,7 @@ impl RunFreeStatus {
 }
 
 impl Run {
-    pub(crate) fn new(id: RunId, owner: RunOwner, mapping: Mapping, class: SizeClass) -> Self {
+    pub(crate) fn new(id: RunId, owner: Owner, mapping: Mapping, class: SizeClass) -> Self {
         let range = mapping.range();
         let block_size = class.block_size();
         let capacity = range
@@ -295,7 +279,7 @@ impl Run {
         self.id
     }
 
-    pub(crate) const fn owner(&self) -> RunOwner {
+    pub(crate) const fn owner(&self) -> Owner {
         self.owner
     }
 
@@ -542,7 +526,7 @@ mod tests {
         let class = class_for(64, 8);
         let run = Run::new(
             RunId::from_index(0).unwrap(),
-            RunOwner::Central,
+            Owner::Central,
             mapping,
             class,
         );
@@ -571,7 +555,7 @@ mod tests {
         let class = class_for(128, 8);
         let run = Run::new(
             RunId::from_index(1).unwrap(),
-            RunOwner::Central,
+            Owner::Central,
             mapping,
             class,
         );
@@ -588,7 +572,7 @@ mod tests {
         let mapping = OsMemory::map(RUN_SIZE).unwrap();
         let run = Run::new(
             RunId::from_index(7).unwrap(),
-            RunOwner::Central,
+            Owner::Central,
             mapping,
             class_for(64, 8),
         );
@@ -603,7 +587,7 @@ mod tests {
         let mapping = OsMemory::map(RUN_SIZE).unwrap();
         let run = Run::new(
             RunId::from_index(8).unwrap(),
-            RunOwner::Central,
+            Owner::Central,
             mapping,
             class_for(64, 8),
         );
@@ -619,7 +603,7 @@ mod tests {
         let class = class_for(64, 8);
         let run = Run::new(
             RunId::from_index(2).unwrap(),
-            RunOwner::Central,
+            Owner::Central,
             mapping,
             class,
         );
@@ -635,7 +619,7 @@ mod tests {
         let class = class_for(24, 8);
         let run = Run::new(
             RunId::from_index(2).unwrap(),
-            RunOwner::Central,
+            Owner::Central,
             mapping,
             class,
         );
@@ -652,7 +636,7 @@ mod tests {
         let class = class_for(64, 8);
         let run = Run::new(
             RunId::from_index(7).unwrap(),
-            RunOwner::Central,
+            Owner::Central,
             mapping,
             class,
         );
@@ -668,7 +652,7 @@ mod tests {
         let class = class_for(64, 8);
         let run = Run::new(
             RunId::from_index(9).unwrap(),
-            RunOwner::Central,
+            Owner::Central,
             mapping,
             class,
         );
@@ -684,7 +668,7 @@ mod tests {
         let class = class_for(64, 8);
         let run = Run::new(
             RunId::from_index(10).unwrap(),
-            RunOwner::Central,
+            Owner::Central,
             mapping,
             class,
         );
@@ -700,7 +684,7 @@ mod tests {
         let class = class_for(64, 8);
         let run = Run::new(
             RunId::from_index(11).unwrap(),
-            RunOwner::Central,
+            Owner::Central,
             mapping,
             class,
         );
@@ -717,7 +701,7 @@ mod tests {
         let class = class_for(64, 8);
         let run = Run::new(
             RunId::from_index(8).unwrap(),
-            RunOwner::Central,
+            Owner::Central,
             mapping,
             class,
         );
@@ -735,7 +719,7 @@ mod tests {
         let class = SizeClasses::for_layout(spec).unwrap();
         let run = Run::new(
             RunId::from_index(3).unwrap(),
-            RunOwner::Central,
+            Owner::Central,
             mapping,
             class,
         );
@@ -753,7 +737,7 @@ mod tests {
         let range = mapping.range();
         let run = Run::new(
             RunId::from_index(5).unwrap(),
-            RunOwner::Central,
+            Owner::Central,
             mapping,
             class_for(8, 8),
         );

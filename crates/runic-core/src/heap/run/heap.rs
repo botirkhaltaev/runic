@@ -1,7 +1,7 @@
 use core::ptr::NonNull;
 
 use crate::{
-    heap::{HeapId, RUN_SIZE, Run, RunArena, RunError, RunId, RunOwner},
+    heap::{Owner, RUN_SIZE, Run, RunArena, RunError, RunId},
     layout::LayoutSpec,
     memory::{OsMemory, PageMap},
     size_class::{SizeClassId, SizeClasses},
@@ -44,7 +44,7 @@ impl RunHeap {
     pub(crate) fn allocate(
         &mut self,
         class: SizeClassId,
-        owner: HeapId,
+        owner: Owner,
         pages: &PageMap,
     ) -> Option<NonNull<Run>> {
         self.take_available(class)
@@ -59,7 +59,7 @@ impl RunHeap {
     pub(crate) fn allocate_run(
         &mut self,
         class: SizeClassId,
-        owner: HeapId,
+        owner: Owner,
         pages: &PageMap,
     ) -> Option<NonNull<Run>> {
         let class = SizeClasses::class(class)?;
@@ -67,7 +67,7 @@ impl RunHeap {
         let reservation = self.runs.reserve()?;
         let id = reservation.id;
 
-        let run = Run::new(id, RunOwner::for_heap(owner), mapping, class);
+        let run = Run::new(id, owner, mapping, class);
         self.insert_run(reservation, run, pages)
     }
 
@@ -237,7 +237,7 @@ impl From<RunError> for RunHeapError {
 #[cfg(test)]
 mod tests {
     use crate::{
-        heap::{RUN_SIZE, Run, RunId},
+        heap::{HeapId, RUN_SIZE, Run, RunId},
         layout::LayoutSpec,
         memory::{OsMemory, PageMap, PageOwner},
         size_class::SizeClasses,
@@ -250,7 +250,7 @@ mod tests {
         let spec = LayoutSpec::from_size_align(64, 8).unwrap();
         let class = SizeClasses::for_layout(spec).unwrap();
 
-        Run::new(id, RunOwner::Central, mapping, class)
+        Run::new(id, Owner::Central, mapping, class)
     }
 
     fn available_run_id(allocator: &RunHeap, class_index: usize) -> Option<RunId> {
@@ -265,7 +265,7 @@ mod tests {
         class: SizeClassId,
         pages: &PageMap,
     ) -> Option<(NonNull<Run>, NonNull<u8>)> {
-        let mut run = allocator.allocate(class, HeapId::ROOT, pages)?;
+        let mut run = allocator.allocate(class, Owner::for_heap(HeapId::ROOT), pages)?;
         // SAFETY: RunHeap returns pointers to live runs from its arena.
         let ptr = unsafe { run.as_mut() }.allocate()?;
         // SAFETY: RunHeap returns pointers to live runs from its arena.

@@ -57,7 +57,7 @@ mod tests {
         let len = spec.mapping_len(OsMemory::page_size()).unwrap();
         let mapping = OsMemory::map(len).unwrap();
 
-        Extent::new(id, HeapId::ROOT, mapping, spec).unwrap()
+        Extent::new(id, Owner::for_heap(HeapId::ROOT), mapping, spec).unwrap()
     }
 
     fn arena_with_capacity(capacity: usize) -> ExtentArena {

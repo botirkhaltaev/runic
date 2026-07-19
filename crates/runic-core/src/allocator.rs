@@ -9,8 +9,8 @@ use spin::Mutex;
 use crate::{
     config::AllocatorConfig,
     heap::{
-        Extent, ExtentHeap, ExtentHeapError, Heap, HeapError, HeapHandle, HeapId, HeapTable, Run,
-        RunHeap, RunHeapError, RunOwner, THREAD_HEAP,
+        Extent, ExtentHeap, ExtentHeapError, Heap, HeapError, HeapHandle, HeapId, HeapTable, Owner,
+        Run, RunHeap, RunHeapError, THREAD_HEAP,
     },
     layout::LayoutSpec,
     memory::{OsMemory, PageMap, PageOwner},
@@ -123,7 +123,7 @@ impl Allocator {
 
         if let PageOwner::Run(run) = entry {
             // SAFETY: PageMap stores only pointers published from this allocator's live RunArena.
-            if let RunOwner::Thread(heap) = unsafe { run.as_ref() }.owner()
+            if let Owner::Thread(heap) = unsafe { run.as_ref() }.owner()
                 && let Some(result) =
                     THREAD_HEAP.with(|thread_heap| thread_heap.free_run(core, heap, run, ptr))
             {
@@ -429,8 +429,8 @@ impl AllocatorState {
         // SAFETY: PageMap stores only pointers published from this allocator's live RunArena.
         let owner = unsafe { run.as_ref() }.owner();
         match owner {
-            RunOwner::Central => self.root.free_remote(run, ptr)?,
-            RunOwner::Thread(heap_id) => {
+            Owner::Central => self.root.free_remote(run, ptr)?,
+            Owner::Thread(heap_id) => {
                 let heap = self
                     .heaps
                     .handle(heap_id)
@@ -455,7 +455,7 @@ impl AllocatorState {
     ) -> Result<(), AllocatorError> {
         // SAFETY: PageMap stores only pointers published from this allocator's live ExtentArena.
         let owner = unsafe { extent.as_ref() }.owner();
-        if owner.is_root() {
+        if owner.is_central() {
             self.root.free_extent(extent, ptr, pages)?;
         } else {
             return Err(AllocatorError::InvalidMetadata);
@@ -687,10 +687,7 @@ mod tests {
         };
 
         // SAFETY: PageMap stores only live run pointers.
-        assert_eq!(
-            unsafe { run.as_ref() }.owner(),
-            RunOwner::Thread(handle.id())
-        );
+        assert_eq!(unsafe { run.as_ref() }.owner(), Owner::Thread(handle.id()));
         assert_eq!(
             state.dealloc(ptr.as_ptr(), layout, Some(handle.id()), &pages),
             Ok(())
@@ -712,7 +709,7 @@ mod tests {
         };
 
         // SAFETY: PageMap stores only live extent pointers.
-        assert_eq!(unsafe { extent.as_ref() }.owner(), HeapId::ROOT);
+        assert_eq!(unsafe { extent.as_ref() }.owner(), Owner::Central);
         assert_eq!(
             state.dealloc(ptr.as_ptr(), layout, Some(handle.id()), &pages),
             Ok(())
@@ -830,7 +827,7 @@ mod tests {
         };
 
         // SAFETY: PageMap stores only live extent pointers.
-        assert_eq!(unsafe { extent.as_ref() }.owner(), HeapId::ROOT);
+        assert_eq!(unsafe { extent.as_ref() }.owner(), Owner::Central);
         assert_eq!(
             state.dealloc(ptr.as_ptr(), layout, Some(handle.id()), &pages),
             Ok(())
@@ -860,7 +857,7 @@ mod tests {
         };
 
         // SAFETY: PageMap stores only live extent pointers.
-        assert_eq!(unsafe { extent.as_ref() }.owner(), HeapId::ROOT);
+        assert_eq!(unsafe { extent.as_ref() }.owner(), Owner::Central);
         assert_eq!(
             state.dealloc(grown.as_ptr(), large, Some(handle.id()), &pages),
             Ok(())

@@ -7,7 +7,7 @@ pub(crate) type RunArena = Arena<Run, RunId>;
 #[cfg(test)]
 mod tests {
     use crate::{
-        heap::{RUN_SIZE, Run, RunId, RunOwner},
+        heap::{Owner, RUN_SIZE, Run, RunId},
         layout::LayoutSpec,
         memory::OsMemory,
         size_class::SizeClasses,
@@ -22,7 +22,7 @@ mod tests {
         let spec = LayoutSpec::from_size_align(64, 8).unwrap();
         let class = SizeClasses::for_layout(spec).unwrap();
 
-        Run::new(id, RunOwner::Central, mapping, class)
+        Run::new(id, Owner::Central, mapping, class)
     }
 
     fn arena_with_capacity(capacity: usize) -> RunArena {
