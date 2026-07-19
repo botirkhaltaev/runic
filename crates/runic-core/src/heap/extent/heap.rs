@@ -1,4 +1,4 @@
-use core::ptr::{NonNull, write_bytes};
+use core::ptr::NonNull;
 
 use crate::{
     config::ExtentConfig,
@@ -39,29 +39,6 @@ impl ExtentHeap {
         let mapping = self.cache.take(len).or_else(|| OsMemory::map(len))?;
 
         self.allocate_mapping(spec, owner, mapping, pages)
-    }
-
-    pub(crate) fn allocate_zeroed(
-        &mut self,
-        spec: LayoutSpec,
-        requested_size: usize,
-        owner: Owner,
-        pages: &PageMap,
-    ) -> Option<NonNull<u8>> {
-        let len = spec.mapping_len(OsMemory::page_size())?;
-        let (mapping, needs_zeroing) = if let Some(mapping) = self.cache.take(len) {
-            (mapping, true)
-        } else {
-            (OsMemory::map(len)?, false)
-        };
-
-        let ptr = self.allocate_mapping(spec, owner, mapping, pages)?;
-        if needs_zeroing {
-            // SAFETY: ptr was just allocated for spec and is valid for the requested layout size.
-            unsafe { write_bytes(ptr.as_ptr(), 0, requested_size) };
-        }
-
-        Some(ptr)
     }
 
     fn allocate_mapping(

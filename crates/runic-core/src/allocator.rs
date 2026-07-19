@@ -175,31 +175,13 @@ impl Allocator {
     /// to `layout` and eventually pass it back to this allocator with a
     /// compatible layout.
     pub unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let spec = LayoutSpec::from_layout(layout);
-        let Some(core) = self.core() else {
-            return null_mut();
-        };
-
-        let class = SizeClasses::id_for(spec);
-        // SAFETY: core is retained by this Allocator while loaded from self.core.
-        let core_ref = unsafe { core.as_ref() };
-        if let Some(class) = class
-            && let Some(ptr) =
-                THREAD_HEAP.with(|heap| heap.allocate_run(core, class, core_ref.pages()))
-        {
+        // SAFETY: alloc returns a valid pointer for layout or null; we only use it if non-null.
+        let ptr = unsafe { self.alloc(layout) };
+        if !ptr.is_null() {
             // SAFETY: ptr was just allocated for layout and is valid for layout.size() bytes.
-            unsafe { write_bytes(ptr.as_ptr(), 0, layout.size()) };
-            return ptr.as_ptr();
+            unsafe { write_bytes(ptr, 0, layout.size()) };
         }
-
-        if class.is_some() {
-            THREAD_HEAP.with(|heap| heap.release_if_different(core));
-        }
-        let mut state = core_ref.state().lock();
-        let heap =
-            class.and_then(|_| THREAD_HEAP.with(|heap| heap.get_or_acquire(core, &mut state)));
-
-        state.alloc_zeroed(spec, layout.size(), class, heap, core_ref.pages())
+        ptr
     }
 
     #[cold]
@@ -534,40 +516,6 @@ impl AllocatorState {
 
         Ok(new_ptr)
     }
-
-    fn alloc_zeroed(
-        &mut self,
-        spec: LayoutSpec,
-        requested_size: usize,
-        class: Option<SizeClassId>,
-        current_heap: Option<HeapId>,
-        pages: &PageMap,
-    ) -> *mut u8 {
-        match class {
-            Some(class) => {
-                if let Some(heap_id) = current_heap
-                    && let Some(heap) = self.heaps.active_heap(heap_id)
-                    && let Some(ptr) = heap.allocate_remote(class, pages)
-                {
-                    // SAFETY: ptr was just allocated for this layout and is valid for requested_size bytes.
-                    unsafe { write_bytes(ptr.as_ptr(), 0, requested_size) };
-                    return ptr.as_ptr();
-                }
-
-                self.root
-                    .allocate_remote(class, pages)
-                    .map_or(null_mut(), |ptr| {
-                        // SAFETY: ptr was just allocated for this layout and is valid for requested_size bytes.
-                        unsafe { write_bytes(ptr.as_ptr(), 0, requested_size) };
-                        ptr.as_ptr()
-                    })
-            }
-            None => self
-                .root
-                .allocate_zeroed_extent(spec, requested_size, pages)
-                .map_or(null_mut(), NonNull::as_ptr),
-        }
-    }
 }
 
 impl Drop for Allocator {
@@ -814,14 +762,11 @@ mod tests {
         let layout = Layout::from_size_align(128 * 1024, 4096).unwrap();
         let spec = LayoutSpec::from_layout(layout);
         let handle = state.heaps.acquire().unwrap();
-        let ptr = NonNull::new(state.alloc_zeroed(
-            spec,
-            layout.size(),
-            SizeClasses::id_for(spec),
-            Some(handle.id()),
-            &pages,
-        ))
-        .unwrap();
+        let ptr = state
+            .allocate(Some(handle.id()), SizeClasses::id_for(spec), spec, &pages)
+            .unwrap();
+        // SAFETY: ptr was just allocated for layout and is valid for layout.size() bytes.
+        unsafe { write_bytes(ptr.as_ptr(), 0, layout.size()) };
         let PageOwner::Extent(extent) = pages.get(ptr).unwrap() else {
             panic!("large zeroed allocation should publish a central extent");
         };
