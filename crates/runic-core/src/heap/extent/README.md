@@ -5,9 +5,8 @@ Extent metadata owns dedicated large allocations.
 ## Files
 
 - `mod.rs`: `Extent`, `ExtentId`, exact-pointer checks, and resize-in-place rules.
-- `arena.rs`: out-of-line extent metadata storage and reservations.
 - `cache.rs`: bounded retained-mapping cache and extent release policies.
-- `heap.rs`: dedicated allocation via `ExtentInit`, page-map publication, free, and mapping reuse.
+- `heap.rs`: dedicated allocation via `ExtentInit`, `Arena<Extent>`, page-map publication, free, and mapping reuse.
 
 ## Invariants
 

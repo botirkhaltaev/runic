@@ -110,14 +110,11 @@ GlobalAlloc
       -> Allocator
           -> AllocatorCore
               -> PageMap
-              -> Heap
-                  -> RunHeap
-                      -> RunArena
-                  -> ExtentHeap
-                      -> ExtentArena
-                      -> ExtentCache
-              -> HeapTable
+              -> HeapTable { generations[], Arena<Heap> }
                   -> ThreadHeap
+              -> Heap { RunHeap, ExtentHeap, Inbox }
+                  -> RunHeap { Arena<Run>, available[] }
+                  -> ExtentHeap { Arena<Extent>, cache }
               -> Run
               -> Extent
               -> OsMemory
@@ -133,17 +130,16 @@ RunicAlloc     owns the Rust GlobalAlloc boundary.
 Allocator      owns the core public allocator API and abort boundary.
 AllocatorCore  owns PageMap and locked shared allocator state.
 Heap           owns run and extent allocation policy for one heap identity.
-HeapTable      owns thread heap slots, generation identity, and remote inboxes.
+HeapTable      owns Arena<Heap>, generations[], and remote batch push.
+Arena          owns fixed-capacity freelist metadata storage.
 LayoutSpec     owns normalized layout semantics.
 SizeClasses    owns size-class selection.
 OsMemory       owns mmap and munmap.
 PageMap        owns page-indexed owner-pointer lookup.
-RunHeap        owns small-allocation policy and per-class available run lists.
-RunArena       owns out-of-line run metadata storage.
+RunHeap        owns Arena<Run>, small-allocation policy, and available run lists.
 Run            owns fixed-block allocation metadata and block bitmap state.
 BlockStates    owns reusable, allocated, and remote-pending block state.
-ExtentHeap     owns dedicated allocation policy and mapping reuse.
-ExtentArena    owns out-of-line extent metadata storage.
+ExtentHeap     owns Arena<Extent>, dedicated allocation policy, and mapping reuse.
 ExtentCache    owns retained extent mappings, eviction, and reuse lookup.
 Extent         owns dedicated allocation metadata.
 ```

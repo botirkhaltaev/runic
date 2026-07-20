@@ -3,7 +3,7 @@
 Scope: `crates/runic-core/src/`.
 
 - Put behavior on the entity that owns the data or invariant.
-- Keep module boundaries direct: `Heap`, `PageMap`, `RunHeap`, `ExtentHeap`, `RunArena`, `ExtentArena`, `Run`, `Extent`, `OsMemory`, and `SizeClasses` should own their responsibilities.
+- Keep module boundaries direct: `Heap`, `PageMap`, `RunHeap`, `ExtentHeap`, `Arena`, `Run`, `Extent`, `OsMemory`, and `SizeClasses` should own their responsibilities.
 - Prefer `NonZero*`, `NonNull`, and named-field domain types over sentinel values or ambiguous tuple structs.
 - Unsafe blocks must be narrow and adjacent to the safety reasoning.
 - Keep owner-local and remote-free responsibilities separated in type APIs; there is no central/root ownership heap.

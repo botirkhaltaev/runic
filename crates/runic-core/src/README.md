@@ -5,12 +5,12 @@ Allocator core organized around entities and invariants.
 ## Modules
 
 - `allocator`: public core facade and abort boundary used by the global wrapper.
+- `arena`: fixed-capacity freelist object table for heap/run/extent metadata.
 - `config`: allocator and extent retention/reuse configuration.
-- `heap`: owner-local heaps, run/extent heaps and arenas, heap table, and thread binding.
+- `heap`: owner-local heaps, run/extent heaps, heap table, and thread binding.
 - `layout`: normalized layout semantics and mapping sizing.
 - `memory`: address ranges, mmap ownership, and page-indexed owner lookup.
 - `size_class`: size-class selection.
-- `slot_store`: fixed-capacity slot storage for arenas and related tables.
 
 ## Invariant
 

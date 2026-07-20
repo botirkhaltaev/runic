@@ -1,10 +1,10 @@
 use core::{num::NonZeroU32, ptr::NonNull};
 
 use crate::{
+    arena::Arena,
     config::AllocatorConfig,
     heap::{ExtentHeapError, Heap, HeapId, RunHeapError},
     memory::PageMap,
-    slot_store::{SlotStore, SlotStoreError},
 };
 
 use super::inbox::RemoteList;
@@ -14,7 +14,7 @@ const MAX_HEAPS_U32: u32 = 64;
 const HEAP_METADATA_CAPACITY: u32 = 16_384;
 
 pub(crate) struct HeapTable {
-    slots: SlotStore<Heap>,
+    heaps: Arena<Heap>,
     generations: [NonZeroU32; MAX_HEAPS],
     config: AllocatorConfig,
 }
@@ -24,9 +24,9 @@ pub(crate) struct HeapTable {
 unsafe impl Send for HeapTable {}
 
 impl HeapTable {
-    pub(crate) const fn new(config: AllocatorConfig) -> Self {
+    pub(crate) fn new(config: AllocatorConfig) -> Self {
         Self {
-            slots: SlotStore::new(MAX_HEAPS_U32),
+            heaps: Arena::new(MAX_HEAPS_U32),
             generations: [NonZeroU32::MIN; MAX_HEAPS],
             config,
         }
@@ -37,22 +37,25 @@ impl HeapTable {
             return Some(heap);
         }
 
-        let index = self.slots.reserve()?;
+        let index = self.heaps.claim()?;
         let generation = *self.generations.get(index)?;
-        let id = HeapId::new(u32::try_from(index).ok()?, generation)?;
+        let Some(id) = HeapId::new(u32::try_from(index).ok()?, generation) else {
+            self.heaps.release(index);
+            return None;
+        };
         let heap = Heap::new(id, HEAP_METADATA_CAPACITY, self.config);
 
-        if self.slots.place(index, heap).is_err() {
-            let _ = self.slots.release(index);
+        if self.heaps.insert(index, heap).is_none() {
+            self.heaps.release(index);
             return None;
         }
 
-        self.slots.get_mut(index).map(NonNull::from)
+        self.heaps.get_mut(index).map(NonNull::from)
     }
 
     fn acquire_reusable(&mut self) -> Option<NonNull<Heap>> {
         for index in 0..MAX_HEAPS {
-            let Some(heap) = self.slots.get_mut(index) else {
+            let Some(heap) = self.heaps.get_mut(index) else {
                 continue;
             };
             if !heap.is_free() {
@@ -70,7 +73,7 @@ impl HeapTable {
 
     pub(crate) fn get(&self, id: HeapId) -> Option<&Heap> {
         let index = usize::try_from(id.index()).ok()?;
-        let heap = self.slots.get(index)?;
+        let heap = self.heaps.get(index)?;
         self.matches_generation(index, id).then_some(heap)
     }
 
@@ -79,7 +82,7 @@ impl HeapTable {
         if !self.matches_generation(index, id) {
             return None;
         }
-        self.slots.get_mut(index)
+        self.heaps.get_mut(index)
     }
 
     pub(crate) fn push_remote_batch(&self, id: HeapId, list: &RemoteList) -> Result<(), HeapError> {
@@ -166,11 +169,5 @@ impl From<ExtentHeapError> for HeapError {
             ExtentHeapError::InvalidPointer => Self::InvalidPointer,
             ExtentHeapError::DoubleFree => Self::DoubleFree,
         }
-    }
-}
-
-impl From<SlotStoreError> for HeapError {
-    fn from(_: SlotStoreError) -> Self {
-        Self::InvalidMetadata
     }
 }

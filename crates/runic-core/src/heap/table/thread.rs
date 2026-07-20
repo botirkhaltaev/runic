@@ -6,7 +6,7 @@ use core::{
 
 use crate::{
     allocator::{AllocatorCore, AllocatorState},
-    heap::{Heap, HeapId, Run},
+    heap::{Heap, HeapId, Run, RunHeapError},
     memory::PageMap,
     size_class::{SizeClassId, SizeClasses},
 };
@@ -252,15 +252,17 @@ impl ThreadHeap {
         class: SizeClassId,
         mut heap: NonNull<Heap>,
     ) -> Option<NonNull<u8>> {
-        let run = self.cached_run(class)?;
+        let mut run = self.cached_run(class)?;
 
         // SAFETY: heap is installed only while this TLS heap retains the allocator core.
-        let allocation = unsafe { heap.as_mut() }.allocate_local(run);
-        if allocation.is_none() {
+        let heap = unsafe { heap.as_mut() };
+        // SAFETY: cached run pointers are published from this heap's live arena.
+        let Some(allocation) = unsafe { run.as_mut() }.allocate() else {
             self.clear_run(class);
-        }
-
-        allocation
+            return None;
+        };
+        heap.retain_allocation();
+        Some(allocation)
     }
 
     fn free_run_current(
@@ -270,14 +272,19 @@ impl ThreadHeap {
         pages: &PageMap,
     ) -> Result<(), HeapError> {
         let mut heap = self.installed_heap();
-        // SAFETY: PageMap stores only pointers published from this allocator's live RunArena.
+        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
         let class = unsafe { run.as_ref() }.class();
 
         if self.cached_run(class) == Some(run) {
             // SAFETY: heap is installed only while this TLS heap retains the allocator core.
-            return unsafe { heap.as_mut() }
-                .free_local(run, ptr)
-                .map_err(HeapError::from);
+            let heap = unsafe { heap.as_mut() };
+            // SAFETY: cached run pointers are published from this heap's live arena.
+            unsafe { run.as_ref() }
+                .free_local(ptr)
+                .map_err(RunHeapError::from)
+                .map_err(HeapError::from)?;
+            heap.release_allocation();
+            return Ok(());
         }
 
         // SAFETY: this TLS thread is the Active owner of the installed heap.
@@ -324,7 +331,7 @@ impl ThreadHeap {
             };
 
             // SAFETY: heap is installed only while this TLS heap retains the allocator core.
-            let _ = unsafe { heap.as_mut() }.return_run(run);
+            let _ = unsafe { heap.as_mut() }.runs.return_available(run);
         }
     }
 

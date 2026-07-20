@@ -13,7 +13,7 @@ Allocator
   -> AllocatorCore
       -> PageMap
       -> AllocatorState
-          -> HeapTable { generations[], SlotStore<Heap> }
+          -> HeapTable { generations[], Arena<Heap> }
               -> ThreadHeap (TLS)
 
 Heap
@@ -34,7 +34,7 @@ Table/arena full returns null.
 
 ```text
 HeapTable
-  owns SlotStore<Heap>, generations[], acquire/release, push_remote_batch
+  owns Arena<Heap>, generations[], acquire/release, push_remote_batch
 
 Heap
   owns mode, RunHeap, ExtentHeap, alloc_count, Inbox mailbox

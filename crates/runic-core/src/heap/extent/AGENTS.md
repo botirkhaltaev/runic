@@ -2,10 +2,6 @@
 
 Scope: `crates/runic-core/src/heap/extent/`.
 
-- Keep exact-pointer validation and Free|Allocated|RemotePending claim/complete on `Extent`.
-- Keep dedicated allocation policy, mapping reuse, and cache-vs-fresh zeroing (`ExtentInit`) on `ExtentHeap`.
-- Keep metadata storage and reservation behavior on `ExtentArena`.
-- Stamp each extent with the allocating heap's `HeapId`.
-- Remove page-map ownership before removing extent metadata.
-- Avoid unbounded mapping retention; preserve `ExtentCache` slot and byte limits.
-- Add tests beside the extent entity that owns the changed invariant.
+- Put exact-pointer and remote-pending behavior on `Extent`.
+- Keep metadata storage on `ExtentHeap` via `Arena<Extent>` (`claim` / `insert` / `release` / `remove`).
+- Extent cache policy lives on `ExtentCache` owned by `ExtentHeap`.

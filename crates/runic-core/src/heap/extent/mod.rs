@@ -13,10 +13,6 @@ use crate::{
 };
 
 use super::HeapId;
-use super::arena::{Arena, ArenaId, ArenaValue};
-
-pub(crate) type ExtentArena = Arena<Extent, ExtentId>;
-pub(crate) type ExtentReservation = super::arena::ArenaReservation<ExtentId>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ExtentId {
@@ -30,16 +26,6 @@ impl ExtentId {
 
     pub(crate) const fn index(self) -> u32 {
         self.index.get() - 1
-    }
-}
-
-impl ArenaId for ExtentId {
-    fn index(self) -> u32 {
-        self.index()
-    }
-
-    fn from_index(index: u32) -> Option<Self> {
-        ExtentId::from_index(index)
     }
 }
 
@@ -82,12 +68,6 @@ pub(crate) struct Extent {
     mapping: Mapping,
     range: AddressRange,
     state: AtomicU8,
-}
-
-impl ArenaValue<ExtentId> for Extent {
-    fn id(&self) -> ExtentId {
-        self.id
-    }
 }
 
 impl Extent {

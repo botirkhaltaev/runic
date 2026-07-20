@@ -8,16 +8,14 @@ use crate::{
     config::AllocatorConfig, layout::LayoutSpec, memory::PageMap, size_class::SizeClassId,
 };
 
-pub(crate) mod arena;
 pub(crate) mod extent;
 pub(crate) mod id;
 pub(crate) mod run;
 pub(crate) mod table;
 
 pub(crate) use extent::heap::{ExtentHeap, ExtentHeapError, ExtentInit};
-pub(crate) use extent::{Extent, ExtentArena};
+pub(crate) use extent::Extent;
 pub(crate) use id::HeapId;
-pub(crate) use run::arena::RunArena;
 pub(crate) use run::{RUN_SIZE, Run, RunError, RunHeap, RunHeapError, RunId};
 pub(crate) use table::{HeapError, HeapTable, Inbox, RemoteList, THREAD_HEAP};
 
@@ -51,8 +49,8 @@ impl HeapMode {
 pub(crate) struct Heap {
     mode: AtomicU8,
     id: HeapId,
-    runs: RunHeap,
-    extents: ExtentHeap,
+    pub(crate) runs: RunHeap,
+    pub(crate) extents: ExtentHeap,
     alloc_count: Cell<u32>,
     inbox: Inbox,
 }
@@ -65,7 +63,7 @@ unsafe impl Send for Heap {}
 unsafe impl Sync for Heap {}
 
 impl Heap {
-    pub(crate) const fn new(id: HeapId, capacity: u32, config: AllocatorConfig) -> Self {
+    pub(crate) fn new(id: HeapId, capacity: u32, config: AllocatorConfig) -> Self {
         Self {
             mode: AtomicU8::new(HeapMode::Active.raw()),
             id,
@@ -157,35 +155,8 @@ impl Heap {
             self.flush(pages).ok()?;
         }
 
-        self.runs
-            .take_available(class, self.id)
-            .or_else(|| self.runs.allocate(class, self.id, pages))
-    }
-
-    pub(crate) fn return_run(&mut self, run: NonNull<Run>) -> Result<(), RunHeapError> {
-        self.runs.return_available(run)
-    }
-
-    pub(crate) fn allocate_local(&mut self, mut run: NonNull<Run>) -> Option<NonNull<u8>> {
-        // SAFETY: cached run pointers are published from this heap's live RunArena and retained by
-        // the owning TLS heap entry while the heap remains installed.
-        let ptr = unsafe { run.as_mut() }.allocate()?;
-        self.retain_allocation();
-        Some(ptr)
-    }
-
-    pub(crate) fn free_local(
-        &mut self,
-        run: NonNull<Run>,
-        ptr: NonNull<u8>,
-    ) -> Result<(), RunHeapError> {
-        // SAFETY: cached run pointers are published from this heap's live RunArena and retained by
-        // the owning TLS heap entry while the heap remains installed.
-        unsafe { run.as_ref() }
-            .free_local(ptr)
-            .map_err(RunHeapError::from)?;
-        self.release_allocation();
-        Ok(())
+        // `RunHeap::allocate` already tries available then cold allocate_run.
+        self.runs.allocate(class, self.id, pages)
     }
 
     pub(crate) fn allocate_extent(
@@ -267,14 +238,14 @@ impl Heap {
         self.alloc_count.get() != 0
     }
 
-    fn retain_allocation(&self) {
+    pub(crate) fn retain_allocation(&self) {
         let Some(live) = self.alloc_count.get().checked_add(1) else {
             Self::abort();
         };
         self.alloc_count.set(live);
     }
 
-    fn release_allocation(&self) {
+    pub(crate) fn release_allocation(&self) {
         let Some(live) = self.alloc_count.get().checked_sub(1) else {
             Self::abort();
         };

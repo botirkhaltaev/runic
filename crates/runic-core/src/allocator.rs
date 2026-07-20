@@ -10,8 +10,9 @@ use crate::{
     config::AllocatorConfig,
     heap::{
         Extent, ExtentHeap, ExtentHeapError, ExtentInit, Heap, HeapError, HeapId, HeapTable,
-        RemoteList, Run, RunHeap, RunHeapError, THREAD_HEAP,
+        RemoteList, Run, RunError, RunHeap, RunHeapError, THREAD_HEAP,
     },
+    heap::extent::ExtentError,
     layout::LayoutSpec,
     memory::{OsMemory, PageMap, PageOwner},
     size_class::{SizeClassId, SizeClasses},
@@ -120,7 +121,7 @@ impl Allocator {
         };
 
         if let PageOwner::Run(run) = entry {
-            // SAFETY: PageMap stores only pointers published from this allocator's live RunArena.
+            // SAFETY: PageMap stores only pointers published from this allocator's live Arena<Run>.
             let heap_id = unsafe { run.as_ref() }.heap_id();
             if let Some(result) =
                 THREAD_HEAP.with(|thread_heap| thread_heap.free_run(core, heap_id, run, ptr))
@@ -270,7 +271,7 @@ impl Allocator {
         current_heap: Option<HeapId>,
         pages: &PageMap,
     ) -> Result<(), AllocatorError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live RunArena.
+        // SAFETY: PageMap stores only pointers published from this allocator's live Arena<Run>.
         let heap_id = unsafe { run.as_ref() }.heap_id();
 
         if Some(heap_id) == current_heap {
@@ -291,9 +292,12 @@ impl Allocator {
         };
 
         if route.is_active {
-            RunHeap::claim_free(run, ptr).map_err(AllocatorError::from)?;
+            // SAFETY: PageMap stores only pointers published from this allocator's live arena.
+            unsafe { run.as_ref() }
+                .claim_free(ptr)
+                .map_err(AllocatorError::from)?;
             if let Err(error) = Self::enqueue_remote(core_ref, heap_id, ptr) {
-                // SAFETY: PageMap stores only pointers published from this allocator's live RunArena.
+                // SAFETY: PageMap stores only pointers published from this allocator's live Arena<Run>.
                 if unsafe { run.as_ref() }.unclaim(ptr).is_err() {
                     AllocatorState::abort_internal();
                 }
@@ -326,7 +330,7 @@ impl Allocator {
         current_heap: Option<HeapId>,
         pages: &PageMap,
     ) -> Result<(), AllocatorError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live ExtentArena.
+        // SAFETY: PageMap stores only pointers published from this allocator's live Arena<Extent>.
         let heap_id = unsafe { extent.as_ref() }.heap_id();
 
         if Some(heap_id) == current_heap {
@@ -347,9 +351,13 @@ impl Allocator {
         };
 
         if route.is_active {
-            ExtentHeap::claim_free(extent).map_err(AllocatorError::from)?;
+            // SAFETY: PageMap stores only pointers published from this allocator's live arena.
+            unsafe { extent.as_ref() }
+                .claim_free()
+                .map_err(AllocatorError::from)?;
             if let Err(error) = Self::enqueue_remote(core_ref, heap_id, ptr) {
-                if ExtentHeap::unclaim(extent).is_err() {
+                // SAFETY: PageMap stores only pointers published from this allocator's live arena.
+                if unsafe { extent.as_ref() }.unclaim().is_err() {
                     AllocatorState::abort_internal();
                 }
                 let mut state = core_ref.state().lock();
@@ -488,7 +496,7 @@ impl AllocatorCore {
 }
 
 impl AllocatorState {
-    pub(crate) const fn with_config(config: AllocatorConfig) -> Self {
+    pub(crate) fn with_config(config: AllocatorConfig) -> Self {
         Self {
             heaps: HeapTable::new(config),
         }
@@ -569,7 +577,7 @@ impl AllocatorState {
         current_heap: Option<HeapId>,
         pages: &PageMap,
     ) -> Result<(), AllocatorError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live RunArena.
+        // SAFETY: PageMap stores only pointers published from this allocator's live Arena<Run>.
         let heap_id = unsafe { run.as_ref() }.heap_id();
 
         if Some(heap_id) == current_heap {
@@ -582,12 +590,15 @@ impl AllocatorState {
             .ok_or(AllocatorError::InvalidMetadata)?;
 
         if heap.is_active() {
-            RunHeap::claim_free(run, ptr).map_err(AllocatorError::from)?;
+            // SAFETY: PageMap stores only pointers published from this allocator's live arena.
+            unsafe { run.as_ref() }
+                .claim_free(ptr)
+                .map_err(AllocatorError::from)?;
             if let Err(error) = self
                 .heaps
                 .push_remote_batch(heap_id, &RemoteList::from_ends(ptr, ptr))
             {
-                // SAFETY: PageMap stores only pointers published from this allocator's live RunArena.
+                // SAFETY: PageMap stores only pointers published from this allocator's live Arena<Run>.
                 if unsafe { run.as_ref() }.unclaim(ptr).is_err() {
                     Self::abort_internal();
                 }
@@ -612,7 +623,7 @@ impl AllocatorState {
         ptr: NonNull<u8>,
         pages: &PageMap,
     ) -> Result<(), AllocatorError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live RunArena.
+        // SAFETY: PageMap stores only pointers published from this allocator's live Arena<Run>.
         let heap_id = unsafe { run.as_ref() }.heap_id();
         let heap = self
             .heaps
@@ -648,7 +659,7 @@ impl AllocatorState {
         current_heap: Option<HeapId>,
         pages: &PageMap,
     ) -> Result<(), AllocatorError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live ExtentArena.
+        // SAFETY: PageMap stores only pointers published from this allocator's live Arena<Extent>.
         let heap_id = unsafe { extent.as_ref() }.heap_id();
 
         if Some(heap_id) == current_heap {
@@ -661,12 +672,16 @@ impl AllocatorState {
             .ok_or(AllocatorError::InvalidMetadata)?;
 
         if heap.is_active() {
-            ExtentHeap::claim_free(extent).map_err(AllocatorError::from)?;
+            // SAFETY: PageMap stores only pointers published from this allocator's live arena.
+            unsafe { extent.as_ref() }
+                .claim_free()
+                .map_err(AllocatorError::from)?;
             if let Err(error) = self
                 .heaps
                 .push_remote_batch(heap_id, &RemoteList::from_ends(ptr, ptr))
             {
-                if ExtentHeap::unclaim(extent).is_err() {
+                // SAFETY: PageMap stores only pointers published from this allocator's live arena.
+                if unsafe { extent.as_ref() }.unclaim().is_err() {
                     Self::abort_internal();
                 }
                 if self.heaps.get(heap_id).is_some_and(Heap::is_draining) {
@@ -690,7 +705,7 @@ impl AllocatorState {
         ptr: NonNull<u8>,
         pages: &PageMap,
     ) -> Result<(), AllocatorError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live ExtentArena.
+        // SAFETY: PageMap stores only pointers published from this allocator's live Arena<Extent>.
         let heap_id = unsafe { extent.as_ref() }.heap_id();
         let heap = self
             .heaps
@@ -830,6 +845,12 @@ impl From<RunHeapError> for AllocatorError {
     }
 }
 
+impl From<RunError> for AllocatorError {
+    fn from(error: RunError) -> Self {
+        Self::from(RunHeapError::from(error))
+    }
+}
+
 impl From<ExtentHeapError> for AllocatorError {
     fn from(error: ExtentHeapError) -> Self {
         match error {
@@ -838,6 +859,12 @@ impl From<ExtentHeapError> for AllocatorError {
             ExtentHeapError::InvalidMetadata => Self::InvalidMetadata,
             ExtentHeapError::DoubleFree => Self::DoubleFree,
         }
+    }
+}
+
+impl From<ExtentError> for AllocatorError {
+    fn from(error: ExtentError) -> Self {
+        Self::from(ExtentHeapError::from(error))
     }
 }
 

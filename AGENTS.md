@@ -61,18 +61,18 @@ GlobalAlloc
       -> AllocatorCore
       -> PageMap
       -> PageBackend / OsMemory
-      -> HeapTable { generations[], SlotStore<Heap> }
+      -> HeapTable { generations[], Arena<Heap> }
           -> ThreadHeap
       -> Heap { mode, RunHeap, ExtentHeap, alloc_count, Inbox }
-          -> RunHeap -> RunArena -> Run (HeapId, BlockStates)
-          -> ExtentHeap -> ExtentArena -> Extent (HeapId)
+          -> RunHeap { Arena<Run>, available[] } -> Run (HeapId, BlockStates)
+          -> ExtentHeap { Arena<Extent>, cache } -> Extent (HeapId)
 ```
 
 ## Rust Rules
 
 - Use `#![deny(unsafe_op_in_unsafe_fn)]`.
 - Keep unsafe code small, explicit, local, and adjacent to the safety reasoning.
-- Prefer methods on `Allocator`, `Heap`, `RunHeap`, `ExtentHeap`, `RunArena`, `ExtentArena`, `Run`, `Extent`, `PageMap`, `OsMemory`, and `SizeClasses`.
+- Prefer methods on `Allocator`, `Heap`, `RunHeap`, `ExtentHeap`, `Run`, `Extent`, `Arena`, `PageMap`, `OsMemory`, and `SizeClasses`.
 - Avoid allocator-internal `Vec`, `Box`, `HashMap`, `String`, formatting, or panic paths unless recursion risk is addressed.
 - Abort on invalid frees in v0.1.
 - Do not unwind across allocator boundaries.
