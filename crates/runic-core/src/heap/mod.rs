@@ -13,8 +13,8 @@ pub(crate) mod id;
 pub(crate) mod run;
 pub(crate) mod table;
 
-pub(crate) use extent::heap::{ExtentHeap, ExtentHeapError, ExtentInit};
 pub(crate) use extent::Extent;
+pub(crate) use extent::heap::{ExtentHeap, ExtentHeapError, ExtentInit};
 pub(crate) use id::HeapId;
 pub(crate) use run::{RUN_SIZE, Run, RunError, RunHeap, RunHeapError, RunId};
 pub(crate) use table::{HeapError, HeapTable, Inbox, RemoteList, THREAD_HEAP};

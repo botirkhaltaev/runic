@@ -8,11 +8,11 @@ use spin::Mutex;
 
 use crate::{
     config::AllocatorConfig,
+    heap::extent::ExtentError,
     heap::{
         Extent, ExtentHeap, ExtentHeapError, ExtentInit, Heap, HeapError, HeapId, HeapTable,
         RemoteList, Run, RunError, RunHeap, RunHeapError, THREAD_HEAP,
     },
-    heap::extent::ExtentError,
     layout::LayoutSpec,
     memory::{OsMemory, PageMap, PageOwner},
     size_class::{SizeClassId, SizeClasses},

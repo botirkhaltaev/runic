@@ -149,18 +149,14 @@ impl<T> Slots<T> {
     }
 
     fn slots_mut(&mut self) -> &mut [Slot<T>] {
-        debug_assert!(
-            self.len <= self.mapping.range().len() / core::mem::size_of::<Slot<T>>()
-        );
+        debug_assert!(self.len <= self.mapping.range().len() / core::mem::size_of::<Slot<T>>());
 
         // SAFETY: unique access to mmap storage sized for `len` slots.
         unsafe { slice::from_raw_parts_mut(self.base.as_ptr(), self.len) }
     }
 
     fn slots(&self) -> &[Slot<T>] {
-        debug_assert!(
-            self.len <= self.mapping.range().len() / core::mem::size_of::<Slot<T>>()
-        );
+        debug_assert!(self.len <= self.mapping.range().len() / core::mem::size_of::<Slot<T>>());
 
         // SAFETY: shared access to mmap storage sized for `len` slots.
         unsafe { slice::from_raw_parts(self.base.as_ptr(), self.len) }
@@ -301,9 +297,11 @@ mod tests {
             let mut arena = Arena::new(4);
             let occupied = arena.claim().unwrap();
             let claimed = arena.claim().unwrap();
-            assert!(arena
-                .insert(occupied, DropCounter { drops: &drops })
-                .is_some());
+            assert!(
+                arena
+                    .insert(occupied, DropCounter { drops: &drops })
+                    .is_some()
+            );
             assert_ne!(occupied, claimed);
             // `claimed` is released by dropping the arena without insert — no DropCounter.
         }

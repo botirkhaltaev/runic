@@ -73,11 +73,7 @@ impl RunHeap {
         self.insert_run(index, id, run, pages)
     }
 
-    pub(crate) fn free(
-        &mut self,
-        run: NonNull<Run>,
-        ptr: NonNull<u8>,
-    ) -> Result<(), RunHeapError> {
+    pub(crate) fn free(&mut self, run: NonNull<Run>, ptr: NonNull<u8>) -> Result<(), RunHeapError> {
         let freed = Self::free_block(run, ptr)?;
         self.finish_free(freed)
     }
