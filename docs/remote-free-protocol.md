@@ -2,113 +2,73 @@
 
 Issue: #27
 
-Remote frees are part of the v0.5 thread-local heap milestone. A free on a non-owner thread must not mutate another heap's local metadata directly.
+Remote frees must not mutate another heap's freelist or available-run lists directly. Ownership is `HeapId` on every `Run` and `Extent`.
 
 ## Ownership Identity
 
-Every small-allocation source needs an owner identity.
-
-Initial shape:
-
 ```text
-HeapId
-Run owner: Central | Thread(HeapId)
-PageMap lookup: Run pointer | Extent pointer
+HeapId          slot index + generation
+Run.heap_id     HeapId
+Extent.heap_id  HeapId
+PageMap lookup  Run pointer | Extent pointer
 ```
 
-Run metadata remains stable in `RunArena`; owner identity lives on `Run` for v0.5. If a future `Region` entity owns publication and lifecycle, owner identity may move there directly.
+There is no central/root ownership heap. Metadata stays immovable in arenas so `PageMap` pointers remain valid after thread exit.
 
 ## Free Routing
 
 On free:
 
 1. Look up the pointer in `PageMap`.
-2. Validate that the pointer maps to a run or extent owner.
-3. For extents, keep exact-pointer validation on shared metadata.
-4. For runs, compare the current heap id to the run owner id.
-5. If local, validate and free through local run/cache metadata.
-6. If remote, mark the block `RemotePending` and enqueue a remote-free message for the owner heap.
+2. Compare TLS `HeapId` to the entity `HeapId`.
+3. **Local:** exclusive `Heap` free (cached run: `free_local`; else flush inbox if needed then free).
+4. **Remote Active:** `claim_free` (run block → `RemotePending`, or extent pending) → re-check slot gen/mode → `Inbox::push` without holding the table lock.
+5. **Remote Draining:** under table lock, flush inbox then exclusive free; may reclaim when empty.
 
-The freeing thread must not complete the free directly into the owner heap's reusable block state.
+The freeing thread must not complete into the owner freelist while the owner is `Active`.
 
-## Remote-Free Message
+## Remote inbox
 
-The minimum message is:
+Each `Heap` owns a lock-free MPSC `Inbox` (intrusive links in remote-pending blocks). Enqueue is lock-free and must never block on the owner (see remote-free burst / #61).
+
+Owner drains via `Heap::flush`:
+
+- alloc miss (freelist empty): flush → retry same cached run → then new run/mmap
+- slow local free / take_run paths when inbox non-empty
+- thread exit and Draining flush under table lock
+
+`flush` routes each pointer through `PageMap` (run or extent) and completes the free, decrementing `alloc_count`.
+
+## Claim → push contract
 
 ```text
-RemoteFree
-  run pointer to stable RunArena metadata
-  pointer
+1. Resolve HeapId → slot; load mode + generation
+2. Fail if Free or generation mismatch
+3. claim_free(ptr) → Pending
+4. Re-check mode ∈ {Active, Draining} and generation
+5. On failure: unclaim/abort (no orphan Pending)
+6. inbox.push(ptr)
+7. If Draining: flush under table lock then free directly
 ```
 
-The receiving heap already owns the run metadata and can validate:
+## Synchronization
 
-- pointer belongs to the run
-- pointer is a block boundary
-- block is currently allocated
-- block is not already remote-pending or free
-
-Do not trust remote-free messages as prevalidated frees.
-
-## Queue Policy
-
-The first queue should be allocation-free and bounded.
-
-Recommended first version:
-
-- one bounded inbox per owning heap in `HeapTable`
-- fixed capacity chosen at allocator construction
-- remote enqueue runs under the shared heap lock in v0.5
-- owner drains on allocation slow path, deallocation slow path, and thread exit
-
-If enqueue fails, drain the target inbox and retry once. If enqueue still fails, return an invalid-metadata error that aborts at the allocator boundary. A free must never be silently dropped.
-
-## Synchronization Rules
-
-Keep memory ordering minimal and explicit:
-
-- Producer writes the message before publishing the queue slot.
-- Consumer acquires the published slot before reading the message.
-- Remote producers may only perform `Allocated -> RemotePending`; the owner completes `RemotePending -> Reusable`.
-- Queue slot reuse happens only after the consumer marks the slot empty.
-
-No allocator-internal dynamic allocation is allowed for queue growth.
+- Remote producers: atomics only (`claim` + MPSC inbox push).
+- Active owner: exclusive `&mut Heap` via TLS (no run/extent mutex).
+- Draining: table lock for exclusive flush/reclaim (no separate orphan lock).
+- `alloc_count`: Pending counts as live; reclaim only when count is 0 and inbox empty.
 
 ## Failure Behavior
 
-Invalid pointers still abort at the allocator boundary.
+Invalid pointers and double frees abort (or report domain errors that abort at the allocator boundary). A free must never be silently dropped.
 
-Remote-free queue failure must not silently drop frees. The options are:
+## Tests
 
-- validated global-lock fallback
-- abort with a distinct invalid-metadata path
-- drain owner queues before retrying, if the current thread owns the target heap
-
-For v0.5, use shared-lock remote routing because it preserves correctness while keeping the remote-free queue bounded and auditable. Lock-free enqueue is a later optimization.
-
-## Interaction With Thread-Local Heaps
-
-The first thread-local heap implementation should use this protocol narrowly:
-
-- local small allocations can hit local caches
-- local frees return to local metadata
-- remote frees enqueue to the owner
-- large allocations remain shared extents
-- page-map ownership remains the source of truth for pointer routing
-
-## Tests Required For Implementation
-
-An implementation PR should include:
-
-- local free still validates block boundaries
-- remote free does not mutate owner-local metadata directly
-- owner drain validates and returns blocks
-- double remote free aborts or reports double free at the allocator boundary
-- queue-full fallback does not lose the free
-- randomized cross-thread allocation/free traces
-
-## Deferred Decisions
-
-- Lock-free or batched remote-free messages.
-- Moving owner identity from `Run` to a future region/span entity.
-- Per-CPU/RSEQ frontends.
+- local free validates block boundaries / exact extent pointers
+- remote free does not mutate owner freelists directly
+- owner flush validates and returns blocks
+- double remote free aborts / reports double free
+- remote burst completes without owner progress (#61)
+- exit + late remote free + draining reclaim
+- stale generation fails cleanly
+- randomized cross-thread traces

@@ -1,23 +1,22 @@
 use core::ptr::NonNull;
 
 use crate::{
-    heap::{HeapId, RUN_SIZE, Run, RunArena, RunError, RunOwner},
+    arena::Arena,
+    heap::{HeapId, RUN_SIZE, Run, RunError, RunId},
     layout::LayoutSpec,
     memory::{OsMemory, PageMap},
     size_class::{SizeClassId, SizeClasses},
 };
 
-use super::RunReservation;
-
 pub(crate) struct RunHeap {
-    runs: RunArena,
+    runs: Arena<Run>,
     available: [Option<NonNull<Run>>; SizeClasses::COUNT],
 }
 
 #[derive(Clone, Copy)]
 struct FreedRun {
     class: SizeClassId,
-    owner: NonNull<Run>,
+    run: NonNull<Run>,
     was_full: bool,
 }
 
@@ -34,9 +33,9 @@ pub(crate) enum RunHeapError {
 }
 
 impl RunHeap {
-    pub(crate) const fn new(capacity: u32) -> Self {
+    pub(crate) fn new(capacity: u32) -> Self {
         Self {
-            runs: RunArena::new(capacity),
+            runs: Arena::new(capacity),
             available: [None; SizeClasses::COUNT],
         }
     }
@@ -44,11 +43,11 @@ impl RunHeap {
     pub(crate) fn allocate(
         &mut self,
         class: SizeClassId,
-        owner: HeapId,
+        heap_id: HeapId,
         pages: &PageMap,
     ) -> Option<NonNull<Run>> {
         self.take_available(class)
-            .or_else(|| self.allocate_run(class, owner, pages))
+            .or_else(|| self.allocate_run(class, heap_id, pages))
     }
 
     pub(crate) fn take_available(&mut self, class: SizeClassId) -> Option<NonNull<Run>> {
@@ -59,77 +58,79 @@ impl RunHeap {
     pub(crate) fn allocate_run(
         &mut self,
         class: SizeClassId,
-        owner: HeapId,
+        heap_id: HeapId,
         pages: &PageMap,
     ) -> Option<NonNull<Run>> {
         let class = SizeClasses::class(class)?;
         let mapping = OsMemory::map(RUN_SIZE)?;
-        let reservation = self.runs.reserve()?;
-        let id = reservation.id();
+        let index = self.runs.claim()?;
+        let Some(id) = RunId::from_index(u32::try_from(index).ok()?) else {
+            self.runs.release(index);
+            return None;
+        };
 
-        let run = Run::new(id, RunOwner::for_heap(owner), mapping, class);
-        self.insert_run(reservation, run, pages)
+        let run = Run::new(id, heap_id, mapping, class);
+        self.insert_run(index, id, run, pages)
     }
 
-    pub(crate) fn free(
-        &mut self,
-        owner: NonNull<Run>,
-        ptr: NonNull<u8>,
-    ) -> Result<(), RunHeapError> {
-        let freed = Self::free_block(owner, ptr)?;
+    pub(crate) fn free(&mut self, run: NonNull<Run>, ptr: NonNull<u8>) -> Result<(), RunHeapError> {
+        let freed = Self::free_block(run, ptr)?;
         self.finish_free(freed)
     }
 
-    pub(crate) fn mark_remote_pending(
-        owner: NonNull<Run>,
-        ptr: NonNull<u8>,
-    ) -> Result<(), RunHeapError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live RunArena.
-        let run = unsafe { owner.as_ref() };
-        run.mark_remote_pending(ptr).map_err(RunHeapError::from)
+    pub(crate) fn rebind_available(&mut self, heap_id: HeapId) {
+        for head in &mut self.available {
+            let mut current = *head;
+            while let Some(mut run_ptr) = current {
+                // SAFETY: available-list pointers are created only from live arena entries.
+                unsafe { run_ptr.as_mut() }.set_heap_id(heap_id);
+                // SAFETY: available-list pointers are created only from live arena entries.
+                current = unsafe { run_ptr.as_ref() }.available_next();
+            }
+        }
     }
 
     pub(crate) fn complete_remote_free(
         &mut self,
-        owner: NonNull<Run>,
+        run: NonNull<Run>,
         ptr: NonNull<u8>,
     ) -> Result<(), RunHeapError> {
-        let freed = Self::complete_remote_block(owner, ptr)?;
+        let freed = Self::complete_remote_block(run, ptr)?;
         self.finish_free(freed)
     }
 
-    fn free_block(mut owner: NonNull<Run>, ptr: NonNull<u8>) -> Result<FreedRun, RunHeapError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live RunArena.
-        let run = unsafe { owner.as_mut() };
-
-        let status = run.free_local(ptr).map_err(RunHeapError::from)?;
+    fn free_block(mut run: NonNull<Run>, ptr: NonNull<u8>) -> Result<FreedRun, RunHeapError> {
+        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
+        let run_ref = unsafe { run.as_mut() };
+        let status = run_ref.free_local(ptr).map_err(RunHeapError::from)?;
 
         Ok(FreedRun {
-            class: run.class(),
-            owner: NonNull::from(&mut *run),
+            class: run_ref.class(),
+            run: NonNull::from(&mut *run_ref),
             was_full: status.was_full(),
         })
     }
 
     fn complete_remote_block(
-        mut owner: NonNull<Run>,
+        mut run: NonNull<Run>,
         ptr: NonNull<u8>,
     ) -> Result<FreedRun, RunHeapError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live RunArena.
-        let run = unsafe { owner.as_mut() };
-
-        let status = run.complete_remote_free(ptr).map_err(RunHeapError::from)?;
+        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
+        let run_ref = unsafe { run.as_mut() };
+        let status = run_ref
+            .complete_remote_free(ptr)
+            .map_err(RunHeapError::from)?;
 
         Ok(FreedRun {
-            class: run.class(),
-            owner: NonNull::from(&mut *run),
+            class: run_ref.class(),
+            run: NonNull::from(&mut *run_ref),
             was_full: status.was_full(),
         })
     }
 
     fn finish_free(&mut self, freed: FreedRun) -> Result<(), RunHeapError> {
         if freed.was_full {
-            self.push_available(freed.class.index(), freed.owner)?;
+            self.push_available(freed.class.index(), freed.run)?;
         }
 
         Ok(())
@@ -140,7 +141,7 @@ impl RunHeap {
         ptr: NonNull<u8>,
         spec: LayoutSpec,
     ) -> Result<bool, RunHeapError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live RunArena.
+        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
         let run = unsafe { run.as_ref() };
 
         run.resize_in_place(ptr, spec).map_err(RunHeapError::from)
@@ -150,7 +151,7 @@ impl RunHeap {
         &mut self,
         mut run_ptr: NonNull<Run>,
     ) -> Result<(), RunHeapError> {
-        // SAFETY: caller supplies a pointer derived from this allocator's live RunArena.
+        // SAFETY: caller supplies a pointer derived from this allocator's live arena.
         let run = unsafe { run_ptr.as_mut() };
         self.push_available(run.class().index(), run_ptr)
     }
@@ -159,7 +160,7 @@ impl RunHeap {
         loop {
             let mut run_ptr = *self.available.get(class_index)?.as_ref()?;
             let next = {
-                // SAFETY: available-list pointers are created only from live RunArena entries.
+                // SAFETY: available-list pointers are created only from live arena entries.
                 let run = unsafe { run_ptr.as_mut() };
                 run.take_available_next()
             };
@@ -167,7 +168,7 @@ impl RunHeap {
             let available = self.available.get_mut(class_index)?;
             *available = next;
 
-            // SAFETY: available-list pointers are created only from live RunArena entries.
+            // SAFETY: available-list pointers are created only from live arena entries.
             if unsafe { run_ptr.as_ref() }.has_available_blocks() {
                 return Some(run_ptr);
             }
@@ -183,7 +184,7 @@ impl RunHeap {
             return Err(RunHeapError::InvalidMetadata);
         };
 
-        // SAFETY: caller supplies a pointer derived from this allocator's live RunArena.
+        // SAFETY: caller supplies a pointer derived from this allocator's live arena.
         let run = unsafe { run_ptr.as_mut() };
 
         if !run.has_available_blocks() {
@@ -198,25 +199,27 @@ impl RunHeap {
 
     fn insert_run(
         &mut self,
-        reservation: RunReservation,
+        index: usize,
+        id: RunId,
         run: Run,
         pages: &PageMap,
     ) -> Option<NonNull<Run>> {
-        let id = reservation.id();
         let range = run.range();
 
-        if self.runs.insert(reservation, run).is_err() {
+        if self.runs.insert(index, run).is_none() {
+            self.runs.release(index);
             return None;
         }
 
-        let Some(inserted_run) = self.runs.get_mut(id) else {
-            let _removed = self.runs.remove(id);
+        let Some(inserted_run) = self.runs.get_mut(index) else {
+            let _removed = self.runs.remove(usize::try_from(id.index()).ok()?);
             return None;
         };
+        debug_assert_eq!(inserted_run.id, id);
         let run_ptr = NonNull::from(&mut *inserted_run);
 
         if pages.publish_run(range, run_ptr).is_err() {
-            let _removed = self.runs.remove(id);
+            let _removed = self.runs.remove(usize::try_from(id.index()).ok()?);
             return None;
         }
 
@@ -237,7 +240,7 @@ impl From<RunError> for RunHeapError {
 #[cfg(test)]
 mod tests {
     use crate::{
-        heap::{RUN_SIZE, Run, RunId},
+        heap::{HeapId, RUN_SIZE, Run, RunId},
         layout::LayoutSpec,
         memory::{OsMemory, PageMap, PageOwner},
         size_class::SizeClasses,
@@ -249,8 +252,9 @@ mod tests {
         let mapping = OsMemory::map(RUN_SIZE).unwrap();
         let spec = LayoutSpec::from_size_align(64, 8).unwrap();
         let class = SizeClasses::for_layout(spec).unwrap();
+        let heap = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
 
-        Run::new(id, RunOwner::Central, mapping, class)
+        Run::new(id, heap, mapping, class)
     }
 
     fn available_run_id(allocator: &RunHeap, class_index: usize) -> Option<RunId> {
@@ -265,7 +269,8 @@ mod tests {
         class: SizeClassId,
         pages: &PageMap,
     ) -> Option<(NonNull<Run>, NonNull<u8>)> {
-        let mut run = allocator.allocate(class, HeapId::ROOT, pages)?;
+        let heap = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
+        let mut run = allocator.allocate(class, heap, pages)?;
         // SAFETY: RunHeap returns pointers to live runs from its arena.
         let ptr = unsafe { run.as_mut() }.allocate()?;
         // SAFETY: RunHeap returns pointers to live runs from its arena.
@@ -308,16 +313,17 @@ mod tests {
     fn failed_run_page_publication_removes_table_entry() {
         let mut allocator = RunHeap::new(4);
         let pages = PageMap::new();
-        let reservation = allocator.runs.reserve().unwrap();
-        let id = reservation.id();
+        let index = allocator.runs.claim().unwrap();
+        let id = RunId::from_index(u32::try_from(index).unwrap()).unwrap();
+        assert_eq!(usize::try_from(id.index()).unwrap(), index);
         let run = reusable_run(id);
         let range = run.range();
         let existing = NonNull::dangling();
 
         pages.publish_run(range, existing).unwrap();
 
-        assert_eq!(allocator.insert_run(reservation, run, &pages), None);
-        assert!(allocator.runs.get_mut(id).is_none());
+        assert_eq!(allocator.insert_run(index, id, run, &pages), None);
+        assert!(allocator.runs.get_mut(index).is_none());
         assert_eq!(pages.get(range.base()), Some(PageOwner::Run(existing)));
     }
 }

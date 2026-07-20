@@ -1,16 +1,15 @@
 # runic-core/src
 
-This directory contains the allocator core. Modules are intentionally organized around allocator entities and invariants.
+Allocator core organized around entities and invariants.
 
 ## Modules
 
-- `address`: address ranges and pointer offset helpers.
-- `allocator`: public core allocator facade and abort boundary used by the global wrapper.
-- `extent`: dedicated allocation metadata, extent arena, extent heap, and mapping reuse.
-- `heap`: allocation policy and lock-protected allocator state.
-- `layout`: normalized allocation layout semantics and mapping sizing.
-- `memory`: address ranges, mmap-backed memory ownership, and page-indexed owner lookup.
-- `run`: size-classed fixed-block allocation metadata, run arena, and run heap.
+- `allocator`: public core facade and abort boundary used by the global wrapper.
+- `arena`: fixed-capacity freelist object table for heap/run/extent metadata.
+- `config`: allocator and extent retention/reuse configuration.
+- `heap`: owner-local heaps, run/extent heaps, heap table, and thread binding.
+- `layout`: normalized layout semantics and mapping sizing.
+- `memory`: address ranges, mmap ownership, and page-indexed owner lookup.
 - `size_class`: size-class selection.
 
 ## Invariant

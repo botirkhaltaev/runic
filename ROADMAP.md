@@ -31,15 +31,16 @@ entity owns a real lifecycle, invariant, or policy.
 
 Latest published release: `0.4.0`.
 
-Current v0.5 development adds the per-thread small-run frontend while keeping
-extents central and preserving explicit page-map ownership.
+Current v0.5 development is an owner-local heap frontend: TLS heaps own runs and
+extents stamped with `HeapId`, lock-free remote-free inboxes, and Draining
+lifecycle after thread exit, with explicit page-map ownership.
 
 The current milestone is:
 
 ```text
-A global-lock allocator core with optimized per-thread small-run frontend paths,
-stable run/extent metadata ownership, deterministic mapping retention policy,
-remote-free validation, and randomized trace coverage.
+TLS-owned heaps for small runs and large extents, HeapId ownership on entities,
+claim→inbox→flush remote frees, Alloc miss flush-before-mmap, Free|Active|Draining
+slot lifecycle, deterministic mapping retention, and randomized trace coverage.
 ```
 
 ## Supported Scope
@@ -50,13 +51,14 @@ Build only:
 Linux x86_64
 Rust stable
 GlobalAlloc
-one global heap lock
+owner-local heaps via HeapTable / ThreadHeap
 mmap-backed runs for size-classed allocations
-mmap-backed extents for dedicated allocations
+mmap-backed extents for dedicated allocations (heap-local)
 out-of-line metadata
 page-indexed pointer lookup
 per-size-class available run lists
-bitmap-backed run block state
+bitmap-backed run block state with remote-pending
+lock-free remote-free Treiber inboxes per heap
 configurable extent mapping retention and reuse
 optional empty-run release and mapping retention
 run block-boundary checks
@@ -108,14 +110,11 @@ GlobalAlloc
       -> Allocator
           -> AllocatorCore
               -> PageMap
-              -> Heap
-                  -> RunHeap
-                      -> RunArena
-                  -> ExtentHeap
-                      -> ExtentArena
-                      -> ExtentCache
-              -> HeapTable
+              -> HeapTable { generations[], Arena<Heap> }
                   -> ThreadHeap
+              -> Heap { RunHeap, ExtentHeap, Inbox }
+                  -> RunHeap { Arena<Run>, available[] }
+                  -> ExtentHeap { Arena<Extent>, cache }
               -> Run
               -> Extent
               -> OsMemory
@@ -131,17 +130,16 @@ RunicAlloc     owns the Rust GlobalAlloc boundary.
 Allocator      owns the core public allocator API and abort boundary.
 AllocatorCore  owns PageMap and locked shared allocator state.
 Heap           owns run and extent allocation policy for one heap identity.
-HeapTable      owns thread heap slots, generation identity, and remote inboxes.
+HeapTable      owns Arena<Heap>, generations[], and remote batch push.
+Arena          owns fixed-capacity freelist metadata storage.
 LayoutSpec     owns normalized layout semantics.
 SizeClasses    owns size-class selection.
 OsMemory       owns mmap and munmap.
 PageMap        owns page-indexed owner-pointer lookup.
-RunHeap        owns small-allocation policy and per-class available run lists.
-RunArena       owns out-of-line run metadata storage.
+RunHeap        owns Arena<Run>, small-allocation policy, and available run lists.
 Run            owns fixed-block allocation metadata and block bitmap state.
 BlockStates    owns reusable, allocated, and remote-pending block state.
-ExtentHeap     owns dedicated allocation policy and mapping reuse.
-ExtentArena    owns out-of-line extent metadata storage.
+ExtentHeap     owns Arena<Extent>, dedicated allocation policy, and mapping reuse.
 ExtentCache    owns retained extent mappings, eviction, and reuse lookup.
 Extent         owns dedicated allocation metadata.
 ```
@@ -289,35 +287,35 @@ block-boundary, double-free, stale-free, remote-free, and thread-exit correctnes
 In scope:
 
 ```text
-HeapId owner identity
-RunOwner::Central and RunOwner::Thread
-ThreadHeap frontend for small allocations only
-per-thread run ownership through HeapTable slots
-central refill into thread-owned runs
+HeapId ownership on Run and Extent (no Owner/root heap)
+ThreadHeap frontend for small and large allocations
+per-thread heap ownership through HeapTable slots
 explicit block states for reusable, allocated, and remote-pending blocks
-global-lock remote-free routing with fixed inboxes
-thread-exit drain and ownership transfer
+lock-free remote-free Treiber inbox on each Heap
+alloc-miss flush then retry before mmap
+thread-exit Draining mode with orphan flush and generation bump
+heap-local extents
 threaded benchmark reporting
 ```
 
 Out of scope:
 
 ```text
-local extents
 NUMA
 hugepages
 adaptive cache sizing
 hardening profiles
-lock-free remote-free queues
-unbounded queues
+concurrent per-run remote freelists
+per-CPU/RSEQ frontends
+steal/adopt of live runs between heaps
 ```
 
 Acceptance gate:
 
 ```text
 same-thread local small allocation/free improves threaded churn
-cross-thread frees remain validated and do not mutate owner-local metadata directly
-thread exit with live allocations remains valid
+cross-thread frees remain validated and do not mutate owner freelists directly
+thread exit with live allocations remains valid; late remote frees complete under Draining
 existing abort tests pass
 randomized cross-thread traces pass
 no allocator-internal heap allocation is introduced
@@ -337,16 +335,15 @@ docs/span-ownership-evaluation.md
 Goal:
 
 ```text
-Optimize remote-free enqueue and drain behavior after v0.5 proves ownership and
-validation semantics.
+Optimize remote-free reuse latency after ownership and Draining are stable
+(e.g. concurrent per-run remote freelists or freer-side batch buffers).
 ```
 
 Acceptance gate:
 
 ```text
-bounded allocation-free queue remains mandatory
-owner-side validation of every remote free
-queue-full behavior that does not drop frees
+owner-side validation of every remote free remains mandatory
+enqueue never drops frees and never blocks the freer on the owner
 randomized cross-thread traces
 abort cases remain intact
 ```

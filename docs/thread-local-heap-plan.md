@@ -2,7 +2,9 @@
 
 Issue: #8
 
-Runic v0.5 keeps one locked `AllocatorState` for slow paths but adds a per-thread small-run frontend for same-thread hits.
+Runic v0.5 uses TLS owner-local heaps for small runs and large extents. Slow paths
+still coordinate through `AllocatorState` / `HeapTable` for acquire and release;
+steady-state hits avoid that lock.
 
 ## Current Signal
 
@@ -17,78 +19,33 @@ Recent local comparison runs show Runic is most constrained by global serializat
 - `compare/threaded/mixed_thread_random/mimalloc/4`: about `138 us`.
 - `compare/threaded/mixed_thread_random/snmalloc/4`: about `147 us`.
 
-The v0.5 thread-local design should target these workloads:
+Target workloads:
 
 - `threaded/thread_local_churn`
 - `threaded/mixed_thread_random`
-- later, randomized cross-thread traces once remote-free ownership exists
+- randomized cross-thread traces
 
 ## Lessons From #16
 
-A global-lock small-object cache is not enough by itself. The rejected #16 cache attempts either weakened stale-free detection or added enough state traffic to regress single-thread workloads.
+A global-lock small-object cache is not enough by itself. Thread-local heaps help
+only when a local hit avoids meaningful shared metadata work.
 
-Thread-local heaps should therefore be introduced only when a local hit can avoid meaningful global metadata work, not merely move blocks between two global-lock-owned containers.
+## v0.5 Shape (implemented)
 
-## v0.5 Shape
+- Every `Run` / `Extent` stores `HeapId` (no root/central ownership heap).
+- TLS `ThreadHeap` caches runs; hot alloc/free need no table lock.
+- Alloc miss: flush remote inbox → retry → then take/create run.
+- Remote free: claim → lock-free `Inbox` push; owner/Draining flush completes.
+- Slot lifecycle: `Free | Active | Draining` with generation bump on reclaim.
+- Extents are heap-local with the same remote protocol.
 
-The thread heap should be narrow but complete:
-
-- Small allocations only.
-- Per-thread ownership for small runs.
-- Refill through `HeapTable` under the global lock into thread-owned runs.
-- Return or drain blocks through explicit `Run` state transitions.
-- Route remote frees through `HeapTable` inboxes with owner-side validation.
-
-The central allocator state remains responsible for:
-
-- mmap-backed run creation
-- page-map publication
-- heap table ownership and remote inboxes
-- extent allocation
-- invalid free policy
-
-The thread heap owns only the frontend handle for small runs; it does not own extents, page-map publication, or OS mappings.
-
-## Required Ownership Rules
-
-Before implementation, Runic needs an explicit representation for cached block ownership:
-
-- A block in a local cache must not be reported as a live user allocation.
-- A stale free of a locally cached block must not be accepted as a valid free.
-- A cached block must not also be reachable from the run bitmap as available.
-- A local cache must know which run or future region/span owns each cached block.
-- The design must define what happens when the freeing thread is not the owning local heap.
-
-These requirements point directly at #24 and #27. A span/region ownership model may make cached block ownership easier to encode, and the remote-free protocol must exist before local heaps handle cross-thread frees efficiently.
-
-## Implementation Boundary
-
-The v0.5 implementation should not attempt unrelated allocator features.
-
-In scope:
-
-- Thread-local small allocation hits.
-- Batch refill from global run metadata.
-- Explicit local cache drain and ownership transfer on thread exit.
-- Shared-lock remote-free routing with fixed inboxes.
-- Existing global path fallback for large allocations and uncommon cases.
-
-Out of scope:
-
-- NUMA placement.
-- Hugepage policy.
-- Per-CPU caches.
-- Lock-free remote-free queues before the shared-lock protocol is proven.
-- Hardening features before #28.
+See [thread-local-frontend-scope.md](thread-local-frontend-scope.md) and
+[remote-free-protocol.md](remote-free-protocol.md).
 
 ## Acceptance For #25
 
-The implementation PR for #25 should show:
-
 - `threaded/thread_local_churn` improves materially over the global-lock baseline.
-- `threaded/mixed_thread_random` improves or the remaining blocker is identified.
 - Abort tests for invalid free, double free, and realloc-after-free still pass.
-- Cached block ownership is explicit in types or state transitions, not implicit in comments.
 - Remote frees are validated and never silently dropped.
-- Thread exit with live allocations remains valid.
+- Thread exit with live allocations remains valid; late frees complete under Draining.
 - No allocator-internal heap allocation is introduced.

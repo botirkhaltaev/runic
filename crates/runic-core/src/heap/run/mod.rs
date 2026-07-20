@@ -2,17 +2,16 @@ use core::{cell::UnsafeCell, mem::size_of, num::NonZeroU32, ptr::NonNull};
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
-mod arena;
-mod heap;
+pub(crate) mod heap;
 
 use crate::{
-    heap::HeapId,
     layout::LayoutSpec,
     memory::{AddressRange, Mapping},
     size_class::{SizeClass, SizeClassId},
 };
 
-pub(crate) use arena::{RunArena, RunReservation};
+use super::HeapId;
+
 pub(crate) use heap::{RunHeap, RunHeapError};
 
 pub(crate) const RUN_SIZE: usize = 64 * 1024;
@@ -22,22 +21,6 @@ const MAX_BLOCKS: usize = RUN_SIZE / MIN_BLOCK_SIZE;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RunId {
     index: NonZeroU32,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RunOwner {
-    Central,
-    Thread(HeapId),
-}
-
-impl RunOwner {
-    pub(crate) const fn for_heap(heap: HeapId) -> Self {
-        if heap.is_root() {
-            Self::Central
-        } else {
-            Self::Thread(heap)
-        }
-    }
 }
 
 impl RunId {
@@ -195,6 +178,19 @@ impl BlockStates {
         }
     }
 
+    fn unclaim_remote_pending(&self, index: BlockIndex) -> Result<(), BlockStateError> {
+        let state = self.state(index)?;
+        match state.compare_exchange(
+            BlockState::RemotePending.raw(),
+            BlockState::Allocated.raw(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => Ok(()),
+            Err(observed) => Self::state_error(observed),
+        }
+    }
+
     fn load(&self, index: BlockIndex) -> Result<BlockState, BlockStateError> {
         let raw = self.state(index)?.load(Ordering::Relaxed);
         BlockState::from_raw(raw).ok_or(BlockStateError::InvalidIndex)
@@ -218,7 +214,7 @@ impl BlockStates {
 
 pub(crate) struct Run {
     id: RunId,
-    owner: RunOwner,
+    heap: HeapId,
     mapping: Mapping,
     range: AddressRange,
     class: SizeClassId,
@@ -251,7 +247,7 @@ impl RunFreeStatus {
 }
 
 impl Run {
-    pub(crate) fn new(id: RunId, owner: RunOwner, mapping: Mapping, class: SizeClass) -> Self {
+    pub(crate) fn new(id: RunId, heap: HeapId, mapping: Mapping, class: SizeClass) -> Self {
         let range = mapping.range();
         let block_size = class.block_size();
         let capacity = range
@@ -261,7 +257,7 @@ impl Run {
             .min(MAX_BLOCKS);
         Self {
             id,
-            owner,
+            heap,
             mapping,
             range,
             class: class.id(),
@@ -273,12 +269,17 @@ impl Run {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn id(&self) -> RunId {
         self.id
     }
 
-    pub(crate) const fn owner(&self) -> RunOwner {
-        self.owner
+    pub(crate) fn set_heap_id(&mut self, heap: HeapId) {
+        self.heap = heap;
+    }
+
+    pub(crate) const fn heap_id(&self) -> HeapId {
+        self.heap
     }
 
     pub(crate) const fn class(&self) -> SizeClassId {
@@ -298,6 +299,11 @@ impl Run {
     pub(crate) fn take_available_next(&self) -> Option<NonNull<Run>> {
         // SAFETY: owner-local methods are called only by the owning heap.
         unsafe { &mut *self.state.get() }.available_next.take()
+    }
+
+    pub(crate) fn available_next(&self) -> Option<NonNull<Run>> {
+        // SAFETY: owner-local methods are called only by the owning heap.
+        unsafe { (*self.state.get()).available_next }
     }
 
     pub(crate) fn range(&self) -> AddressRange {
@@ -350,10 +356,24 @@ impl Run {
         Ok(RunFreeStatus { was_full })
     }
 
-    pub(crate) fn mark_remote_pending(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
+    pub(crate) fn claim_free(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
         let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
 
         match self.blocks.mark_remote_pending(block.index()) {
+            Ok(()) => Ok(()),
+            Err(
+                BlockStateError::AlreadyFree
+                | BlockStateError::AlreadyAllocated
+                | BlockStateError::AlreadyPending,
+            ) => Err(RunError::DoubleFree),
+            Err(BlockStateError::InvalidIndex) => Err(RunError::InvalidPointer),
+        }
+    }
+
+    pub(crate) fn unclaim(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
+        let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
+
+        match self.blocks.unclaim_remote_pending(block.index()) {
             Ok(()) => Ok(()),
             Err(
                 BlockStateError::AlreadyFree
@@ -518,13 +538,17 @@ mod tests {
         SizeClasses::for_layout(spec).unwrap()
     }
 
+    fn test_heap_id() -> HeapId {
+        HeapId::new(0, NonZeroU32::MIN).unwrap()
+    }
+
     #[test]
     fn reusable_run_takes_each_block_once() {
         let mapping = OsMemory::map(RUN_SIZE).unwrap();
         let class = class_for(64, 8);
         let run = Run::new(
             RunId::from_index(0).unwrap(),
-            RunOwner::Central,
+            test_heap_id(),
             mapping,
             class,
         );
@@ -553,7 +577,7 @@ mod tests {
         let class = class_for(128, 8);
         let run = Run::new(
             RunId::from_index(1).unwrap(),
-            RunOwner::Central,
+            test_heap_id(),
             mapping,
             class,
         );
@@ -570,7 +594,7 @@ mod tests {
         let mapping = OsMemory::map(RUN_SIZE).unwrap();
         let run = Run::new(
             RunId::from_index(7).unwrap(),
-            RunOwner::Central,
+            test_heap_id(),
             mapping,
             class_for(64, 8),
         );
@@ -585,7 +609,7 @@ mod tests {
         let mapping = OsMemory::map(RUN_SIZE).unwrap();
         let run = Run::new(
             RunId::from_index(8).unwrap(),
-            RunOwner::Central,
+            test_heap_id(),
             mapping,
             class_for(64, 8),
         );
@@ -601,7 +625,7 @@ mod tests {
         let class = class_for(64, 8);
         let run = Run::new(
             RunId::from_index(2).unwrap(),
-            RunOwner::Central,
+            test_heap_id(),
             mapping,
             class,
         );
@@ -617,7 +641,7 @@ mod tests {
         let class = class_for(24, 8);
         let run = Run::new(
             RunId::from_index(2).unwrap(),
-            RunOwner::Central,
+            test_heap_id(),
             mapping,
             class,
         );
@@ -634,7 +658,7 @@ mod tests {
         let class = class_for(64, 8);
         let run = Run::new(
             RunId::from_index(7).unwrap(),
-            RunOwner::Central,
+            test_heap_id(),
             mapping,
             class,
         );
@@ -650,14 +674,14 @@ mod tests {
         let class = class_for(64, 8);
         let run = Run::new(
             RunId::from_index(9).unwrap(),
-            RunOwner::Central,
+            test_heap_id(),
             mapping,
             class,
         );
         let ptr = run.allocate().unwrap();
 
-        assert_eq!(run.mark_remote_pending(ptr), Ok(()));
-        assert_eq!(run.mark_remote_pending(ptr), Err(RunError::DoubleFree));
+        assert_eq!(run.claim_free(ptr), Ok(()));
+        assert_eq!(run.claim_free(ptr), Err(RunError::DoubleFree));
     }
 
     #[test]
@@ -666,13 +690,13 @@ mod tests {
         let class = class_for(64, 8);
         let run = Run::new(
             RunId::from_index(10).unwrap(),
-            RunOwner::Central,
+            test_heap_id(),
             mapping,
             class,
         );
         let ptr = run.allocate().unwrap();
 
-        assert_eq!(run.mark_remote_pending(ptr), Ok(()));
+        assert_eq!(run.claim_free(ptr), Ok(()));
         assert!(matches!(run.free_local(ptr), Err(RunError::DoubleFree)));
     }
 
@@ -682,13 +706,13 @@ mod tests {
         let class = class_for(64, 8);
         let run = Run::new(
             RunId::from_index(11).unwrap(),
-            RunOwner::Central,
+            test_heap_id(),
             mapping,
             class,
         );
         let ptr = run.allocate().unwrap();
 
-        assert_eq!(run.mark_remote_pending(ptr), Ok(()));
+        assert_eq!(run.claim_free(ptr), Ok(()));
         assert!(run.complete_remote_free(ptr).is_ok());
         assert_eq!(run.allocate(), Some(ptr));
     }
@@ -699,7 +723,7 @@ mod tests {
         let class = class_for(64, 8);
         let run = Run::new(
             RunId::from_index(8).unwrap(),
-            RunOwner::Central,
+            test_heap_id(),
             mapping,
             class,
         );
@@ -717,7 +741,7 @@ mod tests {
         let class = SizeClasses::for_layout(spec).unwrap();
         let run = Run::new(
             RunId::from_index(3).unwrap(),
-            RunOwner::Central,
+            test_heap_id(),
             mapping,
             class,
         );
@@ -735,7 +759,7 @@ mod tests {
         let range = mapping.range();
         let run = Run::new(
             RunId::from_index(5).unwrap(),
-            RunOwner::Central,
+            test_heap_id(),
             mapping,
             class_for(8, 8),
         );

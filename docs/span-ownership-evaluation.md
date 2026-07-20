@@ -7,7 +7,7 @@ Runic currently models mapped memory through separate domain entities:
 - `Run` owns small-allocation geometry and bitmap-backed block state.
 - `Extent` owns dedicated allocation metadata.
 - `PageMap` owns address lookup publication.
-- `RunArena` and `ExtentArena` own metadata slots.
+- `Arena<Run>` / `Arena<Extent>` (on `RunHeap` / `ExtentHeap`) own metadata slots.
 - `ExtentCache` owns reusable extent mappings.
 - `RunHeap` owns empty-run release behavior.
 - `Heap` coordinates lifecycle transitions.

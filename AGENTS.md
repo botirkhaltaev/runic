@@ -16,16 +16,17 @@
 - Use simple, clear names for public and internal APIs; avoid names that encode implementation details, transient benchmark work, compatibility shims, or a single use site.
 - Make invalid states hard to express with `NonZero*`, `NonNull`, named domain types, and checked construction.
 - Avoid tuple structs with unnamed fields for domain entities; use named fields when field meaning matters.
-- Avoid free helper functions unless they remove real duplication or express a cross-entity operation.
-- Prefer entity methods over free helper functions; helper code must not become an adapter layer around ownership or lifecycle behavior.
+- Avoid free helpers and one-line pass-through methods; call the owning entity directly unless the helper removes real duplication or encodes an invariant.
 - Avoid passive adapter, wrapper, or compatibility layers unless they encode a real invariant or remove meaningful duplication.
 - Avoid callback-style helper patterns for ordinary control flow; prefer direct calls and explicit results.
 - Keep code and architecture simple; introduce abstractions only when they reduce complexity or clarify invariants.
 - Optimize for the best allocator architecture rather than backward compatibility or temporary migration paths.
 - Keep hot paths simple, direct, and minimal-instruction while preserving explicit correctness invariants.
-- Separate owner-local, shared/central, and remote-free paths in type APIs; do not hide cross-thread behavior behind broad manager methods.
-- Do not model small or large allocation ownership as a shared heap; sharing should happen through ownership transfer, remote-free coordination, or backend reuse.
+- Separate owner-local and remote-free paths in type APIs; do not hide cross-thread behavior behind broad manager methods.
+- Do not model small or large allocation ownership as a shared/root heap; every run and extent is stamped with a `HeapId`, and sharing uses remote-free coordination or backend reuse.
 - Treat caches as allocator-domain ownership structures, not benchmark-specific shortcuts.
+- After code or API changes, revamp nearest subtree `AGENTS.md` files so rules match the new architecture; rewrite or delete stale bullets.
+- Update nearest subtree `README.md` files when module layout, APIs, or invariants they describe changed.
 
 ## API Policy
 
@@ -60,23 +61,18 @@ GlobalAlloc
       -> AllocatorCore
       -> PageMap
       -> PageBackend / OsMemory
-      -> Heap
-          -> RunHeap
-              -> RunArena
-          -> ExtentHeap
-              -> ExtentArena
-      -> HeapTable
+      -> HeapTable { generations[], Arena<Heap> }
           -> ThreadHeap
-          -> HeapSlot
-      -> Run -> BlockStates
-      -> Extent -> OsMemory
+      -> Heap { mode, RunHeap, ExtentHeap, alloc_count, Inbox }
+          -> RunHeap { Arena<Run>, available[] } -> Run (HeapId, BlockStates)
+          -> ExtentHeap { Arena<Extent>, cache } -> Extent (HeapId)
 ```
 
 ## Rust Rules
 
 - Use `#![deny(unsafe_op_in_unsafe_fn)]`.
 - Keep unsafe code small, explicit, local, and adjacent to the safety reasoning.
-- Prefer methods on `Allocator`, `Heap`, `RunHeap`, `ExtentHeap`, `RunArena`, `ExtentArena`, `Run`, `Extent`, `PageMap`, `OsMemory`, and `SizeClasses`.
+- Prefer methods on `Allocator`, `Heap`, `RunHeap`, `ExtentHeap`, `Run`, `Extent`, `Arena`, `PageMap`, `OsMemory`, and `SizeClasses`.
 - Avoid allocator-internal `Vec`, `Box`, `HashMap`, `String`, formatting, or panic paths unless recursion risk is addressed.
 - Abort on invalid frees in v0.1.
 - Do not unwind across allocator boundaries.
@@ -87,11 +83,7 @@ GlobalAlloc
 
 - `allocator-refs/` is read-only inspiration for tests, invariants, workload shapes, and benchmark categories; do not copy implementation code.
 - `ROADMAP.md` owns project direction and milestone boundaries.
-
-## Issue Tracking
-
-- If an agent notices a real issue, critique, or improvement outside the current task, create or update a GitHub issue instead of expanding scope.
-- Keep follow-up lists in GitHub issues, not in this file, unless they are durable project policy.
+- File out-of-scope issues on GitHub; keep durable policy here, not follow-up lists.
 
 ## Commands
 

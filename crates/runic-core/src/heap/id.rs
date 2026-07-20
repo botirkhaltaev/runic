@@ -7,11 +7,6 @@ pub(crate) struct HeapId {
 }
 
 impl HeapId {
-    pub(crate) const ROOT: Self = Self {
-        slot: NonZeroU32::MAX,
-        generation: NonZeroU32::MIN,
-    };
-
     pub(crate) fn new(slot: u32, generation: NonZeroU32) -> Option<Self> {
         Some(Self {
             slot: NonZeroU32::new(slot.checked_add(1)?)?,
@@ -25,10 +20,5 @@ impl HeapId {
 
     pub(crate) const fn generation(self) -> NonZeroU32 {
         self.generation
-    }
-
-    pub(crate) const fn is_root(self) -> bool {
-        self.slot.get() == Self::ROOT.slot.get()
-            && self.generation.get() == Self::ROOT.generation.get()
     }
 }
