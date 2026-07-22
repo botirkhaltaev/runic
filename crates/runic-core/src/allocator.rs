@@ -14,7 +14,7 @@ use crate::{
         Run, RunError, RunHeap, RunHeapError, THREAD_HEAP,
     },
     layout::LayoutSpec,
-    memory::{OsMemory, PageMap, PageOwner},
+    memory::{Mapping, OsMemory, PageMap, PageOwner},
     size_class::SizeClasses,
 };
 
@@ -28,6 +28,11 @@ pub(crate) struct AllocatorInner {
     refs: AtomicU32,
     pages: PageMap,
     pub(crate) table: Mutex<HeapTable>,
+    /// Self-hosted backing storage: this `AllocatorInner` value lives inside the
+    /// mmap region this `Mapping` owns. Never read directly; held only so its
+    /// `Drop` (munmap) runs when this value is dropped. Declared last so it
+    /// drops only after every other field has released its own resources.
+    _storage: Mapping,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -474,16 +479,18 @@ impl Allocator {
 
 impl AllocatorInner {
     fn new(config: AllocatorConfig) -> Option<NonNull<Self>> {
-        let mapping = OsMemory::map(core::mem::size_of::<Self>())?;
-        let inner = mapping.base().cast::<Self>();
-        core::mem::forget(mapping);
+        let storage = OsMemory::map(core::mem::size_of::<Self>())?;
+        let inner = storage.base().cast::<Self>();
 
         // SAFETY: inner points to uniquely owned mmap storage aligned at least to a page boundary.
+        // `storage` is moved into the value it backs; its `Drop` unmaps this same region only
+        // after every other field has already been dropped in place (see field order above).
         unsafe {
             inner.as_ptr().write(Self {
                 refs: AtomicU32::new(1),
                 pages: PageMap::new(),
                 table: Mutex::new(HeapTable::new(config)),
+                _storage: storage,
             });
         }
 
@@ -540,13 +547,11 @@ impl AllocatorInner {
     }
 
     unsafe fn destroy(inner: NonNull<Self>) {
-        let Some(mapping_len) = OsMemory::round_to_page(core::mem::size_of::<Self>()) else {
-            Self::abort();
-        };
         // SAFETY: caller guarantees this is the final reference to inner.
+        // Dropping fields in declaration order drops `_storage` last, unmapping this region
+        // only after `pages` and `table` have released their own resources; nothing touches
+        // `inner` afterward.
         unsafe { inner.as_ptr().drop_in_place() };
-        // SAFETY: storage was allocated by OsMemory::map and is no longer occupied by AllocatorInner.
-        unsafe { OsMemory::unmap(inner.cast::<u8>(), mapping_len) };
     }
 
     #[cold]

@@ -11,7 +11,11 @@ pub(crate) struct Mapping {
 }
 
 impl Mapping {
-    pub(crate) const fn new(base: NonNull<u8>, len: usize) -> Self {
+    /// Constructs a `Mapping` over an mmap allocation.
+    ///
+    /// Private: every `Mapping` must describe a live mmap region owned uniquely
+    /// by that `Mapping`, so construction is confined to `OsMemory::map`.
+    const fn new(base: NonNull<u8>, len: usize) -> Self {
         Self { base, len }
     }
 
@@ -66,15 +70,6 @@ impl OsMemory {
     pub(crate) fn round_to_page(len: usize) -> Option<usize> {
         let mask = PAGE_SIZE - 1;
         len.checked_add(mask).map(|value| value & !mask)
-    }
-
-    /// # Safety
-    ///
-    /// `base` and `len` must identify a live mapping returned by `OsMemory::map`
-    /// that is not owned by any `Mapping` value and will not be unmapped again.
-    pub(crate) unsafe fn unmap(base: NonNull<u8>, len: usize) {
-        // SAFETY: caller guarantees this is a live mmap allocation with unique ownership.
-        unsafe { libc::munmap(base.as_ptr().cast(), len) };
     }
 }
 
