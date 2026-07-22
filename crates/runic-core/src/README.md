@@ -10,7 +10,7 @@ Allocator core organized around entities and invariants.
 - `heap`: owner-local heaps, run/extent heaps, heap table, and thread binding.
 - `layout`: normalized layout semantics and mapping sizing.
 - `memory`: address ranges, mmap ownership, and page-indexed owner lookup.
-- `size_class`: size-class selection.
+- `size_class`: size-class selection; the alignment remap table is const-generated from the single `SIZES` table, not hand-maintained.
 
 ## Invariant
 

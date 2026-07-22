@@ -535,7 +535,7 @@ mod tests {
 
     fn class_for(size: usize, align: usize) -> SizeClass {
         let spec = LayoutSpec::from_size_align(size, align).unwrap();
-        SizeClasses::for_layout(spec).unwrap()
+        SizeClasses::class(SizeClasses::id_for(spec).unwrap()).unwrap()
     }
 
     fn test_heap_id() -> HeapId {
@@ -754,8 +754,7 @@ mod tests {
     #[test]
     fn reusable_run_returns_aligned_blocks_for_alignment_sensitive_layout() {
         let mapping = OsMemory::map(RUN_SIZE).unwrap();
-        let spec = LayoutSpec::from_size_align(17, 16).unwrap();
-        let class = SizeClasses::for_layout(spec).unwrap();
+        let class = class_for(17, 16);
         let run = Run::new(
             RunId::from_index(3).unwrap(),
             test_heap_id(),

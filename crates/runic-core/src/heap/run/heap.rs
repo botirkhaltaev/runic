@@ -241,15 +241,19 @@ mod tests {
         heap::{HeapId, RUN_SIZE, Run, RunId},
         layout::LayoutSpec,
         memory::{OsMemory, PageMap, PageOwner},
-        size_class::SizeClasses,
+        size_class::{SizeClass, SizeClasses},
     };
 
     use super::*;
 
+    fn class_for(size: usize, align: usize) -> SizeClass {
+        let spec = LayoutSpec::from_size_align(size, align).unwrap();
+        SizeClasses::class(SizeClasses::id_for(spec).unwrap()).unwrap()
+    }
+
     fn reusable_run(id: RunId) -> Run {
         let mapping = OsMemory::map(RUN_SIZE).unwrap();
-        let spec = LayoutSpec::from_size_align(64, 8).unwrap();
-        let class = SizeClasses::for_layout(spec).unwrap();
+        let class = class_for(64, 8);
         let heap = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
 
         Run::new(id, heap, mapping, class)
@@ -282,8 +286,7 @@ mod tests {
     fn run_heap_relinks_previously_full_run_after_free() {
         let mut allocator = RunHeap::new(2);
         let pages = PageMap::new();
-        let spec = LayoutSpec::from_size_align(64, 8).unwrap();
-        let class = SizeClasses::for_layout(spec).unwrap();
+        let class = class_for(64, 8);
         let class_index = class.id().index();
         let capacity = RUN_SIZE / class.block_size();
         let (_run, first) = allocate_block(&mut allocator, class.id(), &pages).unwrap();
