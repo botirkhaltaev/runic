@@ -10,8 +10,8 @@ use crate::{
     config::AllocatorConfig,
     heap::extent::ExtentError,
     heap::{
-        Extent, ExtentHeap, ExtentHeapError, ExtentInit, Heap, HeapError, HeapId, HeapMode,
-        HeapTable, Run, RunError, RunHeap, RunHeapError, THREAD_HEAP,
+        Extent, ExtentHeap, ExtentHeapError, ExtentInit, HeapError, HeapId, HeapMode, HeapTable,
+        Run, RunError, RunHeap, RunHeapError, THREAD_HEAP,
     },
     layout::LayoutSpec,
     memory::{OsMemory, PageMap, PageOwner},
@@ -82,7 +82,7 @@ impl Allocator {
         let Some(heap_id) = heap_id else {
             return null_mut();
         };
-        let Some(heap) = table.get_mut(heap_id) else {
+        let Some(heap) = table.heap_mut(heap_id) else {
             return null_mut();
         };
         if !heap.is_active() {
@@ -227,7 +227,7 @@ impl Allocator {
             let Some(heap_id) = heap_id else {
                 return null_mut();
             };
-            let Some(heap) = table.get_mut(heap_id) else {
+            let Some(heap) = table.heap_mut(heap_id) else {
                 return null_mut();
             };
             if !heap.is_active() {
@@ -320,7 +320,7 @@ impl Allocator {
         if Some(heap_id) == current_heap {
             let mut table = inner_ref.table.lock();
             let heap = table
-                .get_mut(heap_id)
+                .heap_mut(heap_id)
                 .ok_or(AllocatorError::InvalidMetadata)?;
             return heap
                 .free_run_owner(run, ptr, pages)
@@ -329,8 +329,7 @@ impl Allocator {
 
         let mode = {
             let table = inner_ref.table.lock();
-            let heap = table.get(heap_id).ok_or(AllocatorError::InvalidMetadata)?;
-            heap.mode()
+            table.mode(heap_id).ok_or(AllocatorError::InvalidMetadata)?
         };
 
         match mode {
@@ -343,7 +342,7 @@ impl Allocator {
                 // have gone Free/stale if the HeapId is wrong.
                 {
                     let table = inner_ref.table.lock();
-                    match table.get(heap_id).map(Heap::mode) {
+                    match table.mode(heap_id) {
                         Some(HeapMode::Active | HeapMode::Draining) => {}
                         Some(HeapMode::Free) | None => {
                             // SAFETY: we just claimed this block on the live PageMap run.
@@ -361,11 +360,11 @@ impl Allocator {
             HeapMode::Draining => {
                 let mut table = inner_ref.table.lock();
                 let heap = table
-                    .get_mut(heap_id)
+                    .heap_mut(heap_id)
                     .ok_or(AllocatorError::InvalidMetadata)?;
                 heap.flush(pages).map_err(AllocatorError::from)?;
                 heap.free_run(run, ptr).map_err(AllocatorError::from)?;
-                let _ = table.try_reclaim(heap_id);
+                let _ = table.reclaim(heap_id);
                 Ok(())
             }
             HeapMode::Free => Err(AllocatorError::InvalidMetadata),
@@ -386,7 +385,7 @@ impl Allocator {
         if Some(heap_id) == current_heap {
             let mut table = inner_ref.table.lock();
             let heap = table
-                .get_mut(heap_id)
+                .heap_mut(heap_id)
                 .ok_or(AllocatorError::InvalidMetadata)?;
             return heap
                 .free_extent_owner(extent, ptr, pages)
@@ -395,8 +394,7 @@ impl Allocator {
 
         let mode = {
             let table = inner_ref.table.lock();
-            let heap = table.get(heap_id).ok_or(AllocatorError::InvalidMetadata)?;
-            heap.mode()
+            table.mode(heap_id).ok_or(AllocatorError::InvalidMetadata)?
         };
 
         match mode {
@@ -407,7 +405,7 @@ impl Allocator {
                     .map_err(AllocatorError::from)?;
                 {
                     let table = inner_ref.table.lock();
-                    match table.get(heap_id).map(Heap::mode) {
+                    match table.mode(heap_id) {
                         Some(HeapMode::Active | HeapMode::Draining) => {}
                         Some(HeapMode::Free) | None => {
                             // SAFETY: we just claimed this extent on the live PageMap entry.
@@ -425,12 +423,12 @@ impl Allocator {
             HeapMode::Draining => {
                 let mut table = inner_ref.table.lock();
                 let heap = table
-                    .get_mut(heap_id)
+                    .heap_mut(heap_id)
                     .ok_or(AllocatorError::InvalidMetadata)?;
                 heap.flush(pages).map_err(AllocatorError::from)?;
                 heap.free_extent(extent, ptr, pages)
                     .map_err(AllocatorError::from)?;
-                let _ = table.try_reclaim(heap_id);
+                let _ = table.reclaim(heap_id);
                 Ok(())
             }
             HeapMode::Free => Err(AllocatorError::InvalidMetadata),
@@ -612,14 +610,13 @@ mod tests {
 
     fn acquire_id(inner_ref: &AllocatorInner) -> HeapId {
         let mut table = inner_ref.table.lock();
-        // SAFETY: acquire returns a live table-resident heap.
-        unsafe { table.acquire().unwrap().as_ref().id() }
+        table.acquire().unwrap().0
     }
 
     fn allocate_small(inner_ref: &AllocatorInner, id: HeapId, layout: Layout) -> NonNull<u8> {
         let spec = LayoutSpec::from_layout(layout);
         let mut table = inner_ref.table.lock();
-        let heap = table.get_mut(id).unwrap();
+        let heap = table.heap_mut(id).unwrap();
         assert!(heap.is_active());
         heap.allocate_run(SizeClasses::id_for(spec).unwrap(), inner_ref.pages())
             .unwrap()
@@ -633,7 +630,7 @@ mod tests {
     ) -> NonNull<u8> {
         let spec = LayoutSpec::from_layout(layout);
         let mut table = inner_ref.table.lock();
-        let heap = table.get_mut(id).unwrap();
+        let heap = table.heap_mut(id).unwrap();
         assert!(heap.is_active());
         heap.allocate_extent(spec, inner_ref.pages(), init).unwrap()
     }
@@ -682,7 +679,7 @@ mod tests {
 
         {
             let mut table = inner_ref.table.lock();
-            let heap = table.get_mut(id).unwrap();
+            let heap = table.heap_mut(id).unwrap();
             assert_eq!(
                 heap.free_extent_owner(extent, ptr, inner_ref.pages()),
                 Ok(())
@@ -705,7 +702,7 @@ mod tests {
         assert_eq!(unsafe { run.as_ref() }.heap_id(), id);
 
         let mut table = inner_ref.table.lock();
-        let heap = table.get_mut(unsafe { run.as_ref() }.heap_id()).unwrap();
+        let heap = table.heap_mut(unsafe { run.as_ref() }.heap_id()).unwrap();
         assert_eq!(heap.free_run_owner(run, ptr, inner_ref.pages()), Ok(()));
     }
 
@@ -722,7 +719,7 @@ mod tests {
         assert_eq!(unsafe { extent.as_ref() }.heap_id(), id);
 
         let mut table = inner_ref.table.lock();
-        let heap = table.get_mut(id).unwrap();
+        let heap = table.heap_mut(id).unwrap();
         assert_eq!(
             heap.free_extent_owner(extent, ptr, inner_ref.pages()),
             Ok(())
@@ -765,10 +762,10 @@ mod tests {
         {
             let mut table = inner_ref.table.lock();
             assert_eq!(table.retire(id, inner_ref.pages()), Ok(()));
-            assert_eq!(table.get(id).map(Heap::mode), Some(HeapMode::Draining));
+            assert_eq!(table.mode(id), Some(HeapMode::Draining));
             let list = RemoteList::from_ends(ptr, ptr);
             assert_eq!(table.publish(id, &list, inner_ref.pages()), Ok(()));
-            assert!(table.get(id).is_none());
+            assert!(table.heap(id).is_none());
         }
     }
 
@@ -790,7 +787,7 @@ mod tests {
         {
             let mut table = inner_ref.table.lock();
             assert_eq!(table.retire(first, inner_ref.pages()), Ok(()));
-            assert_eq!(table.get(first).map(Heap::mode), Some(HeapMode::Draining));
+            assert_eq!(table.mode(first), Some(HeapMode::Draining));
         }
 
         let ptr_b = allocate_small(inner_ref, second, layout);
@@ -800,7 +797,7 @@ mod tests {
             Allocator::dealloc_run_slow(inner_ref, run_b, ptr_b, None, inner_ref.pages()),
             Ok(())
         );
-        assert!(inner_ref.table.lock().get(first).is_none());
+        assert!(inner_ref.table.lock().heap(first).is_none());
 
         // Drain the freer's retained second-heap batch so TLS state does not leak across tests.
         let mut pending = None;
@@ -825,17 +822,17 @@ mod tests {
         let mut table = inner_ref.table.lock();
         assert_eq!(table.retire(id, inner_ref.pages()), Ok(()));
         {
-            let owner = table.get_mut(id).unwrap();
+            let owner = table.heap_mut(id).unwrap();
             assert_eq!(owner.flush(inner_ref.pages()), Ok(()));
             assert_eq!(owner.free_run(first_run, first), Ok(()));
         }
-        let _ = table.try_reclaim(id);
+        let _ = table.reclaim(id);
         {
-            let owner = table.get_mut(id).unwrap();
+            let owner = table.heap_mut(id).unwrap();
             assert_eq!(owner.flush(inner_ref.pages()), Ok(()));
             assert_eq!(owner.free_run(second_run, second), Ok(()));
         }
-        let _ = table.try_reclaim(id);
+        let _ = table.reclaim(id);
     }
 
     #[test]
@@ -851,11 +848,11 @@ mod tests {
             let mut table = inner_ref.table.lock();
             assert_eq!(table.retire(heap, inner_ref.pages()), Ok(()));
             {
-                let owner = table.get_mut(heap).unwrap();
+                let owner = table.heap_mut(heap).unwrap();
                 assert_eq!(owner.flush(inner_ref.pages()), Ok(()));
                 assert_eq!(owner.free_run(run, ptr), Ok(()));
             }
-            let _ = table.try_reclaim(heap);
+            let _ = table.reclaim(heap);
         }
         assert!(inner_ref.pages().get(ptr).is_some());
         let reused = acquire_id(inner_ref);
@@ -873,7 +870,7 @@ mod tests {
 
         {
             let mut table = inner_ref.table.lock();
-            let heap = table.get_mut(unsafe { run.as_ref() }.heap_id()).unwrap();
+            let heap = table.heap_mut(unsafe { run.as_ref() }.heap_id()).unwrap();
             assert_eq!(heap.free_run_owner(run, ptr, inner_ref.pages()), Ok(()));
         }
         assert!(inner_ref.pages().get(ptr).is_some());
@@ -891,7 +888,7 @@ mod tests {
         let reused_run = run_of(inner_ref, reused_ptr);
         let mut table = inner_ref.table.lock();
         assert_eq!(
-            table.get_mut(reused).unwrap().free_run_owner(
+            table.heap_mut(reused).unwrap().free_run_owner(
                 reused_run,
                 reused_ptr,
                 inner_ref.pages()
@@ -919,7 +916,7 @@ mod tests {
         assert_eq!(unsafe { extent.as_ref() }.heap_id(), id);
 
         let mut table = inner_ref.table.lock();
-        let owner = table.get_mut(id).unwrap();
+        let owner = table.heap_mut(id).unwrap();
         assert_eq!(
             owner.free_extent_owner(extent, ptr, inner_ref.pages()),
             Ok(())

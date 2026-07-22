@@ -130,7 +130,7 @@ RunicAlloc     owns the Rust GlobalAlloc boundary.
 Allocator      owns the core public allocator API and abort boundary.
 AllocatorInner owns the refcounted mmap instance: PageMap and Mutex<HeapTable>.
 Heap           owns run and extent allocation policy for one heap identity.
-HeapTable      owns slots Arena<Heap>, generations[], acquire/retire/try_reclaim, and publish.
+HeapTable      owns slots Arena<Heap>, generations[], acquire/retire/reclaim, heap/mode, and publish.
 Arena          owns fixed-capacity freelist metadata storage.
 LayoutSpec     owns normalized layout semantics.
 SizeClasses    owns size-class selection.

@@ -221,12 +221,10 @@ impl ThreadHeap {
             return None;
         }
 
-        let Some(heap) = table.acquire() else {
+        let Some((id, heap)) = table.acquire() else {
             AllocatorInner::release(inner);
             return None;
         };
-        // SAFETY: acquire returns a live table-resident heap.
-        let id = unsafe { heap.as_ref() }.id();
         self.install(inner, heap, id);
 
         Some(id)

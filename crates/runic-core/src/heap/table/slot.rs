@@ -13,6 +13,7 @@ const MAX_HEAPS: usize = 64;
 const MAX_HEAPS_U32: u32 = 64;
 const HEAP_METADATA_CAPACITY: u32 = 16_384;
 
+/// Generation-checked heap slots and remote-batch delivery.
 pub(crate) struct HeapTable {
     slots: Arena<Heap>,
     generations: [NonZeroU32; MAX_HEAPS],
@@ -32,9 +33,10 @@ impl HeapTable {
         }
     }
 
-    pub(crate) fn acquire(&mut self) -> Option<NonNull<Heap>> {
-        if let Some(heap) = self.acquire_reusable() {
-            return Some(heap);
+    /// Acquire a heap for TLS bind: reuse a Free slot or claim a fresh one.
+    pub(crate) fn acquire(&mut self) -> Option<(HeapId, NonNull<Heap>)> {
+        if let Some(acquired) = self.acquire_reusable() {
+            return Some(acquired);
         }
 
         let index = self.slots.claim()?;
@@ -50,10 +52,12 @@ impl HeapTable {
             return None;
         }
 
-        self.slots.get_mut(index).map(NonNull::from)
+        let heap = NonNull::from(self.slots.get_mut(index)?);
+        // SAFETY: heap was just inserted into a live table slot.
+        Some((unsafe { heap.as_ref().id() }, heap))
     }
 
-    fn acquire_reusable(&mut self) -> Option<NonNull<Heap>> {
+    fn acquire_reusable(&mut self) -> Option<(HeapId, NonNull<Heap>)> {
         for index in 0..MAX_HEAPS {
             let Some(heap) = self.slots.get_mut(index) else {
                 continue;
@@ -65,19 +69,23 @@ impl HeapTable {
             let generation = *self.generations.get(index)?;
             let id = HeapId::new(u32::try_from(index).ok()?, generation)?;
             heap.reactivate(id);
-            return Some(NonNull::from(heap));
+            let heap = NonNull::from(heap);
+            // SAFETY: heap is a live Free slot just reactivated in this table.
+            return Some((unsafe { heap.as_ref().id() }, heap));
         }
 
         None
     }
 
-    pub(crate) fn get(&self, id: HeapId) -> Option<&Heap> {
+    /// Generation-checked shared borrow of a live heap.
+    pub(crate) fn heap(&self, id: HeapId) -> Option<&Heap> {
         let index = usize::try_from(id.index()).ok()?;
         let heap = self.slots.get(index)?;
         self.matches_generation(index, id).then_some(heap)
     }
 
-    pub(crate) fn get_mut(&mut self, id: HeapId) -> Option<&mut Heap> {
+    /// Generation-checked exclusive borrow of a live heap.
+    pub(crate) fn heap_mut(&mut self, id: HeapId) -> Option<&mut Heap> {
         let index = usize::try_from(id.index()).ok()?;
         if !self.matches_generation(index, id) {
             return None;
@@ -85,10 +93,15 @@ impl HeapTable {
         self.slots.get_mut(index)
     }
 
+    /// Lifecycle mode for a live `HeapId`, or `None` if missing/stale.
+    pub(crate) fn mode(&self, id: HeapId) -> Option<HeapMode> {
+        self.heap(id).map(Heap::mode)
+    }
+
     /// Publish a claimed remote-free batch to `id`.
     ///
     /// - `Active`: enqueue onto the heap inbox (owner flushes later).
-    /// - `Draining`: enqueue then complete under the table lock, then try reclaim.
+    /// - `Draining`: enqueue then complete under the table lock, then reclaim if empty.
     /// - `Free` / stale generation: error (caller must not drop claimed nodes).
     pub(crate) fn publish(
         &mut self,
@@ -96,10 +109,9 @@ impl HeapTable {
         list: &RemoteList,
         pages: &PageMap,
     ) -> Result<(), HeapError> {
-        let mode = self.get(id).ok_or(HeapError::InvalidHeap)?.mode();
-        match mode {
+        match self.mode(id).ok_or(HeapError::InvalidHeap)? {
             HeapMode::Active => {
-                self.get(id)
+                self.heap(id)
                     .ok_or(HeapError::InvalidHeap)?
                     .inbox()
                     .push_batch(list);
@@ -107,46 +119,41 @@ impl HeapTable {
             }
             HeapMode::Draining => {
                 {
-                    let heap = self.get_mut(id).ok_or(HeapError::InvalidHeap)?;
+                    let heap = self.heap_mut(id).ok_or(HeapError::InvalidHeap)?;
                     heap.inbox().push_batch(list);
                     heap.flush(pages)?;
                 }
-                let _ = self.try_reclaim(id);
+                let _ = self.reclaim(id);
                 Ok(())
             }
             HeapMode::Free => Err(HeapError::InvalidHeap),
         }
     }
 
-    /// Owner thread gives up the heap: flush, enter Draining, flush again, try reclaim.
+    /// Owner thread gives up the heap: flush, enter Draining, flush again, reclaim if empty.
     pub(crate) fn retire(&mut self, id: HeapId, pages: &PageMap) -> Result<(), HeapError> {
-        let index = usize::try_from(id.index())
-            .ok()
-            .ok_or(HeapError::InvalidHeap)?;
         let reclaimed = {
-            let heap = self.get_mut(id).ok_or(HeapError::InvalidHeap)?;
+            let heap = self.heap_mut(id).ok_or(HeapError::InvalidHeap)?;
             heap.flush(pages)?;
             heap.begin_drain();
             heap.flush(pages)?;
             heap.try_reclaim()
         };
         if reclaimed {
-            self.bump_generation(index);
+            self.bump_generation(id);
         }
         Ok(())
     }
 
-    pub(crate) fn try_reclaim(&mut self, id: HeapId) -> bool {
-        let Some(index) = usize::try_from(id.index()).ok() else {
-            return false;
-        };
-        let Some(heap) = self.get_mut(id) else {
+    /// If the heap is empty under Draining, mark Free and bump its generation.
+    pub(crate) fn reclaim(&mut self, id: HeapId) -> bool {
+        let Some(heap) = self.heap_mut(id) else {
             return false;
         };
         if !heap.try_reclaim() {
             return false;
         }
-        self.bump_generation(index);
+        self.bump_generation(id);
         true
     }
 
@@ -156,7 +163,10 @@ impl HeapTable {
             .is_some_and(|generation| *generation == id.generation())
     }
 
-    fn bump_generation(&mut self, index: usize) {
+    fn bump_generation(&mut self, id: HeapId) {
+        let Ok(index) = usize::try_from(id.index()) else {
+            return;
+        };
         let Some(stored) = self.generations.get_mut(index) else {
             return;
         };

@@ -69,7 +69,7 @@ GlobalAlloc
 ```
 
 - `AllocatorInner` is the refcounted mmap instance behind lazy `AtomicPtr` init — not a domain entity. `PageMap` stays outside the table mutex so owner-local TLS hits never take that lock.
-- `HeapTable` owns slot identity, `acquire`/`retire`/`try_reclaim`, and mode-aware remote `publish` only — not allocate/dealloc routers.
+- `HeapTable` owns slot identity (`acquire`/`retire`/`reclaim`), generation-checked `heap`/`heap_mut`/`mode`, and mode-aware remote `publish` only — not allocate/dealloc routers.
 
 ## Rust Rules
 
