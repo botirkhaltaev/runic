@@ -16,6 +16,7 @@ impl LayoutSpec {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn from_size_align(size: usize, align: usize) -> Option<Self> {
         Layout::from_size_align(size, align)
             .ok()

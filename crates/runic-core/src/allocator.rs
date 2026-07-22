@@ -10,8 +10,8 @@ use crate::{
     config::AllocatorConfig,
     heap::extent::ExtentError,
     heap::{
-        Extent, ExtentHeap, ExtentHeapError, ExtentInit, Heap, HeapError, HeapId, HeapTable,
-        RemoteList, Run, RunError, RunHeap, RunHeapError, THREAD_HEAP,
+        Extent, ExtentHeap, ExtentHeapError, ExtentInit, Heap, HeapError, HeapId, HeapMode,
+        HeapTable, Run, RunError, RunHeap, RunHeapError, THREAD_HEAP,
     },
     layout::LayoutSpec,
     memory::{OsMemory, PageMap, PageOwner},
@@ -146,29 +146,65 @@ impl Allocator {
     /// for `old`. If a non-null pointer is supplied, no other live reference may
     /// be used to access the old allocation after successful reallocation.
     pub unsafe fn realloc(&self, ptr: *mut u8, old: Layout, new_size: usize) -> *mut u8 {
-        let core = if ptr.is_null() {
-            let Some(core) = self.core() else {
+        if ptr.is_null() {
+            let Ok(new_layout) = Layout::from_size_align(new_size, old.align()) else {
                 return null_mut();
             };
-            core
-        } else {
-            let Some(core) = self.loaded_core() else {
-                Self::abort();
-            };
-            core
+            // SAFETY: the returned pointer is used only as a fresh allocation for new_layout.
+            return unsafe { self.alloc(new_layout) };
+        }
+
+        if new_size == 0 {
+            // SAFETY: ptr is non-null and the caller guarantees it was returned for old.
+            unsafe { self.dealloc(ptr, old) };
+            return null_mut();
+        }
+
+        let Some(core) = self.loaded_core() else {
+            Self::abort();
         };
-        let current_heap = THREAD_HEAP.with(|heap| heap.heap_id(core));
         // SAFETY: core is retained by this Allocator while loaded from self.core.
         let core_ref = unsafe { core.as_ref() };
-        let mut state = core_ref.state().lock();
-        let current_heap = if current_heap.is_some() {
-            current_heap
-        } else {
-            THREAD_HEAP.with(|heap| heap.get_or_acquire(core, &mut state))
+
+        let Some(old_ptr) = NonNull::new(ptr) else {
+            return null_mut();
         };
-        state
-            .realloc(ptr, old, new_size, current_heap, core_ref.pages())
-            .unwrap_or_else(|_| Self::abort())
+        let Some(entry) = core_ref.pages().get(old_ptr) else {
+            Self::abort();
+        };
+
+        let Ok(new_layout) = Layout::from_size_align(new_size, old.align()) else {
+            return null_mut();
+        };
+        let new_spec = LayoutSpec::from_layout(new_layout);
+
+        let resized = match entry {
+            PageOwner::Run(run) => {
+                RunHeap::resize_in_place(run, old_ptr, new_spec).map_err(AllocatorError::from)
+            }
+            PageOwner::Extent(extent) => {
+                ExtentHeap::resize_in_place(extent, old_ptr, new_spec).map_err(AllocatorError::from)
+            }
+        };
+        match resized {
+            Ok(true) => return ptr,
+            Ok(false) => {}
+            Err(_) => Self::abort(),
+        }
+
+        // SAFETY: alloc returns a valid pointer for new_layout or null; we only use it if non-null.
+        let new_ptr = unsafe { self.alloc(new_layout) };
+        if new_ptr.is_null() {
+            return null_mut();
+        }
+
+        // SAFETY: new_ptr is freshly allocated for at least new_layout.size() bytes; ptr is
+        // valid for old.size() bytes.
+        unsafe { copy_nonoverlapping(ptr, new_ptr, old.size().min(new_layout.size())) };
+        // SAFETY: ptr was validated above as a pointer this allocator owns.
+        unsafe { self.dealloc(ptr, old) };
+
+        new_ptr
     }
 
     /// Allocates zero-initialized memory for `layout`.
@@ -279,47 +315,44 @@ impl Allocator {
             return state.dealloc_run_local(run, ptr, pages);
         }
 
-        let route = {
+        let mode = {
             let state = core_ref.state().lock();
             let heap = state
                 .heaps
                 .get(heap_id)
                 .ok_or(AllocatorError::InvalidMetadata)?;
-            RemoteRoute {
-                is_active: heap.is_active(),
-                is_draining: heap.is_draining(),
-            }
+            heap.mode()
         };
 
-        if route.is_active {
-            // SAFETY: PageMap stores only pointers published from this allocator's live arena.
-            unsafe { run.as_ref() }
-                .claim_free(ptr)
-                .map_err(AllocatorError::from)?;
-            if let Err(error) = Self::enqueue_remote(core_ref, heap_id, ptr) {
-                // SAFETY: PageMap stores only pointers published from this allocator's live Arena<Run>.
-                if unsafe { run.as_ref() }.unclaim(ptr).is_err() {
-                    AllocatorState::abort_internal();
+        match mode {
+            HeapMode::Active => {
+                // SAFETY: PageMap stores only pointers published from this allocator's live arena.
+                unsafe { run.as_ref() }
+                    .claim_free(ptr)
+                    .map_err(AllocatorError::from)?;
+                if let Err(error) = Self::enqueue_remote(core_ref, heap_id, ptr) {
+                    // SAFETY: PageMap stores only pointers published from this allocator's live Arena<Run>.
+                    if unsafe { run.as_ref() }.unclaim(ptr).is_err() {
+                        AllocatorState::abort_internal();
+                    }
+                    let mut state = core_ref.state().lock();
+                    let heap = state
+                        .heaps
+                        .get(heap_id)
+                        .ok_or(AllocatorError::InvalidMetadata)?;
+                    if heap.is_draining() {
+                        return state.dealloc_run_draining(heap_id, run, ptr, pages);
+                    }
+                    return Err(error);
                 }
-                let mut state = core_ref.state().lock();
-                let heap = state
-                    .heaps
-                    .get(heap_id)
-                    .ok_or(AllocatorError::InvalidMetadata)?;
-                if heap.is_draining() {
-                    return state.dealloc_run_draining(heap_id, run, ptr, pages);
-                }
-                return Err(error);
+                Ok(())
             }
-            return Ok(());
+            HeapMode::Draining => {
+                let mut state = core_ref.state().lock();
+                state.dealloc_run_draining(heap_id, run, ptr, pages)
+            }
+            HeapMode::Free => Err(AllocatorError::InvalidMetadata),
         }
-
-        if route.is_draining {
-            let mut state = core_ref.state().lock();
-            return state.dealloc_run_draining(heap_id, run, ptr, pages);
-        }
-
-        Err(AllocatorError::InvalidMetadata)
     }
 
     #[cold]
@@ -338,47 +371,44 @@ impl Allocator {
             return state.dealloc_extent_local(extent, ptr, pages);
         }
 
-        let route = {
+        let mode = {
             let state = core_ref.state().lock();
             let heap = state
                 .heaps
                 .get(heap_id)
                 .ok_or(AllocatorError::InvalidMetadata)?;
-            RemoteRoute {
-                is_active: heap.is_active(),
-                is_draining: heap.is_draining(),
-            }
+            heap.mode()
         };
 
-        if route.is_active {
-            // SAFETY: PageMap stores only pointers published from this allocator's live arena.
-            unsafe { extent.as_ref() }
-                .claim_free()
-                .map_err(AllocatorError::from)?;
-            if let Err(error) = Self::enqueue_remote(core_ref, heap_id, ptr) {
+        match mode {
+            HeapMode::Active => {
                 // SAFETY: PageMap stores only pointers published from this allocator's live arena.
-                if unsafe { extent.as_ref() }.unclaim().is_err() {
-                    AllocatorState::abort_internal();
+                unsafe { extent.as_ref() }
+                    .claim_free()
+                    .map_err(AllocatorError::from)?;
+                if let Err(error) = Self::enqueue_remote(core_ref, heap_id, ptr) {
+                    // SAFETY: PageMap stores only pointers published from this allocator's live arena.
+                    if unsafe { extent.as_ref() }.unclaim().is_err() {
+                        AllocatorState::abort_internal();
+                    }
+                    let mut state = core_ref.state().lock();
+                    let heap = state
+                        .heaps
+                        .get(heap_id)
+                        .ok_or(AllocatorError::InvalidMetadata)?;
+                    if heap.is_draining() {
+                        return state.dealloc_extent_draining(heap_id, extent, ptr, pages);
+                    }
+                    return Err(error);
                 }
-                let mut state = core_ref.state().lock();
-                let heap = state
-                    .heaps
-                    .get(heap_id)
-                    .ok_or(AllocatorError::InvalidMetadata)?;
-                if heap.is_draining() {
-                    return state.dealloc_extent_draining(heap_id, extent, ptr, pages);
-                }
-                return Err(error);
+                Ok(())
             }
-            return Ok(());
+            HeapMode::Draining => {
+                let mut state = core_ref.state().lock();
+                state.dealloc_extent_draining(heap_id, extent, ptr, pages)
+            }
+            HeapMode::Free => Err(AllocatorError::InvalidMetadata),
         }
-
-        if route.is_draining {
-            let mut state = core_ref.state().lock();
-            return state.dealloc_extent_draining(heap_id, extent, ptr, pages);
-        }
-
-        Err(AllocatorError::InvalidMetadata)
     }
 
     /// Coalesce onto the TLS remote batch; publish any returned list to its target inbox.
@@ -398,11 +428,6 @@ impl Allocator {
             .push_remote_batch(id, &list)
             .map_err(AllocatorError::from)
     }
-}
-
-struct RemoteRoute {
-    is_active: bool,
-    is_draining: bool,
 }
 
 impl AllocatorCore {
@@ -550,73 +575,6 @@ impl AllocatorState {
         heap.allocate_extent(spec, pages, init)
     }
 
-    fn dealloc(
-        &mut self,
-        ptr: NonNull<u8>,
-        current_heap: Option<HeapId>,
-        pages: &PageMap,
-    ) -> Result<(), AllocatorError> {
-        let Some(entry) = pages.get(ptr) else {
-            return Err(AllocatorError::UnknownPointer);
-        };
-
-        match entry {
-            PageOwner::Run(run) => self.dealloc_run(run, ptr, current_heap, pages)?,
-            PageOwner::Extent(extent) => {
-                self.dealloc_extent(extent, ptr, current_heap, pages)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn dealloc_run(
-        &mut self,
-        run: NonNull<Run>,
-        ptr: NonNull<u8>,
-        current_heap: Option<HeapId>,
-        pages: &PageMap,
-    ) -> Result<(), AllocatorError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live Arena<Run>.
-        let heap_id = unsafe { run.as_ref() }.heap_id();
-
-        if Some(heap_id) == current_heap {
-            return self.dealloc_run_local(run, ptr, pages);
-        }
-
-        let heap = self
-            .heaps
-            .get(heap_id)
-            .ok_or(AllocatorError::InvalidMetadata)?;
-
-        if heap.is_active() {
-            // SAFETY: PageMap stores only pointers published from this allocator's live arena.
-            unsafe { run.as_ref() }
-                .claim_free(ptr)
-                .map_err(AllocatorError::from)?;
-            if let Err(error) = self
-                .heaps
-                .push_remote_batch(heap_id, &RemoteList::from_ends(ptr, ptr))
-            {
-                // SAFETY: PageMap stores only pointers published from this allocator's live Arena<Run>.
-                if unsafe { run.as_ref() }.unclaim(ptr).is_err() {
-                    Self::abort_internal();
-                }
-                if self.heaps.get(heap_id).is_some_and(Heap::is_draining) {
-                    return self.dealloc_run_draining(heap_id, run, ptr, pages);
-                }
-                return Err(AllocatorError::from(error));
-            }
-            return Ok(());
-        }
-
-        if heap.is_draining() {
-            return self.dealloc_run_draining(heap_id, run, ptr, pages);
-        }
-
-        Err(AllocatorError::InvalidMetadata)
-    }
-
     pub(crate) fn dealloc_run_local(
         &mut self,
         run: NonNull<Run>,
@@ -650,53 +608,6 @@ impl AllocatorState {
         heap.free_run(run, ptr).map_err(AllocatorError::from)?;
         let _ = self.heaps.try_reclaim_heap(heap_id);
         Ok(())
-    }
-
-    fn dealloc_extent(
-        &mut self,
-        extent: NonNull<Extent>,
-        ptr: NonNull<u8>,
-        current_heap: Option<HeapId>,
-        pages: &PageMap,
-    ) -> Result<(), AllocatorError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live Arena<Extent>.
-        let heap_id = unsafe { extent.as_ref() }.heap_id();
-
-        if Some(heap_id) == current_heap {
-            return self.dealloc_extent_local(extent, ptr, pages);
-        }
-
-        let heap = self
-            .heaps
-            .get(heap_id)
-            .ok_or(AllocatorError::InvalidMetadata)?;
-
-        if heap.is_active() {
-            // SAFETY: PageMap stores only pointers published from this allocator's live arena.
-            unsafe { extent.as_ref() }
-                .claim_free()
-                .map_err(AllocatorError::from)?;
-            if let Err(error) = self
-                .heaps
-                .push_remote_batch(heap_id, &RemoteList::from_ends(ptr, ptr))
-            {
-                // SAFETY: PageMap stores only pointers published from this allocator's live arena.
-                if unsafe { extent.as_ref() }.unclaim().is_err() {
-                    Self::abort_internal();
-                }
-                if self.heaps.get(heap_id).is_some_and(Heap::is_draining) {
-                    return self.dealloc_extent_draining(heap_id, extent, ptr, pages);
-                }
-                return Err(AllocatorError::from(error));
-            }
-            return Ok(());
-        }
-
-        if heap.is_draining() {
-            return self.dealloc_extent_draining(heap_id, extent, ptr, pages);
-        }
-
-        Err(AllocatorError::InvalidMetadata)
     }
 
     pub(crate) fn dealloc_extent_local(
@@ -734,82 +645,6 @@ impl AllocatorState {
             .map_err(AllocatorError::from)?;
         let _ = self.heaps.try_reclaim_heap(heap_id);
         Ok(())
-    }
-
-    fn realloc(
-        &mut self,
-        ptr: *mut u8,
-        old: Layout,
-        new_size: usize,
-        current_heap: Option<HeapId>,
-        pages: &PageMap,
-    ) -> Result<*mut u8, AllocatorError> {
-        if ptr.is_null() {
-            let Some(spec) = LayoutSpec::from_size_align(new_size, old.align()) else {
-                return Ok(null_mut());
-            };
-
-            return Ok(self
-                .allocate(current_heap, SizeClasses::id_for(spec), spec, pages)
-                .map_or(null_mut(), NonNull::as_ptr));
-        }
-
-        if new_size == 0 {
-            let Some(ptr) = NonNull::new(ptr) else {
-                return Ok(null_mut());
-            };
-            self.dealloc(ptr, current_heap, pages)?;
-            return Ok(null_mut());
-        }
-
-        let Some(old_ptr) = NonNull::new(ptr) else {
-            return Ok(null_mut());
-        };
-
-        let Some(entry) = pages.get(old_ptr) else {
-            return Err(AllocatorError::UnknownPointer);
-        };
-
-        let Ok(new_layout) = Layout::from_size_align(new_size, old.align()) else {
-            return Ok(null_mut());
-        };
-        let new_spec = LayoutSpec::from_layout(new_layout);
-
-        match entry {
-            PageOwner::Run(run) => {
-                if RunHeap::resize_in_place(run, old_ptr, new_spec).map_err(AllocatorError::from)? {
-                    return Ok(ptr);
-                }
-            }
-            PageOwner::Extent(extent) => {
-                if ExtentHeap::resize_in_place(extent, old_ptr, new_spec)
-                    .map_err(AllocatorError::from)?
-                {
-                    return Ok(ptr);
-                }
-            }
-        }
-
-        let new_ptr = self
-            .allocate(current_heap, SizeClasses::id_for(new_spec), new_spec, pages)
-            .map_or(null_mut(), NonNull::as_ptr);
-
-        if new_ptr.is_null() {
-            return Ok(null_mut());
-        }
-
-        // SAFETY: new_ptr is a fresh allocation of at least new_layout.size() bytes; ptr is valid for old.size().
-        unsafe { copy_nonoverlapping(ptr, new_ptr, old.size().min(new_layout.size())) };
-
-        if let Err(error) = self.dealloc(old_ptr, current_heap, pages) {
-            if let Some(new_ptr) = NonNull::new(new_ptr) {
-                let _ = self.dealloc(new_ptr, current_heap, pages);
-            }
-
-            return Err(error);
-        }
-
-        Ok(new_ptr)
     }
 
     #[cold]
@@ -880,234 +715,278 @@ impl From<HeapError> for AllocatorError {
 
 #[cfg(test)]
 mod tests {
-    use core::ptr::write_bytes;
-
     use super::*;
 
-    fn acquire_id(state: &mut AllocatorState) -> HeapId {
+    /// Lazily-initialized core for an `Allocator` created in this test.
+    fn allocator_core(allocator: &Allocator) -> &AllocatorCore {
+        let core = allocator.core().unwrap();
+        // SAFETY: core is retained by `allocator` for the lifetime of this borrow.
+        unsafe { core.as_ref() }
+    }
+
+    fn acquire_id(core_ref: &AllocatorCore) -> HeapId {
+        let mut state = core_ref.state().lock();
         // SAFETY: acquire returns a live table-resident heap.
         unsafe { state.heaps.acquire().unwrap().as_ref().id() }
     }
 
-    #[test]
-    fn allocator_state_reports_small_double_free() {
-        let mut state = AllocatorState::with_config(AllocatorConfig::new());
-        let pages = PageMap::new();
-        let layout = Layout::from_size_align(64, 8).unwrap();
+    fn allocate_small(core_ref: &AllocatorCore, id: HeapId, layout: Layout) -> NonNull<u8> {
         let spec = LayoutSpec::from_layout(layout);
-        let id = acquire_id(&mut state);
-        let ptr = state
-            .allocate(Some(id), SizeClasses::id_for(spec), spec, &pages)
-            .unwrap();
-
-        assert_eq!(state.dealloc(ptr, Some(id), &pages), Ok(()));
-        assert_eq!(
-            state.dealloc(ptr, Some(id), &pages),
-            Err(AllocatorError::DoubleFree)
-        );
+        let mut state = core_ref.state().lock();
+        state
+            .allocate(Some(id), SizeClasses::id_for(spec), spec, core_ref.pages())
+            .unwrap()
     }
 
-    #[test]
-    fn allocator_state_reports_small_realloc_after_free() {
-        let mut state = AllocatorState::with_config(AllocatorConfig::new());
-        let pages = PageMap::new();
-        let layout = Layout::from_size_align(64, 8).unwrap();
+    fn allocate_extent(
+        core_ref: &AllocatorCore,
+        id: HeapId,
+        layout: Layout,
+        init: ExtentInit,
+    ) -> NonNull<u8> {
         let spec = LayoutSpec::from_layout(layout);
-        let id = acquire_id(&mut state);
-        let ptr = state
-            .allocate(Some(id), SizeClasses::id_for(spec), spec, &pages)
-            .unwrap();
-
-        assert_eq!(state.dealloc(ptr, Some(id), &pages), Ok(()));
-        assert_eq!(
-            state.realloc(ptr.as_ptr(), layout, 128, Some(id), &pages),
-            Err(AllocatorError::DoubleFree)
-        );
+        let mut state = core_ref.state().lock();
+        state
+            .allocate_extent(Some(id), spec, core_ref.pages(), init)
+            .unwrap()
     }
 
-    #[test]
-    fn allocator_state_reports_large_double_free_as_unknown_pointer() {
-        let mut state = AllocatorState::with_config(AllocatorConfig::new());
-        let pages = PageMap::new();
-        let layout = Layout::from_size_align(128 * 1024, 4096).unwrap();
-        let spec = LayoutSpec::from_layout(layout);
-        let id = acquire_id(&mut state);
-        let ptr = state
-            .allocate(Some(id), SizeClasses::id_for(spec), spec, &pages)
-            .unwrap();
-
-        assert_eq!(state.dealloc(ptr, Some(id), &pages), Ok(()));
-        assert_eq!(
-            state.dealloc(ptr, Some(id), &pages),
-            Err(AllocatorError::UnknownPointer)
-        );
-    }
-
-    #[test]
-    fn allocator_state_allocates_small_from_current_heap() {
-        let mut state = AllocatorState::with_config(AllocatorConfig::new());
-        let pages = PageMap::new();
-        let layout = Layout::from_size_align(64, 8).unwrap();
-        let spec = LayoutSpec::from_layout(layout);
-        let id = acquire_id(&mut state);
-        let ptr = state
-            .allocate(Some(id), SizeClasses::id_for(spec), spec, &pages)
-            .unwrap();
-        let PageOwner::Run(run) = pages.get(ptr).unwrap() else {
-            panic!("small current-heap allocation should publish a run");
+    fn run_of(core_ref: &AllocatorCore, ptr: NonNull<u8>) -> NonNull<Run> {
+        let PageOwner::Run(run) = core_ref.pages().get(ptr).unwrap() else {
+            panic!("expected a run-owned pointer");
         };
+        run
+    }
+
+    fn extent_of(core_ref: &AllocatorCore, ptr: NonNull<u8>) -> NonNull<Extent> {
+        let PageOwner::Extent(extent) = core_ref.pages().get(ptr).unwrap() else {
+            panic!("expected an extent-owned pointer");
+        };
+        extent
+    }
+
+    #[test]
+    fn allocator_reports_small_double_free() {
+        let allocator = Allocator::new();
+        let core_ref = allocator_core(&allocator);
+        let id = acquire_id(core_ref);
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        let ptr = allocate_small(core_ref, id, layout);
+        let run = run_of(core_ref, ptr);
+
+        assert_eq!(
+            Allocator::dealloc_run_slow(core_ref, run, ptr, Some(id), core_ref.pages()),
+            Ok(())
+        );
+        assert_eq!(
+            Allocator::dealloc_run_slow(core_ref, run, ptr, Some(id), core_ref.pages()),
+            Err(AllocatorError::DoubleFree)
+        );
+    }
+
+    #[test]
+    fn allocator_extent_free_unpublishes_page_entry() {
+        let allocator = Allocator::new();
+        let core_ref = allocator_core(&allocator);
+        let id = acquire_id(core_ref);
+        let layout = Layout::from_size_align(128 * 1024, 4096).unwrap();
+        let ptr = allocate_extent(core_ref, id, layout, ExtentInit::Uninit);
+        let extent = extent_of(core_ref, ptr);
+
+        {
+            let mut state = core_ref.state().lock();
+            assert_eq!(
+                state.dealloc_extent_local(extent, ptr, core_ref.pages()),
+                Ok(())
+            );
+        }
+
+        assert!(core_ref.pages().get(ptr).is_none());
+    }
+
+    #[test]
+    fn allocator_allocates_small_from_current_heap() {
+        let allocator = Allocator::new();
+        let core_ref = allocator_core(&allocator);
+        let id = acquire_id(core_ref);
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        let ptr = allocate_small(core_ref, id, layout);
+        let run = run_of(core_ref, ptr);
 
         // SAFETY: PageMap stores only live run pointers.
         assert_eq!(unsafe { run.as_ref() }.heap_id(), id);
-        assert_eq!(state.dealloc(ptr, Some(id), &pages), Ok(()));
+
+        let mut state = core_ref.state().lock();
+        assert_eq!(state.dealloc_run_local(run, ptr, core_ref.pages()), Ok(()));
     }
 
     #[test]
-    fn allocator_state_allocates_extent_from_current_heap() {
-        let mut state = AllocatorState::with_config(AllocatorConfig::new());
-        let pages = PageMap::new();
+    fn allocator_allocates_extent_from_current_heap() {
+        let allocator = Allocator::new();
+        let core_ref = allocator_core(&allocator);
+        let id = acquire_id(core_ref);
         let layout = Layout::from_size_align(128 * 1024, 4096).unwrap();
-        let spec = LayoutSpec::from_layout(layout);
-        let id = acquire_id(&mut state);
-        let ptr = state
-            .allocate(Some(id), SizeClasses::id_for(spec), spec, &pages)
-            .unwrap();
-        let PageOwner::Extent(extent) = pages.get(ptr).unwrap() else {
-            panic!("large allocation should publish an extent");
-        };
+        let ptr = allocate_extent(core_ref, id, layout, ExtentInit::Uninit);
+        let extent = extent_of(core_ref, ptr);
 
         // SAFETY: PageMap stores only live extent pointers.
         assert_eq!(unsafe { extent.as_ref() }.heap_id(), id);
-        assert_eq!(state.dealloc(ptr, Some(id), &pages), Ok(()));
+
+        let mut state = core_ref.state().lock();
+        assert_eq!(
+            state.dealloc_extent_local(extent, ptr, core_ref.pages()),
+            Ok(())
+        );
     }
 
     #[test]
-    fn allocator_state_rejects_duplicate_remote_free() {
-        let mut state = AllocatorState::with_config(AllocatorConfig::new());
-        let pages = PageMap::new();
+    fn allocator_rejects_duplicate_remote_free() {
+        let allocator = Allocator::new();
+        let core_ref = allocator_core(&allocator);
+        let id = acquire_id(core_ref);
         let layout = Layout::from_size_align(64, 8).unwrap();
-        let spec = LayoutSpec::from_layout(layout);
-        let id = acquire_id(&mut state);
-        let ptr = state
-            .allocate(Some(id), SizeClasses::id_for(spec), spec, &pages)
-            .unwrap();
+        let ptr = allocate_small(core_ref, id, layout);
+        let run = run_of(core_ref, ptr);
 
-        assert_eq!(state.dealloc(ptr, None, &pages), Ok(()));
+        // `current_heap: None` simulates a free arriving from a thread that does not
+        // own this heap, exercising the claim -> batch -> push_remote_batch path.
         assert_eq!(
-            state.dealloc(ptr, None, &pages),
+            Allocator::dealloc_run_slow(core_ref, run, ptr, None, core_ref.pages()),
+            Ok(())
+        );
+        assert_eq!(
+            Allocator::dealloc_run_slow(core_ref, run, ptr, None, core_ref.pages()),
             Err(AllocatorError::DoubleFree)
         );
     }
 
     #[test]
-    fn allocator_state_tracks_fast_current_heap_run_allocations_before_reclaim() {
-        let mut state = AllocatorState::with_config(AllocatorConfig::new());
-        let pages = PageMap::new();
+    fn allocator_tracks_live_run_allocations_through_draining_reclaim() {
+        let allocator = Allocator::new();
+        let core_ref = allocator_core(&allocator);
+        let id = acquire_id(core_ref);
         let layout = Layout::from_size_align(64, 8).unwrap();
-        let spec = LayoutSpec::from_layout(layout);
-        let class = SizeClasses::id_for(spec).unwrap();
-        let id = acquire_id(&mut state);
-        let first = state.allocate(Some(id), Some(class), spec, &pages).unwrap();
-        let second = state.allocate(Some(id), Some(class), spec, &pages).unwrap();
+        let first = allocate_small(core_ref, id, layout);
+        let second = allocate_small(core_ref, id, layout);
+        let first_run = run_of(core_ref, first);
+        let second_run = run_of(core_ref, second);
 
-        assert_eq!(state.release_heap(id, &pages), Ok(()));
-        assert_eq!(state.dealloc(first, None, &pages), Ok(()));
-        assert_eq!(state.dealloc(second, None, &pages), Ok(()));
+        let mut state = core_ref.state().lock();
+        assert_eq!(state.release_heap(id, core_ref.pages()), Ok(()));
+        assert_eq!(
+            state.dealloc_run_draining(id, first_run, first, core_ref.pages()),
+            Ok(())
+        );
+        assert_eq!(
+            state.dealloc_run_draining(id, second_run, second, core_ref.pages()),
+            Ok(())
+        );
     }
 
     #[test]
-    fn allocator_state_reuses_released_heap_after_remote_free() {
-        let mut state = AllocatorState::with_config(AllocatorConfig::new());
-        let pages = PageMap::new();
+    fn allocator_reuses_released_heap_after_draining_free() {
+        let allocator = Allocator::new();
+        let core_ref = allocator_core(&allocator);
+        let heap = acquire_id(core_ref);
         let layout = Layout::from_size_align(64, 8).unwrap();
-        let spec = LayoutSpec::from_layout(layout);
-        let heap = acquire_id(&mut state);
-        let ptr = state
-            .allocate(Some(heap), SizeClasses::id_for(spec), spec, &pages)
-            .unwrap();
+        let ptr = allocate_small(core_ref, heap, layout);
+        let run = run_of(core_ref, ptr);
 
-        assert_eq!(state.release_heap(heap, &pages), Ok(()));
-        assert_eq!(state.dealloc(ptr, None, &pages), Ok(()));
-        assert!(pages.get(ptr).is_some());
-        let reused = acquire_id(&mut state);
+        {
+            let mut state = core_ref.state().lock();
+            assert_eq!(state.release_heap(heap, core_ref.pages()), Ok(()));
+            assert_eq!(
+                state.dealloc_run_draining(heap, run, ptr, core_ref.pages()),
+                Ok(())
+            );
+        }
+        assert!(core_ref.pages().get(ptr).is_some());
+        let reused = acquire_id(core_ref);
         assert_eq!(reused.index(), heap.index());
     }
 
     #[test]
-    fn allocator_state_release_retains_empty_heap_run_page_entry_for_reuse() {
-        let mut state = AllocatorState::with_config(AllocatorConfig::new());
-        let pages = PageMap::new();
+    fn allocator_release_retains_empty_heap_run_page_entry_for_reuse() {
+        let allocator = Allocator::new();
+        let core_ref = allocator_core(&allocator);
+        let heap = acquire_id(core_ref);
         let layout = Layout::from_size_align(64, 8).unwrap();
-        let spec = LayoutSpec::from_layout(layout);
-        let heap = acquire_id(&mut state);
-        let ptr = state
-            .allocate(Some(heap), SizeClasses::id_for(spec), spec, &pages)
-            .unwrap();
+        let ptr = allocate_small(core_ref, heap, layout);
+        let run = run_of(core_ref, ptr);
 
-        assert_eq!(state.dealloc(ptr, Some(heap), &pages), Ok(()));
-        assert!(pages.get(ptr).is_some());
-        assert_eq!(state.release_heap(heap, &pages), Ok(()));
-        assert!(pages.get(ptr).is_some());
+        {
+            let mut state = core_ref.state().lock();
+            assert_eq!(state.dealloc_run_local(run, ptr, core_ref.pages()), Ok(()));
+        }
+        assert!(core_ref.pages().get(ptr).is_some());
+        {
+            let mut state = core_ref.state().lock();
+            assert_eq!(state.release_heap(heap, core_ref.pages()), Ok(()));
+        }
+        assert!(core_ref.pages().get(ptr).is_some());
 
-        let reused = acquire_id(&mut state);
+        let reused = acquire_id(core_ref);
         assert_eq!(reused.index(), heap.index());
         assert_ne!(reused.generation(), heap.generation());
-        let reused_ptr = state
-            .allocate(Some(reused), SizeClasses::id_for(spec), spec, &pages)
-            .unwrap();
+        let reused_ptr = allocate_small(core_ref, reused, layout);
         assert_eq!(reused_ptr, ptr);
-        assert_eq!(state.dealloc(reused_ptr, Some(reused), &pages), Ok(()));
+        let reused_run = run_of(core_ref, reused_ptr);
+        let mut state = core_ref.state().lock();
+        assert_eq!(
+            state.dealloc_run_local(reused_run, reused_ptr, core_ref.pages()),
+            Ok(())
+        );
     }
 
     #[test]
-    fn allocator_state_zeroed_large_allocation_uses_current_heap() {
-        let mut state = AllocatorState::with_config(AllocatorConfig::new());
-        let pages = PageMap::new();
+    fn allocator_zeroed_large_allocation_uses_current_heap() {
+        let allocator = Allocator::new();
+        let core_ref = allocator_core(&allocator);
+        let id = acquire_id(core_ref);
         let layout = Layout::from_size_align(128 * 1024, 4096).unwrap();
-        let spec = LayoutSpec::from_layout(layout);
-        let id = acquire_id(&mut state);
-        let ptr = state
-            .allocate_extent(Some(id), spec, &pages, ExtentInit::Zeroed)
-            .unwrap();
+        let ptr = allocate_extent(core_ref, id, layout, ExtentInit::Zeroed);
         // SAFETY: ptr was just allocated zeroed for layout and is valid for layout.size() bytes.
         assert!(
             unsafe { core::slice::from_raw_parts(ptr.as_ptr(), layout.size()) }
                 .iter()
                 .all(|&byte| byte == 0)
         );
-        let PageOwner::Extent(extent) = pages.get(ptr).unwrap() else {
-            panic!("large zeroed allocation should publish an extent");
-        };
+        let extent = extent_of(core_ref, ptr);
 
         // SAFETY: PageMap stores only live extent pointers.
         assert_eq!(unsafe { extent.as_ref() }.heap_id(), id);
-        assert_eq!(state.dealloc(ptr, Some(id), &pages), Ok(()));
+
+        let mut state = core_ref.state().lock();
+        assert_eq!(
+            state.dealloc_extent_local(extent, ptr, core_ref.pages()),
+            Ok(())
+        );
     }
 
     #[test]
-    fn allocator_state_realloc_growth_uses_current_heap_extent() {
-        let mut state = AllocatorState::with_config(AllocatorConfig::new());
-        let pages = PageMap::new();
+    fn allocator_realloc_growth_uses_current_heap_extent() {
+        let allocator = Allocator::new();
         let small = Layout::from_size_align(64, 8).unwrap();
         let large = Layout::from_size_align(128 * 1024, 8).unwrap();
-        let spec = LayoutSpec::from_layout(small);
-        let id = acquire_id(&mut state);
-        let ptr = state
-            .allocate(Some(id), SizeClasses::id_for(spec), spec, &pages)
-            .unwrap();
 
-        // SAFETY: ptr was allocated for small.size() bytes above.
-        unsafe { write_bytes(ptr.as_ptr(), 0xab, small.size()) };
-        let grown = state
-            .realloc(ptr.as_ptr(), small, large.size(), Some(id), &pages)
-            .unwrap();
-        let grown = NonNull::new(grown).unwrap();
-        let PageOwner::Extent(extent) = pages.get(grown).unwrap() else {
-            panic!("grown allocation should publish an extent");
-        };
+        // SAFETY: small is a valid non-zero-size layout.
+        let ptr = unsafe { allocator.alloc(small) };
+        assert!(!ptr.is_null());
+        // SAFETY: ptr was just allocated for small.size() bytes.
+        unsafe { write_bytes(ptr, 0xab, small.size()) };
+
+        let core_ref = allocator_core(&allocator);
+        let id = unsafe { run_of(core_ref, NonNull::new(ptr).unwrap()).as_ref() }.heap_id();
+
+        // SAFETY: ptr was returned by alloc(small) above and is not yet freed.
+        let grown = unsafe { allocator.realloc(ptr, small, large.size()) };
+        assert!(!grown.is_null());
+        let extent = extent_of(core_ref, NonNull::new(grown).unwrap());
 
         // SAFETY: PageMap stores only live extent pointers.
         assert_eq!(unsafe { extent.as_ref() }.heap_id(), id);
-        assert_eq!(state.dealloc(grown, Some(id), &pages), Ok(()));
+
+        // SAFETY: grown was returned by realloc above for large.
+        unsafe { allocator.dealloc(grown, large) };
     }
 }
