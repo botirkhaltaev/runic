@@ -441,7 +441,7 @@ mod tests {
 
         let (id, list) = batch.append(heap_id(1), node_ptr(&b)).unwrap();
         assert_eq!(id, heap_id(0));
-        assert_eq!(list.first, Some(node_ptr(&a)));
+        assert_eq!(list.first, node_ptr(&a));
         assert_eq!(list.last, node_ptr(&a));
         assert!(!batch.is_empty());
     }
