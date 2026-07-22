@@ -269,6 +269,23 @@ mod tests {
     }
 
     #[test]
+    fn extent_unclaim_restores_allocated() {
+        let spec = LayoutSpec::from_size_align(128 * 1024, 4096).unwrap();
+        let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
+        let extent = Extent::new(
+            ExtentId::from_index(7).unwrap(),
+            test_heap_id(),
+            mapping,
+            spec,
+        )
+        .unwrap();
+
+        assert_eq!(extent.claim_free(), Ok(()));
+        assert_eq!(extent.unclaim(), Ok(()));
+        assert_eq!(extent.free(extent.ptr()), Ok(()));
+    }
+
+    #[test]
     fn extent_resizes_in_place_for_smaller_layout() {
         let spec = LayoutSpec::from_size_align(128 * 1024, 4096).unwrap();
         let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();

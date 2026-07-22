@@ -108,9 +108,8 @@ Use this architecture first:
 GlobalAlloc
   -> RunicAlloc
       -> Allocator
-          -> AllocatorCore
-              -> PageMap
-              -> HeapTable { generations[], Arena<Heap> }
+          -> AllocatorInner { refs, pages: PageMap, table: Mutex<HeapTable> }
+              -> HeapTable { generations[], slots: Arena<Heap> }
                   -> ThreadHeap
               -> Heap { RunHeap, ExtentHeap, Inbox }
                   -> RunHeap { Arena<Run>, available[] }
@@ -120,17 +119,18 @@ GlobalAlloc
               -> OsMemory
 ```
 
-Keep one global lock around `AllocatorState` for v0.5 slow paths; same-thread
+Keep one global lock around `HeapTable` for v0.5 slow paths; same-thread
 small-run hits may use thread-owned heap metadata without entering that lock.
+`PageMap` stays outside that mutex so dealloc lookup is not table-locked.
 
 ## Entity Responsibilities
 
 ```text
 RunicAlloc     owns the Rust GlobalAlloc boundary.
 Allocator      owns the core public allocator API and abort boundary.
-AllocatorCore  owns PageMap and locked shared allocator state.
+AllocatorInner owns the refcounted mmap instance: PageMap and Mutex<HeapTable>.
 Heap           owns run and extent allocation policy for one heap identity.
-HeapTable      owns Arena<Heap>, generations[], and remote batch push.
+HeapTable      owns slots Arena<Heap>, generations[], acquire/retire/reclaim, heap/mode, and publish.
 Arena          owns fixed-capacity freelist metadata storage.
 LayoutSpec     owns normalized layout semantics.
 SizeClasses    owns size-class selection.
@@ -321,15 +321,6 @@ randomized cross-thread traces pass
 no allocator-internal heap allocation is introduced
 ```
 
-Primary references:
-
-```text
-docs/thread-local-frontend-scope.md
-docs/thread-local-heap-plan.md
-docs/remote-free-protocol.md
-docs/span-ownership-evaluation.md
-```
-
 ### v0.6 Later: Remote Free Queue Optimization
 
 Goal:
@@ -366,8 +357,6 @@ guard pages for selected large allocations
 randomized placement only after deterministic paths are stable
 ```
 
-Primary reference: `docs/allocator-hardening-policy.md`.
-
 ### v0.8 Later: Backend Regions And Hugepage-Aware Allocation
 
 Goal:
@@ -375,13 +364,6 @@ Goal:
 ```text
 Explore backend region ownership, decay, purge, and hugepage-aware mapping only
 after mapping lifecycle and heap ownership are explicit.
-```
-
-Primary references:
-
-```text
-docs/span-ownership-evaluation.md
-docs/hugepage-backend-exploration.md
 ```
 
 ## Reference Lessons

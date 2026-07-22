@@ -9,17 +9,22 @@ use core::{
 };
 
 /// Intrusive chain of remote-pending user blocks (FIFO within a publish).
+///
+/// `first` and `last` are always valid, non-null ends: a `RemoteList` is only ever
+/// constructed from a batch that already contains at least one pointer.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct RemoteList {
-    pub(crate) first: Option<NonNull<u8>>,
+    pub(crate) first: NonNull<u8>,
     pub(crate) last: NonNull<u8>,
+    cursor: Option<NonNull<u8>>,
 }
 
 impl RemoteList {
     pub(crate) fn from_ends(first: NonNull<u8>, last: NonNull<u8>) -> Self {
         Self {
-            first: Some(first),
+            first,
             last,
+            cursor: Some(first),
         }
     }
 }
@@ -28,13 +33,13 @@ impl Iterator for RemoteList {
     type Item = NonNull<u8>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let ptr = self.first?;
+        let ptr = self.cursor?;
         if ptr == self.last {
-            self.first = None;
+            self.cursor = None;
         } else {
             // SAFETY: nodes between first and last were linked by the producer.
             let next = unsafe { &*ptr.as_ptr().cast::<AtomicPtr<u8>>() }.load(Ordering::Acquire);
-            self.first = NonNull::new(next);
+            self.cursor = NonNull::new(next);
         }
         Some(ptr)
     }
@@ -64,9 +69,8 @@ impl Inbox {
     }
 
     pub(crate) fn push_batch(&self, list: &RemoteList) {
-        let head = list.first.expect("non-empty remote list");
         // Link this batch in front of whatever is currently published.
-        let prev = self.head.swap(head.as_ptr(), Ordering::AcqRel);
+        let prev = self.head.swap(list.first.as_ptr(), Ordering::AcqRel);
         Self::next_of(list.last.as_ptr()).store(prev, Ordering::Release);
     }
 
@@ -124,7 +128,7 @@ mod tests {
         let ptr = node_ptr(&node);
         inbox.push_batch(&RemoteList::from_ends(ptr, ptr));
         let list = inbox.drain().unwrap();
-        assert_eq!(list.first, Some(ptr));
+        assert_eq!(list.first, ptr);
         assert_eq!(list.last, ptr);
         assert_eq!(collect_list(list), [Some(ptr), None, None, None]);
         assert!(inbox.is_empty());
@@ -177,7 +181,7 @@ mod tests {
         let ptr = node_ptr(&node);
         moved.push_batch(&RemoteList::from_ends(ptr, ptr));
         let list = moved.drain().unwrap();
-        assert_eq!(list.first, Some(ptr));
+        assert_eq!(list.first, ptr);
         assert_eq!(list.last, ptr);
         assert!(moved.is_empty());
     }

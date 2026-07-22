@@ -440,6 +440,35 @@ fn allocator_drains_remote_free_when_owner_thread_exits() {
 }
 
 #[test]
+fn allocator_publishes_retained_remote_batch_after_owner_exits() {
+    // Freer claims while owner is Active (TLS batch retains below capacity), owner then
+    // exits to Draining, and freer TLS teardown must complete the batch without abort.
+    let allocator = Allocator::new();
+    let layout = Layout::from_size_align(64, 8).unwrap();
+    let (ptr_tx, ptr_rx) = mpsc::channel();
+    let (batched_tx, batched_rx) = mpsc::channel();
+    let (owner_done_tx, owner_done_rx) = mpsc::channel();
+
+    thread::scope(|scope| {
+        let allocator = &allocator;
+        scope.spawn(move || {
+            let ptr = unsafe { allocator.alloc(layout) };
+            assert!(!ptr.is_null());
+            ptr_tx.send(ptr.addr()).unwrap();
+            batched_rx.recv().unwrap();
+            owner_done_tx.send(()).unwrap();
+        });
+
+        scope.spawn(move || {
+            let ptr = ptr_rx.recv().unwrap() as *mut u8;
+            unsafe { allocator.dealloc(ptr, layout) };
+            batched_tx.send(()).unwrap();
+            owner_done_rx.recv().unwrap();
+        });
+    });
+}
+
+#[test]
 fn allocator_frees_large_allocation_from_non_owner_thread() {
     let allocator = Allocator::new();
     let layout = Layout::from_size_align(128 * 1024, 4096).unwrap();

@@ -5,8 +5,8 @@ use core::{
 };
 
 use crate::{
-    allocator::{AllocatorCore, AllocatorState},
-    heap::{Heap, HeapId, Run, RunHeapError},
+    allocator::AllocatorInner,
+    heap::{Heap, HeapId, HeapTable, Run, RunHeapError},
     memory::PageMap,
     size_class::{SizeClassId, SizeClasses},
 };
@@ -93,8 +93,9 @@ impl RemoteBatch {
     }
 }
 
+/// Thread-local frontend: bound heap, cached runs, and outbound remote batch.
 pub(crate) struct ThreadHeap {
-    core: Cell<*mut AllocatorCore>,
+    inner: Cell<*mut AllocatorInner>,
     heap_id: Cell<Option<HeapId>>,
     heap: Cell<*mut Heap>,
     runs: [Cell<*mut Run>; SizeClasses::COUNT],
@@ -103,14 +104,14 @@ pub(crate) struct ThreadHeap {
 
 impl Drop for ThreadHeap {
     fn drop(&mut self) {
-        self.release_current();
+        self.unbind();
     }
 }
 
 impl ThreadHeap {
     const fn new() -> Self {
         Self {
-            core: Cell::new(core::ptr::null_mut()),
+            inner: Cell::new(core::ptr::null_mut()),
             heap_id: Cell::new(None),
             heap: Cell::new(core::ptr::null_mut()),
             runs: [const { Cell::new(core::ptr::null_mut()) }; SizeClasses::COUNT],
@@ -118,86 +119,125 @@ impl ThreadHeap {
         }
     }
 
-    pub(crate) fn allocate_run(
+    /// Owner-local small allocation via the TLS run cache.
+    ///
+    /// Returns `None` when this thread is not bound to `inner` (caller should `bind`).
+    pub(crate) fn alloc(
         &self,
-        core: NonNull<AllocatorCore>,
+        inner: NonNull<AllocatorInner>,
         class: SizeClassId,
         pages: &PageMap,
     ) -> Option<NonNull<u8>> {
-        if !self.matches(core) {
+        if !self.matches(inner) {
             return None;
         }
 
-        self.allocate_run_current(class, pages)
+        let mut heap = self.bound_heap();
+
+        if let Some(allocation) = self.alloc_cached(class, heap) {
+            return Some(allocation);
+        }
+
+        // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
+        if unsafe { heap.as_mut() }.flush(pages).is_ok()
+            && let Some(allocation) = self.alloc_cached(class, heap)
+        {
+            return Some(allocation);
+        }
+
+        // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
+        let heap_mut = unsafe { heap.as_mut() };
+        heap_mut.flush(pages).ok()?;
+        let run = heap_mut.take_or_allocate_run(class, pages)?;
+        self.cache_run(class, run);
+
+        self.alloc_cached(class, heap)
     }
 
-    pub(crate) fn free_run(
+    /// Owner-local free for a run owned by the bound heap.
+    ///
+    /// Returns `Ok(false)` when unbound or bound to a different heap (slow path).
+    pub(crate) fn free(
         &self,
-        core: NonNull<AllocatorCore>,
+        inner: NonNull<AllocatorInner>,
         heap: HeapId,
         run: NonNull<Run>,
         ptr: NonNull<u8>,
-    ) -> Option<Result<(), HeapError>> {
-        if !self.matches(core) || self.heap_id.get()? != heap {
-            return None;
+    ) -> Result<bool, HeapError> {
+        if !self.matches(inner) || self.heap_id.get() != Some(heap) {
+            return Ok(false);
         }
 
-        Some(self.free_run_current(
+        let mut bound = self.bound_heap();
+        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
+        let class = unsafe { run.as_ref() }.class();
+
+        if self.cached_run(class) == Some(run) {
+            // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
+            let heap = unsafe { bound.as_mut() };
+            // SAFETY: cached run pointers are published from this heap's live arena.
+            unsafe { run.as_ref() }
+                .free_local(ptr)
+                .map_err(RunHeapError::from)
+                .map_err(HeapError::from)?;
+            heap.release_allocation();
+            return Ok(true);
+        }
+
+        // SAFETY: this TLS thread is the Active owner of the bound heap; pages outlive the free.
+        unsafe { bound.as_mut() }.free_run_owner(
             run,
             ptr,
-            // SAFETY: core is retained by the calling TLS heap while installed.
-            unsafe { core.as_ref().pages() },
-        ))
+            // SAFETY: inner is retained by this TLS entry while bound.
+            unsafe { inner.as_ref().pages() },
+        )?;
+        Ok(true)
     }
 
-    pub(crate) fn heap_id(&self, core: NonNull<AllocatorCore>) -> Option<HeapId> {
-        self.matches(core).then_some(())?;
+    /// Bound heap id when this TLS entry is attached to `inner`.
+    pub(crate) fn bound(&self, inner: NonNull<AllocatorInner>) -> Option<HeapId> {
+        self.matches(inner).then_some(())?;
         self.heap_id.get()
     }
 
-    pub(crate) fn release_if_different(&self, core: NonNull<AllocatorCore>) {
-        if !self.is_empty() && !self.matches(core) {
-            self.release_current();
-        }
-    }
-
-    pub(crate) fn get_or_acquire(
+    /// Bind this thread to a heap in `inner`'s table.
+    ///
+    /// Reuses the current binding when already attached to `inner`; otherwise unbinds any
+    /// foreign binding and acquires a fresh heap under the caller's table lock.
+    pub(crate) fn bind(
         &self,
-        core: NonNull<AllocatorCore>,
-        state: &mut AllocatorState,
+        inner: NonNull<AllocatorInner>,
+        table: &mut HeapTable,
     ) -> Option<HeapId> {
-        if self.matches(core) {
+        if self.matches(inner) {
             return self.heap_id.get();
         }
 
-        debug_assert!(self.is_empty());
-        if !AllocatorCore::retain(core) {
+        if !self.is_empty() {
+            self.unbind();
+        }
+
+        if !AllocatorInner::retain(inner) {
             return None;
         }
 
-        let Some(heap) = state.acquire_heap() else {
-            AllocatorCore::release(core);
+        let Some((id, heap)) = table.acquire() else {
+            AllocatorInner::release(inner);
             return None;
         };
-        // SAFETY: acquire returns a live table-resident heap.
-        let id = unsafe { heap.as_ref().id() };
-        self.install(core, heap, id);
+        self.install(inner, heap, id);
 
         Some(id)
     }
 
-    /// Coalesce a remote free; returns a list the caller must publish when present.
-    pub(crate) fn enqueue_remote(
-        &self,
-        target: HeapId,
-        ptr: NonNull<u8>,
-    ) -> Option<(HeapId, RemoteList)> {
+    /// Coalesce a claimed remote free; returns a list the caller must `HeapTable::publish`.
+    pub(crate) fn batch(&self, target: HeapId, ptr: NonNull<u8>) -> Option<(HeapId, RemoteList)> {
         // SAFETY: ThreadHeap is thread-local; exclusive access to the remote batch.
         unsafe { &mut *self.remote.get() }.append(target, ptr)
     }
 
-    /// Take any pending outbound remote frees (TLS release / protocol flush).
-    pub(crate) fn take_remote(&self) -> Option<(HeapId, RemoteList)> {
+    /// Take any pending outbound remote frees (unbind / protocol flush).
+    pub(crate) fn take_batch(&self) -> Option<(HeapId, RemoteList)> {
         // SAFETY: ThreadHeap is thread-local; exclusive access to the remote batch.
         let batch = unsafe { &mut *self.remote.get() };
         if batch.is_empty() {
@@ -206,55 +246,28 @@ impl ThreadHeap {
         batch.take()
     }
 
-    fn install(&self, core: NonNull<AllocatorCore>, heap: NonNull<Heap>, id: HeapId) {
+    fn install(&self, inner: NonNull<AllocatorInner>, heap: NonNull<Heap>, id: HeapId) {
         self.heap.set(heap.as_ptr());
         self.heap_id.set(Some(id));
-        self.core.set(core.as_ptr());
+        self.inner.set(inner.as_ptr());
     }
 
-    fn matches(&self, core: NonNull<AllocatorCore>) -> bool {
-        self.core.get() == core.as_ptr()
+    fn matches(&self, inner: NonNull<AllocatorInner>) -> bool {
+        self.inner.get() == inner.as_ptr()
     }
 
     fn is_empty(&self) -> bool {
-        self.core.get().is_null()
+        self.inner.get().is_null()
     }
 
     fn heap_ptr(&self) -> Option<NonNull<Heap>> {
         NonNull::new(self.heap.get())
     }
 
-    fn allocate_run_current(&self, class: SizeClassId, pages: &PageMap) -> Option<NonNull<u8>> {
-        let mut heap = self.installed_heap();
-
-        if let Some(allocation) = self.allocate_cached_run(class, heap) {
-            return Some(allocation);
-        }
-
-        // SAFETY: heap is installed only while this TLS heap retains the allocator core.
-        if unsafe { heap.as_mut() }.flush(pages).is_ok()
-            && let Some(allocation) = self.allocate_cached_run(class, heap)
-        {
-            return Some(allocation);
-        }
-
-        // SAFETY: heap is installed only while this TLS heap retains the allocator core.
-        let heap_mut = unsafe { heap.as_mut() };
-        heap_mut.flush(pages).ok()?;
-        let run = heap_mut.take_or_allocate_run(class, pages)?;
-        self.cache_run(class, run);
-
-        self.allocate_cached_run(class, heap)
-    }
-
-    fn allocate_cached_run(
-        &self,
-        class: SizeClassId,
-        mut heap: NonNull<Heap>,
-    ) -> Option<NonNull<u8>> {
+    fn alloc_cached(&self, class: SizeClassId, mut heap: NonNull<Heap>) -> Option<NonNull<u8>> {
         let mut run = self.cached_run(class)?;
 
-        // SAFETY: heap is installed only while this TLS heap retains the allocator core.
+        // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
         let heap = unsafe { heap.as_mut() };
         // SAFETY: cached run pointers are published from this heap's live arena.
         let Some(allocation) = unsafe { run.as_mut() }.allocate() else {
@@ -263,36 +276,6 @@ impl ThreadHeap {
         };
         heap.retain_allocation();
         Some(allocation)
-    }
-
-    fn free_run_current(
-        &self,
-        run: NonNull<Run>,
-        ptr: NonNull<u8>,
-        pages: &PageMap,
-    ) -> Result<(), HeapError> {
-        let mut heap = self.installed_heap();
-        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
-        let class = unsafe { run.as_ref() }.class();
-
-        if self.cached_run(class) == Some(run) {
-            // SAFETY: heap is installed only while this TLS heap retains the allocator core.
-            let heap = unsafe { heap.as_mut() };
-            // SAFETY: cached run pointers are published from this heap's live arena.
-            unsafe { run.as_ref() }
-                .free_local(ptr)
-                .map_err(RunHeapError::from)
-                .map_err(HeapError::from)?;
-            heap.release_allocation();
-            return Ok(());
-        }
-
-        // SAFETY: this TLS thread is the Active owner of the installed heap.
-        let heap_mut = unsafe { heap.as_mut() };
-        if !heap_mut.inbox().is_empty() {
-            heap_mut.flush(pages)?;
-        }
-        heap_mut.free_run(run, ptr).map_err(HeapError::from)
     }
 
     fn cached_run(&self, class: SizeClassId) -> Option<NonNull<Run>> {
@@ -313,10 +296,10 @@ impl ThreadHeap {
         unsafe { self.runs.get_unchecked(class.index()) }
     }
 
-    fn installed_heap(&self) -> NonNull<Heap> {
+    fn bound_heap(&self) -> NonNull<Heap> {
         let heap = self.heap.get();
         debug_assert!(!heap.is_null());
-        // SAFETY: callers reach this only after this TLS heap matched an installed allocator core.
+        // SAFETY: callers reach this only after this TLS entry matched a bound allocator inner.
         unsafe { NonNull::new_unchecked(heap) }
     }
 
@@ -330,41 +313,41 @@ impl ThreadHeap {
                 continue;
             };
 
-            // SAFETY: heap is installed only while this TLS heap retains the allocator core.
+            // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
             let _ = unsafe { heap.as_mut() }.runs.return_available(run);
         }
     }
 
-    fn publish_outbound(&self, core_ref: &AllocatorCore) {
-        while let Some((id, list)) = self.take_remote() {
-            let state = core_ref.state().lock();
-            if state.heaps.push_remote_batch(id, &list).is_err() {
+    fn publish_batches(&self, inner: &AllocatorInner) {
+        while let Some((id, list)) = self.take_batch() {
+            let mut table = inner.table.lock();
+            if table.publish(id, &list, inner.pages()).is_err() {
                 abort();
             }
         }
     }
 
     #[cold]
-    fn release_current(&self) {
+    fn unbind(&self) {
         self.return_cached_runs();
-        let Some(core) = NonNull::new(self.core.replace(core::ptr::null_mut())) else {
+        let Some(inner) = NonNull::new(self.inner.replace(core::ptr::null_mut())) else {
             return;
         };
         let heap_id = self.heap_id.replace(None);
         self.heap.set(core::ptr::null_mut());
 
-        // SAFETY: this TLS heap retained core while installed.
-        let core_ref = unsafe { core.as_ref() };
-        self.publish_outbound(core_ref);
+        // SAFETY: this TLS entry retained inner while bound.
+        let inner_ref = unsafe { inner.as_ref() };
+        self.publish_batches(inner_ref);
 
         if let Some(heap_id) = heap_id {
-            let mut state = core_ref.state().lock();
-            if state.release_heap(heap_id, core_ref.pages()).is_err() {
+            let mut table = inner_ref.table.lock();
+            if table.retire(heap_id, inner_ref.pages()).is_err() {
                 abort();
             }
         }
 
-        AllocatorCore::release(core);
+        AllocatorInner::release(inner);
     }
 }
 
@@ -441,7 +424,7 @@ mod tests {
 
         let (id, list) = batch.append(heap_id(1), node_ptr(&b)).unwrap();
         assert_eq!(id, heap_id(0));
-        assert_eq!(list.first, Some(node_ptr(&a)));
+        assert_eq!(list.first, node_ptr(&a));
         assert_eq!(list.last, node_ptr(&a));
         assert!(!batch.is_empty());
     }

@@ -3,7 +3,7 @@ use core::{num::NonZeroU32, ptr::NonNull};
 use crate::{
     arena::Arena,
     config::AllocatorConfig,
-    heap::{ExtentHeapError, Heap, HeapId, RunHeapError},
+    heap::{ExtentHeapError, Heap, HeapId, HeapMode, RunHeapError},
     memory::PageMap,
 };
 
@@ -13,49 +13,53 @@ const MAX_HEAPS: usize = 64;
 const MAX_HEAPS_U32: u32 = 64;
 const HEAP_METADATA_CAPACITY: u32 = 16_384;
 
+/// Generation-checked heap slots and remote-batch delivery.
 pub(crate) struct HeapTable {
-    heaps: Arena<Heap>,
+    slots: Arena<Heap>,
     generations: [NonZeroU32; MAX_HEAPS],
     config: AllocatorConfig,
 }
 
-// SAFETY: HeapTable is owned by AllocatorState. Slot mutation and remote routing are
-// coordinated by the allocator lock; heap internals require exclusive owner or table access.
+// SAFETY: HeapTable is owned under AllocatorInner's table mutex. Slot mutation and remote
+// routing are coordinated by that lock; heap internals require exclusive owner or table access.
 unsafe impl Send for HeapTable {}
 
 impl HeapTable {
     pub(crate) fn new(config: AllocatorConfig) -> Self {
         Self {
-            heaps: Arena::new(MAX_HEAPS_U32),
+            slots: Arena::new(MAX_HEAPS_U32),
             generations: [NonZeroU32::MIN; MAX_HEAPS],
             config,
         }
     }
 
-    pub(crate) fn acquire(&mut self) -> Option<NonNull<Heap>> {
-        if let Some(heap) = self.acquire_reusable() {
-            return Some(heap);
+    /// Acquire a heap for TLS bind: reuse a Free slot or claim a fresh one.
+    pub(crate) fn acquire(&mut self) -> Option<(HeapId, NonNull<Heap>)> {
+        if let Some(acquired) = self.acquire_reusable() {
+            return Some(acquired);
         }
 
-        let index = self.heaps.claim()?;
+        let index = self.slots.claim()?;
         let generation = *self.generations.get(index)?;
         let Some(id) = HeapId::new(u32::try_from(index).ok()?, generation) else {
-            self.heaps.release(index);
+            self.slots.release(index);
             return None;
         };
         let heap = Heap::new(id, HEAP_METADATA_CAPACITY, self.config);
 
-        if self.heaps.insert(index, heap).is_none() {
-            self.heaps.release(index);
+        if self.slots.insert(index, heap).is_none() {
+            self.slots.release(index);
             return None;
         }
 
-        self.heaps.get_mut(index).map(NonNull::from)
+        let heap = NonNull::from(self.slots.get_mut(index)?);
+        // SAFETY: heap was just inserted into a live table slot.
+        Some((unsafe { heap.as_ref().id() }, heap))
     }
 
-    fn acquire_reusable(&mut self) -> Option<NonNull<Heap>> {
+    fn acquire_reusable(&mut self) -> Option<(HeapId, NonNull<Heap>)> {
         for index in 0..MAX_HEAPS {
-            let Some(heap) = self.heaps.get_mut(index) else {
+            let Some(heap) = self.slots.get_mut(index) else {
                 continue;
             };
             if !heap.is_free() {
@@ -65,64 +69,91 @@ impl HeapTable {
             let generation = *self.generations.get(index)?;
             let id = HeapId::new(u32::try_from(index).ok()?, generation)?;
             heap.reactivate(id);
-            return Some(NonNull::from(heap));
+            let heap = NonNull::from(heap);
+            // SAFETY: heap is a live Free slot just reactivated in this table.
+            return Some((unsafe { heap.as_ref().id() }, heap));
         }
 
         None
     }
 
-    pub(crate) fn get(&self, id: HeapId) -> Option<&Heap> {
+    /// Generation-checked shared borrow of a live heap.
+    pub(crate) fn heap(&self, id: HeapId) -> Option<&Heap> {
         let index = usize::try_from(id.index()).ok()?;
-        let heap = self.heaps.get(index)?;
+        let heap = self.slots.get(index)?;
         self.matches_generation(index, id).then_some(heap)
     }
 
-    pub(crate) fn get_mut(&mut self, id: HeapId) -> Option<&mut Heap> {
+    /// Generation-checked exclusive borrow of a live heap.
+    pub(crate) fn heap_mut(&mut self, id: HeapId) -> Option<&mut Heap> {
         let index = usize::try_from(id.index()).ok()?;
         if !self.matches_generation(index, id) {
             return None;
         }
-        self.heaps.get_mut(index)
+        self.slots.get_mut(index)
     }
 
-    pub(crate) fn push_remote_batch(&self, id: HeapId, list: &RemoteList) -> Result<(), HeapError> {
-        let heap = self.get(id).ok_or(HeapError::InvalidHeap)?;
-        if !heap.is_active() {
-            return Err(HeapError::InvalidHeap);
+    /// Lifecycle mode for a live `HeapId`, or `None` if missing/stale.
+    pub(crate) fn mode(&self, id: HeapId) -> Option<HeapMode> {
+        self.heap(id).map(Heap::mode)
+    }
+
+    /// Publish a claimed remote-free batch to `id`.
+    ///
+    /// - `Active`: enqueue onto the heap inbox (owner flushes later).
+    /// - `Draining`: enqueue then complete under the table lock, then reclaim if empty.
+    /// - `Free` / stale generation: error (caller must not drop claimed nodes).
+    pub(crate) fn publish(
+        &mut self,
+        id: HeapId,
+        list: &RemoteList,
+        pages: &PageMap,
+    ) -> Result<(), HeapError> {
+        match self.mode(id).ok_or(HeapError::InvalidHeap)? {
+            HeapMode::Active => {
+                self.heap(id)
+                    .ok_or(HeapError::InvalidHeap)?
+                    .inbox()
+                    .push_batch(list);
+                Ok(())
+            }
+            HeapMode::Draining => {
+                {
+                    let heap = self.heap_mut(id).ok_or(HeapError::InvalidHeap)?;
+                    heap.inbox().push_batch(list);
+                    heap.flush(pages)?;
+                }
+                let _ = self.reclaim(id);
+                Ok(())
+            }
+            HeapMode::Free => Err(HeapError::InvalidHeap),
         }
-
-        heap.inbox().push_batch(list);
-        Ok(())
     }
 
-    pub(crate) fn release_heap(&mut self, id: HeapId, pages: &PageMap) -> Result<(), HeapError> {
-        let index = usize::try_from(id.index())
-            .ok()
-            .ok_or(HeapError::InvalidHeap)?;
+    /// Owner thread gives up the heap: flush, enter Draining, flush again, reclaim if empty.
+    pub(crate) fn retire(&mut self, id: HeapId, pages: &PageMap) -> Result<(), HeapError> {
         let reclaimed = {
-            let heap = self.get_mut(id).ok_or(HeapError::InvalidHeap)?;
+            let heap = self.heap_mut(id).ok_or(HeapError::InvalidHeap)?;
             heap.flush(pages)?;
             heap.begin_drain();
             heap.flush(pages)?;
             heap.try_reclaim()
         };
         if reclaimed {
-            self.bump_generation(index);
+            self.bump_generation(id);
         }
         Ok(())
     }
 
-    pub(crate) fn try_reclaim_heap(&mut self, id: HeapId) -> bool {
-        let Some(index) = usize::try_from(id.index()).ok() else {
-            return false;
-        };
-        let Some(heap) = self.get_mut(id) else {
+    /// If the heap is empty under Draining, mark Free and bump its generation.
+    pub(crate) fn reclaim(&mut self, id: HeapId) -> bool {
+        let Some(heap) = self.heap_mut(id) else {
             return false;
         };
         if !heap.try_reclaim() {
             return false;
         }
-        self.bump_generation(index);
+        self.bump_generation(id);
         true
     }
 
@@ -132,7 +163,10 @@ impl HeapTable {
             .is_some_and(|generation| *generation == id.generation())
     }
 
-    fn bump_generation(&mut self, index: usize) {
+    fn bump_generation(&mut self, id: HeapId) {
+        let Ok(index) = usize::try_from(id.index()) else {
+            return;
+        };
         let Some(stored) = self.generations.get_mut(index) else {
             return;
         };

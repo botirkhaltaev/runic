@@ -685,6 +685,23 @@ mod tests {
     }
 
     #[test]
+    fn remote_pending_run_unclaim_restores_allocated() {
+        let mapping = OsMemory::map(RUN_SIZE).unwrap();
+        let class = class_for(64, 8);
+        let run = Run::new(
+            RunId::from_index(12).unwrap(),
+            test_heap_id(),
+            mapping,
+            class,
+        );
+        let ptr = run.allocate().unwrap();
+
+        assert_eq!(run.claim_free(ptr), Ok(()));
+        assert_eq!(run.unclaim(ptr), Ok(()));
+        assert!(run.free_local(ptr).is_ok());
+    }
+
+    #[test]
     fn remote_pending_run_reports_local_free_as_double_free() {
         let mapping = OsMemory::map(RUN_SIZE).unwrap();
         let class = class_for(64, 8);
