@@ -14,19 +14,19 @@ const MAX_HEAPS_U32: u32 = 64;
 const HEAP_METADATA_CAPACITY: u32 = 16_384;
 
 pub(crate) struct HeapTable {
-    heaps: Arena<Heap>,
+    slots: Arena<Heap>,
     generations: [NonZeroU32; MAX_HEAPS],
     config: AllocatorConfig,
 }
 
-// SAFETY: HeapTable is owned by AllocatorState. Slot mutation and remote routing are
-// coordinated by the allocator lock; heap internals require exclusive owner or table access.
+// SAFETY: HeapTable is owned under AllocatorInner's table mutex. Slot mutation and remote
+// routing are coordinated by that lock; heap internals require exclusive owner or table access.
 unsafe impl Send for HeapTable {}
 
 impl HeapTable {
     pub(crate) fn new(config: AllocatorConfig) -> Self {
         Self {
-            heaps: Arena::new(MAX_HEAPS_U32),
+            slots: Arena::new(MAX_HEAPS_U32),
             generations: [NonZeroU32::MIN; MAX_HEAPS],
             config,
         }
@@ -37,25 +37,25 @@ impl HeapTable {
             return Some(heap);
         }
 
-        let index = self.heaps.claim()?;
+        let index = self.slots.claim()?;
         let generation = *self.generations.get(index)?;
         let Some(id) = HeapId::new(u32::try_from(index).ok()?, generation) else {
-            self.heaps.release(index);
+            self.slots.release(index);
             return None;
         };
         let heap = Heap::new(id, HEAP_METADATA_CAPACITY, self.config);
 
-        if self.heaps.insert(index, heap).is_none() {
-            self.heaps.release(index);
+        if self.slots.insert(index, heap).is_none() {
+            self.slots.release(index);
             return None;
         }
 
-        self.heaps.get_mut(index).map(NonNull::from)
+        self.slots.get_mut(index).map(NonNull::from)
     }
 
     fn acquire_reusable(&mut self) -> Option<NonNull<Heap>> {
         for index in 0..MAX_HEAPS {
-            let Some(heap) = self.heaps.get_mut(index) else {
+            let Some(heap) = self.slots.get_mut(index) else {
                 continue;
             };
             if !heap.is_free() {
@@ -73,7 +73,7 @@ impl HeapTable {
 
     pub(crate) fn get(&self, id: HeapId) -> Option<&Heap> {
         let index = usize::try_from(id.index()).ok()?;
-        let heap = self.heaps.get(index)?;
+        let heap = self.slots.get(index)?;
         self.matches_generation(index, id).then_some(heap)
     }
 
@@ -82,7 +82,7 @@ impl HeapTable {
         if !self.matches_generation(index, id) {
             return None;
         }
-        self.heaps.get_mut(index)
+        self.slots.get_mut(index)
     }
 
     /// Publish a claimed remote-free batch to `id`.
@@ -90,7 +90,7 @@ impl HeapTable {
     /// - `Active`: enqueue onto the heap inbox (owner flushes later).
     /// - `Draining`: enqueue then complete under the table lock, then try reclaim.
     /// - `Free` / stale generation: error (caller must not drop claimed nodes).
-    pub(crate) fn push_remote_batch(
+    pub(crate) fn publish(
         &mut self,
         id: HeapId,
         list: &RemoteList,
@@ -111,14 +111,15 @@ impl HeapTable {
                     heap.inbox().push_batch(list);
                     heap.flush(pages)?;
                 }
-                let _ = self.try_reclaim_heap(id);
+                let _ = self.try_reclaim(id);
                 Ok(())
             }
             HeapMode::Free => Err(HeapError::InvalidHeap),
         }
     }
 
-    pub(crate) fn release_heap(&mut self, id: HeapId, pages: &PageMap) -> Result<(), HeapError> {
+    /// Owner thread gives up the heap: flush, enter Draining, flush again, try reclaim.
+    pub(crate) fn retire(&mut self, id: HeapId, pages: &PageMap) -> Result<(), HeapError> {
         let index = usize::try_from(id.index())
             .ok()
             .ok_or(HeapError::InvalidHeap)?;
@@ -135,7 +136,7 @@ impl HeapTable {
         Ok(())
     }
 
-    pub(crate) fn try_reclaim_heap(&mut self, id: HeapId) -> bool {
+    pub(crate) fn try_reclaim(&mut self, id: HeapId) -> bool {
         let Some(index) = usize::try_from(id.index()).ok() else {
             return false;
         };

@@ -10,11 +10,9 @@ thread exit.
 
 ```text
 Allocator
-  -> AllocatorCore
-      -> PageMap
-      -> AllocatorState
-          -> HeapTable { generations[], Arena<Heap> }
-              -> ThreadHeap (TLS)
+  -> AllocatorInner { refs, pages: PageMap, table: Mutex<HeapTable> }
+      -> HeapTable { generations[], slots: Arena<Heap> }
+          -> ThreadHeap (TLS)
 
 Heap
   -> mode (Free | Active | Draining)
@@ -26,21 +24,21 @@ Run / Extent
   -> HeapId
 ```
 
-`PageMap` and `OsMemory` stay core-shared. Allocation ownership is never a process-wide
-root heap: every run and extent is stamped with the allocating thread's `HeapId`.
-Table/arena full returns null.
+`PageMap` stays on `AllocatorInner` outside the table mutex. `OsMemory` stays shared.
+Allocation ownership is never a process-wide root heap: every run and extent is stamped
+with the allocating thread's `HeapId`. Table/arena full returns null.
 
 ## Entities
 
 ```text
 HeapTable
-  owns Arena<Heap>, generations[], acquire/release, push_remote_batch
+  owns slots Arena<Heap>, generations[], acquire/retire/try_reclaim, publish
 
 Heap
   owns mode, RunHeap, ExtentHeap, alloc_count, Inbox mailbox
 
 ThreadHeap
-  owns retained AllocatorCore ref, HeapId, Heap pointer, cached runs
+  owns retained AllocatorInner ref, HeapId, Heap pointer, cached runs
 
 Run
   owns mapping, size class, block states, HeapId
@@ -101,7 +99,7 @@ TLS HeapId == entity HeapId
   cached run → free_local
   else → flush if needed + exclusive free
 else
-  claim → HeapTable::push_remote_batch
+  claim → HeapTable::publish
   if Draining → flush under table lock / try_reclaim
 ```
 
@@ -128,7 +126,7 @@ Live allocations remain valid: metadata is immovable and `PageMap` still points 
 
 ```text
 HeapTable acquire / generation bump on reclaim
-ThreadHeap retains and releases AllocatorCore
+ThreadHeap retains and releases AllocatorInner
 Run/Extent report HeapId
 block states detect double free and double remote free
 alloc miss reuses remote frees before new mapping

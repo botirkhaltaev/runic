@@ -22,7 +22,7 @@ On free:
 1. Look up the pointer in `PageMap`.
 2. Compare TLS `HeapId` to the entity `HeapId`.
 3. **Local:** exclusive `Heap` free (cached run: `free_local`; else flush inbox if needed then free).
-4. **Remote Active:** `claim_free` (run block → `RemotePending`, or extent pending) → coalesce onto the freer TLS `RemoteBatch` → publish any returned `RemoteList` via `HeapTable::push_remote_batch` without blocking on the owner.
+4. **Remote Active:** `claim_free` (run block → `RemotePending`, or extent pending) → coalesce onto the freer TLS `RemoteBatch` → publish any returned `RemoteList` via `HeapTable::publish` without blocking on the owner.
 5. **Remote Draining (mode snapshot):** under table lock, flush inbox then exclusive free; may reclaim when empty.
 
 The freeing thread must not complete into the owner freelist while the owner is `Active`.
@@ -48,7 +48,7 @@ Owner drains via `Heap::flush`:
 2. Fail if Free or generation mismatch
 3. claim_free(ptr) → Pending
 4. Append to TLS RemoteBatch for HeapId
-5. If a RemoteList is returned (capacity or target change), publish it:
+5. If a RemoteList is returned (capacity or target change), `HeapTable::publish` it:
    - Active: Inbox::push_batch
    - Draining: push_batch then flush under table lock (may reclaim)
    - Free / stale gen: fail (do not drop the list)

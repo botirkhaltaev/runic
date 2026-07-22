@@ -23,7 +23,7 @@
 - Optimize for the best allocator architecture rather than backward compatibility or temporary migration paths.
 - Keep hot paths simple, direct, and minimal-instruction while preserving explicit correctness invariants.
 - Separate owner-local and remote-free paths in type APIs; do not hide cross-thread behavior behind broad manager methods.
-- Keep exactly one claim → batch → `push_remote_batch` → flush remote-free protocol; do not grow a second, parallel remote-free implementation alongside it (e.g. an unbatched or lock-scoped shortcut) for `realloc`, tests, or any other caller. `push_remote_batch` must complete retained batches against `Draining` heaps (late frees after owner exit), not only `Active` inbox enqueue.
+- Keep exactly one claim → batch → `HeapTable::publish` → flush remote-free protocol; do not grow a second, parallel remote-free implementation alongside it (e.g. an unbatched or lock-scoped shortcut) for `realloc`, tests, or any other caller. `publish` must complete retained batches against `Draining` heaps (late frees after owner exit), not only `Active` inbox enqueue.
 - Do not model small or large allocation ownership as a shared/root heap; every run and extent is stamped with a `HeapId`, and sharing uses remote-free coordination or backend reuse.
 - Treat caches as allocator-domain ownership structures, not benchmark-specific shortcuts.
 - After code or API changes, revamp nearest subtree `AGENTS.md` files so rules match the new architecture; rewrite or delete stale bullets.
@@ -58,16 +58,18 @@ Use this first:
 
 ```text
 GlobalAlloc
-  -> Allocator
-      -> AllocatorCore
-      -> PageMap
-      -> PageBackend / OsMemory
-      -> HeapTable { generations[], Arena<Heap> }
-          -> ThreadHeap
-      -> Heap { mode, RunHeap, ExtentHeap, alloc_count, Inbox }
-          -> RunHeap { Arena<Run>, available[] } -> Run (HeapId, BlockStates)
-          -> ExtentHeap { Arena<Extent>, cache } -> Extent (HeapId)
+ -> Allocator
+     -> AllocatorInner { refs, pages: PageMap, table: Mutex<HeapTable> }
+     -> PageBackend / OsMemory
+     -> HeapTable { generations[], slots: Arena<Heap> }
+         -> ThreadHeap
+     -> Heap { mode, RunHeap, ExtentHeap, alloc_count, Inbox }
+         -> RunHeap { Arena<Run>, available[] } -> Run (HeapId, BlockStates)
+         -> ExtentHeap { Arena<Extent>, cache } -> Extent (HeapId)
 ```
+
+- `AllocatorInner` is the refcounted mmap instance behind lazy `AtomicPtr` init — not a domain entity. `PageMap` stays outside the table mutex so owner-local TLS hits never take that lock.
+- `HeapTable` owns slot identity, `acquire`/`retire`/`try_reclaim`, and mode-aware remote `publish` only — not allocate/dealloc routers.
 
 ## Rust Rules
 

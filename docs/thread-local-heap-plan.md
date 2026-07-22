@@ -3,7 +3,7 @@
 Issue: #8
 
 Runic v0.5 uses TLS owner-local heaps for small runs and large extents. Slow paths
-still coordinate through `AllocatorState` / `HeapTable` for acquire and release;
+still coordinate through `HeapTable` (under `AllocatorInner`'s table mutex) for acquire and retire;
 steady-state hits avoid that lock.
 
 ## Current Signal

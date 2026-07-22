@@ -181,6 +181,22 @@ impl Heap {
         Ok(())
     }
 
+    /// Owner-local non-cached free: flush inbox if needed, then free.
+    ///
+    /// Callable via TLS installed `Heap` without taking the table mutex. Does not wrap the
+    /// cached-run hit (`Run::free_local`); that path stays on `ThreadHeap` for minimal work.
+    pub(crate) fn free_run_owner(
+        &mut self,
+        run: NonNull<Run>,
+        ptr: NonNull<u8>,
+        pages: &PageMap,
+    ) -> Result<(), HeapError> {
+        if !self.inbox.is_empty() {
+            self.flush(pages)?;
+        }
+        self.free_run(run, ptr).map_err(HeapError::from)
+    }
+
     pub(crate) fn complete_remote_run(
         &mut self,
         run: NonNull<Run>,
@@ -200,6 +216,20 @@ impl Heap {
         self.extents.free(extent, ptr, pages)?;
         self.release_allocation();
         Ok(())
+    }
+
+    /// Owner-local extent free: flush inbox if needed, then free.
+    pub(crate) fn free_extent_owner(
+        &mut self,
+        extent: NonNull<Extent>,
+        ptr: NonNull<u8>,
+        pages: &PageMap,
+    ) -> Result<(), HeapError> {
+        if !self.inbox.is_empty() {
+            self.flush(pages)?;
+        }
+        self.free_extent(extent, ptr, pages)
+            .map_err(HeapError::from)
     }
 
     pub(crate) fn complete_remote_extent(

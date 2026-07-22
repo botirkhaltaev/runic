@@ -108,9 +108,8 @@ Use this architecture first:
 GlobalAlloc
   -> RunicAlloc
       -> Allocator
-          -> AllocatorCore
-              -> PageMap
-              -> HeapTable { generations[], Arena<Heap> }
+          -> AllocatorInner { refs, pages: PageMap, table: Mutex<HeapTable> }
+              -> HeapTable { generations[], slots: Arena<Heap> }
                   -> ThreadHeap
               -> Heap { RunHeap, ExtentHeap, Inbox }
                   -> RunHeap { Arena<Run>, available[] }
@@ -120,17 +119,18 @@ GlobalAlloc
               -> OsMemory
 ```
 
-Keep one global lock around `AllocatorState` for v0.5 slow paths; same-thread
+Keep one global lock around `HeapTable` for v0.5 slow paths; same-thread
 small-run hits may use thread-owned heap metadata without entering that lock.
+`PageMap` stays outside that mutex so dealloc lookup is not table-locked.
 
 ## Entity Responsibilities
 
 ```text
 RunicAlloc     owns the Rust GlobalAlloc boundary.
 Allocator      owns the core public allocator API and abort boundary.
-AllocatorCore  owns PageMap and locked shared allocator state.
+AllocatorInner owns the refcounted mmap instance: PageMap and Mutex<HeapTable>.
 Heap           owns run and extent allocation policy for one heap identity.
-HeapTable      owns Arena<Heap>, generations[], and remote batch push.
+HeapTable      owns slots Arena<Heap>, generations[], acquire/retire/try_reclaim, and publish.
 Arena          owns fixed-capacity freelist metadata storage.
 LayoutSpec     owns normalized layout semantics.
 SizeClasses    owns size-class selection.
