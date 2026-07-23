@@ -1,12 +1,12 @@
 use core::ptr::{NonNull, write_bytes};
 
-    use crate::{
-        arena::Arena,
-        config::ExtentConfig,
-        heap::{Extent, HeapId},
-        layout::LayoutSpec,
-        memory::{OsMemory, PageMap},
-    };
+use crate::{
+    arena::Arena,
+    config::ExtentConfig,
+    heap::{Extent, HeapId},
+    layout::LayoutSpec,
+    memory::{OsMemory, PageMap},
+};
 
 use super::{ExtentError, ExtentId, cache::ExtentCache};
 
