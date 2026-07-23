@@ -128,14 +128,10 @@ mod tests {
 
     use super::*;
 
-    fn for_layout(spec: LayoutSpec) -> Option<SizeClass> {
-        SizeClasses::class(SizeClasses::id_for(spec)?)
-    }
-
     #[test]
     fn size_classes_map_one_byte_to_eight() {
         let spec = LayoutSpec::from_size_align(1, 1).unwrap();
-        let class = for_layout(spec).unwrap();
+        let class = SizeClasses::class(SizeClasses::id_for(spec).unwrap()).unwrap();
 
         assert_eq!(class.block_size(), 8);
     }
@@ -144,7 +140,7 @@ mod tests {
     fn size_classes_map_exact_boundaries_to_themselves() {
         for &size in &SizeClasses::SIZES {
             let spec = LayoutSpec::from_size_align(size, 1).unwrap();
-            let class = for_layout(spec).unwrap();
+            let class = SizeClasses::class(SizeClasses::id_for(spec).unwrap()).unwrap();
 
             assert_eq!(class.block_size(), size);
         }
@@ -154,20 +150,20 @@ mod tests {
     fn size_classes_reject_larger_than_small_max() {
         let spec = LayoutSpec::from_size_align(SizeClasses::SMALL_MAX + 1, 1).unwrap();
 
-        assert!(for_layout(spec).is_none());
+        assert!(SizeClasses::id_for(spec).is_none());
     }
 
     #[test]
     fn size_classes_reject_over_page_alignment() {
         let spec = LayoutSpec::from_size_align(1, PAGE_SIZE * 2).unwrap();
 
-        assert!(for_layout(spec).is_none());
+        assert!(SizeClasses::id_for(spec).is_none());
     }
 
     #[test]
     fn size_classes_choose_naturally_aligned_block() {
         let spec = LayoutSpec::from_size_align(17, 16).unwrap();
-        let class = for_layout(spec).unwrap();
+        let class = SizeClasses::class(SizeClasses::id_for(spec).unwrap()).unwrap();
 
         assert_eq!(class.block_size(), 32);
     }
@@ -178,7 +174,7 @@ mod tests {
             for align in [1, 2, 4, 8, 16, 32, 64, 128, 4096] {
                 let layout = Layout::from_size_align(size, align).unwrap();
                 let spec = LayoutSpec::from_layout(layout);
-                let Some(class) = for_layout(spec) else {
+                let Some(class) = SizeClasses::id_for(spec).and_then(SizeClasses::class) else {
                     continue;
                 };
 
@@ -195,7 +191,9 @@ mod tests {
                 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
             ] {
                 let spec = LayoutSpec::from_size_align(size, align).unwrap();
-                let class = for_layout(spec).map(SizeClass::block_size);
+                let class = SizeClasses::id_for(spec)
+                    .and_then(SizeClasses::class)
+                    .map(SizeClass::block_size);
                 let reference = if align > PAGE_SIZE {
                     None
                 } else {
