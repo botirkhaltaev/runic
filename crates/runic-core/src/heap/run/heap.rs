@@ -332,8 +332,7 @@ mod tests {
     fn rebind_heap_id_rebinds_runs_off_the_available_list() {
         let mut allocator = RunHeap::new(2);
         let pages = PageMap::new();
-        let spec = LayoutSpec::from_size_align(64, 8).unwrap();
-        let class = SizeClasses::for_layout(spec).unwrap();
+        let class = class_for(64, 8);
         let old = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
         let new = HeapId::new(0, core::num::NonZeroU32::new(2).unwrap()).unwrap();
 

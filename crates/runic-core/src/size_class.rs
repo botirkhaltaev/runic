@@ -89,6 +89,9 @@ impl SizeClasses {
                 while index < Self::COUNT - 1 && Self::SIZES[index] % align != 0 {
                     index += 1;
                 }
+                // Every alignment power through PAGE_SIZE must be covered by
+                // some size class at or after `start` (SIZES ends at SMALL_MAX).
+                assert!(Self::SIZES[index] % align == 0);
                 table[power][start] = index;
                 start += 1;
             }

@@ -55,10 +55,9 @@ impl LayoutSpec {
     /// allocation at any address while still allowing the returned pointer
     /// to be rounded up to `align`.
     ///
-    /// The mapping must be at least `size + align` bytes: in the worst case
-    /// the mapping's base address is already `1` byte past an aligned
-    /// address, so up to `align` bytes of headroom before `size` bytes of
-    /// usable space may be sacrificed to alignment.
+    /// Worst-case alignment padding is `align - 1` bytes (base one past an
+    /// aligned address). This uses the conservative `size + align` bound —
+    /// one byte more than necessary — before rounding up to `page_size`.
     pub(crate) fn mapping_len(self, page_size: usize) -> Option<usize> {
         let size_with_align_headroom = self.size.checked_add(self.align.get())?;
         let mask = page_size.checked_sub(1)?;
