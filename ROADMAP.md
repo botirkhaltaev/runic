@@ -57,10 +57,10 @@ mmap-backed extents for dedicated allocations (heap-local)
 out-of-line metadata
 page-indexed pointer lookup
 per-size-class available run lists
-bitmap-backed run block state with remote-pending
+per-block AtomicU8 run block state with remote-pending
 lock-free remote-free Treiber inboxes per heap
 configurable extent mapping retention and reuse
-optional empty-run release and mapping retention
+runs retained for the heap lifetime (no empty-run OS release in v0.5)
 run block-boundary checks
 extent exact-pointer checks
 basic realloc
@@ -137,8 +137,8 @@ SizeClasses    owns size-class selection.
 OsMemory       owns mmap and munmap.
 PageMap        owns page-indexed owner-pointer lookup.
 RunHeap        owns Arena<Run>, small-allocation policy, and available run lists.
-Run            owns fixed-block allocation metadata and block bitmap state.
-BlockStates    owns reusable, allocated, and remote-pending block state.
+Run            owns fixed-block allocation metadata and per-block state.
+BlockStates    owns reusable, allocated, and remote-pending block state (one AtomicU8 per block).
 ExtentHeap     owns Arena<Extent>, dedicated allocation policy, and mapping reuse.
 ExtentCache    owns retained extent mappings, eviction, and reuse lookup.
 Extent         owns dedicated allocation metadata.
@@ -170,7 +170,7 @@ Default tests should cover:
 ```text
 layout normalization and overflow checks
 size-class alignment invariants
-bitmap block-state behavior
+per-block AtomicU8 block-state behavior
 mmap mapping and writability
 run block uniqueness and boundary checks
 run arena reservation, insertion, mutation, removal
@@ -214,9 +214,8 @@ preserves stale-free detection.
 Dedicated extent churn is primarily controlled by mapping retention policy.
 Keep extent retention deterministic, bounded, and allocation-free.
 
-Empty-run release policies are opt-in. Early policy-grid runs show they can
-regress single-size churn, so default behavior should keep empty runs live unless
-new workloads justify a different default.
+Empty-run OS release is not implemented in v0.5: runs stay published and arena-
+resident for the heap lifetime. Extent retention policies are extent-only.
 ```
 
 ## Milestones
@@ -229,7 +228,7 @@ Delivered:
 out-of-line run and extent metadata
 page-indexed owner lookup
 available run lists
-bitmap-backed run block state
+per-block AtomicU8 run block state
 basic realloc and alloc_zeroed
 randomized traces
 abort-case tests
@@ -257,7 +256,6 @@ In scope:
 ```text
 AllocatorConfig and ExtentConfig
 ExtentPolicy and ExtentReuse
-empty-run release behavior through RunHeap
 ExtentCache fixed-slot storage
 policy_grid benchmark coverage
 page-map publication/removal invariants for cached mappings
@@ -272,7 +270,7 @@ workspace clippy passes with -D warnings
 benchmark binaries build
 policy_grid shows default behavior remains reasonable
 RSS checks confirm bounded retention
-empty-run release stays opt-in unless workloads justify changing the default
+runs remain retained by default (empty-run OS release not shipped)
 ```
 
 ### v0.5 Next: Full Thread-Local Heaps

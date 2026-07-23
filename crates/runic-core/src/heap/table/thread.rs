@@ -139,18 +139,18 @@ impl ThreadHeap {
         }
 
         // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
-        if unsafe { heap.as_mut() }.flush(pages).is_ok()
-            && let Some(allocation) = self.alloc_cached(class, heap)
-        {
-            return Some(allocation);
+        let heap_mut = unsafe { heap.as_mut() };
+        if !heap_mut.inbox().is_empty() {
+            heap_mut.flush(pages).ok()?;
+            if let Some(allocation) = self.alloc_cached(class, heap) {
+                return Some(allocation);
+            }
         }
 
+        // Inbox is empty after the optional flush above, so acquire_run will not flush again.
         // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
-        let heap_mut = unsafe { heap.as_mut() };
-        heap_mut.flush(pages).ok()?;
-        let run = heap_mut.take_or_allocate_run(class, pages)?;
+        let run = unsafe { heap.as_mut() }.acquire_run(class, pages)?;
         self.cache_run(class, run);
-
         self.alloc_cached(class, heap)
     }
 
@@ -265,16 +265,14 @@ impl ThreadHeap {
     }
 
     fn alloc_cached(&self, class: SizeClassId, mut heap: NonNull<Heap>) -> Option<NonNull<u8>> {
-        let mut run = self.cached_run(class)?;
+        let run = self.cached_run(class)?;
 
         // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
         let heap = unsafe { heap.as_mut() };
-        // SAFETY: cached run pointers are published from this heap's live arena.
-        let Some(allocation) = unsafe { run.as_mut() }.allocate() else {
+        let Some(allocation) = heap.alloc_from(run) else {
             self.clear_run(class);
             return None;
         };
-        heap.retain_allocation();
         Some(allocation)
     }
 

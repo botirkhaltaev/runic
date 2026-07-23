@@ -118,6 +118,11 @@ impl BlockState {
     }
 }
 
+/// Per-block Free / Allocated / `RemotePending` state.
+///
+/// One `AtomicU8` per block slot, sized to the smallest size class's worst-case
+/// block count (`MAX_BLOCKS`). Not a packed bitmap; this is the only
+/// free/allocated/remote-pending tracker on a run.
 struct BlockStates {
     states: [AtomicU8; MAX_BLOCKS],
 }
@@ -299,11 +304,6 @@ impl Run {
     pub(crate) fn take_available_next(&self) -> Option<NonNull<Run>> {
         // SAFETY: owner-local methods are called only by the owning heap.
         unsafe { &mut *self.state.get() }.available_next.take()
-    }
-
-    pub(crate) fn available_next(&self) -> Option<NonNull<Run>> {
-        // SAFETY: owner-local methods are called only by the owning heap.
-        unsafe { (*self.state.get()).available_next }
     }
 
     pub(crate) fn range(&self) -> AddressRange {

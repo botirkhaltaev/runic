@@ -82,10 +82,6 @@ impl Heap {
         self.id = id;
     }
 
-    pub(crate) fn rebind_available_runs(&mut self, heap_id: HeapId) {
-        self.runs.rebind_available(heap_id);
-    }
-
     pub(crate) fn inbox(&self) -> &Inbox {
         &self.inbox
     }
@@ -105,7 +101,7 @@ impl Heap {
     pub(crate) fn reactivate(&mut self, id: HeapId) {
         self.mode.store(HeapMode::Active.raw(), Ordering::Release);
         self.set_id(id);
-        self.rebind_available_runs(id);
+        self.runs.rebind_heap_id(id);
     }
 
     /// Mark Free when empty; caller bumps table generation.
@@ -123,27 +119,8 @@ impl Heap {
         HeapMode::from_raw(self.mode.load(Ordering::Acquire)).unwrap_or(HeapMode::Free)
     }
 
-    pub(crate) fn allocate_run(
-        &mut self,
-        class: SizeClassId,
-        pages: &PageMap,
-    ) -> Option<NonNull<u8>> {
-        if !self.inbox.is_empty() {
-            self.flush(pages).ok()?;
-        }
-
-        let mut run = self.runs.allocate(class, self.id, pages)?;
-        // SAFETY: RunHeap returns pointers to live runs from this heap's arena.
-        let ptr = unsafe { run.as_mut() }.allocate()?;
-        self.retain_allocation();
-        // SAFETY: RunHeap returns pointers to live runs from this heap's arena.
-        if unsafe { run.as_ref() }.has_available_blocks() {
-            let _ = self.runs.return_available(run);
-        }
-        Some(ptr)
-    }
-
-    pub(crate) fn take_or_allocate_run(
+    /// Obtain a run for `class`: flush inbox once if needed, then available or cold mmap.
+    pub(crate) fn acquire_run(
         &mut self,
         class: SizeClassId,
         pages: &PageMap,
@@ -152,8 +129,26 @@ impl Heap {
             self.flush(pages).ok()?;
         }
 
-        // `RunHeap::allocate` already tries available then cold allocate_run.
         self.runs.allocate(class, self.id, pages)
+    }
+
+    /// Take one block from a run previously returned by [`Heap::acquire_run`].
+    pub(crate) fn alloc_from(&mut self, mut run: NonNull<Run>) -> Option<NonNull<u8>> {
+        // SAFETY: caller supplies a run pointer from this heap's live arena.
+        let ptr = unsafe { run.as_mut() }.allocate()?;
+        self.retain_allocation();
+        Some(ptr)
+    }
+
+    /// One-shot small alloc without holding a sticky run: acquire, take one block, return run.
+    pub(crate) fn alloc_run(&mut self, class: SizeClassId, pages: &PageMap) -> Option<NonNull<u8>> {
+        let run = self.acquire_run(class, pages)?;
+        let ptr = self.alloc_from(run)?;
+        // SAFETY: run was just returned by this heap's live arena.
+        if unsafe { run.as_ref() }.has_available_blocks() {
+            let _ = self.runs.return_available(run);
+        }
+        Some(ptr)
     }
 
     pub(crate) fn allocate_extent(

@@ -109,6 +109,11 @@ impl<T> Arena<T> {
         self.release(index);
         Some(value)
     }
+
+    /// Number of slots in this arena (occupied and empty), or 0 if unmapped.
+    pub(crate) fn capacity(&self) -> usize {
+        self.slots.as_ref().map_or(0, |slots| slots.len)
+    }
 }
 
 struct Slots<T> {

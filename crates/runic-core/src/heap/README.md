@@ -4,7 +4,7 @@ Owner-local heap frontend: runs for small size classes, extents for dedicated la
 
 ## Layout
 
-- `mod.rs`: `Heap` (mode, runs, extents, `alloc_count`, `Inbox`) and exclusive allocate/free/flush.
+- `mod.rs`: `Heap` (mode, runs, extents, `alloc_count`, `Inbox`); small path via `acquire_run` / `alloc_from` / `alloc_run`.
 - `id.rs`: `HeapId` (slot index + generation).
 - `run/`: size-classed fixed-block runs (`Run`, `RunHeap` with `Arena<Run>`).
 - `extent/`: dedicated mappings (`Extent`, `ExtentHeap` with `Arena<Extent>`, `ExtentCache`).

@@ -41,9 +41,9 @@ Runic v0.4 implements:
 - out-of-line metadata
 - page-indexed owner-pointer lookup
 - per-size-class available run lists
-- bitmap-backed run block state
+- per-block AtomicU8 run block state (reusable / allocated / remote-pending)
 - configurable extent mapping retention and reuse policies
-- optional empty-run release and mapping retention policies
+- runs retained for the heap lifetime (no empty-run OS release in v0.5)
 - run block-boundary checks
 - extent exact-pointer checks
 - basic `realloc`

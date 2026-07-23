@@ -78,15 +78,13 @@ impl RunHeap {
         self.finish_free(freed)
     }
 
-    pub(crate) fn rebind_available(&mut self, heap_id: HeapId) {
-        for head in &mut self.available {
-            let mut current = *head;
-            while let Some(mut run_ptr) = current {
-                // SAFETY: available-list pointers are created only from live arena entries.
-                unsafe { run_ptr.as_mut() }.set_heap_id(heap_id);
-                // SAFETY: available-list pointers are created only from live arena entries.
-                current = unsafe { run_ptr.as_ref() }.available_next();
-            }
+    pub(crate) fn rebind_heap_id(&mut self, heap_id: HeapId) {
+        let len = self.runs.capacity();
+        for index in 0..len {
+            let Some(run) = self.runs.get_mut(index) else {
+                continue;
+            };
+            run.set_heap_id(heap_id);
         }
     }
 
@@ -325,5 +323,25 @@ mod tests {
         assert_eq!(allocator.insert_run(index, id, run, &pages), None);
         assert!(allocator.runs.get_mut(index).is_none());
         assert_eq!(pages.get(range.base()), Some(PageOwner::Run(existing)));
+    }
+
+    #[test]
+    fn rebind_heap_id_rebinds_runs_off_the_available_list() {
+        let mut allocator = RunHeap::new(2);
+        let pages = PageMap::new();
+        let spec = LayoutSpec::from_size_align(64, 8).unwrap();
+        let class = SizeClasses::for_layout(spec).unwrap();
+        let old = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
+        let new = HeapId::new(0, core::num::NonZeroU32::new(2).unwrap()).unwrap();
+
+        let run = allocator.allocate(class.id(), old, &pages).unwrap();
+        // Leave the run checked out (sticky-style): never return_available.
+        // SAFETY: run came from this heap's live arena.
+        assert_eq!(unsafe { run.as_ref() }.heap_id(), old);
+
+        allocator.rebind_heap_id(new);
+
+        // SAFETY: run remains a live arena entry after rebind.
+        assert_eq!(unsafe { run.as_ref() }.heap_id(), new);
     }
 }

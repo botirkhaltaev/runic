@@ -89,7 +89,7 @@ impl Allocator {
             return null_mut();
         }
         match class {
-            Some(class) => heap.allocate_run(class, pages),
+            Some(class) => heap.alloc_run(class, pages),
             None => heap.allocate_extent(spec, pages, ExtentInit::Uninit),
         }
         .map_or(null_mut(), NonNull::as_ptr)
@@ -618,7 +618,7 @@ mod tests {
         let mut table = inner_ref.table.lock();
         let heap = table.heap_mut(id).unwrap();
         assert!(heap.is_active());
-        heap.allocate_run(SizeClasses::id_for(spec).unwrap(), inner_ref.pages())
+        heap.alloc_run(SizeClasses::id_for(spec).unwrap(), inner_ref.pages())
             .unwrap()
     }
 
