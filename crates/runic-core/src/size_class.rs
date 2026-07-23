@@ -43,63 +43,12 @@ impl SizeClasses {
     pub(crate) const COUNT: usize = 27;
     pub(crate) const SMALL_MAX: usize = 32 * 1024;
     const MIN_ALIGNMENT: usize = 8;
-    /// One entry per representable alignment power, from `2^0` up to and
-    /// including `PAGE_SIZE`.
-    const ALIGN_POWER_COUNT: usize = Self::align_power_count();
-    /// The one source of truth for size classes: every other table in this
-    /// type (the alignment remap) is const-generated from `SIZES`.
+    /// The one hand-authored size-class table. Alignment remaps search this
+    /// list; there is no second parallel align table to keep in sync.
     const SIZES: [usize; Self::COUNT] = [
         8, 16, 24, 32, 48, 64, 80, 96, 128, 160, 192, 256, 320, 384, 512, 768, 1024, 1536, 2048,
         3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768,
     ];
-    /// `ALIGNED_CLASS_BY_START[power][start]` is the smallest class index at
-    /// or after `start` whose block size is a multiple of `2^power`. `SIZES`
-    /// is sorted and its last entry (`SMALL_MAX`) is a multiple of every
-    /// representable alignment, so the search always terminates within
-    /// `SIZES`.
-    const ALIGNED_CLASS_BY_START: [[usize; Self::COUNT]; Self::ALIGN_POWER_COUNT] =
-        Self::build_aligned_class_map();
-
-    const fn align_power_count() -> usize {
-        let mut power = 0;
-        let mut align = 1usize;
-        while align < PAGE_SIZE {
-            align <<= 1;
-            power += 1;
-        }
-        power + 1
-    }
-
-    /// Builds [`Self::ALIGNED_CLASS_BY_START`] from [`Self::SIZES`] at compile time.
-    ///
-    /// `slice::get` is not yet usable from `const fn` on stable Rust, so this
-    /// uses direct indexing. Every index is bounded by the loop condition
-    /// immediately above it, so an out-of-bounds access can only ever be a
-    /// compile-time evaluation error, never a runtime panic.
-    #[allow(clippy::indexing_slicing)]
-    const fn build_aligned_class_map() -> [[usize; Self::COUNT]; Self::ALIGN_POWER_COUNT] {
-        let mut table = [[0usize; Self::COUNT]; Self::ALIGN_POWER_COUNT];
-
-        let mut power = 0;
-        while power < Self::ALIGN_POWER_COUNT {
-            let align = 1usize << power;
-            let mut start = 0;
-            while start < Self::COUNT {
-                let mut index = start;
-                while index < Self::COUNT - 1 && Self::SIZES[index] % align != 0 {
-                    index += 1;
-                }
-                // Every alignment power through PAGE_SIZE must be covered by
-                // some size class at or after `start` (SIZES ends at SMALL_MAX).
-                assert!(Self::SIZES[index] % align == 0);
-                table[power][start] = index;
-                start += 1;
-            }
-            power += 1;
-        }
-
-        table
-    }
 
     pub(crate) fn id_for(spec: LayoutSpec) -> Option<SizeClassId> {
         let required = spec.minimum_block_size();
@@ -156,14 +105,20 @@ impl SizeClasses {
         first_class + ((size - first_size) / quantum)
     }
 
+    /// Smallest class index at or after `start` whose block size is a multiple
+    /// of `align`. `SIZES` ends at `SMALL_MAX`, which is a multiple of every
+    /// representable alignment through `PAGE_SIZE`, so a hit always exists for
+    /// in-range starts.
     fn aligned_class_from(start: usize, align: usize) -> Option<SizeClassId> {
         debug_assert!(align.is_power_of_two());
-        let align_power = usize::try_from(align.trailing_zeros()).ok()?;
-        Self::ALIGNED_CLASS_BY_START
-            .get(align_power)?
-            .get(start)
-            .copied()
-            .map(SizeClassId::new)
+        let mut index = start;
+        while let Some(&block_size) = Self::SIZES.get(index) {
+            if block_size.is_multiple_of(align) {
+                return Some(SizeClassId::new(index));
+            }
+            index += 1;
+        }
+        None
     }
 }
 
@@ -279,8 +234,8 @@ mod tests {
     }
 
     #[test]
-    fn size_classes_alignment_table_covers_page_alignment() {
-        assert_eq!(1_usize << (SizeClasses::ALIGN_POWER_COUNT - 1), PAGE_SIZE);
+    fn size_classes_reject_over_page_alignment_bound_is_power_of_two() {
+        assert!(PAGE_SIZE.is_power_of_two());
     }
 
     #[test]
@@ -298,18 +253,26 @@ mod tests {
     }
 
     #[test]
-    fn aligned_class_map_matches_linear_oracle() {
-        for power in 0..SizeClasses::ALIGN_POWER_COUNT {
-            let align = 1_usize << power;
-
+    fn aligned_class_from_covers_all_starts_and_align_powers() {
+        let mut align = 1usize;
+        loop {
             for start in 0..SizeClasses::COUNT {
-                let generated = SizeClasses::ALIGNED_CLASS_BY_START[power][start];
-                let reference = (start..SizeClasses::COUNT)
-                    .find(|&index| SizeClasses::SIZES[index].is_multiple_of(align))
+                let id = SizeClasses::aligned_class_from(start, align)
                     .expect("SMALL_MAX is a multiple of every representable alignment");
+                let block_size = SizeClasses::SIZES.get(id.index()).copied();
+                let reference = (start..SizeClasses::COUNT).find_map(|index| {
+                    let size = *SizeClasses::SIZES.get(index)?;
+                    size.is_multiple_of(align).then_some(size)
+                });
 
-                assert_eq!(generated, reference, "power={power} start={start}");
+                assert_eq!(block_size, reference, "align={align} start={start}");
+                assert!(id.index() >= start);
             }
+
+            if align == PAGE_SIZE {
+                break;
+            }
+            align <<= 1;
         }
     }
 
