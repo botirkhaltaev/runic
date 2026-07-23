@@ -1,8 +1,8 @@
 use core::{
     cell::UnsafeCell,
-    mem::{MaybeUninit, size_of},
+    mem::size_of,
     ptr::NonNull,
-    sync::atomic::{AtomicPtr, AtomicU32, Ordering},
+    sync::atomic::{AtomicPtr, Ordering},
 };
 
 use crate::memory::{Mapping, OsMemory};
@@ -29,7 +29,14 @@ impl L1Table {
             .ok_or(PageMapError::InvalidRange)
     }
 
-    pub(super) fn ensure_l2_table(&self, index: L1Index) -> Result<(), PageMapError> {
+    /// Ensures an L2 table exists for `index`.
+    ///
+    /// Caller must hold `PageMap::l1_mapping`.
+    pub(super) fn ensure_l2_table(
+        &self,
+        index: L1Index,
+        l1_mapping: &mut Option<Mapping>,
+    ) -> Result<(), PageMapError> {
         let entry = self.entry(index)?;
 
         if entry.has_l2_table() {
@@ -39,21 +46,26 @@ impl L1Table {
         let Some(mapping) = OsMemory::map(size_of::<L2Table>()) else {
             return Err(PageMapError::MetadataAllocFailed);
         };
-        entry.install_l2_mapping(mapping);
+        entry.install_l2_mapping(mapping, l1_mapping);
 
         Ok(())
     }
 }
 
+/// L2 table mmap ownership and occupancy; mutated only while `PageMap::l1_mapping` is held.
+pub(super) struct L2Mapping {
+    mapping: Option<Mapping>,
+    occupied_pages: u32,
+}
+
 #[repr(C)]
 pub(super) struct L1Entry {
     table: AtomicPtr<L2Table>,
-    mapping: UnsafeCell<MaybeUninit<Mapping>>,
-    occupied_pages: AtomicU32,
+    l2_mapping: UnsafeCell<L2Mapping>,
 }
 
-// SAFETY: L1Entry publishes the L2 table pointer atomically. Mapping storage is
-// initialized before publication and dropped only when PageMap is dropped.
+// SAFETY: The L2 table pointer is published atomically for lock-free get. `l2_mapping` is
+// only accessed while `PageMap::l1_mapping` is locked (or uniquely in PageMap drop).
 unsafe impl Sync for L1Entry {}
 
 impl L1Entry {
@@ -72,12 +84,12 @@ impl L1Entry {
         Some(unsafe { table.as_ref() })
     }
 
-    fn install_l2_mapping(&self, mapping: Mapping) {
+    fn install_l2_mapping(&self, mapping: Mapping, _l1_mapping: &mut Option<Mapping>) {
         let table = mapping.base().cast::<L2Table>().as_ptr();
-        // SAFETY: mutation is serialized by the allocator lifecycle lock, and readers cannot
-        // observe this mapping until table is published below.
-        unsafe { (*self.mapping.get()).write(mapping) };
-        self.occupied_pages.store(0, Ordering::Release);
+        // SAFETY: caller holds `PageMap::l1_mapping`, which serializes all L2Mapping mutation.
+        let l2_mapping = unsafe { &mut *self.l2_mapping.get() };
+        l2_mapping.mapping = Some(mapping);
+        l2_mapping.occupied_pages = 0;
         self.table.store(table, Ordering::Release);
     }
 
@@ -87,21 +99,25 @@ impl L1Entry {
         }
 
         self.table.store(core::ptr::null_mut(), Ordering::Release);
-        self.occupied_pages.store(0, Ordering::Release);
-        // SAFETY: PageMap drop has unique access; mapping was initialized before table publication.
-        unsafe { self.mapping.get_mut().assume_init_drop() };
+        let l2_mapping = self.l2_mapping.get_mut();
+        l2_mapping.occupied_pages = 0;
+        l2_mapping.mapping = None;
     }
 
+    /// Caller must hold `PageMap::l1_mapping`.
     pub(super) fn owns_segment(
         &self,
         segment: L2Segment,
         expected: MapEntry,
+        _l1_mapping: &mut Option<Mapping>,
     ) -> Result<bool, PageMapError> {
         let Some(table) = self.l2_table_ref() else {
             return Ok(expected.is_empty());
         };
 
-        if expected.is_empty() && self.occupied_pages.load(Ordering::Acquire) == 0 {
+        // SAFETY: caller holds `PageMap::l1_mapping`.
+        let occupied_pages = unsafe { (*self.l2_mapping.get()).occupied_pages };
+        if expected.is_empty() && occupied_pages == 0 {
             return Ok(true);
         }
 
@@ -117,10 +133,18 @@ impl L1Entry {
     /// Runs and extents share this one representation; there is no alternate
     /// encoding to fall back to, so a segment either fits directly or the
     /// insert fails (see `memory/AGENTS.md`).
-    pub(super) fn assign(&self, segment: L2Segment, value: MapEntry) -> Result<(), PageMapError> {
-        let occupied_pages = self
+    ///
+    /// Caller must hold `PageMap::l1_mapping`.
+    pub(super) fn assign(
+        &self,
+        segment: L2Segment,
+        value: MapEntry,
+        _l1_mapping: &mut Option<Mapping>,
+    ) -> Result<(), PageMapError> {
+        // SAFETY: caller holds `PageMap::l1_mapping`.
+        let l2_mapping = unsafe { &mut *self.l2_mapping.get() };
+        let occupied_pages = l2_mapping
             .occupied_pages
-            .load(Ordering::Acquire)
             .checked_add(segment.pages())
             .ok_or(PageMapError::InvalidRange)?;
         let table = self
@@ -128,21 +152,27 @@ impl L1Entry {
             .ok_or(PageMapError::MetadataAllocFailed)?;
 
         table.write_pages(segment, value)?;
-        self.occupied_pages.store(occupied_pages, Ordering::Release);
+        l2_mapping.occupied_pages = occupied_pages;
 
         Ok(())
     }
 
-    pub(super) fn clear_segment(&self, segment: L2Segment) -> Result<(), PageMapError> {
-        let occupied_pages = self
+    /// Caller must hold `PageMap::l1_mapping`.
+    pub(super) fn clear_segment(
+        &self,
+        segment: L2Segment,
+        _l1_mapping: &mut Option<Mapping>,
+    ) -> Result<(), PageMapError> {
+        // SAFETY: caller holds `PageMap::l1_mapping`.
+        let l2_mapping = unsafe { &mut *self.l2_mapping.get() };
+        let occupied_pages = l2_mapping
             .occupied_pages
-            .load(Ordering::Acquire)
             .checked_sub(segment.pages())
             .ok_or(PageMapError::UnexpectedEntry)?;
         let table = self.l2_table_ref().ok_or(PageMapError::UnexpectedEntry)?;
 
         table.write_pages(segment, MapEntry::empty())?;
-        self.occupied_pages.store(occupied_pages, Ordering::Release);
+        l2_mapping.occupied_pages = occupied_pages;
 
         Ok(())
     }

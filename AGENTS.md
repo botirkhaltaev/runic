@@ -61,7 +61,7 @@ Use this first:
 GlobalAlloc
  -> Allocator
      -> AllocatorInner { refs, pages: PageMap, table: Mutex<HeapTable> }
-     -> PageBackend / OsMemory
+     -> OsMemory
      -> HeapTable { generations[], slots: Arena<Heap> }
          -> ThreadHeap
      -> Heap { mode, RunHeap, ExtentHeap, alloc_count, Inbox }

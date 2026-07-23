@@ -1,6 +1,5 @@
 use core::{
-    cell::UnsafeCell,
-    mem::{MaybeUninit, size_of},
+    mem::size_of,
     ptr::NonNull,
     sync::atomic::{AtomicPtr, Ordering},
 };
@@ -47,20 +46,18 @@ pub(crate) enum PageOwner {
 
 pub(crate) struct PageMap {
     l1: AtomicPtr<L1Table>,
-    mapping: UnsafeCell<MaybeUninit<Mapping>>,
-    writer: Mutex<()>,
+    l1_mapping: Mutex<Option<Mapping>>,
 }
 
 // SAFETY: The L1 pointer is published atomically. Publication/removal is serialized by
-// writer; lookups use atomic reads and L2 tables are retained until PageMap drop.
+// `l1_mapping`; lookups use atomic reads and L2 tables are retained until PageMap drop.
 unsafe impl Sync for PageMap {}
 
 impl PageMap {
     pub(crate) const fn new() -> Self {
         Self {
             l1: AtomicPtr::new(core::ptr::null_mut()),
-            mapping: UnsafeCell::new(MaybeUninit::uninit()),
-            writer: Mutex::new(()),
+            l1_mapping: Mutex::new(None),
         }
     }
 
@@ -75,9 +72,9 @@ impl PageMap {
         mapping: &Mapping,
         run: NonNull<Run>,
     ) -> Result<(), PageMapError> {
-        let _writer = self.writer.lock();
+        let mut l1_mapping = self.l1_mapping.lock();
         let range = PageRange::from_mapping(mapping).ok_or(PageMapError::InvalidRange)?;
-        self.insert(range, PageOwner::Run(run))
+        self.insert(&mut l1_mapping, range, PageOwner::Run(run))
     }
 
     pub(crate) fn publish_extent(
@@ -85,9 +82,9 @@ impl PageMap {
         mapping: &Mapping,
         extent: NonNull<Extent>,
     ) -> Result<(), PageMapError> {
-        let _writer = self.writer.lock();
+        let mut l1_mapping = self.l1_mapping.lock();
         let range = PageRange::from_mapping(mapping).ok_or(PageMapError::InvalidRange)?;
-        self.insert(range, PageOwner::Extent(extent))
+        self.insert(&mut l1_mapping, range, PageOwner::Extent(extent))
     }
 
     pub(crate) fn unpublish_extent(
@@ -95,22 +92,30 @@ impl PageMap {
         mapping: &Mapping,
         extent: NonNull<Extent>,
     ) -> Result<(), PageMapError> {
-        let _writer = self.writer.lock();
+        let mut l1_mapping = self.l1_mapping.lock();
         let range = PageRange::from_mapping(mapping).ok_or(PageMapError::InvalidRange)?;
-        self.remove(range, PageOwner::Extent(extent))
+        self.remove(&mut l1_mapping, range, PageOwner::Extent(extent))
     }
 
-    fn insert(&self, range: PageRange, entry: PageOwner) -> Result<(), PageMapError> {
+    fn insert(
+        &self,
+        l1_mapping: &mut Option<Mapping>,
+        range: PageRange,
+        entry: PageOwner,
+    ) -> Result<(), PageMapError> {
         let occupied = MapEntry::from_owner(entry).ok_or(PageMapError::InvalidRange)?;
 
-        self.validate_insert(range)?;
-        self.prepare_insert(range)?;
+        self.validate_insert(l1_mapping, range)?;
+        self.prepare_insert(l1_mapping, range)?;
 
         let result = if let Some(l1) = self.l1() {
             let mut result = Ok(());
 
             for segment in range.segments() {
-                if let Err(error) = l1.entry(segment.l1)?.assign(segment.l2, occupied) {
+                if let Err(error) = l1
+                    .entry(segment.l1)?
+                    .assign(segment.l2, occupied, l1_mapping)
+                {
                     result = Err(error);
                     break;
                 }
@@ -122,7 +127,7 @@ impl PageMap {
         };
 
         if let Err(error) = result {
-            self.rollback_insert(range, occupied);
+            self.rollback_insert(l1_mapping, range, occupied);
 
             return Err(error);
         }
@@ -130,18 +135,24 @@ impl PageMap {
         Ok(())
     }
 
-    fn remove(&self, range: PageRange, expected: PageOwner) -> Result<(), PageMapError> {
-        self.validate_remove(range, expected)?;
+    fn remove(
+        &self,
+        l1_mapping: &mut Option<Mapping>,
+        range: PageRange,
+        expected: PageOwner,
+    ) -> Result<(), PageMapError> {
+        self.validate_remove(l1_mapping, range, expected)?;
 
         let l1 = self.l1().ok_or(PageMapError::UnexpectedEntry)?;
         for segment in range.segments() {
-            l1.entry(segment.l1)?.clear_segment(segment.l2)?;
+            l1.entry(segment.l1)?
+                .clear_segment(segment.l2, l1_mapping)?;
         }
 
         Ok(())
     }
 
-    fn rollback_insert(&self, range: PageRange, entry: MapEntry) {
+    fn rollback_insert(&self, l1_mapping: &mut Option<Mapping>, range: PageRange, entry: MapEntry) {
         let Some(l1) = self.l1() else {
             return;
         };
@@ -149,7 +160,7 @@ impl PageMap {
         for segment in range.segments() {
             if l1
                 .entry(segment.l1)
-                .and_then(|entry_slot| entry_slot.owns_segment(segment.l2, entry))
+                .and_then(|entry_slot| entry_slot.owns_segment(segment.l2, entry, l1_mapping))
                 != Ok(true)
             {
                 continue;
@@ -157,7 +168,7 @@ impl PageMap {
 
             let _ = l1
                 .entry(segment.l1)
-                .and_then(|entry_slot| entry_slot.clear_segment(segment.l2));
+                .and_then(|entry_slot| entry_slot.clear_segment(segment.l2, l1_mapping));
         }
     }
 
@@ -168,28 +179,33 @@ impl PageMap {
         Some(unsafe { l1.as_ref() })
     }
 
-    fn l1_or_init(&self) -> Result<&L1Table, PageMapError> {
+    fn l1_or_init(&self, l1_mapping: &mut Option<Mapping>) -> Result<&L1Table, PageMapError> {
         if self.l1.load(Ordering::Acquire).is_null() {
             let mapping =
                 OsMemory::map(size_of::<L1Table>()).ok_or(PageMapError::MetadataAllocFailed)?;
             let ptr = mapping.base().cast::<L1Table>().as_ptr();
-            // SAFETY: insert/remove are externally serialized, and readers cannot observe this
-            // mapping until l1 is published below.
-            unsafe { (*self.mapping.get()).write(mapping) };
+            *l1_mapping = Some(mapping);
             self.l1.store(ptr, Ordering::Release);
         }
 
         self.l1().ok_or(PageMapError::MetadataAllocFailed)
     }
 
-    fn validate_insert(&self, range: PageRange) -> Result<(), PageMapError> {
+    fn validate_insert(
+        &self,
+        l1_mapping: &mut Option<Mapping>,
+        range: PageRange,
+    ) -> Result<(), PageMapError> {
         let Some(l1) = self.l1() else {
             return Ok(());
         };
 
         let empty = MapEntry::empty();
         for segment in range.segments() {
-            if !l1.entry(segment.l1)?.owns_segment(segment.l2, empty)? {
+            if !l1
+                .entry(segment.l1)?
+                .owns_segment(segment.l2, empty, l1_mapping)?
+            {
                 return Err(PageMapError::Overlap);
             }
         }
@@ -197,7 +213,12 @@ impl PageMap {
         Ok(())
     }
 
-    fn validate_remove(&self, range: PageRange, expected: PageOwner) -> Result<(), PageMapError> {
+    fn validate_remove(
+        &self,
+        l1_mapping: &mut Option<Mapping>,
+        range: PageRange,
+        expected: PageOwner,
+    ) -> Result<(), PageMapError> {
         let expected = MapEntry::from_owner(expected).ok_or(PageMapError::InvalidRange)?;
 
         let Some(l1) = self.l1() else {
@@ -205,7 +226,10 @@ impl PageMap {
         };
 
         for segment in range.segments() {
-            if !l1.entry(segment.l1)?.owns_segment(segment.l2, expected)? {
+            if !l1
+                .entry(segment.l1)?
+                .owns_segment(segment.l2, expected, l1_mapping)?
+            {
                 return Err(PageMapError::UnexpectedEntry);
             }
         }
@@ -213,22 +237,16 @@ impl PageMap {
         Ok(())
     }
 
-    fn prepare_insert(&self, range: PageRange) -> Result<(), PageMapError> {
-        let result = {
-            let l1 = self.l1_or_init()?;
-            let mut result = Ok(());
+    fn prepare_insert(
+        &self,
+        l1_mapping: &mut Option<Mapping>,
+        range: PageRange,
+    ) -> Result<(), PageMapError> {
+        let l1 = self.l1_or_init(l1_mapping)?;
 
-            for segment in range.segments() {
-                if let Err(error) = l1.ensure_l2_table(segment.l1) {
-                    result = Err(error);
-                    break;
-                }
-            }
-
-            result
-        };
-
-        result?;
+        for segment in range.segments() {
+            l1.ensure_l2_table(segment.l1, l1_mapping)?;
+        }
 
         Ok(())
     }
@@ -236,17 +254,19 @@ impl PageMap {
 
 impl Drop for PageMap {
     fn drop(&mut self) {
-        let Some(mut l1_ptr) = NonNull::new(self.l1.load(Ordering::Acquire)) else {
+        let Some(mut l1_ptr) = NonNull::new(*self.l1.get_mut()) else {
             return;
         };
+        *self.l1.get_mut() = core::ptr::null_mut();
+
         // SAFETY: PageMap drop has unique access to the L1 table.
         let l1 = unsafe { l1_ptr.as_mut() };
 
         for entry in &mut l1.entries {
             entry.drop_l2_mapping();
         }
-        // SAFETY: l1 was published only after mapping initialization.
-        unsafe { self.mapping.get_mut().assume_init_drop() };
+
+        let _ = self.l1_mapping.get_mut().take();
     }
 }
 
