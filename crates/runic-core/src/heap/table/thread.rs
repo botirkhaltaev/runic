@@ -325,7 +325,7 @@ impl ThreadHeap {
     /// Exclusive access to the bound heap.
     ///
     /// Callers must have already confirmed this TLS entry is bound (`matches` / heap-id check).
-    /// ThreadHeap is thread-local and stores the heap pointer in a `Cell`; this is the
+    /// `ThreadHeap` is thread-local and stores the heap pointer in a `Cell`; this is the
     /// interior-mutability bridge to the exclusive `Heap` binding.
     #[expect(
         clippy::mut_from_ref,
