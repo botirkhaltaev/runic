@@ -163,10 +163,6 @@ mod tests {
 
     use super::*;
 
-    fn cache(policy: ExtentPolicy, budget: Budget) -> ExtentCache {
-        ExtentCache::new(ExtentConfig::new().with_policy(policy).with_budget(budget))
-    }
-
     fn mapping(len: usize) -> Mapping {
         OsMemory::map(len).unwrap()
     }
@@ -194,7 +190,11 @@ mod tests {
 
     #[test]
     fn extent_cache_enforces_slot_capacity_for_keep_policy() {
-        let mut cache = cache(ExtentPolicy::Keep, Budget::new(2, 1024 * 1024));
+        let mut cache = ExtentCache::new(
+            ExtentConfig::new()
+                .with_policy(ExtentPolicy::Keep)
+                .with_budget(Budget::new(2, 1024 * 1024)),
+        );
 
         assert!(cache.insert(mapping(4096)).is_ok());
         assert!(cache.insert(mapping(4096)).is_ok());
@@ -203,7 +203,11 @@ mod tests {
 
     #[test]
     fn extent_cache_enforces_byte_capacity_for_keep_policy() {
-        let mut cache = cache(ExtentPolicy::Keep, Budget::new(4, 4096));
+        let mut cache = ExtentCache::new(
+            ExtentConfig::new()
+                .with_policy(ExtentPolicy::Keep)
+                .with_budget(Budget::new(4, 4096)),
+        );
 
         assert!(cache.insert(mapping(4096)).is_ok());
         assert!(cache.insert(mapping(4096)).is_err());
@@ -211,7 +215,11 @@ mod tests {
 
     #[test]
     fn extent_cache_drop_policy_retains_nothing() {
-        let mut cache = cache(ExtentPolicy::Drop, Budget::new(32, 1024 * 1024));
+        let mut cache = ExtentCache::new(
+            ExtentConfig::new()
+                .with_policy(ExtentPolicy::Drop)
+                .with_budget(Budget::new(32, 1024 * 1024)),
+        );
 
         assert!(cache.insert(mapping(4096)).is_err());
         assert!(cache.take(4096).is_none());
@@ -219,7 +227,11 @@ mod tests {
 
     #[test]
     fn extent_cache_keep_policy_never_evicts_to_make_room() {
-        let mut cache = cache(ExtentPolicy::Keep, Budget::new(1, 8192));
+        let mut cache = ExtentCache::new(
+            ExtentConfig::new()
+                .with_policy(ExtentPolicy::Keep)
+                .with_budget(Budget::new(1, 8192)),
+        );
         let first = mapping(4096);
         let first_ptr = first.base();
 
