@@ -149,6 +149,7 @@ impl ThreadHeap {
         }
 
         // Inbox is empty after the optional flush above, so acquire_run will not flush again.
+        // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
         let run = unsafe { heap.as_mut() }.acquire_run(class, pages)?;
         self.cache_run(class, run);
         self.alloc_cached(class, heap)
