@@ -114,7 +114,10 @@ impl ExtentHeap {
         ptr: NonNull<u8>,
         pages: &PageMap,
     ) -> Result<(), ExtentHeapError> {
-        Self::validate_local_free(extent_ptr, ptr)?;
+        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
+        unsafe { extent_ptr.as_ref() }
+            .free(ptr)
+            .map_err(ExtentHeapError::from)?;
         self.retire(extent_ptr, pages)
     }
 
@@ -134,17 +137,6 @@ impl ExtentHeap {
             .map_err(ExtentHeapError::from)?;
         extent.validate_free(ptr).map_err(ExtentHeapError::from)?;
         Ok(())
-    }
-
-    /// Validate an owner-local free before the shared retire path.
-    fn validate_local_free(
-        extent_ptr: NonNull<Extent>,
-        ptr: NonNull<u8>,
-    ) -> Result<(), ExtentHeapError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
-        unsafe { extent_ptr.as_ref() }
-            .free(ptr)
-            .map_err(ExtentHeapError::from)
     }
 
     /// One retire path shared by local and remote-completed frees: unpublish the

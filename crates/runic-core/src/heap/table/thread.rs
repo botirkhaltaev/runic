@@ -133,21 +133,23 @@ impl ThreadHeap {
             return None;
         }
 
-        let heap = self.heap_mut();
+        let mut heap = self.bound_heap();
 
         if let Some(allocation) = self.alloc_cached(class, heap) {
             return Some(allocation);
         }
 
-        if !heap.inbox().is_empty() {
-            heap.flush(pages).ok()?;
+        // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
+        let heap_mut = unsafe { heap.as_mut() };
+        if !heap_mut.inbox().is_empty() {
+            heap_mut.flush(pages).ok()?;
             if let Some(allocation) = self.alloc_cached(class, heap) {
                 return Some(allocation);
             }
         }
 
         // Inbox is empty after the optional flush above, so acquire_run will not flush again.
-        let run = heap.acquire_run(class, pages)?;
+        let run = unsafe { heap.as_mut() }.acquire_run(class, pages)?;
         self.cache_run(class, run);
         self.alloc_cached(class, heap)
     }
@@ -166,7 +168,8 @@ impl ThreadHeap {
             return None;
         }
 
-        self.heap_mut().allocate_extent(spec, pages, init)
+        // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
+        unsafe { self.bound_heap().as_mut() }.allocate_extent(spec, pages, init)
     }
 
     /// Owner-local free for a run owned by the bound heap.
@@ -183,7 +186,7 @@ impl ThreadHeap {
             return Ok(false);
         }
 
-        let heap = self.heap_mut();
+        let mut heap = self.bound_heap();
         // SAFETY: PageMap stores only pointers published from this allocator's live arena.
         let class = unsafe { run.as_ref() }.class();
 
@@ -193,11 +196,13 @@ impl ThreadHeap {
                 .free_local(ptr)
                 .map_err(RunHeapError::from)
                 .map_err(HeapError::from)?;
-            heap.release_allocation();
+            // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
+            unsafe { heap.as_mut() }.release_allocation();
             return Ok(true);
         }
 
-        heap.free_run_owner(
+        // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
+        unsafe { heap.as_mut() }.free_run_owner(
             run,
             ptr,
             // SAFETY: inner is retained by this TLS entry while bound.
@@ -220,7 +225,8 @@ impl ThreadHeap {
             return Ok(false);
         }
 
-        self.heap_mut().free_extent_owner(
+        // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
+        unsafe { self.bound_heap().as_mut() }.free_extent_owner(
             extent,
             ptr,
             // SAFETY: inner is retained by this TLS entry while bound.
@@ -295,8 +301,11 @@ impl ThreadHeap {
         self.inner.get().is_null()
     }
 
-    fn alloc_cached(&self, class: SizeClassId, heap: &mut Heap) -> Option<NonNull<u8>> {
+    fn alloc_cached(&self, class: SizeClassId, mut heap: NonNull<Heap>) -> Option<NonNull<u8>> {
         let run = self.cached_run(class)?;
+
+        // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
+        let heap = unsafe { heap.as_mut() };
         let Some(allocation) = heap.alloc_from(run) else {
             self.clear_run(class);
             return None;
@@ -322,35 +331,26 @@ impl ThreadHeap {
         unsafe { self.runs.get_unchecked(class.index()) }
     }
 
-    /// Exclusive access to the bound heap.
-    ///
-    /// Callers must have already confirmed this TLS entry is bound (`matches` / heap-id check).
-    /// `ThreadHeap` is thread-local and stores the heap pointer in a `Cell`; this is the
-    /// interior-mutability bridge to the exclusive `Heap` binding.
-    #[expect(
-        clippy::mut_from_ref,
-        reason = "TLS ThreadHeap owns an exclusive Cell<*mut Heap> binding"
-    )]
-    fn heap_mut(&self) -> &mut Heap {
+    /// Bound heap pointer after a successful `matches` / heap-id check.
+    fn bound_heap(&self) -> NonNull<Heap> {
         let heap = self.heap.get();
         debug_assert!(!heap.is_null());
-        // SAFETY: ThreadHeap is thread-local; callers only use this while bound to a live heap.
-        unsafe { &mut *heap }
+        // SAFETY: callers reach this only after this TLS entry matched a bound allocator inner.
+        unsafe { NonNull::new_unchecked(heap) }
     }
 
     fn return_cached_runs(&self) {
-        let heap = self.heap.get();
-        if heap.is_null() {
+        let Some(mut heap) = NonNull::new(self.heap.get()) else {
             return;
-        }
-        // SAFETY: ThreadHeap is thread-local; heap is non-null while a binding is installed.
-        let heap = unsafe { &mut *heap };
+        };
 
         for run in &self.runs {
             let Some(run) = NonNull::new(run.replace(core::ptr::null_mut())) else {
                 continue;
             };
-            let _ = heap.runs.return_available(run);
+
+            // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
+            let _ = unsafe { heap.as_mut() }.runs.return_available(run);
         }
     }
 

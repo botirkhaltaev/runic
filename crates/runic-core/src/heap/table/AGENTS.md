@@ -6,6 +6,7 @@ Scope: `crates/runic-core/src/heap/table/`.
 - `Inbox` is a movable Treiber-style head of intrusive `RemoteList` batches; construct with `Inbox::new()`.
 - `RemoteList.first`/`.last` are plain `NonNull<u8>`, not `Option`: a list is only ever built from a non-empty batch, so construction (`RemoteList::from_ends`) and `Inbox::push_batch` never need to check or `expect` non-emptiness.
 - Keep `ThreadHeap` thin and composable: `bind` / `unbind`, owner-local `alloc` / `free` (runs) and `alloc_extent` / `free_extent` (extents), `bound`, and remote `batch` / `take_batch`. Do not mirror `Heap`/`HeapTable` allocate-dealloc routers on TLS. Extents have no sticky TLS slot cache; mapping reuse stays on `ExtentCache`.
+- Bound-heap access from TLS uses `bound_heap() -> NonNull<Heap>` plus local `as_mut()` at the call site; do not add `&mut Heap` from `&self` helpers that need `clippy::mut_from_ref` expects.
 - `ThreadHeap::bind` reuses a matching binding or unbinds a foreign one then `HeapTable::acquire`s; `unbind` returns cached runs, publishes outbound batches, and `retire`s the bound heap.
 - Remote frees use batched transport: `ThreadHeap::batch` coalesces onto `RemoteBatch`; callers `HeapTable::publish` returned lists. Do not add single-node push/pop façades.
 - Create heaps with `Heap::new` + `Arena::claim` / `insert` (inbox is movable; no placement-only install).

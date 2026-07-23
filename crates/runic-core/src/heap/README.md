@@ -8,7 +8,7 @@ Owner-local heap frontend: runs for small size classes, extents for dedicated la
 - `id.rs`: `HeapId` (slot index + generation).
 - `run/`: size-classed fixed-block runs (`Run`, `RunHeap` with `Arena<Run>`).
 - `extent/`: dedicated mappings (`Extent`, `ExtentHeap` with `Arena<Extent>`, `ExtentCache`).
-- `table/`: `HeapTable` (`acquire`/`retire`/`reclaim`, `heap`/`mode`, `publish`), `Inbox`, and `ThreadHeap` (`bind`/`alloc`/`free`/`batch`).
+- `table/`: `HeapTable` (`acquire`/`retire`/`reclaim`, `heap`/`mode`, `publish`), `Inbox`, and `ThreadHeap` (`bind`/`alloc`/`free`/`alloc_extent`/`free_extent`/`batch`).
 
 ## Invariants
 
