@@ -169,6 +169,7 @@ impl ThreadHeap {
     ///
     /// Returns `Ok(false)` when unbound or bound to a different heap (slow path).
     /// Sticky hit is the straight-line body; non-cached owner free is cold.
+    #[inline(always)]
     pub(crate) fn free(
         &self,
         inner: NonNull<AllocatorInner>,
@@ -205,6 +206,7 @@ impl ThreadHeap {
     /// Owner-local free for an extent owned by the bound heap.
     ///
     /// Returns `Ok(false)` when unbound or bound to a different heap (slow path).
+    #[inline(always)]
     pub(crate) fn free_extent(
         &self,
         inner: NonNull<AllocatorInner>,
