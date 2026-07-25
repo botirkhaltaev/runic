@@ -1,14 +1,14 @@
 //! Grow-on-demand mmap object table with an intrusive freelist.
 //!
 //! `new(max)` records a hard index limit only — no slots are mapped until
-//! `claim`. Growth maps chunk-sized slot groups via [`OsMemory::map`], linked
-//! from the arena (no `alloc::Vec`, no fat in-struct directory). Slots are empty
-//! or occupied only. Callers that fail after `claim` and before `insert` must
-//! `release` the index.
+//! `claim`. Growth maps chunk-sized slot groups via [`OsMemory::map`]. The newest
+//! chunk is a typed [`Chunk`] (owns its [`Mapping`]); older chunks stay linked
+//! from that mapping's header. Slots are empty or occupied only. Callers that
+//! fail after `claim` and before `insert` must `release` the index.
 
 use core::{mem::MaybeUninit, ptr::NonNull};
 
-use crate::memory::{OsMemory, PAGE_SIZE};
+use crate::memory::{Mapping, OsMemory, PAGE_SIZE};
 
 const FREE_END: u32 = u32::MAX;
 
@@ -21,17 +21,23 @@ pub(crate) struct Arena<T> {
     bump: usize,
     free_head: u32,
     slots_per_chunk: usize,
-    /// Intrusive list of chunk mappings; header lives at each mapping base.
-    chunks: Option<NonNull<ChunkHeader>>,
+    /// Newest chunk. Older chunks are linked through [`ChunkHeader::next`].
+    head: Option<Chunk<T>>,
     chunk_count: usize,
-    _marker: core::marker::PhantomData<T>,
+}
+
+/// One live slot chunk: owns the mmap and a typed pointer into its slot array.
+struct Chunk<T> {
+    mapping: Mapping,
+    base: NonNull<Slot<T>>,
+    len: usize,
 }
 
 /// Leading bytes of each chunk mapping; `next` links older chunks.
 #[repr(C)]
 struct ChunkHeader {
     next: Option<NonNull<ChunkHeader>>,
-    /// Byte length passed to `munmap` (page-rounded mapping size).
+    /// Byte length passed to `munmap` for older (non-head) chunks.
     bytes: usize,
     /// Slot count in this chunk.
     slots: usize,
@@ -48,9 +54,8 @@ impl<T> Arena<T> {
             bump: 0,
             free_head: FREE_END,
             slots_per_chunk: Self::slots_per_chunk(),
-            chunks: None,
+            head: None,
             chunk_count: 0,
-            _marker: core::marker::PhantomData,
         }
     }
 
@@ -140,11 +145,9 @@ impl<T> Arena<T> {
 
     fn ensure_chunk(&mut self, index: usize) -> Option<()> {
         let chunk_index = index / self.slots_per_chunk;
-        if self.chunk(chunk_index).is_some() {
+        if chunk_index < self.chunk_count {
             return Some(());
         }
-
-        // Chunks grow in order; the next chunk index equals the current count.
         if chunk_index != self.chunk_count {
             return None;
         }
@@ -159,31 +162,43 @@ impl<T> Arena<T> {
             .max(PAGE_SIZE);
         let mapping = OsMemory::map(byte_len)?;
         let bytes = mapping.len().get();
-        let base = mapping.base();
-        // Mapping ownership transfers into the chunk list; prevent double-unmap.
-        core::mem::forget(mapping);
+        let mapping_base = mapping.base();
+        let slot_base = Self::slots_base(mapping_base.cast());
 
-        let header_ptr = base.cast::<ChunkHeader>();
-        // SAFETY: fresh anonymous mapping of `bytes` bytes, uniquely owned here.
+        let older = self.head.take().map(|old| {
+            let older_header = old.mapping.base().cast::<ChunkHeader>();
+            // Older chunk stays reachable through the new header; drop its Mapping
+            // owner so Drop/munmap is unified through the header walk.
+            core::mem::forget(old.mapping);
+            older_header
+        });
+
+        let header_ptr = mapping_base.cast::<ChunkHeader>();
+        // SAFETY: fresh anonymous mapping of `bytes` bytes, uniquely owned by `mapping`.
         unsafe {
             header_ptr.write(ChunkHeader {
-                next: self.chunks,
+                next: older,
                 bytes,
                 slots,
             });
         }
-        self.chunks = Some(header_ptr);
+
+        self.head = Some(Chunk {
+            mapping,
+            base: slot_base,
+            len: slots,
+        });
         self.chunk_count += 1;
         Some(())
     }
 
-    fn chunk(&self, chunk_index: usize) -> Option<NonNull<ChunkHeader>> {
+    fn chunk_header(&self, chunk_index: usize) -> Option<NonNull<ChunkHeader>> {
         // Newest chunk is at the head; chunk 0 was allocated first → deepest.
         if chunk_index >= self.chunk_count {
             return None;
         }
         let from_head = self.chunk_count - 1 - chunk_index;
-        let mut cur = self.chunks?;
+        let mut cur = self.head.as_ref()?.mapping.base().cast::<ChunkHeader>();
         for _ in 0..from_head {
             // SAFETY: chunk list nodes are live headers in owned mappings.
             cur = unsafe { cur.as_ref().next? };
@@ -223,7 +238,18 @@ impl<T> Arena<T> {
 
         let chunk_index = index / self.slots_per_chunk;
         let offset = index % self.slots_per_chunk;
-        let header = self.chunk(chunk_index)?;
+
+        // Fast path: newest chunk holds the typed base directly.
+        if chunk_index + 1 == self.chunk_count {
+            let chunk = self.head.as_ref()?;
+            if offset >= chunk.len {
+                return None;
+            }
+            // SAFETY: offset is in-range for the head chunk's slot array.
+            return Some(unsafe { NonNull::new_unchecked(chunk.base.as_ptr().add(offset)) });
+        }
+
+        let header = self.chunk_header(chunk_index)?;
         // SAFETY: header is a live chunk in this arena's list.
         let slots = unsafe { header.as_ref().slots };
         if offset >= slots {
@@ -243,14 +269,21 @@ impl<T> Drop for Arena<T> {
             }
         }
 
-        let mut cur = self.chunks.take();
+        let Some(head) = self.head.take() else {
+            return;
+        };
+
+        let mut cur = Some(head.mapping.base().cast::<ChunkHeader>());
+        // Head Mapping would munmap on drop; walk all headers (including head) once.
+        core::mem::forget(head.mapping);
+
         while let Some(header) = cur {
             // SAFETY: each node is a chunk header we wrote at mapping base.
             let (next, bytes) = unsafe {
                 let header_ref = header.as_ref();
                 (header_ref.next, header_ref.bytes)
             };
-            // SAFETY: mapping was created by OsMemory::map and forgotten into this list.
+            // SAFETY: mapping was created by OsMemory::map for this chunk.
             unsafe {
                 libc::munmap(header.as_ptr().cast(), bytes);
             }
