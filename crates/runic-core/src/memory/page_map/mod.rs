@@ -112,12 +112,6 @@ impl PageMap {
         let expected = MapEntry::from_owner(expected).ok_or(PageMapError::InvalidRange)?;
         let l1 = self.l1().ok_or(PageMapError::UnexpectedEntry)?;
 
-        for segment in range.segments() {
-            if l1.l2_table_ref(segment.l1).is_none() {
-                return Err(PageMapError::UnexpectedEntry);
-            }
-        }
-
         let _guard = l1.lock_range(range);
         l1.stamp_remove(range, expected)
     }
