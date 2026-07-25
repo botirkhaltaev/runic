@@ -362,7 +362,7 @@ fn page_map_insert_range_rejects_existing_same_entry() {
 }
 
 #[test]
-fn page_map_overlap_rolls_back_partial_assign_and_retains_l2() {
+fn page_map_overlap_rejects_under_write_exclusion_and_retains_l2() {
     let mapping = TestMapping::new((L2_ENTRIES * 2 + 2) * PAGE_SIZE);
     let map = PageMap::new();
     let (_, base_l2) = Page::containing(mapping.base()).indexes().unwrap();
@@ -386,8 +386,9 @@ fn page_map_overlap_rolls_back_partial_assign_and_retains_l2() {
         Err(PageMapError::Overlap)
     );
 
-    // Failed insert may have installed the base L2 while CAS-assigning; L2 is retained for
-    // the PageMap lifetime, but rolled-back pages must read as empty.
+    // Failed insert may install the base L2 during install_l2s; validate-then-store under
+    // write exclusion writes nothing on overlap. Installed L2 is retained for the PageMap
+    // lifetime; rejected pages must read as empty.
     assert_eq!(map.get(mapping.base()), None);
     assert_eq!(map.get(overlap), Some(run(21)));
 }
@@ -486,4 +487,66 @@ fn page_map_remove_range_crosses_l2_boundary() {
     assert!(map.get(mapping.base()).is_none());
     assert!(map.get(boundary).is_none());
     assert!(map.get(last).is_none());
+}
+
+#[test]
+fn page_map_concurrent_disjoint_publish() {
+    let left = TestMapping::new(PAGE_SIZE);
+    let right = TestMapping::new(PAGE_SIZE);
+    let map = PageMap::new();
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            assert_eq!(map.insert(left.page_range(), run(1)), Ok(()));
+        });
+        scope.spawn(|| {
+            assert_eq!(map.insert(right.page_range(), run(2)), Ok(()));
+        });
+    });
+
+    assert_eq!(map.get(left.base()), Some(run(1)));
+    assert_eq!(map.get(right.base()), Some(run(2)));
+}
+
+#[test]
+fn page_map_concurrent_same_l2_disjoint_pages() {
+    let mapping = TestMapping::new(PAGE_SIZE * 2);
+    let map = PageMap::new();
+    let first = PageRange::from_aligned(mapping.base(), PAGE_SIZE).unwrap();
+    let second = PageRange::from_aligned(mapping.ptr_at(PAGE_SIZE), PAGE_SIZE).unwrap();
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            assert_eq!(map.insert(first, run(1)), Ok(()));
+        });
+        scope.spawn(|| {
+            assert_eq!(map.insert(second, run(2)), Ok(()));
+        });
+    });
+
+    assert_eq!(map.get(mapping.base()), Some(run(1)));
+    assert_eq!(map.get(mapping.ptr_at(PAGE_SIZE)), Some(run(2)));
+}
+
+#[test]
+fn page_map_concurrent_overlap_exactly_one_wins() {
+    let mapping = TestMapping::new(PAGE_SIZE);
+    let map = PageMap::new();
+    let range = mapping.page_range();
+
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| map.insert(range, run(1)));
+        let second = scope.spawn(|| map.insert(range, run(2)));
+        (first.join().unwrap(), second.join().unwrap())
+    });
+
+    match (first, second) {
+        (Ok(()), Err(PageMapError::Overlap)) => {
+            assert_eq!(map.get(mapping.base()), Some(run(1)));
+        }
+        (Err(PageMapError::Overlap), Ok(())) => {
+            assert_eq!(map.get(mapping.base()), Some(run(2)));
+        }
+        other => panic!("expected exactly one winner, got {other:?}"),
+    }
 }

@@ -18,6 +18,21 @@ pub(super) struct L1Table {
     pub(super) entries: [L1Entry; L1_ENTRIES],
 }
 
+/// Exclusive stamp access to every distinct L1 entry touched by `range`.
+///
+/// Locks in ascending L1 order on construction; unlocks on drop so insert/remove
+/// cannot forget an unlock across early returns.
+pub(super) struct L1WriteGuard<'a> {
+    l1: &'a L1Table,
+    range: PageRange,
+}
+
+impl Drop for L1WriteGuard<'_> {
+    fn drop(&mut self) {
+        self.l1.unlock_range(self.range);
+    }
+}
+
 impl L1Table {
     pub(super) fn page_entry(&self, l1_index: L1Index, l2_index: L2Index) -> Option<MapEntry> {
         self.entries.get(l1_index.get())?.page_entry(l2_index)
@@ -30,28 +45,32 @@ impl L1Table {
     }
 
     /// Lock distinct L1 entries in ascending L1 order (segment iteration order).
-    pub(super) fn lock_range(&self, range: PageRange) {
+    ///
+    /// Caller must have installed L2s for every touched index (insert) or accept
+    /// that missing L2 is reported by the subsequent stamp (remove).
+    pub(super) fn lock_range(&self, range: PageRange) -> L1WriteGuard<'_> {
         let mut prev = None;
         for segment in range.segments() {
             if prev == Some(segment.l1) {
                 continue;
             }
-            if let Ok(entry) = self.entry(segment.l1) {
-                entry.lock_write();
-            }
+            self.entry(segment.l1)
+                .expect("PageMap: PageRange L1 index must be in-bounds")
+                .lock_write();
             prev = Some(segment.l1);
         }
+        L1WriteGuard { l1: self, range }
     }
 
-    pub(super) fn unlock_range(&self, range: PageRange) {
+    fn unlock_range(&self, range: PageRange) {
         let mut prev = None;
         for segment in range.segments() {
             if prev == Some(segment.l1) {
                 continue;
             }
-            if let Ok(entry) = self.entry(segment.l1) {
-                entry.unlock_write();
-            }
+            self.entry(segment.l1)
+                .expect("PageMap: PageRange L1 index must be in-bounds")
+                .unlock_write();
             prev = Some(segment.l1);
         }
     }
@@ -113,6 +132,13 @@ impl L1Table {
     }
 }
 
+/// One L1 slot: atomic L2 pointer, per-L2 stamp exclusion, and L2 mmap ownership.
+///
+/// # Zero-fill
+///
+/// Anonymous mmap of [`L1Table`] yields valid empty `L1Entry` values: `AtomicPtr` null,
+/// `AtomicBool` `false` (unlocked), and `Option<Mapping>` all-zero niche = `None`.
+/// Do not add fields that break that niche without an explicit init path.
 #[repr(C)]
 pub(super) struct L1Entry {
     table: AtomicPtr<L2Table>,
@@ -125,7 +151,8 @@ pub(super) struct L1Entry {
 
 // SAFETY: `table` is published atomically for lock-free get. `write` serializes stamp mutation
 // for this L2. `mapping` is written once by the install CAS winner and read only on exclusive
-// `PageMap` drop — `get` never touches it.
+// `PageMap` drop — `get` never touches it. Zero-filled mmap is a valid empty entry (null table,
+// unlocked write, `None` mapping).
 unsafe impl Sync for L1Entry {}
 
 impl L1Entry {
@@ -235,5 +262,23 @@ impl L2Table {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod zero_fill_tests {
+    use super::*;
+
+    #[test]
+    fn l1_entry_zeroed_is_unlocked_null_table_none_mapping() {
+        // SAFETY: proves the mmap zero-fill niches documented on `L1Entry`: null `AtomicPtr`,
+        // `AtomicBool` false, and `Option<Mapping>` all-zero = `None`.
+        let entry: L1Entry = unsafe { core::mem::zeroed() };
+
+        assert!(entry.table.load(Ordering::Relaxed).is_null());
+        assert!(!entry.write.load(Ordering::Relaxed));
+        // SAFETY: exclusive local value; no concurrent readers of `mapping`.
+        assert!(unsafe { (*entry.mapping.get()).is_none() });
+        assert!(entry.l2_table_ref().is_none());
     }
 }

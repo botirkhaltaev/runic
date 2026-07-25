@@ -103,26 +103,16 @@ impl PageMap {
             l1.entry(segment.l1)?.install_l2()?;
         }
 
-        l1.lock_range(range);
-        let result = l1.stamp_insert(range, value);
-        l1.unlock_range(range);
-        result
+        let _guard = l1.lock_range(range);
+        l1.stamp_insert(range, value)
     }
 
     fn remove(&self, range: PageRange, expected: PageOwner) -> Result<(), PageMapError> {
         let expected = MapEntry::from_owner(expected).ok_or(PageMapError::InvalidRange)?;
         let l1 = self.l1().ok_or(PageMapError::UnexpectedEntry)?;
 
-        for segment in range.segments() {
-            if l1.entry(segment.l1)?.l2_table_ref().is_none() {
-                return Err(PageMapError::UnexpectedEntry);
-            }
-        }
-
-        l1.lock_range(range);
-        let result = l1.stamp_remove(range, expected);
-        l1.unlock_range(range);
-        result
+        let _guard = l1.lock_range(range);
+        l1.stamp_remove(range, expected)
     }
 
     fn l1(&self) -> Option<&L1Table> {
