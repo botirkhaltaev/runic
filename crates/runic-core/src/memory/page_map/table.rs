@@ -16,11 +16,12 @@ use super::{
 /// L1 root: dense hot L2 tips for lock-free `get`, cold write + Mapping sidebands.
 ///
 /// Profile evidence (PR7):
-/// - Dense tip words (`*8`) beat master's fat `L1Entry` (`*32`) on the get walk.
+/// - Dense tip words (`*8`) beat master's fat L1 slots (`*32`) on the get walk.
 /// - `AtomicBool` on [`L2Table`] rounds each L2 mmap to `0x9000` and regresses large.
-/// - AoS `L1Cold { write, mapping }` kept L2 at `0x8000` but lost the small-churn win
-///   (callgrind: fatter `dealloc` codegen). Keep tips + Mapping SoA like the churn
-///   winner, park write in its own cold array, keep [`L2Table`] at exactly `0x8000`.
+/// - Pairing write with `Mapping` in one cold slot kept L2 at `0x8000` but lost the
+///   small-churn win (callgrind: fatter `dealloc` codegen). Keep tips + `Mapping` as
+///   separate arrays like the churn winner, park write in its own cold array, keep
+///   [`L2Table`] at exactly `0x8000`.
 ///
 /// # Zero-fill
 ///
