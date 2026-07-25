@@ -154,14 +154,6 @@ impl Heap {
         self.extents.allocate(spec, self.id, pages, init)
     }
 
-    pub(crate) fn free_run(
-        &mut self,
-        run: NonNull<Run>,
-        ptr: NonNull<u8>,
-    ) -> Result<(), RunHeapError> {
-        self.runs.free(run, ptr)
-    }
-
     /// Owner-local non-cached free: flush inbox if needed, then free.
     ///
     /// Callable via a TLS-bound `Heap` without taking the table mutex. Does not wrap the
@@ -175,24 +167,7 @@ impl Heap {
         if !self.inbox.is_empty() {
             self.flush(pages)?;
         }
-        self.free_run(run, ptr).map_err(HeapError::from)
-    }
-
-    pub(crate) fn complete_remote_run(
-        &mut self,
-        run: NonNull<Run>,
-        ptr: NonNull<u8>,
-    ) -> Result<(), RunHeapError> {
-        self.runs.complete_remote_free(run, ptr)
-    }
-
-    pub(crate) fn free_extent(
-        &mut self,
-        extent: NonNull<Extent>,
-        ptr: NonNull<u8>,
-        pages: &PageMap,
-    ) -> Result<(), ExtentHeapError> {
-        self.extents.free(extent, ptr, pages)
+        self.runs.free(run, ptr).map_err(HeapError::from)
     }
 
     /// Owner-local extent free: flush inbox if needed, then free.
@@ -205,17 +180,9 @@ impl Heap {
         if !self.inbox.is_empty() {
             self.flush(pages)?;
         }
-        self.free_extent(extent, ptr, pages)
+        self.extents
+            .free(extent, ptr, pages)
             .map_err(HeapError::from)
-    }
-
-    pub(crate) fn complete_remote_extent(
-        &mut self,
-        extent: NonNull<Extent>,
-        ptr: NonNull<u8>,
-        pages: &PageMap,
-    ) -> Result<(), ExtentHeapError> {
-        self.extents.complete_remote_free(extent, ptr, pages)
     }
 
     pub(crate) fn flush(&mut self, pages: &PageMap) -> Result<(), HeapError> {
@@ -223,10 +190,10 @@ impl Heap {
             for ptr in list {
                 match pages.get(ptr) {
                     Some(crate::memory::PageOwner::Run(run)) => {
-                        self.complete_remote_run(run, ptr)?;
+                        self.runs.complete_remote_free(run, ptr)?;
                     }
                     Some(crate::memory::PageOwner::Extent(extent)) => {
-                        self.complete_remote_extent(extent, ptr, pages)?;
+                        self.extents.complete_remote_free(extent, ptr, pages)?;
                     }
                     None => return Err(HeapError::InvalidPointer),
                 }
@@ -238,6 +205,6 @@ impl Heap {
 
     /// Live ownership for Draining reclaim: any run with outstanding blocks, or any extent.
     pub(crate) fn has_live_allocations(&self) -> bool {
-        self.runs.has_live_allocations() || self.extents.has_live_allocations()
+        self.runs.has_live_blocks() || self.extents.has_live_extents()
     }
 }

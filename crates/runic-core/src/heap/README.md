@@ -15,6 +15,7 @@ Owner-local heap frontend: runs for small size classes, extents for dedicated la
 - Every `Run` and `Extent` stores a `HeapId`; there is no root/central ownership heap.
 - Small allocations are owned by a heap's runs; large allocations by that heap's extents.
 - Cross-thread frees use claim → inbox enqueue → owner (or draining) flush; they do not mutate freelists directly.
-- Draining reclaim observes live ownership on the heaps themselves: any run with `live > 0` (allocated or remote-pending) or any occupied extent. There is no side allocation counter on `Heap`.
+- Draining reclaim observes live ownership on the heaps themselves via `RunHeap::has_live_blocks` and `ExtentHeap::has_live_extents` (composed by `Heap::has_live_allocations`). There is no side allocation counter on `Heap`.
+- Owner free composition stays on `Heap::free_*_owner` / `flush`; call `runs` / `extents` entity methods directly elsewhere — no Heap free pass-throughs.
 - `Heap` modes: `Free` (reusable), `Active` (TLS owner), `Draining` (post-exit until empty).
 - `HeapTable::generations[]` owns `HeapId` ABA / reincarnation checks.

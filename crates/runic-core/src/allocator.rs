@@ -414,7 +414,7 @@ impl Allocator {
                     .heap_mut(heap_id)
                     .ok_or(AllocatorError::InvalidMetadata)?;
                 heap.flush(pages).map_err(AllocatorError::from)?;
-                heap.free_run(run, ptr).map_err(AllocatorError::from)?;
+                heap.runs.free(run, ptr).map_err(AllocatorError::from)?;
                 let _ = table.reclaim(heap_id);
                 Ok(())
             }
@@ -477,7 +477,8 @@ impl Allocator {
                     .heap_mut(heap_id)
                     .ok_or(AllocatorError::InvalidMetadata)?;
                 heap.flush(pages).map_err(AllocatorError::from)?;
-                heap.free_extent(extent, ptr, pages)
+                heap.extents
+                    .free(extent, ptr, pages)
                     .map_err(AllocatorError::from)?;
                 let _ = table.reclaim(heap_id);
                 Ok(())
@@ -865,13 +866,13 @@ mod tests {
         {
             let owner = table.heap_mut(id).unwrap();
             assert_eq!(owner.flush(inner_ref.pages()), Ok(()));
-            assert_eq!(owner.free_run(first_run, first), Ok(()));
+            assert_eq!(owner.runs.free(first_run, first), Ok(()));
         }
         let _ = table.reclaim(id);
         {
             let owner = table.heap_mut(id).unwrap();
             assert_eq!(owner.flush(inner_ref.pages()), Ok(()));
-            assert_eq!(owner.free_run(second_run, second), Ok(()));
+            assert_eq!(owner.runs.free(second_run, second), Ok(()));
         }
         let _ = table.reclaim(id);
     }
@@ -891,7 +892,7 @@ mod tests {
             {
                 let owner = table.heap_mut(heap).unwrap();
                 assert_eq!(owner.flush(inner_ref.pages()), Ok(()));
-                assert_eq!(owner.free_run(run, ptr), Ok(()));
+                assert_eq!(owner.runs.free(run, ptr), Ok(()));
             }
             let _ = table.reclaim(heap);
         }

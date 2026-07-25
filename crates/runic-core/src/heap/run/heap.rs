@@ -92,7 +92,7 @@ impl RunHeap {
     }
 
     /// Any occupied run with outstanding allocated or remote-pending blocks.
-    pub(crate) fn has_live_allocations(&self) -> bool {
+    pub(crate) fn has_live_blocks(&self) -> bool {
         let len = self.runs.len();
         for index in 0..len {
             if self.runs.get(index).is_some_and(Run::has_live_blocks) {

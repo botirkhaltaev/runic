@@ -9,7 +9,7 @@ Scope: `crates/runic-core/src/heap/run/`.
 - `ThreadHeap::alloc` sticky hit calls `Run::allocate` in-line (symmetric with sticky `Run::free_local`); miss (cold) flushes at most once, retries sticky, then `acquire_run` and parks the run.
 - On heap reincarnation, `RunHeap::rebind_heap_id` stamps every occupied arena run (not only `available[]`), so sticky/off-list runs cannot keep a stale `HeapId`.
 - `BlockStates` is one `AtomicU8` per block for this run's capacity, an `AddressRange` over the run mapping's state tail after the `RUN_SIZE` payload — not a packed bitmap and not a worst-case inline array. It is the only free/allocated/remote-pending tracker; do not add a second freelist or bitset.
-- `Run::allocate` freelist hits trust run-owned freelist bases (`owned_block_index` / `owned_block_ptr` with `block_index` debug checks); `free_local` and remote paths still validate user pointers with `block_at`.
-- `Run::has_live_blocks` / `RunHeap::has_live_allocations` are the reclaim model for outstanding small ownership (including remote-pending); do not reintroduce a heap-level alloc side counter.
+- Freelist identity is `Option<BlockIndex>` (head + intrusive next index in the block). `allocate` pops/bumps an index then `block_ptr`; do not store raw user pointers in the freelist head or add trusted-pointer helper forks. `free_local` and remote paths validate user pointers with `block_at`.
+- `Run::has_live_blocks` / `RunHeap::has_live_blocks` are the reclaim model for outstanding small ownership (including remote-pending); do not reintroduce a heap-level alloc side counter.
 - Runs are retained in v0.5: no empty-run PageMap unpublish or OS release.
 - Prefer entity methods over free helpers for allocate/free/remote paths.
