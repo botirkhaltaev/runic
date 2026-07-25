@@ -17,7 +17,7 @@ pub(crate) mod table;
 pub(crate) use extent::Extent;
 pub(crate) use extent::heap::{ExtentHeap, ExtentHeapError, ExtentInit};
 pub(crate) use id::HeapId;
-pub(crate) use run::{RUN_SIZE, Run, RunError, RunHeap, RunHeapError, RunId};
+pub(crate) use run::{Run, RunError, RunHeap, RunHeapError, RunId};
 pub(crate) use table::{HeapError, HeapTable, Inbox, THREAD_HEAP};
 
 #[repr(u8)]

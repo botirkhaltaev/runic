@@ -2,7 +2,7 @@ use core::ptr::NonNull;
 
 use crate::{
     arena::Arena,
-    heap::{HeapId, RUN_SIZE, Run, RunError, RunId},
+    heap::{HeapId, Run, RunError, RunId},
     layout::LayoutSpec,
     memory::{OsMemory, PageMap},
     size_class::{SizeClassId, SizeClasses},
@@ -61,7 +61,7 @@ impl RunHeap {
         heap_id: HeapId,
         pages: &PageMap,
     ) -> Option<NonNull<Run>> {
-        let mapping = OsMemory::map(RUN_SIZE)?;
+        let mapping = OsMemory::map(Run::mapping_len(class)?)?;
         let index = self.runs.claim()?;
         let Some(id) = RunId::from_index(u32::try_from(index).ok()?) else {
             self.runs.release(index);
@@ -240,12 +240,13 @@ mod tests {
     use core::alloc::Layout;
 
     use crate::{
-        heap::{HeapId, RUN_SIZE, Run, RunId},
+        heap::{HeapId, Run, RunId},
         layout::LayoutSpec,
         memory::{OsMemory, PageMap, PageOwner},
         size_class::SizeClasses,
     };
 
+    use super::super::RUN_SIZE;
     use super::*;
 
     fn layout_spec(size: usize, align: usize) -> LayoutSpec {
@@ -257,8 +258,8 @@ mod tests {
     }
 
     fn reusable_run(id: RunId) -> Run {
-        let mapping = OsMemory::map(RUN_SIZE).unwrap();
         let class = class_id(64, 8);
+        let mapping = OsMemory::map(Run::mapping_len(class).unwrap()).unwrap();
         let heap = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
 
         Run::new(id, heap, mapping, class).expect("reusable test run")
