@@ -6,7 +6,6 @@ use core::{
 };
 
 use crate::{
-    allocator::Allocator,
     heap::{Extent, Run},
     memory::{Mapping, OsMemory, PAGE_SIZE},
 };
@@ -100,60 +99,30 @@ impl PageMap {
         let value = MapEntry::from_owner(entry).ok_or(PageMapError::InvalidRange)?;
         let l1 = self.l1_or_init()?;
 
-        for (installed, segment) in range.segments().enumerate() {
-            if let Err(error) = l1.entry(segment.l1)?.assign_segment(segment.l2, value) {
-                self.rollback_insert(range, value, installed);
-                return Err(error);
-            }
+        for segment in range.segments() {
+            l1.entry(segment.l1)?.install_l2()?;
         }
 
-        Ok(())
+        l1.lock_range(range);
+        let result = l1.stamp_insert(range, value);
+        l1.unlock_range(range);
+        result
     }
 
     fn remove(&self, range: PageRange, expected: PageOwner) -> Result<(), PageMapError> {
         let expected = MapEntry::from_owner(expected).ok_or(PageMapError::InvalidRange)?;
         let l1 = self.l1().ok_or(PageMapError::UnexpectedEntry)?;
 
-        for (cleared, segment) in range.segments().enumerate() {
-            if let Err(error) = l1.entry(segment.l1)?.clear_segment(segment.l2, expected) {
-                self.restore_remove(range, expected, cleared);
-                return Err(error);
+        for segment in range.segments() {
+            if l1.entry(segment.l1)?.l2_table_ref().is_none() {
+                return Err(PageMapError::UnexpectedEntry);
             }
         }
 
-        Ok(())
-    }
-
-    fn rollback_insert(&self, range: PageRange, value: MapEntry, installed: usize) {
-        let Some(l1) = self.l1() else {
-            return;
-        };
-
-        for segment in range.segments().take(installed) {
-            if l1
-                .entry(segment.l1)
-                .and_then(|entry| entry.clear_segment(segment.l2, value))
-                .is_err()
-            {
-                Allocator::abort();
-            }
-        }
-    }
-
-    fn restore_remove(&self, range: PageRange, expected: MapEntry, cleared: usize) {
-        let Some(l1) = self.l1() else {
-            Allocator::abort();
-        };
-
-        for segment in range.segments().take(cleared) {
-            if l1
-                .entry(segment.l1)
-                .and_then(|entry| entry.assign_segment(segment.l2, expected))
-                .is_err()
-            {
-                Allocator::abort();
-            }
-        }
+        l1.lock_range(range);
+        let result = l1.stamp_remove(range, expected);
+        l1.unlock_range(range);
+        result
     }
 
     fn l1(&self) -> Option<&L1Table> {

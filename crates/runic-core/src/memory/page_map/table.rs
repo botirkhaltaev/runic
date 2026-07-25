@@ -2,18 +2,15 @@ use core::{
     cell::UnsafeCell,
     mem::size_of,
     ptr::NonNull,
-    sync::atomic::{AtomicPtr, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, Ordering},
 };
 
-use crate::{
-    allocator::Allocator,
-    memory::{Mapping, OsMemory},
-};
+use crate::memory::{Mapping, OsMemory};
 
 use super::{
     L1_ENTRIES, L2_ENTRIES, PageMapError,
     entry::{AtomicMapEntry, MapEntry},
-    page::{L1Index, L2Index, L2Segment},
+    page::{L1Index, L2Index, L2Segment, PageRange},
 };
 
 #[repr(C)]
@@ -31,18 +28,104 @@ impl L1Table {
             .get(index.get())
             .ok_or(PageMapError::InvalidRange)
     }
+
+    /// Lock distinct L1 entries in ascending L1 order (segment iteration order).
+    pub(super) fn lock_range(&self, range: PageRange) {
+        let mut prev = None;
+        for segment in range.segments() {
+            if prev == Some(segment.l1) {
+                continue;
+            }
+            if let Ok(entry) = self.entry(segment.l1) {
+                entry.lock_write();
+            }
+            prev = Some(segment.l1);
+        }
+    }
+
+    pub(super) fn unlock_range(&self, range: PageRange) {
+        let mut prev = None;
+        for segment in range.segments() {
+            if prev == Some(segment.l1) {
+                continue;
+            }
+            if let Ok(entry) = self.entry(segment.l1) {
+                entry.unlock_write();
+            }
+            prev = Some(segment.l1);
+        }
+    }
+
+    /// Validate empty then store. Caller must hold write locks for every touched L1 entry.
+    pub(super) fn stamp_insert(
+        &self,
+        range: PageRange,
+        value: MapEntry,
+    ) -> Result<(), PageMapError> {
+        let empty = MapEntry::empty();
+        for segment in range.segments() {
+            let table = self
+                .entry(segment.l1)?
+                .l2_table_ref()
+                .ok_or(PageMapError::MetadataAllocFailed)?;
+            if !table.segment_matches(segment.l2, empty)? {
+                return Err(PageMapError::Overlap);
+            }
+        }
+
+        for segment in range.segments() {
+            let table = self
+                .entry(segment.l1)?
+                .l2_table_ref()
+                .ok_or(PageMapError::MetadataAllocFailed)?;
+            table.write_pages(segment.l2, value)?;
+        }
+
+        Ok(())
+    }
+
+    /// Validate expected then clear. Caller must hold write locks for every touched L1 entry.
+    pub(super) fn stamp_remove(
+        &self,
+        range: PageRange,
+        expected: MapEntry,
+    ) -> Result<(), PageMapError> {
+        for segment in range.segments() {
+            let table = self
+                .entry(segment.l1)?
+                .l2_table_ref()
+                .ok_or(PageMapError::UnexpectedEntry)?;
+            if !table.segment_matches(segment.l2, expected)? {
+                return Err(PageMapError::UnexpectedEntry);
+            }
+        }
+
+        let empty = MapEntry::empty();
+        for segment in range.segments() {
+            let table = self
+                .entry(segment.l1)?
+                .l2_table_ref()
+                .ok_or(PageMapError::UnexpectedEntry)?;
+            table.write_pages(segment.l2, empty)?;
+        }
+
+        Ok(())
+    }
 }
 
 #[repr(C)]
 pub(super) struct L1Entry {
     table: AtomicPtr<L2Table>,
+    /// Per-L2 stamp exclusion. Zero-filled mmap ⇒ unlocked (`false`).
+    write: AtomicBool,
     /// Once installed, retained until `PageMap` drop. Written only by the CAS winner of
     /// [`Self::install_l2`]; read only under exclusive `PageMap::Drop`.
     mapping: UnsafeCell<Option<Mapping>>,
 }
 
-// SAFETY: `table` is published atomically for lock-free get. `mapping` is written once by the
-// install CAS winner and read only on exclusive `PageMap` drop — `get` never touches it.
+// SAFETY: `table` is published atomically for lock-free get. `write` serializes stamp mutation
+// for this L2. `mapping` is written once by the install CAS winner and read only on exclusive
+// `PageMap` drop — `get` never touches it.
 unsafe impl Sync for L1Entry {}
 
 impl L1Entry {
@@ -83,6 +166,20 @@ impl L1Entry {
         self.l2_table_ref().ok_or(PageMapError::MetadataAllocFailed)
     }
 
+    pub(super) fn lock_write(&self) {
+        while self
+            .write
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+    }
+
+    pub(super) fn unlock_write(&self) {
+        self.write.store(false, Ordering::Release);
+    }
+
     pub(super) fn drop_l2_mapping(&mut self) {
         if self.table.load(Ordering::Acquire).is_null() {
             return;
@@ -90,24 +187,6 @@ impl L1Entry {
 
         self.table.store(core::ptr::null_mut(), Ordering::Release);
         let _ = self.mapping.get_mut().take();
-    }
-
-    pub(super) fn assign_segment(
-        &self,
-        segment: L2Segment,
-        value: MapEntry,
-    ) -> Result<(), PageMapError> {
-        self.install_l2()?.assign_segment(segment, value)
-    }
-
-    pub(super) fn clear_segment(
-        &self,
-        segment: L2Segment,
-        expected: MapEntry,
-    ) -> Result<(), PageMapError> {
-        self.l2_table_ref()
-            .ok_or(PageMapError::UnexpectedEntry)?
-            .clear_segment(segment, expected)
     }
 
     fn page_entry(&self, index: L2Index) -> Option<MapEntry> {
@@ -126,8 +205,22 @@ impl L2Table {
         if page.is_empty() { None } else { Some(page) }
     }
 
-    /// CAS each page `empty → value`. On mid-segment failure, reverse-CAS installed pages.
-    pub(super) fn assign_segment(
+    /// Caller must hold this L2's write exclusion.
+    pub(super) fn segment_matches(
+        &self,
+        segment: L2Segment,
+        expected: MapEntry,
+    ) -> Result<bool, PageMapError> {
+        let pages = self
+            .pages
+            .get(segment.range())
+            .ok_or(PageMapError::InvalidRange)?;
+
+        Ok(pages.iter().all(|entry| entry.load() == expected))
+    }
+
+    /// Caller must hold this L2's write exclusion.
+    pub(super) fn write_pages(
         &self,
         segment: L2Segment,
         value: MapEntry,
@@ -137,44 +230,10 @@ impl L2Table {
             .get(segment.range())
             .ok_or(PageMapError::InvalidRange)?;
 
-        let empty = MapEntry::empty();
-        for (written, entry) in entries.iter().enumerate() {
-            if entry.compare_exchange(empty, value).is_err() {
-                Self::reverse_cas(entries, written, value, empty);
-                return Err(PageMapError::Overlap);
-            }
+        for entry in entries {
+            entry.store(value);
         }
 
         Ok(())
-    }
-
-    /// CAS each page `expected → empty`. On mid-segment failure, reverse-CAS to restore.
-    pub(super) fn clear_segment(
-        &self,
-        segment: L2Segment,
-        expected: MapEntry,
-    ) -> Result<(), PageMapError> {
-        let entries = self
-            .pages
-            .get(segment.range())
-            .ok_or(PageMapError::InvalidRange)?;
-
-        let empty = MapEntry::empty();
-        for (cleared, entry) in entries.iter().enumerate() {
-            if entry.compare_exchange(expected, empty).is_err() {
-                Self::reverse_cas(entries, cleared, empty, expected);
-                return Err(PageMapError::UnexpectedEntry);
-            }
-        }
-
-        Ok(())
-    }
-
-    fn reverse_cas(entries: &[AtomicMapEntry], count: usize, from: MapEntry, to: MapEntry) {
-        for entry in entries.iter().take(count) {
-            if entry.compare_exchange(from, to).is_err() {
-                Allocator::abort();
-            }
-        }
     }
 }

@@ -17,17 +17,11 @@ impl AtomicMapEntry {
         }
     }
 
-    pub(super) fn compare_exchange(
-        &self,
-        current: MapEntry,
-        new: MapEntry,
-    ) -> Result<(), MapEntry> {
-        // Release on success pairs with `load`'s Acquire in `get`. Failure is Relaxed:
-        // the caller only needs the observed value, not a sync edge.
-        self.raw
-            .compare_exchange(current.raw, new.raw, Ordering::Release, Ordering::Relaxed)
-            .map(|_| ())
-            .map_err(|raw| MapEntry { raw })
+    /// Release store pairs with [`Self::load`]'s Acquire in `get`.
+    ///
+    /// Caller must hold the owning L2 write exclusion.
+    pub(super) fn store(&self, entry: MapEntry) {
+        self.raw.store(entry.raw, Ordering::Release);
     }
 }
 
