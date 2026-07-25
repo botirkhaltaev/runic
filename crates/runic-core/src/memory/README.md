@@ -7,10 +7,10 @@ Memory modules own address ranges, OS mappings, and page-indexed pointer lookup.
 - `address.rs`: ownership-free `AddressRange` geometry and pointer offset checks.
 - `os.rs`: `OsMemory::map` and `Mapping` (mmap ownership; `Drop` munmaps).
 - `page_map/`: page-indexed lookup from user pointers to `PageOwner` metadata pointers.
-  - `mod.rs`: `PageMap` API (`publish_run`, `publish_extent`/`unpublish_extent`, `get`) — publish takes `&Mapping`; once-only L1/L2 CAS install; stamps under tip bit-lock `L1WriteGuard`; lock-free `get` walks L1 tip → masked L2 tip → page entry.
+  - `mod.rs`: `PageMap` API (`publish_run`, `publish_extent`/`unpublish_extent`, `get`) — publish takes `&Mapping`; once-only L1/L2 CAS install; stamps under `L1WriteGuard`; lock-free `get` walks L1 tip → dense L2 tip → page entry.
   - `entry.rs`: `MapEntry` / `AtomicMapEntry` tagged-pointer encoding (`load` / `store`).
   - `page.rs`: page/index arithmetic and per-L1-table range segmentation.
-  - `table.rs`: `L1Table` (hot tip array + cold `mappings`), `L1WriteGuard`, `L2Table` (exactly `0x8000` page stamps; write exclusion is tip bit 0).
+  - `table.rs`: `L1Table` (hot `tables` + cold `L1Cold`), `L1WriteGuard`, `L2Table` (exactly `0x8000` page stamps).
   - `tests.rs`: page-map unit tests (including concurrent publish smoke).
 - `mod.rs`: module exports.
 
@@ -20,15 +20,15 @@ Memory modules own address ranges, OS mappings, and page-indexed pointer lookup.
 - `AddressRange` does not own mmap lifecycle; it is copyable geometry only.
 - Every returned pointer maps to exactly one `PageOwner` while allocated.
 - `PageOwner` pointers must refer to live arena entries until their page-map range is removed.
-- Page-map insertion rejects overlapping ownership (validate under tip bit-lock, then store; Drop unlocks).
-- Page-map removal validates the expected owner under tip bit-lock before clearing; failed remove leaves the map unchanged.
+- Page-map insertion rejects overlapping ownership (validate under `L1WriteGuard`, then store; Drop unlocks).
+- Page-map removal validates the expected owner under `L1WriteGuard` before clearing; failed remove leaves the map unchanged.
 - Runs and extents share one page-map representation: every page in a published range gets its own direct entry. There is no secondary encoding and no silent fallback between representations.
-- L1 hot tips are dense `AtomicPtr` words; bit 0 is the per-L2 write lock; L2 mmap ownership lives in parallel `mappings`. `L2Table` stays eight pages. `get` masks bit 0 and never takes the lock.
+- L1 hot tips are dense `AtomicPtr` words; write exclusion and L2 mmap ownership live in parallel `L1Cold`. `L2Table` stays eight pages. `get` never reads cold cells or takes write locks.
 
 ## Intentional scope decisions (v0.5)
 
 - No opaque `PageOwner` pointer: it stays a concrete `Run`/`Extent` enum since every caller immediately needs the typed pointer.
 - No further L1 densify beyond hot tip words: the table spans the full 48-bit address space and depends on OS lazy paging; VA shape not revisited without profiling data.
 - No empty-L2 reclaim: once an L2 is installed it remains until `PageMap` drop.
-- No global PageMap stamp mutex: exclusion is per tip so disjoint address regions can publish concurrently.
+- No global PageMap stamp mutex: exclusion is per L2 so disjoint address regions can publish concurrently.
 - Consumers that self-host inside a `Mapping` (e.g. `AllocatorInner`) must drop other fields before that `Mapping` munmaps; see `allocator.rs` `Drop`.

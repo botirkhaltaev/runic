@@ -2,7 +2,7 @@ use core::{
     cell::UnsafeCell,
     mem::size_of,
     ptr::NonNull,
-    sync::atomic::{AtomicPtr, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, Ordering},
 };
 
 use crate::memory::{Mapping, OsMemory};
@@ -13,26 +13,35 @@ use super::{
     page::{L1Index, L2Index, L2Segment, PageRange},
 };
 
-/// Write-exclusion flag stolen from the page-aligned L2 tip pointer (bit 0).
-const WRITE_BIT: usize = 1;
-
-/// L1 root: dense hot tips (get) + cold Mapping ownership sideband (install/drop).
+/// L1 root: dense hot tips for `get`, cold write+Mapping sideband for install/stamp.
 ///
-/// Per-L2 stamp exclusion uses [`WRITE_BIT`] on the tip pointer so [`L2Table`] stays
-/// exactly eight pages (`0x8000`). `get` masks the bit off after Acquire load.
+/// Profile evidence (PR7): tip-only densify wins small churn; putting `AtomicBool` on
+/// `L2Table` rounds L2 mmaps to `0x9000` and regresses large; tip-bit locks also
+/// regress large stamp paths. Keep [`L2Table`] at exactly `0x8000` and park write
+/// exclusion next to Mapping ownership (install/drop / stamp only).
 ///
 /// # Zero-fill
 ///
-/// Anonymous mmap yields null tips and `mappings` niche `None`.
+/// Anonymous mmap yields null tips, unlocked `write`, `mappings` niche `None`.
 #[repr(C)]
 pub(super) struct L1Table {
-    /// Hot get/stamp tips. Null ⇒ no L2. Bit 0 ⇒ write lock held (only when non-null).
+    /// Hot get path only. Indexed by [`L1Index`]; null ⇒ no L2 installed.
     tables: [AtomicPtr<L2Table>; L1_ENTRIES],
-    /// L2 mmap ownership. Written by install CAS winner; read only on `PageMap` drop.
-    mappings: [UnsafeCell<Option<Mapping>>; L1_ENTRIES],
+    /// Stamp exclusion + L2 mmap ownership. Not read by `get`.
+    cold: [L1Cold; L1_ENTRIES],
 }
 
-/// Exclusive stamp access to every distinct L1 tip touched by `range`.
+/// Cold per-L1 state: stamp exclusion and L2 mmap ownership.
+#[repr(C)]
+struct L1Cold {
+    write: AtomicBool,
+    mapping: UnsafeCell<Option<Mapping>>,
+}
+
+// SAFETY: `write` serializes stamp mutation for the paired L2. `mapping` is written once by the
+// install CAS winner and read only on exclusive `PageMap` drop — `get` never touches `L1Cold`.
+unsafe impl Sync for L1Cold {}
+
 pub(super) struct L1WriteGuard<'a> {
     l1: &'a L1Table,
     range: PageRange,
@@ -45,7 +54,6 @@ impl Drop for L1WriteGuard<'_> {
 }
 
 impl L1Table {
-    /// Lock-free owner lookup. Touches only tip words + L2 page slots — never `mappings`.
     #[inline]
     pub(super) fn owner(&self, l1_index: L1Index, l2_index: L2Index) -> Option<PageOwner> {
         let l2 = self.l2_table_ref(l1_index)?;
@@ -54,11 +62,9 @@ impl L1Table {
 
     #[inline]
     pub(super) fn l2_table_ref(&self, index: L1Index) -> Option<&L2Table> {
-        let raw = self.tip_slot(index).load(Ordering::Acquire);
-        let addr = raw.addr() & !WRITE_BIT;
-        let table = NonNull::new(core::ptr::with_exposed_provenance_mut(addr))?;
+        let table = NonNull::new(self.tip_slot(index).load(Ordering::Acquire))?;
 
-        // SAFETY: published L2 tip (bit 0 masked) lives for the PageMap lifetime.
+        // SAFETY: published L2 tip lives for the PageMap lifetime.
         Some(unsafe { table.as_ref() })
     }
 
@@ -70,7 +76,6 @@ impl L1Table {
         let mapping =
             OsMemory::map(size_of::<L2Table>()).ok_or(PageMapError::MetadataAllocFailed)?;
         let ptr = mapping.base().cast::<L2Table>().as_ptr();
-        debug_assert_eq!(ptr.addr() & WRITE_BIT, 0);
 
         match self.tip_slot(index).compare_exchange(
             core::ptr::null_mut(),
@@ -79,9 +84,9 @@ impl L1Table {
             Ordering::Acquire,
         ) {
             Ok(_) => {
-                // SAFETY: this thread won the null→ptr CAS; sole writer of `mappings[index]`.
+                // SAFETY: this thread won the null→ptr CAS; sole writer of `cold.mapping`.
                 unsafe {
-                    *self.mapping_slot(index).get() = Some(mapping);
+                    *self.cold_slot(index).mapping.get() = Some(mapping);
                 }
             }
             Err(_) => {
@@ -99,7 +104,7 @@ impl L1Table {
             if prev == Some(segment.l1) {
                 continue;
             }
-            self.lock_tip(segment.l1);
+            self.cold_slot(segment.l1).lock_write();
             prev = Some(segment.l1);
         }
         L1WriteGuard { l1: self, range }
@@ -111,43 +116,8 @@ impl L1Table {
             if prev == Some(segment.l1) {
                 continue;
             }
-            self.unlock_tip(segment.l1);
+            self.cold_slot(segment.l1).unlock_write();
             prev = Some(segment.l1);
-        }
-    }
-
-    fn lock_tip(&self, index: L1Index) {
-        let slot = self.tip_slot(index);
-        loop {
-            let cur = slot.load(Ordering::Relaxed);
-            let unlocked_addr = cur.addr() & !WRITE_BIT;
-            assert!(
-                unlocked_addr != 0,
-                "PageMap: L2 must be installed before stamp lock"
-            );
-            let unlocked = core::ptr::with_exposed_provenance_mut(unlocked_addr);
-            let locked = core::ptr::with_exposed_provenance_mut(unlocked_addr | WRITE_BIT);
-            if slot
-                .compare_exchange(unlocked, locked, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-            {
-                return;
-            }
-            core::hint::spin_loop();
-        }
-    }
-
-    fn unlock_tip(&self, index: L1Index) {
-        let slot = self.tip_slot(index);
-        loop {
-            let cur = slot.load(Ordering::Relaxed);
-            let unlocked = core::ptr::with_exposed_provenance_mut(cur.addr() & !WRITE_BIT);
-            if slot
-                .compare_exchange(cur, unlocked, Ordering::Release, Ordering::Relaxed)
-                .is_ok()
-            {
-                return;
-            }
         }
     }
 
@@ -202,13 +172,12 @@ impl L1Table {
     }
 
     pub(super) fn drop_l2_mappings(&mut self) {
-        for (table, mapping) in self.tables.iter_mut().zip(self.mappings.iter_mut()) {
-            let raw = table.get_mut().addr() & !WRITE_BIT;
-            if raw == 0 {
+        for (table, cold) in self.tables.iter_mut().zip(self.cold.iter_mut()) {
+            if table.get_mut().is_null() {
                 continue;
             }
             *table.get_mut() = core::ptr::null_mut();
-            let _ = mapping.get_mut().take();
+            let _ = cold.mapping.get_mut().take();
         }
     }
 
@@ -219,13 +188,29 @@ impl L1Table {
     }
 
     #[inline]
-    fn mapping_slot(&self, index: L1Index) -> &UnsafeCell<Option<Mapping>> {
+    fn cold_slot(&self, index: L1Index) -> &L1Cold {
         // SAFETY: `L1Index` is only constructed for values `< L1_ENTRIES`.
-        unsafe { self.mappings.get_unchecked(index.get()) }
+        unsafe { self.cold.get_unchecked(index.get()) }
     }
 }
 
-/// Per-page stamps. Exactly eight pages — write exclusion lives in the L1 tip bit.
+impl L1Cold {
+    fn lock_write(&self) {
+        while self
+            .write
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+    }
+
+    fn unlock_write(&self) {
+        self.write.store(false, Ordering::Release);
+    }
+}
+
+/// Per-page stamps. Exactly eight pages (`0x8000`).
 #[repr(C)]
 pub(super) struct L2Table {
     pub(super) pages: [AtomicMapEntry; L2_ENTRIES],
@@ -277,16 +262,16 @@ mod zero_fill_tests {
     use super::*;
 
     #[test]
-    fn tip_zeroed_is_null_and_l2_is_eight_pages() {
-        let tip: AtomicPtr<L2Table> = AtomicPtr::new(core::ptr::null_mut());
-        assert!(tip.load(Ordering::Relaxed).is_null());
-        assert_eq!(size_of::<L2Table>(), 0x8000);
+    fn l1_cold_zeroed_is_unlocked_none_mapping() {
+        // SAFETY: proves mmap zero-fill niches on cold `L1Cold`.
+        let cold: L1Cold = unsafe { core::mem::zeroed() };
+        assert!(!cold.write.load(Ordering::Relaxed));
+        // SAFETY: exclusive local value.
+        assert!(unsafe { (*cold.mapping.get()).is_none() });
     }
 
     #[test]
-    fn mapping_slot_zeroed_is_none() {
-        // SAFETY: proves `Option<Mapping>` all-zero niche used by L1 sideband mmap.
-        let mapping: Option<Mapping> = unsafe { core::mem::zeroed() };
-        assert!(mapping.is_none());
+    fn l2_table_is_exact_eight_pages() {
+        assert_eq!(size_of::<L2Table>(), 0x8000);
     }
 }
