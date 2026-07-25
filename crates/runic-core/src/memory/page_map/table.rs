@@ -1,11 +1,8 @@
 use core::{
-    cell::UnsafeCell,
     mem::size_of,
     ptr::NonNull,
     sync::atomic::{AtomicBool, AtomicPtr, Ordering},
 };
-
-use crate::memory::{Mapping, OsMemory};
 
 use super::{
     L1_ENTRIES, L2_ENTRIES, PageMapError, PageOwner,
@@ -13,24 +10,22 @@ use super::{
     page::{L1Index, L2Index, L2Segment, PageRange},
 };
 
-/// L1 root: compact hot slots for get/stamp, cold mapping ownership sideband.
+/// Hot L1 root: tip + write exclusion only (16-byte stride).
 ///
-/// Each [`L1Slot`] is 16 bytes (`AtomicPtr` + `AtomicBool`) so get/stamp share tip
-/// locality without pulling `Mapping` into the hot line. `get` loads only `table`.
+/// L2 mmap ownership is registered sparsely on [`super::PageMap`] (install/drop only),
+/// so `get` and stamp never first-touch a parallel Mapping sideband.
 ///
 /// # Zero-fill
 ///
-/// Anonymous mmap yields valid empty state: null tips, unlocked write, `mappings` niche `None`.
+/// Anonymous mmap yields null tips and unlocked `write`.
 #[repr(C)]
 pub(super) struct L1Table {
     slots: [L1Slot; L1_ENTRIES],
-    /// L2 mmap ownership. Written by install CAS winner; read only on `PageMap` drop.
-    mappings: [UnsafeCell<Option<Mapping>>; L1_ENTRIES],
 }
 
-/// Hot per-L1 tip + stamp exclusion. 16-byte stride (half the old 32-byte combined entry).
+/// Hot per-L1 tip + stamp exclusion. 16-byte stride (half the old tip+write+Mapping entry).
 #[repr(C)]
-struct L1Slot {
+pub(super) struct L1Slot {
     table: AtomicPtr<L2Table>,
     /// Per-L2 stamp exclusion. Zero-filled mmap ⇒ unlocked (`false`).
     write: AtomicBool,
@@ -58,7 +53,7 @@ impl Drop for L1WriteGuard<'_> {
 }
 
 impl L1Table {
-    /// Lock-free owner lookup. Touches only slot tips + the L2 page slot — never `mappings`.
+    /// Lock-free owner lookup. Touches only slot tips + the L2 page slot.
     #[inline]
     pub(super) fn owner(&self, l1_index: L1Index, l2_index: L2Index) -> Option<PageOwner> {
         let l2 = self.l2_table_ref(l1_index)?;
@@ -73,35 +68,18 @@ impl L1Table {
         Some(unsafe { table.as_ref() })
     }
 
-    pub(super) fn install_l2(&self, index: L1Index) -> Result<&L2Table, PageMapError> {
-        if let Some(table) = self.l2_table_ref(index) {
-            return Ok(table);
-        }
-
-        let mapping =
-            OsMemory::map(size_of::<L2Table>()).ok_or(PageMapError::MetadataAllocFailed)?;
-        let ptr = mapping.base().cast::<L2Table>().as_ptr();
-        let slot = self.slot(index);
-
-        match slot.table.compare_exchange(
+    /// Once-only null→tip CAS. `Ok(())` means this thread published `ptr`; `Err` means another
+    /// tip is already live (caller must drop its unused mapping).
+    pub(super) fn cas_tip(&self, index: L1Index, ptr: *mut L2Table) -> Result<(), *mut L2Table> {
+        match self.slot(index).table.compare_exchange(
             core::ptr::null_mut(),
             ptr,
             Ordering::Release,
             Ordering::Acquire,
         ) {
-            Ok(_) => {
-                // SAFETY: this thread won the null→ptr CAS; sole writer of `mappings[index]`.
-                unsafe {
-                    *self.mapping_slot(index).get() = Some(mapping);
-                }
-            }
-            Err(_) => {
-                drop(mapping);
-            }
+            Ok(_) => Ok(()),
+            Err(current) => Err(current),
         }
-
-        self.l2_table_ref(index)
-            .ok_or(PageMapError::MetadataAllocFailed)
     }
 
     /// Lock distinct L1 slots in ascending L1 order (segment iteration order).
@@ -180,13 +158,9 @@ impl L1Table {
         Ok(())
     }
 
-    pub(super) fn drop_l2_mappings(&mut self) {
-        for (slot, mapping) in self.slots.iter_mut().zip(self.mappings.iter_mut()) {
-            if slot.table.get_mut().is_null() {
-                continue;
-            }
+    pub(super) fn clear_tips(&mut self) {
+        for slot in &mut self.slots {
             *slot.table.get_mut() = core::ptr::null_mut();
-            let _ = mapping.get_mut().take();
         }
     }
 
@@ -194,12 +168,6 @@ impl L1Table {
     fn slot(&self, index: L1Index) -> &L1Slot {
         // SAFETY: `L1Index` is only constructed for values `< L1_ENTRIES`.
         unsafe { self.slots.get_unchecked(index.get()) }
-    }
-
-    #[inline]
-    fn mapping_slot(&self, index: L1Index) -> &UnsafeCell<Option<Mapping>> {
-        // SAFETY: `L1Index` is only constructed for values `< L1_ENTRIES`.
-        unsafe { self.mappings.get_unchecked(index.get()) }
     }
 }
 
@@ -219,10 +187,14 @@ impl L1Slot {
     }
 }
 
+/// Per-page stamps. Sized for an exact 8-page mmap (`L2_ENTRIES * 8 == 0x8000`).
 #[repr(C)]
 pub(super) struct L2Table {
     pub(super) pages: [AtomicMapEntry; L2_ENTRIES],
 }
+
+const _: () = assert!(size_of::<L2Table>() == L2_ENTRIES * size_of::<AtomicMapEntry>());
+const _: () = assert!(size_of::<L2Table>() == 0x8000);
 
 impl L2Table {
     #[inline]
@@ -279,9 +251,7 @@ mod zero_fill_tests {
     }
 
     #[test]
-    fn l1_mapping_slot_zeroed_is_none() {
-        // SAFETY: proves `Option<Mapping>` all-zero niche used by L1 sideband mmap.
-        let mapping: Option<Mapping> = unsafe { core::mem::zeroed() };
-        assert!(mapping.is_none());
+    fn l2_table_is_exact_eight_pages() {
+        assert_eq!(size_of::<L2Table>(), 0x8000);
     }
 }
