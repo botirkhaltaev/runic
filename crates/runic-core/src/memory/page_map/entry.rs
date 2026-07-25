@@ -19,7 +19,7 @@ impl AtomicMapEntry {
 
     /// Release store pairs with [`Self::load`]'s Acquire in `get`.
     ///
-    /// Caller must hold the owning L2 write exclusion.
+    /// Caller must hold the `L1Table` write flag for this entry's L2.
     pub(super) fn store(&self, entry: MapEntry) {
         self.raw.store(entry.raw, Ordering::Release);
     }
