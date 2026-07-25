@@ -62,7 +62,7 @@ impl PageMap {
         }
     }
 
-    /// Lock-free ownership lookup: L1 tip → dense L2 tip → page entry → [`PageOwner`].
+    /// Lock-free ownership lookup: L1 root → `tables[l1]` → page entry → [`PageOwner`].
     #[inline]
     pub(crate) fn get(&self, ptr: NonNull<u8>) -> Option<PageOwner> {
         let (l1_index, l2_index) = Page::containing(ptr).indexes()?;

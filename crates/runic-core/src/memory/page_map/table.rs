@@ -1,6 +1,6 @@
 use core::{
     cell::UnsafeCell,
-    mem::size_of,
+    mem::{offset_of, size_of},
     ptr::NonNull,
     sync::atomic::{AtomicBool, AtomicPtr, Ordering},
 };
@@ -13,19 +13,15 @@ use super::{
     page::{L1Index, L2Index, L2Segment, PageRange},
 };
 
-/// L1 root: dense hot L2 tips for lock-free `get`, cold write + Mapping sidebands.
+/// L1 root for lock-free `get` and cold install/stamp state.
 ///
-/// Profile evidence (PR7):
-/// - Dense tip words (`*8`) beat master's fat L1 slots (`*32`) on the get walk.
-/// - `AtomicBool` on [`L2Table`] rounds each L2 mmap to `0x9000` and regresses large.
-/// - Pairing write with `Mapping` in one cold slot kept L2 at `0x8000` but lost the
-///   small-churn win (callgrind: fatter `dealloc` codegen). Keep tips + `Mapping` as
-///   separate arrays like the churn winner, park write in its own cold array, keep
-///   [`L2Table`] at exactly `0x8000`.
+/// Layout (hot first): dense `tables` for `get`, then per-L2 `writes` and `mappings`.
+/// `get` indexes only `tables`. Stamp exclusion stays off [`L2Table`] so each L2 mmap
+/// remains exactly eight pages (`0x8000`).
 ///
 /// # Zero-fill
 ///
-/// Anonymous mmap yields null tips, unlocked writes, `mappings` niche `None`.
+/// Anonymous mmap yields null `tables`, unlocked `writes`, and `mappings` niche `None`.
 #[repr(C)]
 pub(super) struct L1Table {
     /// Hot get path only. Indexed by [`L1Index`]; null ⇒ no L2 installed.
@@ -35,6 +31,8 @@ pub(super) struct L1Table {
     /// L2 mmap ownership. Written by install CAS winner; read only on `PageMap` drop.
     mappings: [UnsafeCell<Option<Mapping>>; L1_ENTRIES],
 }
+
+const _: () = assert!(offset_of!(L1Table, tables) == 0);
 
 /// Exclusive stamp access to every distinct L2 touched by `range`.
 ///
@@ -225,14 +223,14 @@ impl L1Table {
 // exclusive `PageMap` drop — `get` never touches cold arrays. Zero-filled mmap is valid.
 unsafe impl Sync for L1Table {}
 
-/// Per-page stamps. Exactly eight pages (`0x8000`).
+/// Per-page stamps for one L1 slot. Exactly eight pages (`0x8000`).
 ///
 /// # Zero-fill
 ///
 /// Anonymous mmap yields empty `pages`.
 #[repr(C)]
 pub(super) struct L2Table {
-    pub(super) pages: [AtomicMapEntry; L2_ENTRIES],
+    pages: [AtomicMapEntry; L2_ENTRIES],
 }
 
 const _: () = assert!(size_of::<L2Table>() == 0x8000);
@@ -240,12 +238,16 @@ const _: () = assert!(size_of::<L2Table>() == 0x8000);
 impl L2Table {
     #[inline]
     pub(super) fn owner(&self, index: L2Index) -> Option<PageOwner> {
-        // SAFETY: `L2Index` is only constructed for values `< L2_ENTRIES`.
-        let entry = unsafe { self.pages.get_unchecked(index.get()) };
-        entry.load().owner()
+        self.entry(index).owner()
     }
 
-    /// Caller must hold this L2's write exclusion.
+    #[inline]
+    pub(super) fn entry(&self, index: L2Index) -> MapEntry {
+        // SAFETY: `L2Index` is only constructed for values `< L2_ENTRIES`.
+        unsafe { self.pages.get_unchecked(index.get()) }.load()
+    }
+
+    /// Caller must hold [`L1Table`] write exclusion for this L2's L1 index.
     pub(super) fn segment_matches(
         &self,
         segment: L2Segment,
@@ -259,7 +261,7 @@ impl L2Table {
         Ok(pages.iter().all(|entry| entry.load() == expected))
     }
 
-    /// Caller must hold this L2's write exclusion.
+    /// Caller must hold [`L1Table`] write exclusion for this L2's L1 index.
     pub(super) fn write_pages(
         &self,
         segment: L2Segment,
@@ -285,6 +287,18 @@ mod zero_fill_tests {
     #[test]
     fn l2_table_is_exact_eight_pages() {
         assert_eq!(size_of::<L2Table>(), 0x8000);
+    }
+
+    #[test]
+    fn l1_hot_tables_are_first_field() {
+        assert_eq!(offset_of!(L1Table, tables), 0);
+    }
+
+    #[test]
+    fn l1_table_slot_zeroed_is_null() {
+        // SAFETY: proves mmap zero-fill on hot L2 pointers.
+        let table: AtomicPtr<L2Table> = unsafe { core::mem::zeroed() };
+        assert!(table.load(Ordering::Relaxed).is_null());
     }
 
     #[test]

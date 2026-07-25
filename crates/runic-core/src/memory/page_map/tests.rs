@@ -1,5 +1,5 @@
+use super::table::L2Table;
 use super::*;
-use super::{entry::AtomicMapEntry, table::L2Table};
 
 fn owner_ptr<T>(raw: u32) -> NonNull<T> {
     let addr = (usize::try_from(raw).unwrap() + 1) << 4;
@@ -31,11 +31,7 @@ fn l2_table_for(map: &PageMap, ptr: NonNull<u8>) -> Option<&L2Table> {
 
 fn direct_entry(map: &PageMap, ptr: NonNull<u8>) -> Option<MapEntry> {
     let (_, l2_index) = Page::containing(ptr).indexes()?;
-
-    l2_table_for(map, ptr)?
-        .pages
-        .get(l2_index.get())
-        .map(AtomicMapEntry::load)
+    Some(l2_table_for(map, ptr)?.entry(l2_index))
 }
 
 struct TestMapping {
@@ -176,6 +172,21 @@ fn page_map_remove_range_retains_empty_l2_table_for_stable_reads() {
 
     assert!(map.get(mapping.base()).is_none());
     assert!(has_l2_table(&map, mapping.base()));
+}
+
+#[test]
+fn page_map_remove_rejects_never_published_range_and_keeps_existing() {
+    let published = TestMapping::new(PAGE_SIZE);
+    let map = PageMap::new();
+    assert!(map.insert(published.page_range(), extent(1)).is_ok());
+
+    let stranger = TestMapping::new(PAGE_SIZE);
+    assert_eq!(
+        map.remove(stranger.page_range(), extent(2)),
+        Err(PageMapError::UnexpectedEntry)
+    );
+    assert_eq!(map.get(published.base()), Some(extent(1)));
+    assert!(map.get(stranger.base()).is_none());
 }
 
 #[test]
@@ -432,9 +443,7 @@ fn page_map_insert_extent_range_crosses_l2_boundary() {
     assert_eq!(map.get(last), Some(extent(10)));
 }
 
-/// A single L2 table has 4096 page slots; many more than 64 (the old span-slot
-/// bound) single-page extents must coexist in one table without failing, since
-/// extents now use the same unbounded direct-entry representation as runs.
+/// Many single-page extents share one L2 via direct per-page entries.
 #[test]
 fn page_map_many_single_page_extents_share_one_l2_table_without_exhaustion() {
     const EXTENT_COUNT: usize = 200;
