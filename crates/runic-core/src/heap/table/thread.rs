@@ -134,12 +134,12 @@ impl ThreadHeap {
             return None;
         }
 
-        let mut heap = self.bound_heap();
+        let heap = self.bound_heap();
         let cell = self.run_cell(class);
 
-        if let Some(run) = NonNull::new(cell.get()) {
-            // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
-            match unsafe { heap.as_mut() }.alloc_from(run) {
+        if let Some(mut run) = NonNull::new(cell.get()) {
+            // SAFETY: sticky run pointers are published from this heap's live arena.
+            match unsafe { run.as_mut() }.allocate() {
                 Some(ptr) => return Some(ptr),
                 None => cell.set(core::ptr::null_mut()),
             }
@@ -181,7 +181,6 @@ impl ThreadHeap {
             return Ok(false);
         }
 
-        let mut heap_ptr = self.bound_heap();
         // SAFETY: PageMap stores only pointers published from this allocator's live arena.
         let class = unsafe { run.as_ref() }.class();
 
@@ -191,13 +190,11 @@ impl ThreadHeap {
                 .free_local(ptr)
                 .map_err(RunHeapError::from)
                 .map_err(HeapError::from)?;
-            // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
-            unsafe { heap_ptr.as_mut() }.release_allocation();
             return Ok(true);
         }
 
         // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
-        unsafe { heap_ptr.as_mut() }.free_run_owner(
+        unsafe { self.bound_heap().as_mut() }.free_run_owner(
             run,
             ptr,
             // SAFETY: inner is retained by this TLS entry while bound.
@@ -309,8 +306,9 @@ impl ThreadHeap {
         let heap_mut = unsafe { heap.as_mut() };
         if !heap_mut.inbox().is_empty() {
             heap_mut.flush(pages).ok()?;
-            if let Some(run) = NonNull::new(cell.get()) {
-                if let Some(ptr) = heap_mut.alloc_from(run) {
+            if let Some(mut run) = NonNull::new(cell.get()) {
+                // SAFETY: sticky run pointers are published from this heap's live arena.
+                if let Some(ptr) = unsafe { run.as_mut() }.allocate() {
                     return Some(ptr);
                 }
                 cell.set(core::ptr::null_mut());
@@ -318,9 +316,10 @@ impl ThreadHeap {
         }
 
         // Inbox is empty after the optional flush above, so acquire_run will not flush again.
-        let run = heap_mut.acquire_run(class, pages)?;
+        let mut run = heap_mut.acquire_run(class, pages)?;
         cell.set(run.as_ptr());
-        heap_mut.alloc_from(run)
+        // SAFETY: run was just returned by this heap's live arena.
+        unsafe { run.as_mut() }.allocate()
     }
 
     fn run_cell(&self, class: SizeClassId) -> &Cell<*mut Run> {

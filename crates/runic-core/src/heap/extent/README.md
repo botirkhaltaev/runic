@@ -18,6 +18,7 @@ Extent metadata owns dedicated large allocations.
 - Frees must use the exact returned pointer, not an interior pointer.
 - Remote frees claim pending before enqueue; only the owning heap (or draining freer) completes the free.
 - `ExtentHeap::free` and `ExtentHeap::complete_remote_free` each validate through their own path (local CAS vs. remote-pending check) and then retire through one shared `retire` method: unpublish, remove the arena slot, offer the mapping to `ExtentCache`.
+- Live large ownership for reclaim is occupied arena presence (`ExtentHeap::has_live_allocations`).
 - Page-map entries must be removed before extent metadata is removed.
 - `ExtentInit::Zeroed` memsets only on cache hits (size from `LayoutSpec`); fresh anonymous mappings skip that memset.
 - `ExtentCache` retention must stay within configured slot and byte budgets; `Keep` never evicts an already-retained mapping to admit a new one, and reuse is always exact-length.

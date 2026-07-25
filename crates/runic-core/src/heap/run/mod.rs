@@ -330,6 +330,12 @@ impl Run {
         unsafe { &*self.state.get() }.live < self.capacity
     }
 
+    /// Outstanding blocks on this run (allocated or remote-pending).
+    pub(crate) fn has_live_blocks(&self) -> bool {
+        // SAFETY: read under owner-local access or table-locked reclaim.
+        unsafe { &*self.state.get() }.live != 0
+    }
+
     pub(crate) fn set_available_next(&self, next: Option<NonNull<Run>>) {
         // SAFETY: owner-local methods are called only by the owning heap.
         unsafe { &mut *self.state.get() }.available_next = next;
@@ -352,13 +358,12 @@ impl Run {
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
         let (index, ptr) = if let Some(ptr) = state.pop_free() {
-            let block = self.block_at(ptr)?;
-            (block.index(), ptr)
+            // Freelist nodes are only block bases previously returned by this run.
+            (self.owned_block_index(ptr), ptr)
         } else {
             let index = state.allocate_fresh(self.capacity)?;
-            (index, self.block_ptr(index)?)
+            (index, self.owned_block_ptr(index))
         };
-        debug_assert_eq!(self.block_at(ptr).map(RunBlock::index), Some(index));
         self.blocks.allocate(index).ok()?;
 
         debug_assert!(state.live < self.capacity);
@@ -367,6 +372,7 @@ impl Run {
     }
 
     pub(crate) fn free_local(&self, ptr: NonNull<u8>) -> Result<RunFreeStatus, RunError> {
+        // User pointers stay fully validated; freelist reuse trusts `owned_block_index`.
         let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
@@ -482,12 +488,31 @@ impl Run {
         Some(RunBlock::new(BlockIndex::new(index), ptr))
     }
 
-    fn block_ptr(&self, index: BlockIndex) -> Option<NonNull<u8>> {
-        if index.get() >= self.capacity {
-            return None;
-        }
+    /// Block index for a pointer known to be a freelist/bump base in this run.
+    fn owned_block_index(&self, ptr: NonNull<u8>) -> BlockIndex {
+        let offset = ptr.as_ptr().addr() - self.range().base().as_ptr().addr();
+        let index = if let Some(shift) = self.block_shift {
+            offset >> shift
+        } else {
+            offset / self.block_size
+        };
+        debug_assert_eq!(self.block_index(offset), Some(index));
+        debug_assert_eq!(
+            self.block_at(ptr).map(RunBlock::index),
+            Some(BlockIndex::new(index))
+        );
+        BlockIndex::new(index)
+    }
 
-        RunBlock::at_offset(index, self.range().base(), self.block_size).map(RunBlock::ptr)
+    /// Payload pointer for a bump index known to be in `0..capacity`.
+    fn owned_block_ptr(&self, index: BlockIndex) -> NonNull<u8> {
+        debug_assert!(index.get() < self.capacity);
+        // SAFETY: `allocate_fresh` only yields `index < capacity`, so the offset is in-range.
+        unsafe {
+            RunBlock::at_offset(index, self.range().base(), self.block_size)
+                .unwrap_unchecked()
+                .ptr()
+        }
     }
 
     fn block_index(&self, offset: usize) -> Option<usize> {

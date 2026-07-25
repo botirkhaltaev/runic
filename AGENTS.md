@@ -64,7 +64,7 @@ GlobalAlloc
      -> OsMemory
      -> HeapTable { generations[], slots: Arena<Heap> }
          -> ThreadHeap
-     -> Heap { mode, RunHeap, ExtentHeap, alloc_count, Inbox }
+     -> Heap { mode, RunHeap, ExtentHeap, Inbox }
          -> RunHeap { Arena<Run>, available[] } -> Run (HeapId, BlockStates)
          -> ExtentHeap { Arena<Extent>, cache } -> Extent (HeapId)
 ```
