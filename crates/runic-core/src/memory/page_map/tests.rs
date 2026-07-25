@@ -1,8 +1,5 @@
 use super::*;
-use super::{
-    entry::AtomicMapEntry,
-    table::{L1Entry, L2Table},
-};
+use super::{entry::AtomicMapEntry, table::L2Table};
 
 fn owner_ptr<T>(raw: u32) -> NonNull<T> {
     let addr = (usize::try_from(raw).unwrap() + 1) << 4;
@@ -24,7 +21,7 @@ fn has_l2_table(map: &PageMap, ptr: NonNull<u8>) -> bool {
 
     map.l1()
         .and_then(|l1| l1.entries.get(l1_index.get()))
-        .is_some_and(L1Entry::has_l2_table)
+        .is_some_and(|entry| entry.l2_table_ref().is_some())
 }
 
 fn l2_table_for(map: &PageMap, ptr: NonNull<u8>) -> Option<&L2Table> {
@@ -365,7 +362,7 @@ fn page_map_insert_range_rejects_existing_same_entry() {
 }
 
 #[test]
-fn page_map_overlap_validation_does_not_allocate_empty_l2_tables() {
+fn page_map_overlap_rolls_back_partial_assign_and_retains_l2() {
     let mapping = TestMapping::new((L2_ENTRIES * 2 + 2) * PAGE_SIZE);
     let map = PageMap::new();
     let (_, base_l2) = Page::containing(mapping.base()).indexes().unwrap();
@@ -389,7 +386,8 @@ fn page_map_overlap_validation_does_not_allocate_empty_l2_tables() {
         Err(PageMapError::Overlap)
     );
 
-    assert!(!has_l2_table(&map, mapping.base()));
+    // Failed insert may have installed the base L2 while CAS-assigning; L2 is retained for
+    // the PageMap lifetime, but rolled-back pages must read as empty.
     assert_eq!(map.get(mapping.base()), None);
     assert_eq!(map.get(overlap), Some(run(21)));
 }

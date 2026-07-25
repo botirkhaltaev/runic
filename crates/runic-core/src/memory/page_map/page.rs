@@ -104,10 +104,6 @@ impl L2Segment {
 
         start..end
     }
-
-    pub(super) fn pages(self) -> u32 {
-        self.pages.get_u32()
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -123,10 +119,6 @@ impl PageCount {
 
     pub(super) fn get(self) -> usize {
         usize::from(self.value.get())
-    }
-
-    pub(super) fn get_u32(self) -> u32 {
-        u32::from(self.value.get())
     }
 }
 
