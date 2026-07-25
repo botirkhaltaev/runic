@@ -134,18 +134,17 @@ impl ThreadHeap {
             return None;
         }
 
-        let heap = self.bound_heap();
         let cell = self.run_cell(class);
 
-        if let Some(mut run) = NonNull::new(cell.get()) {
+        if let Some(run) = NonNull::new(cell.get()) {
             // SAFETY: sticky run pointers are published from this heap's live arena.
-            match unsafe { run.as_mut() }.allocate() {
+            match unsafe { run.as_ref() }.allocate() {
                 Some(ptr) => return Some(ptr),
                 None => cell.set(core::ptr::null_mut()),
             }
         }
 
-        self.alloc_miss(class, pages, heap)
+        self.alloc_miss(class, pages, self.bound_heap())
     }
 
     /// Owner-local large allocation via the bound heap (no sticky extent cache).
@@ -306,9 +305,9 @@ impl ThreadHeap {
         let heap_mut = unsafe { heap.as_mut() };
         if !heap_mut.inbox().is_empty() {
             heap_mut.flush(pages).ok()?;
-            if let Some(mut run) = NonNull::new(cell.get()) {
+            if let Some(run) = NonNull::new(cell.get()) {
                 // SAFETY: sticky run pointers are published from this heap's live arena.
-                if let Some(ptr) = unsafe { run.as_mut() }.allocate() {
+                if let Some(ptr) = unsafe { run.as_ref() }.allocate() {
                     return Some(ptr);
                 }
                 cell.set(core::ptr::null_mut());
@@ -316,10 +315,10 @@ impl ThreadHeap {
         }
 
         // Inbox is empty after the optional flush above, so acquire_run will not flush again.
-        let mut run = heap_mut.acquire_run(class, pages)?;
+        let run = heap_mut.acquire_run(class, pages)?;
         cell.set(run.as_ptr());
         // SAFETY: run was just returned by this heap's live arena.
-        unsafe { run.as_mut() }.allocate()
+        unsafe { run.as_ref() }.allocate()
     }
 
     fn run_cell(&self, class: SizeClassId) -> &Cell<*mut Run> {

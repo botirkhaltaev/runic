@@ -131,9 +131,9 @@ impl Heap {
 
     /// One-shot small alloc without holding a sticky run: acquire, take one block, return run.
     pub(crate) fn alloc_run(&mut self, class: SizeClassId, pages: &PageMap) -> Option<NonNull<u8>> {
-        let mut run = self.acquire_run(class, pages)?;
+        let run = self.acquire_run(class, pages)?;
         // SAFETY: run was just returned by this heap's live arena.
-        let ptr = unsafe { run.as_mut() }.allocate()?;
+        let ptr = unsafe { run.as_ref() }.allocate()?;
         // SAFETY: same run pointer from this heap's live arena.
         if unsafe { run.as_ref() }.has_available_blocks() {
             let _ = self.runs.return_available(run);
