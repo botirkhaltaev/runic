@@ -245,11 +245,14 @@ pub(crate) struct Run {
 // block state and never mutate RunState.
 unsafe impl Sync for Run {}
 
+/// Sentinel stored in a free block's intrusive next slot when the list ends.
+const FREE_END: usize = usize::MAX;
+
 struct RunState {
     live: usize,
     bump: usize,
     available_next: Option<NonNull<Run>>,
-    free: Option<NonNull<u8>>,
+    free: Option<BlockIndex>,
 }
 
 pub(crate) struct RunFreeStatus {
@@ -330,6 +333,12 @@ impl Run {
         unsafe { &*self.state.get() }.live < self.capacity
     }
 
+    /// Outstanding blocks on this run (allocated or remote-pending).
+    pub(crate) fn has_live_blocks(&self) -> bool {
+        // SAFETY: read under owner-local access or table-locked reclaim.
+        unsafe { &*self.state.get() }.live != 0
+    }
+
     pub(crate) fn set_available_next(&self, next: Option<NonNull<Run>>) {
         // SAFETY: owner-local methods are called only by the owning heap.
         unsafe { &mut *self.state.get() }.available_next = next;
@@ -351,14 +360,10 @@ impl Run {
     pub(crate) fn allocate(&self) -> Option<NonNull<u8>> {
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
-        let (index, ptr) = if let Some(ptr) = state.pop_free() {
-            let block = self.block_at(ptr)?;
-            (block.index(), ptr)
-        } else {
-            let index = state.allocate_fresh(self.capacity)?;
-            (index, self.block_ptr(index)?)
-        };
-        debug_assert_eq!(self.block_at(ptr).map(RunBlock::index), Some(index));
+        let index = self
+            .pop_free(state)
+            .or_else(|| state.allocate_fresh(self.capacity))?;
+        let ptr = self.block_ptr(index);
         self.blocks.allocate(index).ok()?;
 
         debug_assert!(state.live < self.capacity);
@@ -387,7 +392,7 @@ impl Run {
         };
 
         state.live = live;
-        state.push_free(ptr);
+        self.push_free(state, block.index());
 
         Ok(RunFreeStatus { was_full })
     }
@@ -441,7 +446,7 @@ impl Run {
         };
 
         state.live = live;
-        state.push_free(ptr);
+        self.push_free(state, block.index());
 
         Ok(RunFreeStatus { was_full })
     }
@@ -482,12 +487,46 @@ impl Run {
         Some(RunBlock::new(BlockIndex::new(index), ptr))
     }
 
-    fn block_ptr(&self, index: BlockIndex) -> Option<NonNull<u8>> {
-        if index.get() >= self.capacity {
-            return None;
+    /// Payload pointer for a freelist or bump index in `0..capacity`.
+    fn block_ptr(&self, index: BlockIndex) -> NonNull<u8> {
+        debug_assert!(index.get() < self.capacity);
+        // SAFETY: freelist / `allocate_fresh` only yield `index < capacity`.
+        unsafe {
+            RunBlock::at_offset(index, self.range().base(), self.block_size)
+                .unwrap_unchecked()
+                .ptr()
         }
+    }
 
-        RunBlock::at_offset(index, self.range().base(), self.block_size).map(RunBlock::ptr)
+    fn pop_free(&self, state: &mut RunState) -> Option<BlockIndex> {
+        let index = state.free?;
+        let ptr = self.block_ptr(index);
+        state.free = Self::read_free_next(ptr);
+        Some(index)
+    }
+
+    fn push_free(&self, state: &mut RunState, index: BlockIndex) {
+        let ptr = self.block_ptr(index);
+        Self::write_free_next(ptr, state.free);
+        state.free = Some(index);
+    }
+
+    fn read_free_next(ptr: NonNull<u8>) -> Option<BlockIndex> {
+        // SAFETY: free-list links are stored only in reusable blocks owned by this run.
+        let raw = unsafe { ptr.cast::<usize>().as_ptr().read() };
+        if raw == FREE_END {
+            None
+        } else {
+            Some(BlockIndex::new(raw))
+        }
+    }
+
+    fn write_free_next(ptr: NonNull<u8>, next: Option<BlockIndex>) {
+        let raw = next.map_or(FREE_END, BlockIndex::get);
+        // SAFETY: free-list links are stored only in reusable blocks owned by this run.
+        unsafe {
+            ptr.cast::<usize>().as_ptr().write(raw);
+        }
     }
 
     fn block_index(&self, offset: usize) -> Option<usize> {
@@ -527,31 +566,6 @@ impl RunState {
         let index = BlockIndex::new(self.bump);
         self.bump += 1;
         Some(index)
-    }
-
-    fn pop_free(&mut self) -> Option<NonNull<u8>> {
-        let ptr = self.free?;
-        self.free = Self::read_next(ptr);
-        Some(ptr)
-    }
-
-    fn push_free(&mut self, ptr: NonNull<u8>) {
-        Self::write_next(ptr, self.free);
-        self.free = Some(ptr);
-    }
-
-    fn read_next(ptr: NonNull<u8>) -> Option<NonNull<u8>> {
-        // SAFETY: free-list links are stored only in reusable blocks owned by this run.
-        NonNull::new(unsafe { ptr.cast::<*mut u8>().as_ptr().read() })
-    }
-
-    fn write_next(ptr: NonNull<u8>, next: Option<NonNull<u8>>) {
-        // SAFETY: free-list links are stored only in reusable blocks owned by this run.
-        unsafe {
-            ptr.cast::<*mut u8>()
-                .as_ptr()
-                .write(next.map_or(core::ptr::null_mut(), NonNull::as_ptr));
-        }
     }
 }
 

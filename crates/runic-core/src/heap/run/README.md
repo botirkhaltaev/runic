@@ -11,7 +11,9 @@ Run metadata owns small size-class allocations.
 
 - A run owns one mapping and one size class. The mapping is `RUN_SIZE` payload bytes plus one `AtomicU8` per block for state; `Run::range` is the payload span only.
 - Returned blocks must be valid block boundaries inside the payload span.
+- Freelist head and intrusive links are `BlockIndex` values; allocate resolves an index to a payload pointer. Frees of user pointers validate block boundaries via `block_at`.
 - `BlockStates` is the only free / allocated / remote-pending tracker (one `AtomicU8` per block for the run's capacity, viewed as an `AddressRange` over the mapping's state tail).
 - `RunHeap` available-list pointers must refer to live `Arena<Run>` entries.
 - Sticky TLS caches hold a run checked out from `available[]`; reincarnation rebinds every occupied arena run, including sticky ones.
+- Live small ownership for reclaim is `RunHeap::has_live_blocks` over occupied arena runs (allocated + remote-pending).
 - Runs stay published and arena-resident for the heap lifetime in v0.5 (no empty-run OS release).

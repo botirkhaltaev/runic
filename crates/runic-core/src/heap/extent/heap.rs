@@ -51,6 +51,17 @@ impl ExtentHeap {
         }
     }
 
+    /// Any occupied extent is a live dedicated allocation (extents leave the arena on free).
+    pub(crate) fn has_live_extents(&self) -> bool {
+        let len = self.extents.len();
+        for index in 0..len {
+            if self.extents.get(index).is_some() {
+                return true;
+            }
+        }
+        false
+    }
+
     pub(crate) fn allocate(
         &mut self,
         spec: LayoutSpec,

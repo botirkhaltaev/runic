@@ -1,12 +1,10 @@
 use core::{
-    cell::Cell,
     ptr::NonNull,
     sync::atomic::{AtomicU8, Ordering},
 };
 
 use crate::{
-    allocator::Allocator, config::AllocatorConfig, layout::LayoutSpec, memory::PageMap,
-    size_class::SizeClassId,
+    config::AllocatorConfig, layout::LayoutSpec, memory::PageMap, size_class::SizeClassId,
 };
 
 pub(crate) mod extent;
@@ -52,7 +50,6 @@ pub(crate) struct Heap {
     id: HeapId,
     pub(crate) runs: RunHeap,
     pub(crate) extents: ExtentHeap,
-    alloc_count: Cell<u32>,
     inbox: Inbox,
 }
 
@@ -70,7 +67,6 @@ impl Heap {
             id,
             runs: RunHeap::new(capacity),
             extents: ExtentHeap::new(capacity, config.extent()),
-            alloc_count: Cell::new(0),
             inbox: Inbox::new(),
         }
     }
@@ -133,19 +129,12 @@ impl Heap {
         self.runs.allocate(class, self.id, pages)
     }
 
-    /// Take one block from a run previously returned by [`Heap::acquire_run`].
-    pub(crate) fn alloc_from(&mut self, mut run: NonNull<Run>) -> Option<NonNull<u8>> {
-        // SAFETY: caller supplies a run pointer from this heap's live arena.
-        let ptr = unsafe { run.as_mut() }.allocate()?;
-        self.retain_allocation();
-        Some(ptr)
-    }
-
     /// One-shot small alloc without holding a sticky run: acquire, take one block, return run.
     pub(crate) fn alloc_run(&mut self, class: SizeClassId, pages: &PageMap) -> Option<NonNull<u8>> {
         let run = self.acquire_run(class, pages)?;
-        let ptr = self.alloc_from(run)?;
         // SAFETY: run was just returned by this heap's live arena.
+        let ptr = unsafe { run.as_ref() }.allocate()?;
+        // SAFETY: same run pointer from this heap's live arena.
         if unsafe { run.as_ref() }.has_available_blocks() {
             let _ = self.runs.return_available(run);
         }
@@ -162,19 +151,7 @@ impl Heap {
             self.flush(pages).ok()?;
         }
 
-        let ptr = self.extents.allocate(spec, self.id, pages, init)?;
-        self.retain_allocation();
-        Some(ptr)
-    }
-
-    pub(crate) fn free_run(
-        &mut self,
-        run: NonNull<Run>,
-        ptr: NonNull<u8>,
-    ) -> Result<(), RunHeapError> {
-        self.runs.free(run, ptr)?;
-        self.release_allocation();
-        Ok(())
+        self.extents.allocate(spec, self.id, pages, init)
     }
 
     /// Owner-local non-cached free: flush inbox if needed, then free.
@@ -190,28 +167,7 @@ impl Heap {
         if !self.inbox.is_empty() {
             self.flush(pages)?;
         }
-        self.free_run(run, ptr).map_err(HeapError::from)
-    }
-
-    pub(crate) fn complete_remote_run(
-        &mut self,
-        run: NonNull<Run>,
-        ptr: NonNull<u8>,
-    ) -> Result<(), RunHeapError> {
-        self.runs.complete_remote_free(run, ptr)?;
-        self.release_allocation();
-        Ok(())
-    }
-
-    pub(crate) fn free_extent(
-        &mut self,
-        extent: NonNull<Extent>,
-        ptr: NonNull<u8>,
-        pages: &PageMap,
-    ) -> Result<(), ExtentHeapError> {
-        self.extents.free(extent, ptr, pages)?;
-        self.release_allocation();
-        Ok(())
+        self.runs.free(run, ptr).map_err(HeapError::from)
     }
 
     /// Owner-local extent free: flush inbox if needed, then free.
@@ -224,19 +180,9 @@ impl Heap {
         if !self.inbox.is_empty() {
             self.flush(pages)?;
         }
-        self.free_extent(extent, ptr, pages)
+        self.extents
+            .free(extent, ptr, pages)
             .map_err(HeapError::from)
-    }
-
-    pub(crate) fn complete_remote_extent(
-        &mut self,
-        extent: NonNull<Extent>,
-        ptr: NonNull<u8>,
-        pages: &PageMap,
-    ) -> Result<(), ExtentHeapError> {
-        self.extents.complete_remote_free(extent, ptr, pages)?;
-        self.release_allocation();
-        Ok(())
     }
 
     pub(crate) fn flush(&mut self, pages: &PageMap) -> Result<(), HeapError> {
@@ -244,10 +190,10 @@ impl Heap {
             for ptr in list {
                 match pages.get(ptr) {
                     Some(crate::memory::PageOwner::Run(run)) => {
-                        self.complete_remote_run(run, ptr)?;
+                        self.runs.complete_remote_free(run, ptr)?;
                     }
                     Some(crate::memory::PageOwner::Extent(extent)) => {
-                        self.complete_remote_extent(extent, ptr, pages)?;
+                        self.extents.complete_remote_free(extent, ptr, pages)?;
                     }
                     None => return Err(HeapError::InvalidPointer),
                 }
@@ -257,21 +203,8 @@ impl Heap {
         Ok(())
     }
 
+    /// Live ownership for Draining reclaim: any run with outstanding blocks, or any extent.
     pub(crate) fn has_live_allocations(&self) -> bool {
-        self.alloc_count.get() != 0
-    }
-
-    pub(crate) fn retain_allocation(&self) {
-        let Some(live) = self.alloc_count.get().checked_add(1) else {
-            Allocator::abort();
-        };
-        self.alloc_count.set(live);
-    }
-
-    pub(crate) fn release_allocation(&self) {
-        let Some(live) = self.alloc_count.get().checked_sub(1) else {
-            Allocator::abort();
-        };
-        self.alloc_count.set(live);
+        self.runs.has_live_blocks() || self.extents.has_live_extents()
     }
 }

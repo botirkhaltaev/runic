@@ -4,7 +4,7 @@ Owner-local heap frontend: runs for small size classes, extents for dedicated la
 
 ## Layout
 
-- `mod.rs`: `Heap` (mode, runs, extents, `alloc_count`, `Inbox`); small path via `acquire_run` / `alloc_from` / `alloc_run`.
+- `mod.rs`: `Heap` (mode, runs, extents, `Inbox`); small path via `acquire_run` / `alloc_run`; sticky TLS hits call `Run::{allocate,free_local}` directly.
 - `id.rs`: `HeapId` (slot index + generation).
 - `run/`: size-classed fixed-block runs (`Run`, `RunHeap` with `Arena<Run>`).
 - `extent/`: dedicated mappings (`Extent`, `ExtentHeap` with `Arena<Extent>`, `ExtentCache`).
@@ -15,6 +15,7 @@ Owner-local heap frontend: runs for small size classes, extents for dedicated la
 - Every `Run` and `Extent` stores a `HeapId`; there is no root/central ownership heap.
 - Small allocations are owned by a heap's runs; large allocations by that heap's extents.
 - Cross-thread frees use claim → inbox enqueue → owner (or draining) flush; they do not mutate freelists directly.
-- `alloc_count` tracks outstanding allocations (including remote-pending) for reclaim safety.
+- Draining reclaim observes live ownership on the heaps themselves via `RunHeap::has_live_blocks` and `ExtentHeap::has_live_extents` (composed by `Heap::has_live_allocations`). There is no side allocation counter on `Heap`.
+- Owner free composition stays on `Heap::free_*_owner` / `flush`; call `runs` / `extents` entity methods directly elsewhere — no Heap free pass-throughs.
 - `Heap` modes: `Free` (reusable), `Active` (TLS owner), `Draining` (post-exit until empty).
 - `HeapTable::generations[]` owns `HeapId` ABA / reincarnation checks.
