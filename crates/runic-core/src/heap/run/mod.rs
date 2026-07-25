@@ -41,8 +41,21 @@ impl BlockIndex {
         Self { index }
     }
 
+    const fn get(self) -> usize {
+        self.index
+    }
+
     fn offset(self, block_size: usize) -> Option<usize> {
-        self.index.checked_mul(block_size)
+        self.get().checked_mul(block_size)
+    }
+
+    fn byte_in(self, bytes: AddressRange) -> Option<NonNull<u8>> {
+        if self.get() >= bytes.len() {
+            return None;
+        }
+
+        // SAFETY: `get()` is in `0..bytes.len()`, so the byte is inside the span.
+        Some(unsafe { NonNull::new_unchecked(bytes.base().as_ptr().add(self.get())) })
     }
 }
 
@@ -204,22 +217,15 @@ impl BlockStates {
     }
 
     fn state(&self, index: BlockIndex) -> Result<&AtomicU8, BlockStateError> {
-        if index.index >= self.bytes.len() {
-            return Err(BlockStateError::InvalidIndex);
-        }
+        let ptr = index
+            .byte_in(self.bytes)
+            .ok_or(BlockStateError::InvalidIndex)?;
 
-        // SAFETY: `index` is in `0..bytes.len()`. `bytes` is the run mapping's
-        // state tail, zero-filled as Free, owned by `Run` for this value's
-        // lifetime, and shared only through owner-local / atomic remote
-        // protocols. Each byte is accessed as `AtomicU8`.
-        Ok(unsafe {
-            &*self
-                .bytes
-                .base()
-                .as_ptr()
-                .add(index.index)
-                .cast::<AtomicU8>()
-        })
+        // SAFETY: `byte_in` selected a byte in the run mapping's state tail,
+        // zero-filled as Free, owned by `Run` for this value's lifetime, and
+        // shared only through owner-local / atomic remote protocols. That byte
+        // is accessed as `AtomicU8`.
+        Ok(unsafe { &*ptr.as_ptr().cast::<AtomicU8>() })
     }
 }
 
@@ -477,7 +483,7 @@ impl Run {
     }
 
     fn block_ptr(&self, index: BlockIndex) -> Option<NonNull<u8>> {
-        if index.index >= self.capacity {
+        if index.get() >= self.capacity {
             return None;
         }
 
@@ -597,7 +603,7 @@ mod tests {
         for _ in 0..capacity {
             let ptr = run.allocate().unwrap();
             let block = run.block_at(ptr).unwrap();
-            let index = block.index().index;
+            let index = block.index().get();
 
             assert!(!seen[index]);
             assert!(index < capacity);
