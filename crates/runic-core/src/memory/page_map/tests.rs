@@ -494,26 +494,33 @@ fn page_map_concurrent_disjoint_publish() {
     let left = TestMapping::new(PAGE_SIZE);
     let right = TestMapping::new(PAGE_SIZE);
     let map = PageMap::new();
+    // Copy ranges/bases: `Mapping` is `Send` but not `Sync`, so threads must not borrow TestMapping.
+    let left_range = left.page_range();
+    let right_range = right.page_range();
+    let left_base = left.base();
+    let right_base = right.base();
 
     std::thread::scope(|scope| {
         scope.spawn(|| {
-            assert_eq!(map.insert(left.page_range(), run(1)), Ok(()));
+            assert_eq!(map.insert(left_range, run(1)), Ok(()));
         });
         scope.spawn(|| {
-            assert_eq!(map.insert(right.page_range(), run(2)), Ok(()));
+            assert_eq!(map.insert(right_range, run(2)), Ok(()));
         });
     });
 
-    assert_eq!(map.get(left.base()), Some(run(1)));
-    assert_eq!(map.get(right.base()), Some(run(2)));
+    assert_eq!(map.get(left_base), Some(run(1)));
+    assert_eq!(map.get(right_base), Some(run(2)));
 }
 
 #[test]
 fn page_map_concurrent_same_l2_disjoint_pages() {
     let mapping = TestMapping::new(PAGE_SIZE * 2);
     let map = PageMap::new();
-    let first = PageRange::from_aligned(mapping.base(), PAGE_SIZE).unwrap();
-    let second = PageRange::from_aligned(mapping.ptr_at(PAGE_SIZE), PAGE_SIZE).unwrap();
+    let first_base = mapping.base();
+    let second_base = mapping.ptr_at(PAGE_SIZE);
+    let first = PageRange::from_aligned(first_base, PAGE_SIZE).unwrap();
+    let second = PageRange::from_aligned(second_base, PAGE_SIZE).unwrap();
 
     std::thread::scope(|scope| {
         scope.spawn(|| {
@@ -524,8 +531,8 @@ fn page_map_concurrent_same_l2_disjoint_pages() {
         });
     });
 
-    assert_eq!(map.get(mapping.base()), Some(run(1)));
-    assert_eq!(map.get(mapping.ptr_at(PAGE_SIZE)), Some(run(2)));
+    assert_eq!(map.get(first_base), Some(run(1)));
+    assert_eq!(map.get(second_base), Some(run(2)));
 }
 
 #[test]
@@ -533,6 +540,7 @@ fn page_map_concurrent_overlap_exactly_one_wins() {
     let mapping = TestMapping::new(PAGE_SIZE);
     let map = PageMap::new();
     let range = mapping.page_range();
+    let base = mapping.base();
 
     let (first, second) = std::thread::scope(|scope| {
         let first = scope.spawn(|| map.insert(range, run(1)));
@@ -542,10 +550,10 @@ fn page_map_concurrent_overlap_exactly_one_wins() {
 
     match (first, second) {
         (Ok(()), Err(PageMapError::Overlap)) => {
-            assert_eq!(map.get(mapping.base()), Some(run(1)));
+            assert_eq!(map.get(base), Some(run(1)));
         }
         (Err(PageMapError::Overlap), Ok(())) => {
-            assert_eq!(map.get(mapping.base()), Some(run(2)));
+            assert_eq!(map.get(base), Some(run(2)));
         }
         other => panic!("expected exactly one winner, got {other:?}"),
     }
