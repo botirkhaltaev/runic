@@ -102,8 +102,20 @@ impl Extent {
         self.heap
     }
 
+    pub(crate) fn set_heap_id(&mut self, heap_id: HeapId) {
+        self.heap = heap_id;
+    }
+
     pub(crate) const fn ptr(&self) -> NonNull<u8> {
         self.range.base()
+    }
+
+    /// Allocated or remote-pending — cached Free extents are not live.
+    pub(crate) fn has_live_allocation(&self) -> bool {
+        matches!(
+            self.load_state(),
+            Ok(ExtentState::Allocated | ExtentState::RemotePending)
+        )
     }
 
     pub(crate) fn starts_at(&self, ptr: NonNull<u8>) -> bool {
@@ -193,6 +205,41 @@ impl Extent {
         } else {
             Err(ExtentError::InvalidPointer)
         }
+    }
+
+    /// Finish a remote-pending free into Free so the extent can stay published in cache.
+    pub(crate) fn finish_remote_free(&self) -> Result<(), ExtentError> {
+        match self.state.compare_exchange(
+            ExtentState::RemotePending.raw(),
+            ExtentState::Free.raw(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => Ok(()),
+            Err(value) if value == ExtentState::RemotePending.raw() => Err(ExtentError::DoubleFree),
+            Err(value) if value == ExtentState::Free.raw() => Err(ExtentError::DoubleFree),
+            Err(_) => Err(ExtentError::InvalidPointer),
+        }
+    }
+
+    /// Reuse a Free cached extent for `spec` without republishing its mapping.
+    pub(crate) fn reuse(&mut self, heap_id: HeapId, spec: LayoutSpec) -> Option<NonNull<u8>> {
+        if self.load_state().ok()? != ExtentState::Free {
+            return None;
+        }
+
+        let user_addr = spec.align_addr(self.mapping.base().as_ptr().addr())?;
+        let user_ptr = NonNull::new(core::ptr::with_exposed_provenance_mut(user_addr))?;
+        let range = AddressRange::new(user_ptr, spec.size());
+        if !self.mapping.range().contains(range) {
+            return None;
+        }
+
+        self.heap = heap_id;
+        self.range = range;
+        self.state
+            .store(ExtentState::Allocated.raw(), Ordering::Relaxed);
+        Some(self.ptr())
     }
 
     pub(crate) fn into_mapping(self) -> Mapping {

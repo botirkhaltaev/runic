@@ -711,8 +711,31 @@ mod tests {
     }
 
     #[test]
-    fn allocator_extent_free_unpublishes_page_entry() {
+    fn allocator_extent_free_keeps_page_entry_while_cached() {
         let allocator = Allocator::new();
+        let inner_ref = allocator_inner(&allocator);
+        let id = acquire_id(inner_ref);
+        let layout = Layout::from_size_align(128 * 1024, 4096).unwrap();
+        let ptr = allocate_extent(inner_ref, id, layout, ExtentInit::Uninit);
+        let extent = extent_of(inner_ref, ptr);
+
+        {
+            let mut table = inner_ref.table.lock();
+            let heap = table.heap_mut(id).unwrap();
+            assert_eq!(
+                heap.free_extent_owner(extent, ptr, inner_ref.pages()),
+                Ok(())
+            );
+        }
+
+        assert_eq!(inner_ref.pages().get(ptr), Some(PageOwner::Extent(extent)));
+    }
+
+    #[test]
+    fn allocator_extent_free_unpublishes_when_drop_policy() {
+        let allocator = Allocator::with_config(
+            AllocatorConfig::new().with_extent_policy(crate::config::ExtentPolicy::Drop),
+        );
         let inner_ref = allocator_inner(&allocator);
         let id = acquire_id(inner_ref);
         let layout = Layout::from_size_align(128 * 1024, 4096).unwrap();

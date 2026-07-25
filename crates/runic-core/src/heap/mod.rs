@@ -99,6 +99,7 @@ impl Heap {
         self.mode.store(HeapMode::Active.raw(), Ordering::Release);
         self.set_id(id);
         self.runs.rebind_heap_id(id);
+        self.extents.rebind_heap_id(id);
     }
 
     /// Mark Free when empty; caller bumps table generation.
