@@ -149,21 +149,25 @@ impl Extent {
         &self.mapping
     }
 
+    /// Owner-local free: exact pointer, then `Allocated → Free`.
     pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<(), ExtentError> {
+        self.validate_exact(ptr)?;
         match self.state.compare_exchange(
             ExtentState::Allocated.raw(),
             ExtentState::Free.raw(),
             Ordering::Relaxed,
             Ordering::Relaxed,
         ) {
-            Ok(_) => self.validate_free(ptr),
+            Ok(_) => Ok(()),
             Err(value) if value == ExtentState::RemotePending.raw() => Err(ExtentError::DoubleFree),
             Err(value) if value == ExtentState::Free.raw() => Err(ExtentError::DoubleFree),
             Err(_) => Err(ExtentError::InvalidPointer),
         }
     }
 
-    pub(crate) fn claim_free(&self) -> Result<(), ExtentError> {
+    /// Remote free claim: exact pointer, then `Allocated → RemotePending`.
+    pub(crate) fn claim_free(&self, ptr: NonNull<u8>) -> Result<(), ExtentError> {
+        self.validate_exact(ptr)?;
         match self.state.compare_exchange(
             ExtentState::Allocated.raw(),
             ExtentState::RemotePending.raw(),
@@ -191,24 +195,9 @@ impl Extent {
         }
     }
 
-    pub(crate) fn validate_remote_pending(&self) -> Result<(), ExtentError> {
-        if self.load_state()? == ExtentState::RemotePending {
-            Ok(())
-        } else {
-            Err(ExtentError::DoubleFree)
-        }
-    }
-
-    pub(crate) fn validate_free(&self, ptr: NonNull<u8>) -> Result<(), ExtentError> {
-        if self.starts_at(ptr) {
-            Ok(())
-        } else {
-            Err(ExtentError::InvalidPointer)
-        }
-    }
-
-    /// Finish a remote-pending free into Free so the extent can stay published in cache.
-    pub(crate) fn finish_remote_free(&self) -> Result<(), ExtentError> {
+    /// Owner drain of a remote claim: exact pointer, then `RemotePending → Free`.
+    pub(crate) fn complete_remote_free(&self, ptr: NonNull<u8>) -> Result<(), ExtentError> {
+        self.validate_exact(ptr)?;
         match self.state.compare_exchange(
             ExtentState::RemotePending.raw(),
             ExtentState::Free.raw(),
@@ -240,6 +229,14 @@ impl Extent {
         self.state
             .store(ExtentState::Allocated.raw(), Ordering::Relaxed);
         Some(self.ptr())
+    }
+
+    fn validate_exact(&self, ptr: NonNull<u8>) -> Result<(), ExtentError> {
+        if self.starts_at(ptr) {
+            Ok(())
+        } else {
+            Err(ExtentError::InvalidPointer)
+        }
     }
 
     pub(crate) fn into_mapping(self) -> Mapping {
@@ -331,8 +328,29 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(extent.claim_free(), Ok(()));
+        assert_eq!(extent.claim_free(extent.ptr()), Ok(()));
         assert_eq!(extent.unclaim(), Ok(()));
+        assert_eq!(extent.free(extent.ptr()), Ok(()));
+    }
+
+    #[test]
+    fn extent_rejects_interior_claim_without_state_change() {
+        let spec = layout_spec(128 * 1024, 4096);
+        let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
+        let extent = Extent::new(
+            ExtentId::from_index(8).unwrap(),
+            test_heap_id(),
+            mapping,
+            spec,
+        )
+        .unwrap();
+        // SAFETY: adding one stays within the mapped extent for this non-zero allocation.
+        let interior = unsafe { NonNull::new_unchecked(extent.ptr().as_ptr().add(1)) };
+
+        assert_eq!(
+            extent.claim_free(interior),
+            Err(ExtentError::InvalidPointer)
+        );
         assert_eq!(extent.free(extent.ptr()), Ok(()));
     }
 

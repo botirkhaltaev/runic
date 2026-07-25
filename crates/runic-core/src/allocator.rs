@@ -87,16 +87,14 @@ impl Allocator {
         // SAFETY: inner is retained by this Allocator while installed from self.inner.
         let inner_ref = unsafe { inner.as_ref() };
 
-        // Small path stays in this function so TLS + sticky freelist can inline.
-        // Large/extent work is outlined — sharing it here regresses small-churn codegen.
-        let Some(class) = SizeClasses::id_for(spec) else {
-            return Self::alloc_extent_hot(inner, inner_ref, spec, ExtentInit::Uninit);
-        };
-
-        if let Some(ptr) = THREAD_HEAP.with(|tls| tls.alloc(inner, class, inner_ref.pages())) {
-            return ptr.as_ptr();
+        if let Some(class) = SizeClasses::id_for(spec) {
+            if let Some(ptr) = THREAD_HEAP.with(|tls| tls.alloc(inner, class, inner_ref.pages())) {
+                return ptr.as_ptr();
+            }
+            return Self::alloc_slow(inner, inner_ref, class);
         }
-        Self::alloc_slow(inner, inner_ref, Some(class), spec)
+
+        Self::allocate_extent(inner, inner_ref, spec, ExtentInit::Uninit)
     }
 
     /// Deallocates memory previously returned by this allocator.
@@ -135,9 +133,12 @@ impl Allocator {
                 }
             }
             PageOwner::Extent(extent) => {
-                // Keep extent free out of line so run sticky free keeps a tight shell.
-                if Self::dealloc_extent_hot(inner, extent, ptr) {
-                    return;
+                // SAFETY: PageMap stores only pointers published from this allocator's live Arena<Extent>.
+                let heap_id = unsafe { extent.as_ref() }.heap_id();
+                match THREAD_HEAP.with(|tls| tls.free_extent(inner, heap_id, extent, ptr)) {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(_) => Self::abort(),
                 }
             }
         }
@@ -233,7 +234,7 @@ impl Allocator {
         if SizeClasses::id_for(spec).is_none() {
             // SAFETY: inner is retained by this Allocator while installed from self.inner.
             let inner_ref = unsafe { inner.as_ref() };
-            return Self::alloc_extent_hot(inner, inner_ref, spec, ExtentInit::Zeroed);
+            return Self::allocate_extent(inner, inner_ref, spec, ExtentInit::Zeroed);
         }
 
         // Runs: blocks are reused memory; allocate then zero once at this boundary.
@@ -285,10 +286,8 @@ impl Allocator {
         NonNull::new(self.inner.load(Ordering::Acquire))
     }
 
-    /// Owner-local / slow large alloc, outlined from [`Self::alloc`] so the small
-    /// sticky freelist path keeps its inlined TLS shell.
-    #[inline(never)]
-    fn alloc_extent_hot(
+    /// Owner-local large alloc (TLS hit) or bind + locked allocate (miss).
+    fn allocate_extent(
         inner: NonNull<AllocatorInner>,
         inner_ref: &AllocatorInner,
         spec: LayoutSpec,
@@ -320,8 +319,7 @@ impl Allocator {
     fn alloc_slow(
         inner: NonNull<AllocatorInner>,
         inner_ref: &AllocatorInner,
-        class: Option<SizeClassId>,
-        spec: LayoutSpec,
+        class: SizeClassId,
     ) -> *mut u8 {
         let mut table = inner_ref.table.lock();
         let heap_id = THREAD_HEAP.with(|tls| tls.bind(inner, &mut table));
@@ -335,28 +333,8 @@ impl Allocator {
         if !heap.is_active() {
             return null_mut();
         }
-        match class {
-            Some(class) => heap.alloc_run(class, pages),
-            None => heap.allocate_extent(spec, pages, ExtentInit::Uninit),
-        }
-        .map_or(null_mut(), NonNull::as_ptr)
-    }
-
-    /// Owner-local extent free, outlined from [`Self::dealloc`] so run sticky free
-    /// keeps its inlined TLS shell.
-    #[inline(never)]
-    fn dealloc_extent_hot(
-        inner: NonNull<AllocatorInner>,
-        extent: NonNull<Extent>,
-        ptr: NonNull<u8>,
-    ) -> bool {
-        // SAFETY: PageMap stores only pointers published from this allocator's live Arena<Extent>.
-        let heap_id = unsafe { extent.as_ref() }.heap_id();
-        match THREAD_HEAP.with(|tls| tls.free_extent(inner, heap_id, extent, ptr)) {
-            Ok(true) => true,
-            Ok(false) => false,
-            Err(_) => Self::abort(),
-        }
+        heap.alloc_run(class, pages)
+            .map_or(null_mut(), NonNull::as_ptr)
     }
 
     #[cold]
@@ -475,7 +453,7 @@ impl Allocator {
             HeapMode::Active => {
                 // SAFETY: PageMap stores only pointers published from this allocator's live arena.
                 unsafe { extent.as_ref() }
-                    .claim_free()
+                    .claim_free(ptr)
                     .map_err(AllocatorError::from)?;
                 {
                     let table = inner_ref.table.lock();

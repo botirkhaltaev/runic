@@ -89,12 +89,15 @@ impl ExtentHeap {
         if let Some(mut extent_ptr) = self.cache.take(len) {
             // SAFETY: cache only stores live arena extents owned by this heap.
             let extent = unsafe { extent_ptr.as_mut() };
-            let ptr = extent.reuse(heap_id, spec)?;
-            if init == ExtentInit::Zeroed {
-                // SAFETY: ptr was just reused for spec and is valid for spec.size() bytes.
-                unsafe { write_bytes(ptr.as_ptr(), 0, spec.size()) };
+            if let Some(ptr) = extent.reuse(heap_id, spec) {
+                if init == ExtentInit::Zeroed {
+                    // SAFETY: ptr was just reused for spec and is valid for spec.size() bytes.
+                    unsafe { write_bytes(ptr.as_ptr(), 0, spec.size()) };
+                }
+                return Some(ptr);
             }
-            return Some(ptr);
+            // Cache keyed by mapping length; reuse failure is rare (align) — release and remap.
+            let _ = self.release(extent_ptr, pages);
         }
 
         let mapping = OsMemory::map(len)?;
@@ -131,7 +134,10 @@ impl ExtentHeap {
         ptr: NonNull<u8>,
         pages: &PageMap,
     ) -> Result<(), ExtentHeapError> {
-        Self::validate_remote_free(extent_ptr, ptr)?;
+        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
+        unsafe { extent_ptr.as_ref() }
+            .complete_remote_free(ptr)
+            .map_err(ExtentHeapError::from)?;
         self.retire(extent_ptr, pages)
     }
 
@@ -148,25 +154,7 @@ impl ExtentHeap {
         self.retire(extent_ptr, pages)
     }
 
-    /// Validate a remote-pending free before the shared retire path.
-    ///
-    /// The remote-free protocol already transitioned the extent to
-    /// `RemotePending` via `claim_free`; this only confirms that state and the
-    /// exact pointer before retire.
-    fn validate_remote_free(
-        extent_ptr: NonNull<Extent>,
-        ptr: NonNull<u8>,
-    ) -> Result<(), ExtentHeapError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
-        let extent = unsafe { extent_ptr.as_ref() };
-        extent
-            .validate_remote_pending()
-            .map_err(ExtentHeapError::from)?;
-        extent.validate_free(ptr).map_err(ExtentHeapError::from)?;
-        Ok(())
-    }
-
-    /// Shared local/remote retire: Keep retains the published arena extent in cache;
+    /// Shared local/remote retire of a Free extent: Keep retains it published in cache;
     /// otherwise unpublish, remove, and drop the mapping.
     fn retire(
         &mut self,
@@ -175,16 +163,11 @@ impl ExtentHeap {
     ) -> Result<(), ExtentHeapError> {
         // SAFETY: PageMap stores only pointers published from this allocator's live arena.
         let extent = unsafe { extent_ptr.as_ref() };
+        debug_assert!(!extent.has_live_allocation());
         let len = extent.mapping().len().get();
 
-        if self.cache.will_retain(len) {
-            // Local free already transitioned to Free; remote is still RemotePending.
-            if extent.has_live_allocation() {
-                extent.finish_remote_free().map_err(ExtentHeapError::from)?;
-            }
-            if self.cache.insert(extent_ptr).is_ok() {
-                return Ok(());
-            }
+        if self.cache.will_retain(len) && self.cache.insert(extent_ptr).is_ok() {
+            return Ok(());
         }
 
         self.release(extent_ptr, pages)

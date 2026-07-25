@@ -32,7 +32,8 @@ impl ExtentCache {
         let index = self.find_exact(len)?;
         let slot = self.slots.get_mut(index)?;
         let extent = slot.take()?;
-        self.retained_bytes = self.retained_bytes.saturating_sub(len);
+        debug_assert!(self.retained_bytes >= len);
+        self.retained_bytes -= len;
 
         Some(extent)
     }
@@ -161,39 +162,62 @@ mod tests {
 
     use super::*;
 
-    fn heap_id() -> HeapId {
-        HeapId::new(0, NonZeroU32::MIN).unwrap()
+    /// Owns heap-allocated Free extents for cache tests; drops after the cache.
+    struct OwnedExtents {
+        extents: Vec<NonNull<Extent>>,
     }
 
-    fn leaked_free_extent(mapping_len: usize) -> NonNull<Extent> {
-        let spec = LayoutSpec::from_layout(Layout::from_size_align(mapping_len, 8).unwrap());
-        let mapping = OsMemory::map(mapping_len).unwrap();
-        let extent =
-            Extent::new(ExtentId::from_index(0).unwrap(), heap_id(), mapping, spec).unwrap();
-        assert_eq!(extent.free(extent.ptr()), Ok(()));
-        NonNull::from(Box::leak(Box::new(extent)))
+    impl OwnedExtents {
+        fn new() -> Self {
+            Self {
+                extents: Vec::new(),
+            }
+        }
+
+        fn free_extent(&mut self, mapping_len: usize) -> NonNull<Extent> {
+            let heap_id = HeapId::new(0, NonZeroU32::MIN).unwrap();
+            let spec = LayoutSpec::from_layout(Layout::from_size_align(mapping_len, 8).unwrap());
+            let mapping = OsMemory::map(mapping_len).unwrap();
+            let extent =
+                Extent::new(ExtentId::from_index(0).unwrap(), heap_id, mapping, spec).unwrap();
+            assert_eq!(extent.free(extent.ptr()), Ok(()));
+            let ptr = NonNull::from(Box::leak(Box::new(extent)));
+            self.extents.push(ptr);
+            ptr
+        }
+    }
+
+    impl Drop for OwnedExtents {
+        fn drop(&mut self) {
+            for ptr in self.extents.drain(..) {
+                // SAFETY: each pointer came from Box::leak in free_extent; cache only indexes.
+                drop(unsafe { Box::from_raw(ptr.as_ptr()) });
+            }
+        }
     }
 
     #[test]
     fn extent_cache_reuses_exact_length() {
         let mut cache = ExtentCache::new(ExtentConfig::new());
-        let extent = leaked_free_extent(256 * 1024);
-        // SAFETY: test-owned leaked extent.
+        let mut owned = OwnedExtents::new();
+        let extent = owned.free_extent(256 * 1024);
+        // SAFETY: owned fixture extent.
         let ptr = unsafe { extent.as_ref() }.ptr();
         let len = unsafe { extent.as_ref() }.mapping().len().get();
 
         assert!(cache.insert(extent).is_ok());
 
         let reused = cache.take(len).unwrap();
-        // SAFETY: returned from cache; still the leaked extent.
+        // SAFETY: returned from cache; still owned.
         assert_eq!(unsafe { reused.as_ref() }.ptr(), ptr);
     }
 
     #[test]
     fn extent_cache_rejects_nonmatching_exact_lookup() {
         let mut cache = ExtentCache::new(ExtentConfig::new());
+        let mut owned = OwnedExtents::new();
 
-        assert!(cache.insert(leaked_free_extent(256 * 1024)).is_ok());
+        assert!(cache.insert(owned.free_extent(256 * 1024)).is_ok());
         assert!(cache.take(128 * 1024).is_none());
     }
 
@@ -204,10 +228,11 @@ mod tests {
                 .with_policy(ExtentPolicy::Keep)
                 .with_budget(Budget::new(2, 1024 * 1024)),
         );
+        let mut owned = OwnedExtents::new();
 
-        assert!(cache.insert(leaked_free_extent(4096)).is_ok());
-        assert!(cache.insert(leaked_free_extent(4096)).is_ok());
-        assert!(cache.insert(leaked_free_extent(4096)).is_err());
+        assert!(cache.insert(owned.free_extent(4096)).is_ok());
+        assert!(cache.insert(owned.free_extent(4096)).is_ok());
+        assert!(cache.insert(owned.free_extent(4096)).is_err());
     }
 
     #[test]
@@ -217,9 +242,10 @@ mod tests {
                 .with_policy(ExtentPolicy::Keep)
                 .with_budget(Budget::new(4, 4096)),
         );
+        let mut owned = OwnedExtents::new();
 
-        assert!(cache.insert(leaked_free_extent(4096)).is_ok());
-        assert!(cache.insert(leaked_free_extent(4096)).is_err());
+        assert!(cache.insert(owned.free_extent(4096)).is_ok());
+        assert!(cache.insert(owned.free_extent(4096)).is_err());
     }
 
     #[test]
@@ -229,8 +255,9 @@ mod tests {
                 .with_policy(ExtentPolicy::Drop)
                 .with_budget(Budget::new(32, 1024 * 1024)),
         );
+        let mut owned = OwnedExtents::new();
 
-        assert!(cache.insert(leaked_free_extent(4096)).is_err());
+        assert!(cache.insert(owned.free_extent(4096)).is_err());
         assert!(cache.take(4096).is_none());
     }
 
@@ -241,15 +268,16 @@ mod tests {
                 .with_policy(ExtentPolicy::Keep)
                 .with_budget(Budget::new(1, 8192)),
         );
-        let first = leaked_free_extent(4096);
-        // SAFETY: test-owned leaked extent.
+        let mut owned = OwnedExtents::new();
+        let first = owned.free_extent(4096);
+        // SAFETY: owned fixture extent.
         let first_ptr = unsafe { first.as_ref() }.ptr();
 
         assert!(cache.insert(first).is_ok());
-        assert!(cache.insert(leaked_free_extent(4096)).is_err());
+        assert!(cache.insert(owned.free_extent(4096)).is_err());
 
         let reused = cache.take(4096).unwrap();
-        // SAFETY: returned from cache; still the leaked extent.
+        // SAFETY: returned from cache; still owned.
         assert_eq!(unsafe { reused.as_ref() }.ptr(), first_ptr);
     }
 }
