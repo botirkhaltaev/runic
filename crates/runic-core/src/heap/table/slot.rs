@@ -11,6 +11,7 @@ use super::inbox::RemoteList;
 
 const MAX_HEAPS: usize = 64;
 const MAX_HEAPS_U32: u32 = 64;
+/// Max run/extent arena indices per heap (grow-on-demand; not pre-touched).
 const HEAP_METADATA_CAPACITY: u32 = 16_384;
 
 /// Generation-checked heap slots and remote-batch delivery.

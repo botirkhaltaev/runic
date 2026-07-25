@@ -81,7 +81,8 @@ impl RunHeap {
     }
 
     pub(crate) fn rebind_heap_id(&mut self, heap_id: HeapId) {
-        let len = self.runs.capacity();
+        debug_assert!(self.runs.len() <= self.runs.capacity());
+        let len = self.runs.len();
         for index in 0..len {
             let Some(run) = self.runs.get_mut(index) else {
                 continue;
