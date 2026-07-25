@@ -46,6 +46,9 @@ impl SizeClasses {
     /// every cell is a valid in-range index.
     const ALIGNED_CLASS_BY_START: [[usize; Self::COUNT]; Self::ALIGN_POWER_COUNT] =
         Self::build_aligned_class_map();
+    /// `CLASS_FOR_SIZE[n]` is the smallest class index with `SIZES[i] >= n`
+    /// for `n` in `1..=SMALL_MAX`. Index `0` is unused.
+    const CLASS_FOR_SIZE: [u8; Self::SMALL_MAX + 1] = Self::build_class_for_size();
 
     const fn align_power_count() -> usize {
         let mut power = 0;
@@ -88,6 +91,37 @@ impl SizeClasses {
         table
     }
 
+    /// Builds [`Self::CLASS_FOR_SIZE`] from [`Self::SIZES`] at compile time.
+    ///
+    /// The local table exists only for const evaluation into the static
+    /// [`Self::CLASS_FOR_SIZE`]; `COUNT` fits in `u8`.
+    #[allow(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        clippy::indexing_slicing,
+        clippy::large_stack_arrays
+    )]
+    const fn build_class_for_size() -> [u8; Self::SMALL_MAX + 1] {
+        const { assert!(SizeClasses::COUNT <= 255) };
+
+        let mut table = [0u8; Self::SMALL_MAX + 1];
+        let mut class = 0;
+        let mut prev = 0usize;
+
+        while class < Self::COUNT {
+            let size = Self::SIZES[class];
+            let mut n = prev + 1;
+            while n <= size {
+                table[n] = class as u8;
+                n += 1;
+            }
+            prev = size;
+            class += 1;
+        }
+
+        table
+    }
+
     pub(crate) fn id_for(spec: LayoutSpec) -> Option<SizeClassId> {
         let required = spec.minimum_block_size();
 
@@ -114,8 +148,11 @@ impl SizeClasses {
     }
 
     fn lower_bound_index(required: usize) -> Option<usize> {
-        let index = Self::SIZES.partition_point(|&size| size < required);
-        (index < Self::COUNT).then_some(index)
+        if required == 0 || required > Self::SMALL_MAX {
+            return None;
+        }
+
+        Some(usize::from(*Self::CLASS_FOR_SIZE.get(required)?))
     }
 
     /// Smallest class index at or after `start` whose block size is a multiple
