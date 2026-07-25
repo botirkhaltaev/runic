@@ -3,7 +3,7 @@
 Scope: `crates/runic-core/src/heap/run/`.
 
 - Put block-state and free-list behavior on `Run`.
-- Keep metadata storage on `RunHeap` via grow-on-demand `Arena<Run>` (`claim` / `insert` / `release` / `remove`; hard max, mmap chunks).
+- Keep metadata storage on `RunHeap` via grow-on-demand `Arena<Run>` (`claim` / `insert` / `release` / `remove`; hard max; each chunk owns a `Mapping` in a fixed directory).
 - Available-run lists are owned by `RunHeap`; sticky TLS caches park at most one run per class off those lists and must return through `return_available`.
 - Small alloc composition lives on `Heap`: `acquire_run` (flush once if needed, then available or cold mmap), `alloc_from` (one block), and one-shot `alloc_run` for the locked non-sticky path. Do not reintroduce a `take_or_*` fork.
 - `ThreadHeap::alloc` shares those primitives: sticky hit via `alloc_from`; miss flushes at most once then retries sticky before `acquire_run`.

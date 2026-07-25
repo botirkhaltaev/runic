@@ -9,7 +9,7 @@ Scope: `crates/runic-core/src/heap/table/`.
 - Bound-heap access from TLS uses `bound_heap() -> NonNull<Heap>` plus local `as_mut()` at the call site; do not add `&mut Heap` from `&self` helpers that need `clippy::mut_from_ref` expects.
 - `ThreadHeap::bind` reuses a matching binding or unbinds a foreign one then `HeapTable::acquire`s; `unbind` returns cached runs, publishes outbound batches, and `retire`s the bound heap.
 - Remote frees use batched transport: `ThreadHeap::batch` coalesces onto `RemoteBatch`; callers `HeapTable::publish` returned lists. Do not add single-node push/pop façades.
-- Create heaps with `Heap::new` + grow-on-demand `Arena::claim` / `insert` (inbox is movable; no placement-only install). `HEAP_METADATA_CAPACITY` is a hard max for run/extent arenas, not a pre-touch size.
+- Create heaps with `Heap::new` + grow-on-demand `Arena::claim` / `insert` (inbox is movable; no placement-only install). `HEAP_METADATA_CAPACITY` is a hard max for run/extent arenas, not a pre-touch size. Arena chunks each own a `Mapping` (no `mem::forget` / raw munmap).
 - Keep `Heap` responsible for Free/Active/Draining mode and owner-local lifecycle helpers; `Heap::mode()` returns the `HeapMode` snapshot directly (Free/Active/Draining) for callers that must branch on lifecycle state.
 - Keep `HeapTable` thin and composable: `acquire` / `retire` / `reclaim`, generation-checked `heap` / `heap_mut` / `mode`, and mode-aware `publish`. Do not put allocate/dealloc routers on the table.
 - `HeapTable::acquire` returns `(HeapId, NonNull<Heap>)` for bind; `heap`/`heap_mut`/`mode` fail closed on stale generations.
