@@ -185,7 +185,10 @@ impl<T> Arena<T> {
             return None;
         }
 
-        debug_assert_eq!(chunk.slots.as_ptr().cast::<u8>(), chunk.mapping.base().as_ptr());
+        debug_assert_eq!(
+            chunk.slots.as_ptr().cast::<u8>(),
+            chunk.mapping.base().as_ptr()
+        );
 
         // SAFETY: `slots` points at `chunk.len` slots in `mapping`; `offset` is in range.
         Some(unsafe { NonNull::new_unchecked(chunk.slots.as_ptr().add(offset)) })
