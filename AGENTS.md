@@ -72,6 +72,14 @@ GlobalAlloc
 - `AllocatorInner` is the refcounted mmap instance behind lazy `AtomicPtr` init — not a domain entity. `PageMap` stays outside the table mutex so owner-local TLS hits never take that lock.
 - `HeapTable` owns slot identity (`acquire`/`retire`/`reclaim`), generation-checked `heap`/`heap_mut`/`mode`, and mode-aware remote `publish` only — not allocate/dealloc routers.
 
+## Allocator Boundary Scars
+
+Durable lessons from past boundary bugs; do not reintroduce these shapes.
+
+- Exactly one abort sink: `Allocator::abort`. `Heap`, `ThreadHeap`, and `AllocatorInner` return domain `Result`s or call `Allocator::abort` directly; do not add a second private `abort()` copy.
+- `AllocatorInner` owns refs + `PageMap` + `Mutex<HeapTable>` + self-hosting `Mapping` — not a broad alloc/free/realloc manager. Call `HeapTable` / `Heap` / `ThreadHeap` methods from `Allocator` (and TLS) instead of growing pass-through routers on `AllocatorInner`.
+- Never hold `Mutex<HeapTable>` across a user-memory copy (e.g. `realloc`'s `copy_nonoverlapping`). Compose `alloc` / `dealloc` (or lock only for metadata), release, then copy.
+
 ## Rust Rules
 
 - Use `#![deny(unsafe_op_in_unsafe_fn)]`.

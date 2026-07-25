@@ -19,3 +19,4 @@ Scope: `crates/runic-core/src/heap/table/`.
 - Clear or validate owner-local caches whenever a heap is abandoned or reactivated.
 - Preserve explicit separation between owner-local frees and remote-free claim→`batch`→`publish`→drain behavior. There is exactly one remote-free protocol (`Allocator`'s slow dealloc path claims, coalesces via `ThreadHeap::batch`, and calls `publish`; draining completion under the table lock uses `Heap` free + `reclaim`). Do not add a second, unbatched remote-free implementation for `realloc` or any other caller — route all cross-heap frees (including from `realloc`) through the same `Allocator::dealloc` path.
 - Do not introduce passive forwarding wrappers for heap table behavior; prefer methods on `HeapTable`, `Heap`, or `ThreadHeap` that owns the state.
+- Fatal TLS publish/retire failures call `Allocator::abort` — the single crate abort sink — not a local `abort()` helper.

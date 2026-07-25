@@ -5,7 +5,8 @@ use core::{
 };
 
 use crate::{
-    config::AllocatorConfig, layout::LayoutSpec, memory::PageMap, size_class::SizeClassId,
+    allocator::Allocator, config::AllocatorConfig, layout::LayoutSpec, memory::PageMap,
+    size_class::SizeClassId,
 };
 
 pub(crate) mod extent;
@@ -262,22 +263,15 @@ impl Heap {
 
     pub(crate) fn retain_allocation(&self) {
         let Some(live) = self.alloc_count.get().checked_add(1) else {
-            Self::abort();
+            Allocator::abort();
         };
         self.alloc_count.set(live);
     }
 
     pub(crate) fn release_allocation(&self) {
         let Some(live) = self.alloc_count.get().checked_sub(1) else {
-            Self::abort();
+            Allocator::abort();
         };
         self.alloc_count.set(live);
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn abort() -> ! {
-        // SAFETY: abort terminates the process and does not unwind across allocator boundaries.
-        unsafe { libc::abort() }
     }
 }

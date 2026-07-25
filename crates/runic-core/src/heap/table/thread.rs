@@ -5,7 +5,7 @@ use core::{
 };
 
 use crate::{
-    allocator::AllocatorInner,
+    allocator::{Allocator, AllocatorInner},
     heap::{Extent, ExtentInit, Heap, HeapId, HeapTable, Run, RunHeapError},
     layout::LayoutSpec,
     memory::PageMap,
@@ -359,7 +359,7 @@ impl ThreadHeap {
         while let Some((id, list)) = self.take_batch() {
             let mut table = inner.table.lock();
             if table.publish(id, &list, inner.pages()).is_err() {
-                abort();
+                Allocator::abort();
             }
         }
     }
@@ -380,7 +380,7 @@ impl ThreadHeap {
         if let Some(heap_id) = heap_id {
             let mut table = inner_ref.table.lock();
             if table.retire(heap_id, inner_ref.pages()).is_err() {
-                abort();
+                Allocator::abort();
             }
         }
 
@@ -390,13 +390,6 @@ impl ThreadHeap {
 
 std::thread_local! {
     pub(crate) static THREAD_HEAP: ThreadHeap = const { ThreadHeap::new() };
-}
-
-#[cold]
-#[inline(never)]
-fn abort() -> ! {
-    // SAFETY: abort terminates the process and does not unwind across allocator boundaries.
-    unsafe { libc::abort() }
 }
 
 #[cfg(test)]

@@ -285,9 +285,11 @@ impl Allocator {
         ptr
     }
 
+    /// Sole process-abort sink for this crate. Other layers return domain `Result`s
+    /// or call this; do not add a second `abort()` copy.
     #[cold]
     #[inline(never)]
-    fn abort() -> ! {
+    pub(crate) fn abort() -> ! {
         // SAFETY: abort terminates the process and does not unwind across allocator boundaries.
         unsafe { libc::abort() }
     }
@@ -520,7 +522,7 @@ impl AllocatorInner {
             }
 
             let Some(next) = current.checked_add(1) else {
-                Self::abort();
+                Allocator::abort();
             };
 
             match refs.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
@@ -537,7 +539,7 @@ impl AllocatorInner {
 
         loop {
             if current == 0 {
-                Self::abort();
+                Allocator::abort();
             }
 
             let next = current - 1;
@@ -562,13 +564,6 @@ impl AllocatorInner {
         // SAFETY: caller guarantees this is the final reference to inner.
         // [`Drop`] drops pages → table → storage; nothing touches `inner` afterward.
         unsafe { inner.as_ptr().drop_in_place() };
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn abort() -> ! {
-        // SAFETY: abort terminates the process and does not unwind across allocator boundaries.
-        unsafe { libc::abort() }
     }
 }
 
