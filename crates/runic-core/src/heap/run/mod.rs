@@ -121,10 +121,9 @@ impl BlockState {
 /// One `AtomicU8` per block for this run's capacity, stored in the run mapping
 /// immediately after the `RUN_SIZE` payload span (zero-filled ⇒ Free). Not a
 /// packed bitmap; this is the only free/allocated/remote-pending tracker on a
-/// run.
+/// run. `bytes` is a non-owning view of that state tail.
 struct BlockStates {
-    base: NonNull<AtomicU8>,
-    len: usize,
+    bytes: AddressRange,
 }
 
 impl BlockStates {
@@ -205,15 +204,22 @@ impl BlockStates {
     }
 
     fn state(&self, index: BlockIndex) -> Result<&AtomicU8, BlockStateError> {
-        if index.index >= self.len {
+        if index.index >= self.bytes.len() {
             return Err(BlockStateError::InvalidIndex);
         }
 
-        // SAFETY: `index` is in `0..len`. `base` points at the run mapping's
-        // state tail (length `len`), zero-filled as Free, owned by `Run` for
-        // this value's lifetime, and shared only through owner-local / atomic
-        // remote protocols.
-        Ok(unsafe { &*self.base.as_ptr().add(index.index) })
+        // SAFETY: `index` is in `0..bytes.len()`. `bytes` is the run mapping's
+        // state tail, zero-filled as Free, owned by `Run` for this value's
+        // lifetime, and shared only through owner-local / atomic remote
+        // protocols. Each byte is accessed as `AtomicU8`.
+        Ok(unsafe {
+            &*self
+                .bytes
+                .base()
+                .as_ptr()
+                .add(index.index)
+                .cast::<AtomicU8>()
+        })
     }
 }
 
@@ -281,8 +287,7 @@ impl Run {
         // `mapping`.
         let state_base = unsafe { NonNull::new_unchecked(mapping.base().as_ptr().add(RUN_SIZE)) };
         let blocks = BlockStates {
-            base: state_base.cast(),
-            len: capacity,
+            bytes: AddressRange::new(state_base, capacity),
         };
         Some(Self {
             id,
