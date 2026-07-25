@@ -16,7 +16,7 @@ use crate::{
     },
     layout::LayoutSpec,
     memory::{Mapping, OsMemory, PageMap, PageOwner},
-    size_class::SizeClasses,
+    size_class::{SizeClassId, SizeClasses},
 };
 
 pub struct Allocator {
@@ -84,39 +84,22 @@ impl Allocator {
         let Some(inner) = self.ensure_inner() else {
             return null_mut();
         };
-
-        let class = SizeClasses::id_for(spec);
         // SAFETY: inner is retained by this Allocator while installed from self.inner.
         let inner_ref = unsafe { inner.as_ref() };
-        if let Some(class) = class
-            && let Some(ptr) = THREAD_HEAP.with(|tls| tls.alloc(inner, class, inner_ref.pages()))
-        {
-            return ptr.as_ptr();
-        }
-        if class.is_none()
-            && let Some(ptr) = THREAD_HEAP
-                .with(|tls| tls.alloc_extent(inner, spec, inner_ref.pages(), ExtentInit::Uninit))
-        {
-            return ptr.as_ptr();
+
+        if let Some(class) = SizeClasses::id_for(spec) {
+            if let Some(ptr) = THREAD_HEAP.with(|tls| tls.alloc(inner, class, inner_ref.pages())) {
+                return ptr.as_ptr();
+            }
+            return Self::alloc_slow(inner, inner_ref, Some(class), spec);
         }
 
-        let mut table = inner_ref.table.lock();
-        let heap_id = THREAD_HEAP.with(|tls| tls.bind(inner, &mut table));
-        let pages = inner_ref.pages();
-        let Some(heap_id) = heap_id else {
-            return null_mut();
-        };
-        let Some(heap) = table.heap_mut(heap_id) else {
-            return null_mut();
-        };
-        if !heap.is_active() {
-            return null_mut();
+        if let Some(ptr) = THREAD_HEAP
+            .with(|tls| tls.alloc_extent(inner, spec, inner_ref.pages(), ExtentInit::Uninit))
+        {
+            return ptr.as_ptr();
         }
-        match class {
-            Some(class) => heap.alloc_run(class, pages),
-            None => heap.allocate_extent(spec, pages, ExtentInit::Uninit),
-        }
-        .map_or(null_mut(), NonNull::as_ptr)
+        Self::alloc_slow(inner, inner_ref, None, spec)
     }
 
     /// Deallocates memory previously returned by this allocator.
@@ -136,30 +119,32 @@ impl Allocator {
         };
         // SAFETY: inner is retained by this Allocator while installed from self.inner.
         let inner_ref = unsafe { inner.as_ref() };
-
         let Some(ptr) = NonNull::new(ptr) else {
             return;
         };
-
         let Some(entry) = inner_ref.pages().get(ptr) else {
             Self::abort();
         };
 
-        if let PageOwner::Run(run) = entry {
-            // SAFETY: PageMap stores only pointers published from this allocator's live Arena<Run>.
-            let heap_id = unsafe { run.as_ref() }.heap_id();
-            match THREAD_HEAP.with(|tls| tls.free(inner, heap_id, run, ptr)) {
-                Ok(true) => return,
-                Ok(false) => {}
-                Err(_) => Self::abort(),
+        // Owner-local sticky/owner free is the body; remote/unbound falls to dealloc_slow.
+        match entry {
+            PageOwner::Run(run) => {
+                // SAFETY: PageMap stores only pointers published from this allocator's live Arena<Run>.
+                let heap_id = unsafe { run.as_ref() }.heap_id();
+                match THREAD_HEAP.with(|tls| tls.free(inner, heap_id, run, ptr)) {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(_) => Self::abort(),
+                }
             }
-        } else if let PageOwner::Extent(extent) = entry {
-            // SAFETY: PageMap stores only pointers published from this allocator's live Arena<Extent>.
-            let heap_id = unsafe { extent.as_ref() }.heap_id();
-            match THREAD_HEAP.with(|tls| tls.free_extent(inner, heap_id, extent, ptr)) {
-                Ok(true) => return,
-                Ok(false) => {}
-                Err(_) => Self::abort(),
+            PageOwner::Extent(extent) => {
+                // SAFETY: PageMap stores only pointers published from this allocator's live Arena<Extent>.
+                let heap_id = unsafe { extent.as_ref() }.heap_id();
+                match THREAD_HEAP.with(|tls| tls.free_extent(inner, heap_id, extent, ptr)) {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(_) => Self::abort(),
+                }
             }
         }
 
@@ -322,6 +307,33 @@ impl Allocator {
 
     fn inner(&self) -> Option<NonNull<AllocatorInner>> {
         NonNull::new(self.inner.load(Ordering::Acquire))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn alloc_slow(
+        inner: NonNull<AllocatorInner>,
+        inner_ref: &AllocatorInner,
+        class: Option<SizeClassId>,
+        spec: LayoutSpec,
+    ) -> *mut u8 {
+        let mut table = inner_ref.table.lock();
+        let heap_id = THREAD_HEAP.with(|tls| tls.bind(inner, &mut table));
+        let pages = inner_ref.pages();
+        let Some(heap_id) = heap_id else {
+            return null_mut();
+        };
+        let Some(heap) = table.heap_mut(heap_id) else {
+            return null_mut();
+        };
+        if !heap.is_active() {
+            return null_mut();
+        }
+        match class {
+            Some(class) => heap.alloc_run(class, pages),
+            None => heap.allocate_extent(spec, pages, ExtentInit::Uninit),
+        }
+        .map_or(null_mut(), NonNull::as_ptr)
     }
 
     #[cold]
