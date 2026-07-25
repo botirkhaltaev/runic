@@ -123,6 +123,7 @@ impl ThreadHeap {
     /// Owner-local small allocation via the TLS run cache.
     ///
     /// Returns `None` when this thread is not bound to `inner` (caller should `bind`).
+    /// Sticky hit is the straight-line body; inbox flush / acquire is cold.
     pub(crate) fn alloc(
         &self,
         inner: NonNull<AllocatorInner>,
@@ -134,25 +135,17 @@ impl ThreadHeap {
         }
 
         let mut heap = self.bound_heap();
+        let cell = self.run_cell(class);
 
-        if let Some(allocation) = self.alloc_cached(class, heap) {
-            return Some(allocation);
-        }
-
-        // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
-        let heap_mut = unsafe { heap.as_mut() };
-        if !heap_mut.inbox().is_empty() {
-            heap_mut.flush(pages).ok()?;
-            if let Some(allocation) = self.alloc_cached(class, heap) {
-                return Some(allocation);
+        if let Some(run) = NonNull::new(cell.get()) {
+            // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
+            match unsafe { heap.as_mut() }.alloc_from(run) {
+                Some(ptr) => return Some(ptr),
+                None => cell.set(core::ptr::null_mut()),
             }
         }
 
-        // Inbox is empty after the optional flush above, so acquire_run will not flush again.
-        // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
-        let run = unsafe { heap.as_mut() }.acquire_run(class, pages)?;
-        self.cache_run(class, run);
-        self.alloc_cached(class, heap)
+        self.alloc_miss(class, pages, heap)
     }
 
     /// Owner-local large allocation via the bound heap (no sticky extent cache).
@@ -176,6 +169,7 @@ impl ThreadHeap {
     /// Owner-local free for a run owned by the bound heap.
     ///
     /// Returns `Ok(false)` when unbound or bound to a different heap (slow path).
+    /// Sticky hit is the straight-line body; non-cached owner free is cold.
     pub(crate) fn free(
         &self,
         inner: NonNull<AllocatorInner>,
@@ -187,23 +181,23 @@ impl ThreadHeap {
             return Ok(false);
         }
 
-        let mut heap = self.bound_heap();
+        let mut heap_ptr = self.bound_heap();
         // SAFETY: PageMap stores only pointers published from this allocator's live arena.
         let class = unsafe { run.as_ref() }.class();
 
-        if self.cached_run(class) == Some(run) {
-            // SAFETY: cached run pointers are published from this heap's live arena.
+        if self.run_cell(class).get() == run.as_ptr() {
+            // SAFETY: sticky run pointers are published from this heap's live arena.
             unsafe { run.as_ref() }
                 .free_local(ptr)
                 .map_err(RunHeapError::from)
                 .map_err(HeapError::from)?;
             // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
-            unsafe { heap.as_mut() }.release_allocation();
+            unsafe { heap_ptr.as_mut() }.release_allocation();
             return Ok(true);
         }
 
         // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
-        unsafe { heap.as_mut() }.free_run_owner(
+        unsafe { heap_ptr.as_mut() }.free_run_owner(
             run,
             ptr,
             // SAFETY: inner is retained by this TLS entry while bound.
@@ -302,28 +296,31 @@ impl ThreadHeap {
         self.inner.get().is_null()
     }
 
-    fn alloc_cached(&self, class: SizeClassId, mut heap: NonNull<Heap>) -> Option<NonNull<u8>> {
-        let run = self.cached_run(class)?;
+    #[cold]
+    fn alloc_miss(
+        &self,
+        class: SizeClassId,
+        pages: &PageMap,
+        mut heap: NonNull<Heap>,
+    ) -> Option<NonNull<u8>> {
+        let cell = self.run_cell(class);
 
         // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
-        let heap = unsafe { heap.as_mut() };
-        let Some(allocation) = heap.alloc_from(run) else {
-            self.clear_run(class);
-            return None;
-        };
-        Some(allocation)
-    }
+        let heap_mut = unsafe { heap.as_mut() };
+        if !heap_mut.inbox().is_empty() {
+            heap_mut.flush(pages).ok()?;
+            if let Some(run) = NonNull::new(cell.get()) {
+                if let Some(ptr) = heap_mut.alloc_from(run) {
+                    return Some(ptr);
+                }
+                cell.set(core::ptr::null_mut());
+            }
+        }
 
-    fn cached_run(&self, class: SizeClassId) -> Option<NonNull<Run>> {
-        NonNull::new(self.run_cell(class).get())
-    }
-
-    fn cache_run(&self, class: SizeClassId, run: NonNull<Run>) {
-        self.run_cell(class).set(run.as_ptr());
-    }
-
-    fn clear_run(&self, class: SizeClassId) {
-        self.run_cell(class).set(core::ptr::null_mut());
+        // Inbox is empty after the optional flush above, so acquire_run will not flush again.
+        let run = heap_mut.acquire_run(class, pages)?;
+        cell.set(run.as_ptr());
+        heap_mut.alloc_from(run)
     }
 
     fn run_cell(&self, class: SizeClassId) -> &Cell<*mut Run> {
