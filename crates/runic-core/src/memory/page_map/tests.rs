@@ -20,14 +20,13 @@ fn has_l2_table(map: &PageMap, ptr: NonNull<u8>) -> bool {
     };
 
     map.l1()
-        .and_then(|l1| l1.entries.get(l1_index.get()))
-        .is_some_and(|entry| entry.l2_table_ref().is_some())
+        .is_some_and(|l1| l1.l2_table_ref(l1_index).is_some())
 }
 
 fn l2_table_for(map: &PageMap, ptr: NonNull<u8>) -> Option<&L2Table> {
     let (l1_index, _) = Page::containing(ptr).indexes()?;
 
-    map.l1()?.entries.get(l1_index.get())?.l2_table_ref()
+    map.l1()?.l2_table_ref(l1_index)
 }
 
 fn direct_entry(map: &PageMap, ptr: NonNull<u8>) -> Option<MapEntry> {

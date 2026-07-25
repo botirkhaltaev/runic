@@ -62,10 +62,11 @@ impl PageMap {
         }
     }
 
+    /// Lock-free ownership lookup: L1 tip → dense L2 tip → page entry → [`PageOwner`].
+    #[inline]
     pub(crate) fn get(&self, ptr: NonNull<u8>) -> Option<PageOwner> {
         let (l1_index, l2_index) = Page::containing(ptr).indexes()?;
-
-        self.l1()?.page_entry(l1_index, l2_index)?.owner()
+        self.l1()?.owner(l1_index, l2_index)
     }
 
     pub(crate) fn publish_run(
@@ -100,7 +101,7 @@ impl PageMap {
         let l1 = self.l1_or_init()?;
 
         for segment in range.segments() {
-            l1.entry(segment.l1)?.install_l2()?;
+            l1.install_l2(segment.l1)?;
         }
 
         let _guard = l1.lock_range(range);
@@ -115,6 +116,7 @@ impl PageMap {
         l1.stamp_remove(range, expected)
     }
 
+    #[inline]
     fn l1(&self) -> Option<&L1Table> {
         let l1 = NonNull::new(self.l1.load(Ordering::Acquire))?;
 
@@ -162,10 +164,7 @@ impl Drop for PageMap {
 
         // SAFETY: PageMap drop has unique access to the L1 table.
         let l1 = unsafe { l1_ptr.as_mut() };
-
-        for entry in &mut l1.entries {
-            entry.drop_l2_mapping();
-        }
+        l1.drop_l2_mappings();
 
         let _ = self.l1_mapping.get_mut().take();
     }
