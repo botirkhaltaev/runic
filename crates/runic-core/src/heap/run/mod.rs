@@ -223,8 +223,15 @@ impl BlockStates {
         // SAFETY: `index` is in `0..len`. The mapping is uniquely owned by this
         // `BlockStates`, sized for at least `len` bytes, zero-filled as Free, and
         // shared only through `Run`'s owner-local / atomic remote protocols.
-        let ptr = unsafe { self.mapping.base().as_ptr().add(index.index) }.cast::<AtomicU8>();
-        Ok(unsafe { &*ptr })
+        Ok(unsafe {
+            let ptr = self
+                .mapping
+                .base()
+                .as_ptr()
+                .add(index.index)
+                .cast::<AtomicU8>();
+            &*ptr
+        })
     }
 }
 
