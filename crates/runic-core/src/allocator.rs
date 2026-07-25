@@ -126,25 +126,26 @@ impl Allocator {
             Self::abort();
         };
 
-        // Single TLS enter for both owner kinds (split `with` closures fatten the frame).
-        // Owner-local free is the body; remote/unbound falls to dealloc_slow.
-        let owner_local = THREAD_HEAP.with(|tls| match entry {
+        // Owner-local sticky/owner free is the body; remote/unbound falls to dealloc_slow.
+        match entry {
             PageOwner::Run(run) => {
                 // SAFETY: PageMap stores only pointers published from this allocator's live Arena<Run>.
                 let heap_id = unsafe { run.as_ref() }.heap_id();
-                tls.free(inner, heap_id, run, ptr)
+                match THREAD_HEAP.with(|tls| tls.free(inner, heap_id, run, ptr)) {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(_) => Self::abort(),
+                }
             }
             PageOwner::Extent(extent) => {
                 // SAFETY: PageMap stores only pointers published from this allocator's live Arena<Extent>.
                 let heap_id = unsafe { extent.as_ref() }.heap_id();
-                tls.free_extent(inner, heap_id, extent, ptr)
+                match THREAD_HEAP.with(|tls| tls.free_extent(inner, heap_id, extent, ptr)) {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(_) => Self::abort(),
+                }
             }
-        });
-
-        match owner_local {
-            Ok(true) => return,
-            Ok(false) => {}
-            Err(_) => Self::abort(),
         }
 
         if Self::dealloc_slow(inner, inner_ref, ptr).is_err() {
