@@ -6,7 +6,7 @@ pub(crate) mod heap;
 
 use crate::{
     layout::LayoutSpec,
-    memory::{AddressRange, Mapping},
+    memory::{AddressRange, Mapping, OsMemory},
     size_class::{SizeClassId, SizeClasses},
 };
 
@@ -15,8 +15,6 @@ use super::HeapId;
 pub(crate) use heap::{RunHeap, RunHeapError};
 
 pub(crate) const RUN_SIZE: usize = 64 * 1024;
-const MIN_BLOCK_SIZE: usize = 8;
-const MAX_BLOCKS: usize = RUN_SIZE / MIN_BLOCK_SIZE;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RunId {
@@ -120,18 +118,25 @@ impl BlockState {
 
 /// Per-block Free / Allocated / `RemotePending` state.
 ///
-/// One `AtomicU8` per block slot, sized to the smallest size class's worst-case
-/// block count (`MAX_BLOCKS`). Not a packed bitmap; this is the only
-/// free/allocated/remote-pending tracker on a run.
+/// One `AtomicU8` per block for this run's capacity, owned in a dedicated
+/// anonymous mapping (zero-filled ⇒ Free). Not a packed bitmap; this is the
+/// only free/allocated/remote-pending tracker on a run.
 struct BlockStates {
-    states: [AtomicU8; MAX_BLOCKS],
+    mapping: Mapping,
+    len: usize,
 }
 
 impl BlockStates {
-    fn new() -> Self {
-        Self {
-            states: [const { AtomicU8::new(BlockState::Free.raw()) }; MAX_BLOCKS],
+    fn new(capacity: usize) -> Option<Self> {
+        if capacity == 0 {
+            return None;
         }
+
+        let mapping = OsMemory::map(capacity)?;
+        Some(Self {
+            mapping,
+            len: capacity,
+        })
     }
 
     fn allocate(&self, index: BlockIndex) -> Result<(), BlockStateError> {
@@ -211,9 +216,15 @@ impl BlockStates {
     }
 
     fn state(&self, index: BlockIndex) -> Result<&AtomicU8, BlockStateError> {
-        self.states
-            .get(index.index)
-            .ok_or(BlockStateError::InvalidIndex)
+        if index.index >= self.len {
+            return Err(BlockStateError::InvalidIndex);
+        }
+
+        // SAFETY: `index` is in `0..len`. The mapping is uniquely owned by this
+        // `BlockStates`, sized for at least `len` bytes, zero-filled as Free, and
+        // shared only through `Run`'s owner-local / atomic remote protocols.
+        let ptr = unsafe { self.mapping.base().as_ptr().add(index.index) }.cast::<AtomicU8>();
+        Ok(unsafe { &*ptr })
     }
 }
 
@@ -251,15 +262,16 @@ impl RunFreeStatus {
 }
 
 impl Run {
-    pub(crate) fn new(id: RunId, heap: HeapId, mapping: Mapping, class: SizeClassId) -> Self {
+    pub(crate) fn new(
+        id: RunId,
+        heap: HeapId,
+        mapping: Mapping,
+        class: SizeClassId,
+    ) -> Option<Self> {
         let block_size = SizeClasses::block_size(class);
-        let capacity = mapping
-            .range()
-            .len()
-            .checked_div(block_size)
-            .unwrap_or(0)
-            .min(MAX_BLOCKS);
-        Self {
+        let capacity = mapping.range().len().checked_div(block_size).unwrap_or(0);
+        let blocks = BlockStates::new(capacity)?;
+        Some(Self {
             id,
             heap,
             mapping,
@@ -268,8 +280,8 @@ impl Run {
             block_shift: block_size_shift(block_size),
             capacity,
             state: UnsafeCell::new(RunState::new(block_size)),
-            blocks: BlockStates::new(),
-        }
+            blocks,
+        })
     }
 
     #[cfg(test)]
@@ -556,7 +568,8 @@ mod tests {
             test_heap_id(),
             mapping,
             class,
-        );
+        )
+        .expect("test run");
         let capacity = RUN_SIZE / SizeClasses::block_size(class);
         let mut seen = vec![false; capacity];
 
@@ -585,7 +598,8 @@ mod tests {
             test_heap_id(),
             mapping,
             class,
-        );
+        )
+        .expect("test run");
 
         let ptr = run.allocate().unwrap();
 
@@ -602,7 +616,8 @@ mod tests {
             test_heap_id(),
             mapping,
             class_id(64, 8),
-        );
+        )
+        .expect("test run");
         let new = layout_spec(64, 8);
         let ptr = run.allocate().unwrap();
 
@@ -617,7 +632,8 @@ mod tests {
             test_heap_id(),
             mapping,
             class_id(64, 8),
-        );
+        )
+        .expect("test run");
         let new = layout_spec(80, 8);
         let ptr = run.allocate().unwrap();
 
@@ -633,7 +649,8 @@ mod tests {
             test_heap_id(),
             mapping,
             class,
-        );
+        )
+        .expect("test run");
         let ptr = run.allocate().unwrap();
         let interior = unsafe { NonNull::new_unchecked(ptr.as_ptr().add(1)) };
 
@@ -649,7 +666,8 @@ mod tests {
             test_heap_id(),
             mapping,
             class,
-        );
+        )
+        .expect("test run");
         let ptr = run.allocate().unwrap();
         let interior = unsafe { NonNull::new_unchecked(ptr.as_ptr().add(1)) };
 
@@ -666,7 +684,8 @@ mod tests {
             test_heap_id(),
             mapping,
             class,
-        );
+        )
+        .expect("test run");
         let ptr = run.allocate().unwrap();
 
         assert!(run.free_local(ptr).is_ok());
@@ -682,7 +701,8 @@ mod tests {
             test_heap_id(),
             mapping,
             class,
-        );
+        )
+        .expect("test run");
         let ptr = run.allocate().unwrap();
 
         assert_eq!(run.claim_free(ptr), Ok(()));
@@ -698,7 +718,8 @@ mod tests {
             test_heap_id(),
             mapping,
             class,
-        );
+        )
+        .expect("test run");
         let ptr = run.allocate().unwrap();
 
         assert_eq!(run.claim_free(ptr), Ok(()));
@@ -715,7 +736,8 @@ mod tests {
             test_heap_id(),
             mapping,
             class,
-        );
+        )
+        .expect("test run");
         let ptr = run.allocate().unwrap();
 
         assert_eq!(run.claim_free(ptr), Ok(()));
@@ -731,7 +753,8 @@ mod tests {
             test_heap_id(),
             mapping,
             class,
-        );
+        )
+        .expect("test run");
         let ptr = run.allocate().unwrap();
 
         assert_eq!(run.claim_free(ptr), Ok(()));
@@ -748,7 +771,8 @@ mod tests {
             test_heap_id(),
             mapping,
             class,
-        );
+        )
+        .expect("test run");
 
         assert!(matches!(
             run.free_local(run.range().base()),
@@ -765,7 +789,8 @@ mod tests {
             test_heap_id(),
             mapping,
             class,
-        );
+        )
+        .expect("test run");
         let capacity = RUN_SIZE / SizeClasses::block_size(class);
 
         for _ in 0..capacity {
@@ -783,7 +808,8 @@ mod tests {
             test_heap_id(),
             mapping,
             class_id(8, 8),
-        );
+        )
+        .expect("test run");
 
         assert_eq!(run.range().base(), range.base());
         assert_eq!(run.range().len(), range.len());

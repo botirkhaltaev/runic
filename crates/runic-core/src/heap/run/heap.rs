@@ -68,7 +68,10 @@ impl RunHeap {
             return None;
         };
 
-        let run = Run::new(id, heap_id, mapping, class);
+        let Some(run) = Run::new(id, heap_id, mapping, class) else {
+            self.runs.release(index);
+            return None;
+        };
         self.insert_run(index, id, run, pages)
     }
 
@@ -258,7 +261,7 @@ mod tests {
         let class = class_id(64, 8);
         let heap = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
 
-        Run::new(id, heap, mapping, class)
+        Run::new(id, heap, mapping, class).expect("reusable test run")
     }
 
     fn available_run_id(allocator: &RunHeap, class_index: usize) -> Option<RunId> {
