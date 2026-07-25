@@ -126,10 +126,8 @@ impl Allocator {
             Self::abort();
         };
 
-        // One TLS enter for both owner kinds. Split `with` closures force a fat dealloc
-        // frame (stack spills for capture); callgrind on PR7 showed that costing ~17% more
-        // Ir in `dealloc` than the inlined extent path. Owner-local free is the body;
-        // remote/unbound falls to dealloc_slow.
+        // Single TLS enter for both owner kinds (split `with` closures fatten the frame).
+        // Owner-local free is the body; remote/unbound falls to dealloc_slow.
         let owner_local = THREAD_HEAP.with(|tls| match entry {
             PageOwner::Run(run) => {
                 // SAFETY: PageMap stores only pointers published from this allocator's live Arena<Run>.
