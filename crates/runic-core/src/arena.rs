@@ -1,21 +1,19 @@
 //! Grow-on-demand mmap object table with an intrusive freelist.
 //!
 //! `new(max)` records a hard index limit only — no slots are mapped until
-//! `claim`. Growth maps chunk-sized slot groups via [`OsMemory::map`]. Slots are
-//! empty or occupied only. Callers that fail after `claim` and before `insert`
-//! must `release` the index.
+//! `claim`. Growth maps chunk-sized slot groups via [`OsMemory::map`], linked
+//! from the arena (no `alloc::Vec`, no fat in-struct directory). Slots are empty
+//! or occupied only. Callers that fail after `claim` and before `insert` must
+//! `release` the index.
 
 use core::{mem::MaybeUninit, ptr::NonNull};
 
-use crate::memory::{Mapping, OsMemory, PAGE_SIZE};
+use crate::memory::{OsMemory, PAGE_SIZE};
 
 const FREE_END: u32 = u32::MAX;
 
 /// Target mapping size per growth step (page-rounded by [`OsMemory::map`]).
-const CHUNK_BYTES: usize = 64 * 1024;
-
-/// Fixed chunk directory; must cover `max` at the smallest slot stride we allow.
-const MAX_CHUNKS: usize = 256;
+const CHUNK_BYTES: usize = 256 * 1024;
 
 pub(crate) struct Arena<T> {
     max: usize,
@@ -23,8 +21,20 @@ pub(crate) struct Arena<T> {
     bump: usize,
     free_head: u32,
     slots_per_chunk: usize,
-    chunks: [Option<Mapping>; MAX_CHUNKS],
+    /// Intrusive list of chunk mappings; header lives at each mapping base.
+    chunks: Option<NonNull<ChunkHeader>>,
+    chunk_count: usize,
     _marker: core::marker::PhantomData<T>,
+}
+
+/// Leading bytes of each chunk mapping; `next` links older chunks.
+#[repr(C)]
+struct ChunkHeader {
+    next: Option<NonNull<ChunkHeader>>,
+    /// Byte length passed to `munmap` (page-rounded mapping size).
+    bytes: usize,
+    /// Slot count in this chunk.
+    slots: usize,
 }
 
 // SAFETY: Arena owns mmap-backed storage. Moving ownership does not permit concurrent mutation.
@@ -33,16 +43,13 @@ unsafe impl<T: Send> Send for Arena<T> {}
 impl<T> Arena<T> {
     pub(crate) fn new(max: u32) -> Self {
         let max = usize::try_from(max).unwrap_or(0);
-        let slots_per_chunk = Self::slots_per_chunk();
-        let max_supported = slots_per_chunk.saturating_mul(MAX_CHUNKS);
-        let max = max.min(max_supported);
-
         Self {
             max,
             bump: 0,
             free_head: FREE_END,
-            slots_per_chunk,
-            chunks: [const { None }; MAX_CHUNKS],
+            slots_per_chunk: Self::slots_per_chunk(),
+            chunks: None,
+            chunk_count: 0,
             _marker: core::marker::PhantomData,
         }
     }
@@ -50,9 +57,12 @@ impl<T> Arena<T> {
     pub(crate) fn claim(&mut self) -> Option<usize> {
         if self.free_head != FREE_END {
             let index = usize::try_from(self.free_head).ok()?;
-            let slot = self.slot_mut(index)?;
-            debug_assert!(!slot.is_occupied());
-            self.free_head = slot.take_next();
+            let next = {
+                let slot = self.slot_mut(index)?;
+                debug_assert!(!slot.is_occupied());
+                slot.take_next()
+            };
+            self.free_head = next;
             return Some(index);
         }
 
@@ -118,26 +128,80 @@ impl<T> Arena<T> {
 
     fn slots_per_chunk() -> usize {
         let slot = core::mem::size_of::<Slot<T>>().max(1);
-        (CHUNK_BYTES / slot).max(1)
+        let available = CHUNK_BYTES.saturating_sub(Self::header_bytes());
+        (available / slot).max(1)
+    }
+
+    fn header_bytes() -> usize {
+        let header = core::mem::size_of::<ChunkHeader>();
+        let align = core::mem::align_of::<Slot<T>>().max(1);
+        header.div_ceil(align) * align
     }
 
     fn ensure_chunk(&mut self, index: usize) -> Option<()> {
         let chunk_index = index / self.slots_per_chunk;
-        let chunk = self.chunks.get_mut(chunk_index)?;
-        if chunk.is_some() {
+        if self.chunk(chunk_index).is_some() {
             return Some(());
+        }
+
+        // Chunks grow in order; the next chunk index equals the current count.
+        if chunk_index != self.chunk_count {
+            return None;
         }
 
         let start = chunk_index.checked_mul(self.slots_per_chunk)?;
         if start >= self.max {
             return None;
         }
-        let len = self.slots_per_chunk.min(self.max - start);
-        let byte_len = len.checked_mul(core::mem::size_of::<Slot<T>>())?;
-        // Ensure we ask for at least one page so empty T sizes still map.
-        let byte_len = byte_len.max(PAGE_SIZE);
-        *chunk = Some(OsMemory::map(byte_len)?);
+        let slots = self.slots_per_chunk.min(self.max - start);
+        let byte_len = Self::header_bytes()
+            .checked_add(slots.checked_mul(core::mem::size_of::<Slot<T>>())?)?
+            .max(PAGE_SIZE);
+        let mapping = OsMemory::map(byte_len)?;
+        let bytes = mapping.len().get();
+        let base = mapping.base();
+        // Mapping ownership transfers into the chunk list; prevent double-unmap.
+        core::mem::forget(mapping);
+
+        let header_ptr = base.cast::<ChunkHeader>();
+        // SAFETY: fresh anonymous mapping of `bytes` bytes, uniquely owned here.
+        unsafe {
+            header_ptr.write(ChunkHeader {
+                next: self.chunks,
+                bytes,
+                slots,
+            });
+        }
+        self.chunks = Some(header_ptr);
+        self.chunk_count += 1;
         Some(())
+    }
+
+    fn chunk(&self, chunk_index: usize) -> Option<NonNull<ChunkHeader>> {
+        // Newest chunk is at the head; chunk 0 was allocated first → deepest.
+        if chunk_index >= self.chunk_count {
+            return None;
+        }
+        let from_head = self.chunk_count - 1 - chunk_index;
+        let mut cur = self.chunks?;
+        for _ in 0..from_head {
+            // SAFETY: chunk list nodes are live headers in owned mappings.
+            cur = unsafe { cur.as_ref().next? };
+        }
+        Some(cur)
+    }
+
+    fn slots_base(header: NonNull<ChunkHeader>) -> NonNull<Slot<T>> {
+        // SAFETY: mapping layout is [ChunkHeader][pad][Slot; slots] within owned bytes.
+        unsafe {
+            NonNull::new_unchecked(
+                header
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(Self::header_bytes())
+                    .cast(),
+            )
+        }
     }
 
     fn slot(&self, index: usize) -> Option<&Slot<T>> {
@@ -159,17 +223,15 @@ impl<T> Arena<T> {
 
         let chunk_index = index / self.slots_per_chunk;
         let offset = index % self.slots_per_chunk;
-        let mapping = self.chunks.get(chunk_index)?.as_ref()?;
-        let start = chunk_index * self.slots_per_chunk;
-        let chunk_len = self.slots_per_chunk.min(self.max.saturating_sub(start));
-        if offset >= chunk_len {
+        let header = self.chunk(chunk_index)?;
+        // SAFETY: header is a live chunk in this arena's list.
+        let slots = unsafe { header.as_ref().slots };
+        if offset >= slots {
             return None;
         }
 
-        // SAFETY: mapping was sized for at least `chunk_len` slots; `offset < chunk_len`.
-        Some(unsafe {
-            NonNull::new_unchecked(mapping.base().cast::<Slot<T>>().as_ptr().add(offset))
-        })
+        // SAFETY: offset is in-range for this chunk's slot array.
+        Some(unsafe { NonNull::new_unchecked(Self::slots_base(header).as_ptr().add(offset)) })
     }
 }
 
@@ -179,6 +241,20 @@ impl<T> Drop for Arena<T> {
             if let Some(slot) = self.slot_mut(index) {
                 slot.drop_value();
             }
+        }
+
+        let mut cur = self.chunks.take();
+        while let Some(header) = cur {
+            // SAFETY: each node is a chunk header we wrote at mapping base.
+            let (next, bytes) = unsafe {
+                let header_ref = header.as_ref();
+                (header_ref.next, header_ref.bytes)
+            };
+            // SAFETY: mapping was created by OsMemory::map and forgotten into this list.
+            unsafe {
+                libc::munmap(header.as_ptr().cast(), bytes);
+            }
+            cur = next;
         }
     }
 }
@@ -330,7 +406,7 @@ mod tests {
 
     #[test]
     fn arena_grows_across_chunks_without_eager_len() {
-        let mut arena = Arena::<u32>::new(u32::try_from(MAX_CHUNKS * 2).unwrap());
+        let mut arena = Arena::<u32>::new(4_096);
         assert_eq!(arena.len(), 0);
 
         let first = arena.claim().unwrap();
@@ -338,9 +414,6 @@ mod tests {
         assert_eq!(arena.len(), 1);
         assert!(arena.insert(first, 7).is_some());
 
-        // Force past the first chunk when slots_per_chunk is small enough; for
-        // `u32` slots one chunk holds many entries — claim until bump advances
-        // and capacity still binds.
         let limit = arena.capacity().min(arena.slots_per_chunk + 1);
         while arena.len() < limit {
             let index = arena.claim().unwrap();
@@ -348,5 +421,9 @@ mod tests {
         }
         assert_eq!(arena.len(), limit);
         assert_eq!(arena.get(0).copied(), Some(7));
+        assert_eq!(
+            arena.get(limit - 1).copied(),
+            Some(u32::try_from(limit - 1).unwrap())
+        );
     }
 }
