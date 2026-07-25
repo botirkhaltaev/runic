@@ -1,16 +1,16 @@
-use core::mem::MaybeUninit;
+use core::ptr::NonNull;
 
 use crate::{
     config::{ExtentConfig, ExtentPolicy},
-    memory::Mapping,
+    heap::Extent,
 };
 
-/// Bounded cache of retained extent mappings.
+/// Bounded index of retained published extents.
 ///
-/// Reuse is exact-length only: a retained mapping is returned only if it
-/// matches the requested length exactly. `ExtentPolicy::Keep` admits a freed
-/// mapping while slot and byte budgets allow it and never evicts an already
-/// retained mapping to make room; `ExtentPolicy::Drop` retains nothing.
+/// Slots hold [`NonNull<Extent>`] into the owning [`super::heap::ExtentHeap`] arena.
+/// Cached extents stay page-map published; reuse is exact mapping-length only.
+/// `ExtentPolicy::Keep` admits while slot and byte budgets allow and never evicts an
+/// already retained extent to make room; `ExtentPolicy::Drop` retains nothing.
 pub(crate) struct ExtentCache {
     slots: [ExtentSlot; Self::MAX_SLOTS],
     retained_bytes: usize,
@@ -28,13 +28,14 @@ impl ExtentCache {
         }
     }
 
-    pub(crate) fn take(&mut self, len: usize) -> Option<Mapping> {
+    pub(crate) fn take(&mut self, len: usize) -> Option<NonNull<Extent>> {
         let index = self.find_exact(len)?;
         let slot = self.slots.get_mut(index)?;
-        let mapping = slot.take()?;
-        self.retained_bytes = self.retained_bytes.saturating_sub(mapping.range().len());
+        let extent = slot.take()?;
+        debug_assert!(self.retained_bytes >= len);
+        self.retained_bytes -= len;
 
-        Some(mapping)
+        Some(extent)
     }
 
     pub(crate) fn will_retain(&self, len: usize) -> bool {
@@ -49,25 +50,26 @@ impl ExtentCache {
             && self.retained_bytes <= budget.bytes() - len
     }
 
-    pub(crate) fn insert(&mut self, mapping: Mapping) -> Result<(), Mapping> {
-        let len = mapping.range().len();
+    pub(crate) fn insert(&mut self, extent: NonNull<Extent>) -> Result<(), NonNull<Extent>> {
+        // SAFETY: caller only inserts arena extents owned by the parent ExtentHeap.
+        let len = unsafe { extent.as_ref() }.mapping().len().get();
 
         if !self.will_retain(len) {
-            return Err(mapping);
+            return Err(extent);
         }
 
         let Some(index) = self.empty_slot_index() else {
-            return Err(mapping);
+            return Err(extent);
         };
 
         let Some(retained_bytes) = self.retained_bytes.checked_add(len) else {
-            return Err(mapping);
+            return Err(extent);
         };
 
         let Some(slot) = self.slots.get_mut(index) else {
-            return Err(mapping);
+            return Err(extent);
         };
-        slot.insert(mapping);
+        slot.insert(extent, len);
         self.retained_bytes = retained_bytes;
 
         Ok(())
@@ -103,6 +105,7 @@ impl ExtentCache {
 
 impl Drop for ExtentCache {
     fn drop(&mut self) {
+        // Index only — arena/`Extent` owns the mappings and munmaps them.
         for slot in &mut self.slots {
             let _ = slot.take();
         }
@@ -110,81 +113,111 @@ impl Drop for ExtentCache {
 }
 
 struct ExtentSlot {
-    mapping: MaybeUninit<Mapping>,
-    occupied: bool,
+    extent: Option<NonNull<Extent>>,
+    len: usize,
 }
 
 impl ExtentSlot {
     const fn empty() -> Self {
         Self {
-            mapping: MaybeUninit::uninit(),
-            occupied: false,
+            extent: None,
+            len: 0,
         }
     }
 
     const fn is_empty(&self) -> bool {
-        !self.occupied
+        self.extent.is_none()
     }
 
-    fn len(&self) -> Option<usize> {
+    const fn len(&self) -> Option<usize> {
         if self.is_empty() {
-            return None;
+            None
+        } else {
+            Some(self.len)
         }
-
-        // SAFETY: occupied is set only after mapping.write initializes the slot.
-        Some(unsafe { self.mapping.assume_init_ref() }.range().len())
     }
 
-    fn insert(&mut self, mapping: Mapping) {
+    fn insert(&mut self, extent: NonNull<Extent>, len: usize) {
         debug_assert!(self.is_empty());
-
-        self.mapping.write(mapping);
-        self.occupied = true;
+        self.extent = Some(extent);
+        self.len = len;
     }
 
-    fn take(&mut self) -> Option<Mapping> {
-        if self.is_empty() {
-            return None;
-        }
-
-        self.occupied = false;
-
-        // SAFETY: occupied was true on entry, so mapping is initialized.
-        Some(unsafe { self.mapping.assume_init_read() })
+    fn take(&mut self) -> Option<NonNull<Extent>> {
+        self.len = 0;
+        self.extent.take()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use core::{alloc::Layout, num::NonZeroU32};
+
     use crate::{
         config::{Budget, ExtentConfig, ExtentPolicy},
+        heap::{Extent, HeapId, extent::ExtentId},
+        layout::LayoutSpec,
         memory::OsMemory,
     };
 
     use super::*;
 
-    fn mapping(len: usize) -> Mapping {
-        OsMemory::map(len).unwrap()
+    /// Owns heap-allocated Free extents for cache tests; drops after the cache.
+    struct OwnedExtents {
+        extents: Vec<NonNull<Extent>>,
+    }
+
+    impl OwnedExtents {
+        fn new() -> Self {
+            Self {
+                extents: Vec::new(),
+            }
+        }
+
+        fn free_extent(&mut self, mapping_len: usize) -> NonNull<Extent> {
+            let heap_id = HeapId::new(0, NonZeroU32::MIN).unwrap();
+            let spec = LayoutSpec::from_layout(Layout::from_size_align(mapping_len, 8).unwrap());
+            let mapping = OsMemory::map(mapping_len).unwrap();
+            let extent =
+                Extent::new(ExtentId::from_index(0).unwrap(), heap_id, mapping, spec).unwrap();
+            assert_eq!(extent.free(extent.ptr()), Ok(()));
+            let ptr = NonNull::from(Box::leak(Box::new(extent)));
+            self.extents.push(ptr);
+            ptr
+        }
+    }
+
+    impl Drop for OwnedExtents {
+        fn drop(&mut self) {
+            for ptr in self.extents.drain(..) {
+                // SAFETY: each pointer came from Box::leak in free_extent; cache only indexes.
+                drop(unsafe { Box::from_raw(ptr.as_ptr()) });
+            }
+        }
     }
 
     #[test]
     fn extent_cache_reuses_exact_length() {
         let mut cache = ExtentCache::new(ExtentConfig::new());
-        let mapping = mapping(256 * 1024);
-        let len = mapping.range().len();
-        let ptr = mapping.base();
+        let mut owned = OwnedExtents::new();
+        let extent = owned.free_extent(256 * 1024);
+        // SAFETY: owned fixture extent.
+        let ptr = unsafe { extent.as_ref() }.ptr();
+        let len = unsafe { extent.as_ref() }.mapping().len().get();
 
-        assert!(cache.insert(mapping).is_ok());
+        assert!(cache.insert(extent).is_ok());
 
         let reused = cache.take(len).unwrap();
-        assert_eq!(reused.base(), ptr);
+        // SAFETY: returned from cache; still owned.
+        assert_eq!(unsafe { reused.as_ref() }.ptr(), ptr);
     }
 
     #[test]
     fn extent_cache_rejects_nonmatching_exact_lookup() {
         let mut cache = ExtentCache::new(ExtentConfig::new());
+        let mut owned = OwnedExtents::new();
 
-        assert!(cache.insert(mapping(256 * 1024)).is_ok());
+        assert!(cache.insert(owned.free_extent(256 * 1024)).is_ok());
         assert!(cache.take(128 * 1024).is_none());
     }
 
@@ -195,10 +228,11 @@ mod tests {
                 .with_policy(ExtentPolicy::Keep)
                 .with_budget(Budget::new(2, 1024 * 1024)),
         );
+        let mut owned = OwnedExtents::new();
 
-        assert!(cache.insert(mapping(4096)).is_ok());
-        assert!(cache.insert(mapping(4096)).is_ok());
-        assert!(cache.insert(mapping(4096)).is_err());
+        assert!(cache.insert(owned.free_extent(4096)).is_ok());
+        assert!(cache.insert(owned.free_extent(4096)).is_ok());
+        assert!(cache.insert(owned.free_extent(4096)).is_err());
     }
 
     #[test]
@@ -208,9 +242,10 @@ mod tests {
                 .with_policy(ExtentPolicy::Keep)
                 .with_budget(Budget::new(4, 4096)),
         );
+        let mut owned = OwnedExtents::new();
 
-        assert!(cache.insert(mapping(4096)).is_ok());
-        assert!(cache.insert(mapping(4096)).is_err());
+        assert!(cache.insert(owned.free_extent(4096)).is_ok());
+        assert!(cache.insert(owned.free_extent(4096)).is_err());
     }
 
     #[test]
@@ -220,8 +255,9 @@ mod tests {
                 .with_policy(ExtentPolicy::Drop)
                 .with_budget(Budget::new(32, 1024 * 1024)),
         );
+        let mut owned = OwnedExtents::new();
 
-        assert!(cache.insert(mapping(4096)).is_err());
+        assert!(cache.insert(owned.free_extent(4096)).is_err());
         assert!(cache.take(4096).is_none());
     }
 
@@ -232,13 +268,16 @@ mod tests {
                 .with_policy(ExtentPolicy::Keep)
                 .with_budget(Budget::new(1, 8192)),
         );
-        let first = mapping(4096);
-        let first_ptr = first.base();
+        let mut owned = OwnedExtents::new();
+        let first = owned.free_extent(4096);
+        // SAFETY: owned fixture extent.
+        let first_ptr = unsafe { first.as_ref() }.ptr();
 
         assert!(cache.insert(first).is_ok());
-        assert!(cache.insert(mapping(4096)).is_err());
+        assert!(cache.insert(owned.free_extent(4096)).is_err());
 
         let reused = cache.take(4096).unwrap();
-        assert_eq!(reused.base(), first_ptr);
+        // SAFETY: returned from cache; still owned.
+        assert_eq!(unsafe { reused.as_ref() }.ptr(), first_ptr);
     }
 }
