@@ -49,13 +49,11 @@ impl BlockIndex {
         self.get().checked_mul(block_size)
     }
 
-    fn byte_in(self, bytes: AddressRange) -> Option<NonNull<u8>> {
-        if self.get() >= bytes.len() {
-            return None;
-        }
-
-        // SAFETY: `get()` is in `0..bytes.len()`, so the byte is inside the span.
-        Some(unsafe { NonNull::new_unchecked(bytes.base().as_ptr().add(self.get())) })
+    /// State-tail byte for an index already proven in `0..bytes.len()` (capacity).
+    fn byte_unchecked(self, bytes: AddressRange) -> NonNull<u8> {
+        debug_assert!(self.get() < bytes.len());
+        // SAFETY: caller proved `get() < bytes.len()` via `block_at` / freelist / bump.
+        unsafe { NonNull::new_unchecked(bytes.base().as_ptr().add(self.get())) }
     }
 }
 
@@ -140,20 +138,31 @@ struct BlockStates {
 }
 
 impl BlockStates {
-    fn allocate(&self, index: BlockIndex) -> Result<(), BlockStateError> {
-        let state = self.state(index)?;
-        debug_assert_eq!(self.load(index)?, BlockState::Free);
+    /// Owner-local Free → Allocated. `index` must be capacity-proven.
+    fn allocate(&self, index: BlockIndex) {
+        let state = self.state_unchecked(index);
+        debug_assert_eq!(
+            BlockState::from_raw(state.load(Ordering::Relaxed)),
+            Some(BlockState::Free)
+        );
         state.store(BlockState::Allocated.raw(), Ordering::Relaxed);
-        Ok(())
     }
 
+    /// `index` must be capacity-proven (`block_at` / freelist / bump).
     fn is_allocated(&self, index: BlockIndex) -> Result<bool, BlockStateError> {
-        Ok(self.load(index)? == BlockState::Allocated)
+        let raw = self.state_unchecked(index).load(Ordering::Relaxed);
+        Ok(
+            BlockState::from_raw(raw).ok_or(BlockStateError::InvalidIndex)?
+                == BlockState::Allocated,
+        )
     }
 
+    /// Owner-local Allocated → Free. `index` must be capacity-proven.
     fn release(&self, index: BlockIndex) -> Result<(), BlockStateError> {
-        let state = self.state(index)?;
-        match self.load(index)? {
+        let state = self.state_unchecked(index);
+        match BlockState::from_raw(state.load(Ordering::Relaxed))
+            .ok_or(BlockStateError::InvalidIndex)?
+        {
             BlockState::Allocated => {
                 state.store(BlockState::Free.raw(), Ordering::Relaxed);
                 Ok(())
@@ -164,7 +173,7 @@ impl BlockStates {
     }
 
     fn mark_remote_pending(&self, index: BlockIndex) -> Result<(), BlockStateError> {
-        let state = self.state(index)?;
+        let state = self.state_unchecked(index);
         match state.compare_exchange(
             BlockState::Allocated.raw(),
             BlockState::RemotePending.raw(),
@@ -177,7 +186,7 @@ impl BlockStates {
     }
 
     fn release_remote_pending(&self, index: BlockIndex) -> Result<(), BlockStateError> {
-        let state = self.state(index)?;
+        let state = self.state_unchecked(index);
         match state.compare_exchange(
             BlockState::RemotePending.raw(),
             BlockState::Free.raw(),
@@ -190,7 +199,7 @@ impl BlockStates {
     }
 
     fn unclaim_remote_pending(&self, index: BlockIndex) -> Result<(), BlockStateError> {
-        let state = self.state(index)?;
+        let state = self.state_unchecked(index);
         match state.compare_exchange(
             BlockState::RemotePending.raw(),
             BlockState::Allocated.raw(),
@@ -202,11 +211,6 @@ impl BlockStates {
         }
     }
 
-    fn load(&self, index: BlockIndex) -> Result<BlockState, BlockStateError> {
-        let raw = self.state(index)?.load(Ordering::Relaxed);
-        BlockState::from_raw(raw).ok_or(BlockStateError::InvalidIndex)
-    }
-
     fn state_error(raw: u8) -> Result<(), BlockStateError> {
         match BlockState::from_raw(raw) {
             Some(BlockState::Free) => Err(BlockStateError::AlreadyFree),
@@ -216,16 +220,14 @@ impl BlockStates {
         }
     }
 
-    fn state(&self, index: BlockIndex) -> Result<&AtomicU8, BlockStateError> {
-        let ptr = index
-            .byte_in(self.bytes)
-            .ok_or(BlockStateError::InvalidIndex)?;
+    /// Atom for a capacity-proven block index (one address calc per op).
+    fn state_unchecked(&self, index: BlockIndex) -> &AtomicU8 {
+        let ptr = index.byte_unchecked(self.bytes);
 
-        // SAFETY: `byte_in` selected a byte in the run mapping's state tail,
-        // zero-filled as Free, owned by `Run` for this value's lifetime, and
-        // shared only through owner-local / atomic remote protocols. That byte
-        // is accessed as `AtomicU8`.
-        Ok(unsafe { &*ptr.as_ptr().cast::<AtomicU8>() })
+        // SAFETY: `byte_unchecked` selected a byte in the run mapping's state
+        // tail, zero-filled as Free, owned by `Run` for this value's lifetime,
+        // and shared only through owner-local / atomic remote protocols.
+        unsafe { &*ptr.as_ptr().cast::<AtomicU8>() }
     }
 }
 
@@ -364,7 +366,7 @@ impl Run {
             .pop_free(state)
             .or_else(|| state.allocate_fresh(self.capacity))?;
         let ptr = self.block_ptr(index);
-        self.blocks.allocate(index).ok()?;
+        self.blocks.allocate(index);
 
         debug_assert!(state.live < self.capacity);
         state.live += 1;
