@@ -184,17 +184,22 @@ impl ThreadHeap {
     ) -> Result<(), ThreadFreeError> {
         // SAFETY: PageMap stores only pointers published from this allocator's live arena.
         let run_ref = unsafe { run.as_ref() };
-        if !self.matches(inner) || self.heap_id.get() != Some(run_ref.heap_id()) {
+        if !self.matches(inner) {
             return Err(ThreadFreeError::NotBound);
         }
 
         let class = run_ref.class();
+        // Sticky slots only park this heap's runs — pointer-eq before HeapId.
         if self.run_cell(class).get() == run.as_ptr() {
             // Sticky hit: Run only — do not finish_free / push_available.
             return match run_ref.free(ptr) {
                 Ok(()) => Ok(()),
                 Err(error) => Err(Self::sticky_free_err(error)),
             };
+        }
+
+        if self.heap_id.get() != Some(run_ref.heap_id()) {
+            return Err(ThreadFreeError::NotBound);
         }
 
         // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
