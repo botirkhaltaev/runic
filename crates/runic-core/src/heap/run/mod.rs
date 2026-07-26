@@ -218,17 +218,20 @@ impl BlockStates {
 }
 
 pub(crate) struct Run {
+    /// Owner-local freelist / live / bump — field order prefers sticky locality under
+    /// `repr(Rust)` (not a layout guarantee; do not treat as ABI).
+    state: UnsafeCell<RunState>,
+    /// Cached `mapping.base()` — payload span start (`RUN_SIZE` bytes).
+    payload_base: NonNull<u8>,
+    blocks: BlockStates,
+    /// `trailing_zeros(block_size)` when power-of-two; `None` ⇒ multiply path.
+    block_shift: Option<NonZeroU32>,
+    class: SizeClassId,
+    capacity: usize,
+    block_size: usize,
     id: RunId,
     heap: HeapId,
     mapping: Mapping,
-    /// Cached `mapping.base()` — payload span start (`RUN_SIZE` bytes).
-    payload_base: NonNull<u8>,
-    class: SizeClassId,
-    block_size: usize,
-    block_shift: Option<u32>,
-    capacity: usize,
-    state: UnsafeCell<RunState>,
-    blocks: BlockStates,
 }
 
 // SAFETY: owner-local methods are called only by the owning heap. Remote methods only touch atomic
@@ -257,9 +260,10 @@ impl Run {
         RUN_SIZE.checked_add(capacity)
     }
 
-    const fn block_size_shift(block_size: usize) -> Option<u32> {
+    const fn block_size_shift(block_size: usize) -> Option<NonZeroU32> {
         if block_size.is_power_of_two() {
-            Some(block_size.trailing_zeros())
+            // Min size class is 8 (`trailing_zeros` ≥ 3); never zero for our table.
+            NonZeroU32::new(block_size.trailing_zeros())
         } else {
             None
         }
@@ -289,16 +293,16 @@ impl Run {
             bytes: AddressRange::new(state_base, capacity),
         };
         Some(Self {
+            state: UnsafeCell::new(RunState::new(block_size)),
+            payload_base: mapping.base(),
+            blocks,
+            block_shift: Self::block_size_shift(block_size),
+            class,
+            capacity,
+            block_size,
             id,
             heap,
-            payload_base: mapping.base(),
             mapping,
-            class,
-            block_size,
-            block_shift: Self::block_size_shift(block_size),
-            capacity,
-            state: UnsafeCell::new(RunState::new(block_size)),
-            blocks,
         })
     }
 
@@ -459,7 +463,7 @@ impl Run {
     fn block_ptr(&self, index: BlockIndex) -> NonNull<u8> {
         debug_assert!(index.get() < self.capacity);
         let byte_offset = match self.block_shift {
-            Some(shift) => index.get() << shift,
+            Some(shift) => index.get() << shift.get(),
             None => index.get() * self.block_size,
         };
         // SAFETY: freelist / `allocate_fresh` only yield `index < capacity`, so
@@ -505,7 +509,7 @@ impl Run {
                 return None;
             }
 
-            return Some(offset >> shift);
+            return Some(offset >> shift.get());
         }
 
         if !offset.is_multiple_of(self.block_size) {
@@ -564,7 +568,7 @@ mod tests {
     }
 
     fn class_id(size: usize, align: usize) -> SizeClassId {
-        SizeClasses::id_for(layout_spec(size, align)).unwrap()
+        SizeClasses::id_for(Layout::from_size_align(size, align).unwrap()).unwrap()
     }
 
     fn test_heap_id() -> HeapId {

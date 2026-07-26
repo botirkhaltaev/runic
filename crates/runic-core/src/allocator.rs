@@ -79,20 +79,25 @@ impl Allocator {
     /// only according to `layout`, avoid out-of-bounds access, and eventually
     /// pass the same pointer and a compatible layout back to this allocator.
     pub unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let spec = LayoutSpec::from_layout(layout);
-        let Some(inner) = self.ensure_inner() else {
-            return null_mut();
-        };
-        // SAFETY: inner is retained by this Allocator while installed from self.inner.
-        let inner_ref = unsafe { inner.as_ref() };
-
-        if let Some(class) = SizeClasses::id_for(spec) {
+        // Classify before `LayoutSpec` — small path never builds a spec.
+        if let Some(class) = SizeClasses::id_for(layout) {
+            let Some(inner) = self.ensure_inner() else {
+                return null_mut();
+            };
+            // SAFETY: inner is retained by this Allocator while installed from self.inner.
+            let inner_ref = unsafe { inner.as_ref() };
             if let Some(ptr) = THREAD_HEAP.with(|tls| tls.alloc(inner, class, inner_ref.pages())) {
                 return ptr.as_ptr();
             }
             return Self::alloc_slow(inner, inner_ref, class);
         }
 
+        let spec = LayoutSpec::from_layout(layout);
+        let Some(inner) = self.ensure_inner() else {
+            return null_mut();
+        };
+        // SAFETY: inner is retained by this Allocator while installed from self.inner.
+        let inner_ref = unsafe { inner.as_ref() };
         Self::allocate_extent(inner, inner_ref, spec, ExtentInit::Uninit)
     }
 
@@ -230,18 +235,22 @@ impl Allocator {
     /// only according to `layout` and eventually pass it back to this allocator with a
     /// compatible layout.
     pub unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let spec = LayoutSpec::from_layout(layout);
+        // One classify: small → allocate then zero; large → extent path owns zeroing.
+        let Some(class) = SizeClasses::id_for(layout) else {
+            let spec = LayoutSpec::from_layout(layout);
+            let Some(inner) = self.ensure_inner() else {
+                return null_mut();
+            };
+            // SAFETY: inner is retained by this Allocator while installed from self.inner.
+            let inner_ref = unsafe { inner.as_ref() };
+            return Self::allocate_extent(inner, inner_ref, spec, ExtentInit::Zeroed);
+        };
+
         let Some(inner) = self.ensure_inner() else {
             return null_mut();
         };
         // SAFETY: inner is retained by this Allocator while installed from self.inner.
         let inner_ref = unsafe { inner.as_ref() };
-
-        // One classify: small → allocate then zero; large → extent path owns zeroing.
-        let Some(class) = SizeClasses::id_for(spec) else {
-            return Self::allocate_extent(inner, inner_ref, spec, ExtentInit::Zeroed);
-        };
-
         let ptr =
             if let Some(ptr) = THREAD_HEAP.with(|tls| tls.alloc(inner, class, inner_ref.pages())) {
                 ptr.as_ptr()
@@ -610,11 +619,10 @@ mod tests {
     }
 
     fn allocate_small(inner_ref: &AllocatorInner, id: HeapId, layout: Layout) -> NonNull<u8> {
-        let spec = LayoutSpec::from_layout(layout);
         let mut table = inner_ref.table.lock();
         let heap = table.heap_mut(id).unwrap();
         assert!(heap.is_active());
-        heap.alloc_run(SizeClasses::id_for(spec).unwrap(), inner_ref.pages())
+        heap.alloc_run(SizeClasses::id_for(layout).unwrap(), inner_ref.pages())
             .unwrap()
     }
 
