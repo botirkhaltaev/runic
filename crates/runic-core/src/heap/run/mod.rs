@@ -295,25 +295,13 @@ impl Run {
 
     /// Owner-local: live → freelist. No `BlockStates` store.
     ///
-    /// Double-free poison: freelist-head identity (immediate double-free of the same
-    /// block). Freelist membership (+ bump) is Free/Live authority — no Allocated atomics.
+    /// Double-free poison: freelist-head identity or `RemotePending`. Freelist membership
+    /// (+ bump) is Free/Live authority — no Allocated atomics.
     #[inline]
     pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
-        let Some(block) = self.block_at(ptr) else {
-            return Err(Self::free_invalid());
-        };
+        let block = self.owner_block(ptr)?;
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
-        if block.index().get() >= state.bump {
-            return Err(RunError::DoubleFree);
-        }
-        if self.blocks.is_remote_pending(block.index()) {
-            return Err(RunError::DoubleFree);
-        }
-        if block.index().get() == state.free {
-            return Err(RunError::DoubleFree);
-        }
-
         debug_assert!(state.live > 0);
         state.live -= 1;
         Self::push_free(state, block);
@@ -324,6 +312,47 @@ impl Run {
     #[inline(never)]
     fn free_invalid() -> RunError {
         RunError::InvalidPointer
+    }
+
+    /// Sticky/magazine path: containment + shift index without `Option` `block_at`.
+    ///
+    /// Includes bump / `RemotePending` / freelist-head poison. Does not mutate freelist/`live`.
+    #[inline]
+    pub(crate) fn owner_block(&self, ptr: NonNull<u8>) -> Result<RunBlock, RunError> {
+        let offset = ptr
+            .as_ptr()
+            .addr()
+            .wrapping_sub(self.payload_base.as_ptr().addr());
+        if offset >= RUN_SIZE {
+            return Err(Self::free_invalid());
+        }
+        let index = if self.block_shift != 0 {
+            if offset & (self.block_size - 1) != 0 {
+                return Err(Self::free_invalid());
+            }
+            offset >> self.block_shift
+        } else {
+            let Some(index) = Self::block_index_non_pow2(offset, self.block_size) else {
+                return Err(Self::free_invalid());
+            };
+            index
+        };
+        if index >= self.capacity {
+            return Err(Self::free_invalid());
+        }
+        let index = BlockIndex::new(index);
+        // SAFETY: owner-local methods are called only by the owning heap.
+        let state = unsafe { &*self.state.get() };
+        if index.get() >= state.bump {
+            return Err(RunError::DoubleFree);
+        }
+        if self.blocks.is_remote_pending(index) {
+            return Err(RunError::DoubleFree);
+        }
+        if index.get() == state.free {
+            return Err(RunError::DoubleFree);
+        }
+        Ok(RunBlock::new(index, ptr))
     }
 
     /// Freer: live → `RemotePending` (before batch/publish).
@@ -768,6 +797,23 @@ mod tests {
             let ptr = run.allocate().unwrap();
             assert_eq!(ptr.as_ptr() as usize % 16, 0);
         }
+    }
+
+    #[test]
+    fn run_owner_block_rejects_interior_pointer() {
+        let class = class_id(64, 8);
+        let run = Run::new(
+            RunId::from_index(0).unwrap(),
+            test_heap_id(),
+            map_for_class(class),
+            class,
+        )
+        .expect("test run");
+
+        let ptr = run.allocate().unwrap();
+        assert_eq!(run.owner_block(ptr).unwrap().ptr(), ptr);
+        let interior = unsafe { NonNull::new_unchecked(ptr.as_ptr().add(1)) };
+        assert!(run.owner_block(interior).is_err());
     }
 
     #[test]

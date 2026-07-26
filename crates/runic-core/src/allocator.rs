@@ -108,7 +108,7 @@ impl Allocator {
     /// `ptr` must be null or a pointer previously returned by this allocator
     /// for `layout`. Passing an unknown pointer, an interior pointer, or an
     /// incompatible layout violates the allocator contract and may abort.
-    pub unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+    pub unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if ptr.is_null() {
             return;
         }
@@ -121,16 +121,10 @@ impl Allocator {
         let Some(ptr) = NonNull::new(ptr) else {
             return;
         };
-        // One TLS entry: page→owner lookup + owner-local free (do not nest a second `with`).
+        let class = SizeClasses::id_for(layout);
+        // One TLS entry: layout→sticky first; PageMap for miss/extent/remote.
         THREAD_HEAP.with(|tls| {
-            let Some(owner) = tls.lookup_owner(inner_ref.pages(), ptr) else {
-                Self::abort();
-            };
-            let result = match owner {
-                PageOwner::Run(run) => tls.free(inner, run, ptr),
-                PageOwner::Extent(extent) => tls.free_extent(inner, extent, ptr),
-            };
-            if let Err(error) = result {
+            if let Err((owner, error)) = tls.dealloc(inner, inner_ref.pages(), class, ptr) {
                 Self::dealloc_not_local(inner, inner_ref, owner, ptr, error);
             }
         });
