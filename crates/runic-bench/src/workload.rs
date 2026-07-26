@@ -8,6 +8,8 @@ pub const SIZE_CLASSES: &[usize] = &[
 ];
 
 pub const SINGLE_SIZE_CHURN: &[usize] = &[8, 16, 32, 64, 128, 256, 512, 1024, 4096];
+/// Live-set depths for freelist-heavy recycled churn (gate matrix).
+pub const RECYCLED_LIVE_DEPTHS: &[usize] = &[1, 32, 256];
 pub const LARGE_SIZES: &[usize] = &[32769, 64 * 1024, 256 * 1024, 1024 * 1024];
 pub const ALIGNMENT_CASES: &[(usize, usize)] =
     &[(1, 8), (1, 64), (1, 4096), (64, 64), (4096, 4096)];
@@ -30,6 +32,56 @@ pub fn single_size_churn(target: AllocatorTarget, size: usize, ops: usize) -> us
             checksum ^= ptr.as_ptr().read() as usize;
             checksum ^= ptr.as_ptr().add(size - 1).read() as usize;
         }
+        target.dealloc(ptr, layout);
+    }
+
+    black_box(checksum)
+}
+
+/// Recycled live-set churn: keep `live` allocations and replace them round-robin.
+///
+/// Depth 1 matches immediate free/reuse; deeper live sets exercise freelist allocate
+/// after owner free without collapsing to bump-only traffic.
+///
+/// # Panics
+///
+/// Panics if `size`/`live` are invalid or allocation fails.
+#[must_use]
+pub fn single_size_recycled_churn(
+    target: AllocatorTarget,
+    size: usize,
+    ops: usize,
+    live: usize,
+) -> usize {
+    assert!(live > 0, "live depth must be non-zero");
+    let layout = Layout::from_size_align(size, 8).unwrap();
+    let mut slots = Vec::with_capacity(live);
+    let mut checksum = 0_usize;
+
+    for i in 0..live {
+        let ptr = target.alloc(black_box(layout));
+        unsafe {
+            ptr.as_ptr().write(byte(i));
+            checksum ^= ptr.as_ptr().read() as usize;
+        }
+        slots.push(ptr);
+    }
+
+    for i in 0..ops {
+        let index = i % live;
+        let old = slots[index];
+        target.dealloc(old, layout);
+        let ptr = target.alloc(black_box(layout));
+        unsafe {
+            ptr.as_ptr().write(byte(i));
+            ptr.as_ptr().add(size - 1).write(byte(i >> 8));
+            checksum ^= ptr.as_ptr().read() as usize;
+            checksum ^= ptr.as_ptr().add(size - 1).read() as usize;
+        }
+        slots[index] = ptr;
+    }
+
+    for ptr in slots {
         target.dealloc(ptr, layout);
     }
 
