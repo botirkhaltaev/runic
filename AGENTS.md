@@ -10,7 +10,7 @@
 ## Conventions
 
 - Put behavior on the owning entity; prefer `NonZero*` / `NonNull` / named fields; avoid free one-line helpers and pass-throughs.
-- Owner-local TLS vs remote table: `ThreadHeap::{alloc,alloc_extent,free,free_extent}` / `Allocator::{alloc_remote,alloc_extent_remote,free_remote}`; domain ops `free` / `claim` / `accept`.
+- Owner-local TLS vs remote table: `ThreadHeap::{alloc,alloc_extent,free,free_extent,dealloc}` / `Allocator::{alloc_remote,alloc_extent_remote,free_remote}`; domain ops `free` / `claim` / `accept`.
 - One remote-free protocol: claim → batch → `HeapTable::publish` → flush/`accept` (including `Draining` late frees).
 - `Layout` only at the public boundary; convert once to `LayoutSpec` and pass it inward (`SizeClasses::id_for`, extents, resize).
 - No shared/root ownership heap; every run/extent is stamped with `HeapId`.

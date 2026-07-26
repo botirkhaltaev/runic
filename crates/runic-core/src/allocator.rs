@@ -114,7 +114,7 @@ impl Allocator {
     /// `ptr` must be null or a pointer previously returned by this allocator
     /// for `layout`. Passing an unknown pointer, an interior pointer, or an
     /// incompatible layout violates the allocator contract and may abort.
-    pub unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+    pub unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if ptr.is_null() {
             return;
         }
@@ -127,19 +127,12 @@ impl Allocator {
         let Some(ptr) = NonNull::new(ptr) else {
             return;
         };
-        // One TLS entry for lookup + owner-local free; remote/abort runs after `with`.
-        let remote = THREAD_HEAP.with(|tls| {
-            let Some(owner) = tls.lookup_owner(inner, inner_ref.pages(), ptr) else {
-                Self::abort();
-            };
-            match owner {
-                PageOwner::Run(run) => tls.free(inner, run, ptr).map_err(|error| (owner, error)),
-                PageOwner::Extent(extent) => tls
-                    .free_extent(inner, extent, ptr)
-                    .map_err(|error| (owner, error)),
-            }
-            .err()
-        });
+        let class = SizeClasses::id_for(LayoutSpec::from_layout(layout));
+        // One TLS entry: layout→sticky first; PageMap for miss/extent/remote.
+        // Remote/abort runs after `with` returns.
+        let remote = THREAD_HEAP
+            .with(|tls| tls.dealloc(inner, inner_ref.pages(), class, ptr))
+            .err();
         if let Some((owner, error)) = remote {
             Self::dealloc_remote(inner, inner_ref, owner, ptr, error);
         }
