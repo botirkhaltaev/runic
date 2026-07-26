@@ -116,7 +116,7 @@ impl Allocator {
         let Some(ptr) = NonNull::new(ptr) else {
             return;
         };
-        let Some(owner) = inner_ref.pages().get(ptr) else {
+        let Some(owner) = THREAD_HEAP.with(|tls| tls.lookup_owner(inner_ref.pages(), ptr)) else {
             Self::abort();
         };
 
