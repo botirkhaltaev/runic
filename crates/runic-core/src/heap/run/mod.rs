@@ -159,10 +159,17 @@ impl BlockStates {
     #[cold]
     #[inline(never)]
     fn release_err(raw: u8) -> BlockStateError {
+        // Caller already proved `raw != Allocated`; remaining cases are domain
+        // errors or corrupt bytes (not an index failure after `state_unchecked`).
         match BlockState::from_raw(raw) {
             Some(BlockState::Free) => BlockStateError::AlreadyFree,
             Some(BlockState::RemotePending) => BlockStateError::AlreadyPending,
-            Some(BlockState::Allocated) | None => BlockStateError::InvalidIndex,
+            Some(BlockState::Allocated) => {
+                debug_assert!(false, "release_err after Allocated check");
+                BlockStateError::AlreadyAllocated
+            }
+            // Corrupt state after a capacity-proven index.
+            None => BlockStateError::InvalidIndex,
         }
     }
 
