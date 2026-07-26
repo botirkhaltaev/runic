@@ -23,6 +23,12 @@ impl SizeClassId {
             None
         }
     }
+
+    /// `index` must be in `0..SizeClasses::COUNT` (e.g. from `CLASS_FOR_SIZE`).
+    const unsafe fn new_unchecked(index: usize) -> Self {
+        debug_assert!(index < SizeClasses::COUNT);
+        Self { index }
+    }
 }
 
 pub(crate) struct SizeClasses;
@@ -124,26 +130,39 @@ impl SizeClasses {
 
     /// Map a layout to a small size class, or `None` for large/over-aligned requests.
     ///
-    /// Default-align (`align <= 8`) is the hot path: one bounds check, then a direct
-    /// `CLASS_FOR_SIZE` lookup. Higher alignments take the const align-remap table.
+    /// Default-align (`align <= 8`) is the hot path: size bound + `CLASS_FOR_SIZE`
+    /// only — no `PAGE_SIZE` check (align 8 is always ≤ page). Higher alignments
+    /// take the cold remap path.
+    #[inline]
     pub(crate) fn id_for(spec: LayoutSpec) -> Option<SizeClassId> {
         let align = spec.align();
-        if align > PAGE_SIZE {
-            return None;
-        }
-
         // `LayoutSpec` normalizes zero size to 1; align is a nonzero power of two.
         let required = spec.minimum_block_size();
-        if required > Self::SMALL_MAX {
+
+        if align <= Self::MIN_ALIGNMENT {
+            if required > Self::SMALL_MAX {
+                return None;
+            }
+
+            // SAFETY: `required` is in `1..=SMALL_MAX`, so the table slot is
+            // initialized; every stored class index is `< COUNT`.
+            let index = usize::from(unsafe { *Self::CLASS_FOR_SIZE.get_unchecked(required) });
+            // SAFETY: `index` came from `CLASS_FOR_SIZE` and is `< COUNT`.
+            return Some(unsafe { SizeClassId::new_unchecked(index) });
+        }
+
+        Self::id_for_aligned(required, align)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn id_for_aligned(required: usize, align: usize) -> Option<SizeClassId> {
+        if align > PAGE_SIZE || required > Self::SMALL_MAX {
             return None;
         }
 
         // SAFETY: `required` is in `1..=SMALL_MAX`, so the table slot is initialized.
         let lower_bound = usize::from(unsafe { *Self::CLASS_FOR_SIZE.get_unchecked(required) });
-        if align <= Self::MIN_ALIGNMENT {
-            return SizeClassId::new(lower_bound);
-        }
-
         Self::aligned_class_from(lower_bound, align)
     }
 
