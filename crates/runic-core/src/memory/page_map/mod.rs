@@ -69,15 +69,6 @@ impl PageMap {
         self.l1()?.owner(l1_index, l2_index)
     }
 
-    pub(crate) fn publish_run(
-        &self,
-        mapping: &Mapping,
-        run: NonNull<Run>,
-    ) -> Result<(), PageMapError> {
-        let range = PageRange::from_mapping(mapping).ok_or(PageMapError::InvalidRange)?;
-        self.insert(range, PageOwner::Run(run))
-    }
-
     pub(crate) fn publish_extent(
         &self,
         mapping: &Mapping,

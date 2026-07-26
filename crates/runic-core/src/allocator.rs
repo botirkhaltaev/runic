@@ -11,8 +11,8 @@ use crate::{
     config::AllocatorConfig,
     heap::extent::ExtentError,
     heap::{
-        ExtentHeap, ExtentHeapError, ExtentInit, HeapError, HeapId, HeapMode, HeapTable, RunError,
-        RunHeap, RunHeapError, THREAD_HEAP, ThreadFreeError,
+        ExtentHeap, ExtentHeapError, ExtentInit, HeapError, HeapId, HeapMode, HeapTable, Run,
+        RunError, RunHeap, RunHeapError, THREAD_HEAP, ThreadFreeError,
     },
     layout::LayoutSpec,
     memory::{Mapping, OsMemory, PageMap, PageOwner},
@@ -180,8 +180,20 @@ impl Allocator {
         let Some(old_ptr) = NonNull::new(ptr) else {
             return null_mut();
         };
-        let Some(entry) = inner_ref.pages().get(old_ptr) else {
-            Self::abort();
+        let entry = if SizeClasses::id_for(old).is_some() {
+            if let Some(run) = Run::from_block_ptr(old_ptr) {
+                PageOwner::Run(run)
+            } else {
+                let Some(entry) = inner_ref.pages().get(old_ptr) else {
+                    Self::abort();
+                };
+                entry
+            }
+        } else {
+            let Some(entry) = inner_ref.pages().get(old_ptr) else {
+                Self::abort();
+            };
+            entry
         };
 
         let Ok(new_layout) = Layout::from_size_align(new_size, old.align()) else {
@@ -357,11 +369,11 @@ impl Allocator {
     ) -> Result<(), AllocatorError> {
         let heap_id = match owner {
             PageOwner::Run(run) => {
-                // SAFETY: PageMap stores only pointers published from this allocator's live arenas.
+                // SAFETY: sticky / segment header recovered a live arena run.
                 unsafe { run.as_ref() }.heap_id()
             }
             PageOwner::Extent(extent) => {
-                // SAFETY: PageMap stores only pointers published from this allocator's live arenas.
+                // SAFETY: PageMap stores only extent pointers published from this allocator's live arenas.
                 unsafe { extent.as_ref() }.heap_id()
             }
         };
@@ -385,13 +397,13 @@ impl Allocator {
             HeapMode::Active => {
                 match owner {
                     PageOwner::Run(run) => {
-                        // SAFETY: PageMap stores only pointers published from this allocator's live arenas.
+                        // SAFETY: sticky / segment header recovered a live arena run.
                         unsafe { run.as_ref() }
                             .claim(ptr)
                             .map_err(AllocatorError::from)?;
                     }
                     PageOwner::Extent(extent) => {
-                        // SAFETY: PageMap stores only pointers published from this allocator's live arenas.
+                        // SAFETY: PageMap stores only extent pointers published from this allocator's live arenas.
                         unsafe { extent.as_ref() }
                             .claim(ptr)
                             .map_err(AllocatorError::from)?;
@@ -406,7 +418,7 @@ impl Allocator {
                         Some(HeapMode::Free) | None => {
                             match owner {
                                 PageOwner::Run(run) => {
-                                    // SAFETY: we just claimed this block on the live PageMap run.
+                                    // SAFETY: we just claimed this block on the live run.
                                     if unsafe { run.as_ref() }.unclaim(ptr).is_err() {
                                         Self::abort();
                                     }
@@ -630,11 +642,8 @@ mod tests {
         heap.allocate_extent(spec, inner_ref.pages(), init).unwrap()
     }
 
-    fn run_of(inner_ref: &AllocatorInner, ptr: NonNull<u8>) -> NonNull<Run> {
-        let PageOwner::Run(run) = inner_ref.pages().get(ptr).unwrap() else {
-            panic!("expected a run-owned pointer");
-        };
-        run
+    fn run_of(_inner_ref: &AllocatorInner, ptr: NonNull<u8>) -> NonNull<Run> {
+        Run::from_block_ptr(ptr).expect("expected a run-owned pointer")
     }
 
     fn extent_of(inner_ref: &AllocatorInner, ptr: NonNull<u8>) -> NonNull<Extent> {
@@ -878,13 +887,14 @@ mod tests {
             }
             let _ = table.reclaim(heap);
         }
-        assert!(inner_ref.pages().get(ptr).is_some());
+        assert!(Run::from_block_ptr(ptr).is_some());
+        assert!(inner_ref.pages().get(ptr).is_none());
         let reused = acquire_id(inner_ref);
         assert_eq!(reused.index(), heap.index());
     }
 
     #[test]
-    fn allocator_release_retains_empty_heap_run_page_entry_for_reuse() {
+    fn allocator_release_retains_empty_heap_run_segment_for_reuse() {
         let allocator = Allocator::new();
         let inner_ref = allocator_inner(&allocator);
         let heap = acquire_id(inner_ref);
@@ -900,12 +910,14 @@ mod tests {
                 Ok(())
             );
         }
-        assert!(inner_ref.pages().get(ptr).is_some());
+        assert_eq!(Run::from_block_ptr(ptr), Some(run));
+        assert!(inner_ref.pages().get(ptr).is_none());
         {
             let mut table = inner_ref.table.lock();
             assert_eq!(table.retire(heap, inner_ref.pages()), Ok(()));
         }
-        assert!(inner_ref.pages().get(ptr).is_some());
+        assert_eq!(Run::from_block_ptr(ptr), Some(run));
+        assert!(inner_ref.pages().get(ptr).is_none());
 
         let reused = acquire_id(inner_ref);
         assert_eq!(reused.index(), heap.index());

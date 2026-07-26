@@ -42,15 +42,15 @@
 ## v0.5 Scope
 
 - Build only: Linux x86_64, Rust stable, `GlobalAlloc`, owner-local heaps, heap-owned small runs, and heap-local extent caches backed by global OS/page coordination.
-- Include mmap-backed runs, mmap-backed extents, out-of-line metadata, page-indexed pointer lookup, run block-boundary checks, extent exact-pointer checks, owner-local small hot paths, remote-free coordination, bounded run/extent retention, `realloc`, `alloc_zeroed`, randomized tests, and benchmarks.
+- Include mmap-backed runs (segment-aligned VA + header), mmap-backed extents, out-of-line metadata, page-indexed extent lookup, run block-boundary checks, extent exact-pointer checks, owner-local small hot paths, remote-free coordination, bounded run/extent retention, `realloc`, `alloc_zeroed`, randomized tests, and benchmarks.
 - Do not add per-CPU/RSEQ frontends, quarantine, canaries, hugepages, NUMA, C ABI support, ML placement, dashboards, or background purge yet.
 
 ## Core Invariants
 
-- Every returned pointer maps to exactly one page-map entry.
-- Runs own one mapping and divide it into fixed-size reusable blocks from one size class.
+- Every returned small block maps to exactly one live run segment header (`Run::from_block_ptr`); every returned extent maps to exactly one page-map entry.
+- Runs own one segment-aligned mapping (header page + `RUN_SIZE` payload + state tail) and divide the payload into fixed-size reusable blocks from one size class.
 - Extents own one mapping dedicated to exactly one returned allocation.
-- Every free must map back to a known entry: run frees must be valid block boundaries, and extent frees must be the exact returned pointer.
+- Every free must map back to a known owner: run frees must be valid block boundaries (sticky / segment mask), and extent frees must be the exact returned pointer (PageMap).
 - Correctness comes before speed.
 
 ## Architecture
@@ -69,7 +69,7 @@ GlobalAlloc
          -> ExtentHeap { Arena<Extent>, cache } -> Extent (HeapId)
 ```
 
-- `AllocatorInner` is the refcounted mmap instance behind lazy `AtomicPtr` init — not a domain entity. `PageMap` stays outside the table mutex so owner-local TLS hits never take that lock.
+- `AllocatorInner` is the refcounted mmap instance behind lazy `AtomicPtr` init — not a domain entity. `PageMap` stays outside the table mutex for extent lookup; run ownership uses segment mask → header (no PageMap on the run hot path).
 - `HeapTable` owns slot identity (`acquire`/`retire`/`reclaim`), generation-checked `heap`/`heap_mut`/`mode`, and mode-aware remote `publish` only — not allocate/dealloc routers.
 
 ## Allocator Boundary Scars

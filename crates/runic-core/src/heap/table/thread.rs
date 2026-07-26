@@ -197,7 +197,8 @@ impl ThreadHeap {
         unsafe { self.bound_heap().as_mut() }.allocate_extent(spec, pages, init)
     }
 
-    /// Layout-directed free: sticky for `class`, else `PageMap`. Keeps hot path in one fn.
+    /// Layout-directed free: sticky for `class`, else segment mask → run (small only),
+    /// else `PageMap` (extents). Keeps hot path in one fn.
     #[inline]
     pub(crate) fn dealloc(
         &self,
@@ -219,16 +220,27 @@ impl ThreadHeap {
             }
         }
 
+        // Small layouts: mask → segment header (no PageMap). Large: PageMap only —
+        // never probe segment headers for extent-sized layouts (common large churn).
+        if class.is_some()
+            && let Some(run) = Run::from_block_ptr(ptr)
+        {
+            return self
+                .free(inner, run, ptr)
+                .map_err(|error| (PageOwner::Run(run), error));
+        }
+
         let Some(owner) = self.lookup_owner(pages, ptr) else {
             Allocator::abort();
         };
-        let result = match owner {
-            PageOwner::Run(run) => self.free(inner, run, ptr),
-            PageOwner::Extent(extent) => self.free_extent(inner, extent, ptr),
-        };
-        match result {
-            Ok(()) => Ok(()),
-            Err(error) => Err((owner, error)),
+        match owner {
+            PageOwner::Extent(extent) => self
+                .free_extent(inner, extent, ptr)
+                .map_err(|error| (owner, error)),
+            PageOwner::Run(_) => {
+                // Runs never stamp PageMap; a Run entry here is corrupt.
+                Allocator::abort();
+            }
         }
     }
 
@@ -243,7 +255,7 @@ impl ThreadHeap {
         run: NonNull<Run>,
         ptr: NonNull<u8>,
     ) -> Result<(), ThreadFreeError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
+        // SAFETY: sticky / segment header recovered a live arena run owned by this heap.
         let run_ref = unsafe { run.as_ref() };
         let class = run_ref.class();
         // Sticky before matches: slots only park this heap's runs and are cleared on unbind.
@@ -283,7 +295,7 @@ impl ThreadHeap {
         extent: NonNull<Extent>,
         ptr: NonNull<u8>,
     ) -> Result<(), ThreadFreeError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
+        // SAFETY: PageMap stores only extent pointers published from this allocator's live arena.
         let heap_id = unsafe { extent.as_ref() }.heap_id();
         if !self.matches(inner) || self.heap_id.get() != Some(heap_id) {
             return Err(ThreadFreeError::NotBound);

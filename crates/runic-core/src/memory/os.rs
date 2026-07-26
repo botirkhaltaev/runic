@@ -6,8 +6,9 @@ pub(crate) const PAGE_SIZE: usize = 4096;
 
 /// Sole owner of one live anonymous mmap region.
 ///
-/// Constructed only by [`OsMemory::map`]. `Drop` munmaps the region. Length is
-/// always nonzero and a multiple of [`PAGE_SIZE`]; base is always page-aligned.
+/// Constructed only by [`OsMemory::map`] / [`OsMemory::map_aligned`]. `Drop`
+/// munmaps the region. Length is always nonzero and a multiple of [`PAGE_SIZE`];
+/// base is always page-aligned (and segment-aligned after `map_aligned`).
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Mapping {
     base: NonNull<u8>,
@@ -16,7 +17,8 @@ pub(crate) struct Mapping {
 
 impl Mapping {
     /// Private: every `Mapping` must describe a live mmap region owned uniquely
-    /// by that `Mapping`, so construction is confined to `OsMemory::map`.
+    /// by that `Mapping`, so construction is confined to `OsMemory::map` /
+    /// `OsMemory::map_aligned`.
     fn new(base: NonNull<u8>, len: NonZeroUsize) -> Self {
         debug_assert!(base.as_ptr().addr().is_multiple_of(PAGE_SIZE));
         debug_assert!(len.get().is_multiple_of(PAGE_SIZE));
@@ -80,6 +82,47 @@ impl OsMemory {
         NonNull::new(ptr.cast::<u8>()).map(|base| Mapping::new(base, rounded_len))
     }
 
+    /// Map `len` bytes with `align`-aligned base (`align` and `len` must be page multiples).
+    ///
+    /// Used for run segments so any block pointer recovers the header via
+    /// `ptr & !(align - 1)`.
+    pub(crate) fn map_aligned(len: usize, align: usize) -> Option<Mapping> {
+        if len == 0 || align < PAGE_SIZE || !align.is_power_of_two() {
+            return None;
+        }
+        if !len.is_multiple_of(PAGE_SIZE) || !align.is_multiple_of(PAGE_SIZE) {
+            return None;
+        }
+
+        let total = len.checked_add(align)?;
+        let oversized = Self::map(total)?;
+        let raw = oversized.base().as_ptr().addr();
+        let aligned = (raw.checked_add(align - 1)?) & !(align - 1);
+        let prefix = aligned - raw;
+        let suffix = oversized.len().get() - prefix - len;
+
+        // Disarm Drop; we munmap the edges and re-wrap the aligned window.
+        let oversized = core::mem::ManuallyDrop::new(oversized);
+        let base = oversized.base();
+
+        if prefix > 0 {
+            // SAFETY: prefix is a leading page-multiple of the anonymous mapping we own.
+            unsafe {
+                libc::munmap(base.as_ptr().cast(), prefix);
+            }
+        }
+        if suffix > 0 {
+            // SAFETY: suffix is a trailing page-multiple of the same anonymous mapping.
+            unsafe {
+                libc::munmap(base.as_ptr().wrapping_add(prefix + len).cast(), suffix);
+            }
+        }
+
+        let aligned_base = NonNull::new(base.as_ptr().wrapping_add(prefix))?;
+        let aligned_len = NonZeroUsize::new(len)?;
+        Some(Mapping::new(aligned_base, aligned_len))
+    }
+
     pub(crate) fn round_to_page(len: usize) -> Option<usize> {
         if len == 0 {
             return None;
@@ -87,6 +130,28 @@ impl OsMemory {
 
         let mask = PAGE_SIZE - 1;
         len.checked_add(mask).map(|value| value & !mask)
+    }
+
+    /// True when the page containing `ptr` is readable in this process.
+    ///
+    /// Used before segment-header loads so mask→base never SEGV on holes
+    /// (e.g. extent pointers that mask into unmapped VA).
+    pub(crate) fn page_readable(ptr: NonNull<u8>) -> bool {
+        let page_addr = ptr.as_ptr().addr() & !(PAGE_SIZE - 1);
+        let page = core::ptr::with_exposed_provenance::<libc::c_void>(page_addr);
+        let mut fds = [-1, -1];
+        // SAFETY: pipe with a two-slot fd array; write probes readability via EFAULT.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return false;
+        }
+        // SAFETY: write copies from `page`; returns EFAULT when unmapped (no signal).
+        let wrote = unsafe { libc::write(fds[1], page, 1) };
+        // SAFETY: both ends were opened by this pipe call.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        wrote == 1
     }
 }
 
@@ -127,6 +192,24 @@ mod tests {
         assert_eq!(mapping.len().get(), PAGE_SIZE);
 
         drop(mapping);
+    }
+
+    #[test]
+    fn os_memory_map_aligned_returns_align_aligned_base() {
+        const ALIGN: usize = 128 * 1024;
+        let mapping = OsMemory::map_aligned(ALIGN, ALIGN).unwrap();
+
+        assert_eq!(mapping.base().as_ptr().addr() % ALIGN, 0);
+        assert_eq!(mapping.len().get(), ALIGN);
+        assert_eq!(mapping.base().as_ptr().addr() % PAGE_SIZE, 0);
+    }
+
+    #[test]
+    fn os_memory_map_aligned_rejects_bad_align() {
+        assert!(OsMemory::map_aligned(PAGE_SIZE, 0).is_none());
+        assert!(OsMemory::map_aligned(PAGE_SIZE, PAGE_SIZE / 2).is_none());
+        assert!(OsMemory::map_aligned(PAGE_SIZE, PAGE_SIZE + 1).is_none());
+        assert!(OsMemory::map_aligned(0, PAGE_SIZE).is_none());
     }
 
     #[test]

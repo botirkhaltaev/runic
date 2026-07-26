@@ -1,12 +1,16 @@
-use core::{cell::UnsafeCell, mem::size_of, num::NonZeroU32, ptr::NonNull};
-
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use core::{
+    cell::UnsafeCell,
+    mem::size_of,
+    num::NonZeroU32,
+    ptr::NonNull,
+    sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering},
+};
 
 pub(crate) mod heap;
 
 use crate::{
     layout::LayoutSpec,
-    memory::{AddressRange, Mapping},
+    memory::{AddressRange, Mapping, PAGE_SIZE},
     size_class::{SizeClassId, SizeClasses},
 };
 
@@ -14,7 +18,47 @@ use super::HeapId;
 
 pub(crate) use heap::{RunHeap, RunHeapError};
 
+/// Fixed payload span for one size-class run (blocks live here).
 pub(crate) const RUN_SIZE: usize = 64 * 1024;
+
+/// Segment quantum: header page + `RUN_SIZE` payload + state tail (≤ 128 KiB).
+///
+/// Any block pointer recovers the segment base via `ptr & !(SEGMENT_SIZE - 1)`.
+pub(crate) const SEGMENT_SIZE: usize = 128 * 1024;
+
+/// First page of a run segment: mask-recoverable header → arena `Run`.
+const SEGMENT_HEADER_SIZE: usize = PAGE_SIZE;
+
+/// ASCII `RUNICSEG` — distinguishes live run segments from other VA.
+const SEGMENT_MAGIC: u64 = 0x5255_4e49_4353_4547;
+
+#[repr(C)]
+struct SegmentHeader {
+    magic: u64,
+    run: AtomicPtr<Run>,
+}
+
+impl SegmentHeader {
+    fn install(base: NonNull<u8>, run: NonNull<Run>) {
+        // SAFETY: `base` is the start of a uniquely owned, page-aligned run segment mapping.
+        let header = unsafe { &mut *base.cast::<Self>().as_ptr() };
+        header.magic = SEGMENT_MAGIC;
+        header.run.store(run.as_ptr(), Ordering::Release);
+    }
+
+    fn load(base: NonNull<u8>) -> Option<NonNull<Run>> {
+        // Masked bases from extent / garbage pointers may be unmapped — probe first.
+        if !crate::memory::OsMemory::page_readable(base) {
+            return None;
+        }
+        // SAFETY: page_readable proved the header page is mapped; base is page-aligned.
+        let header = unsafe { &*base.cast::<Self>().as_ptr() };
+        if header.magic != SEGMENT_MAGIC {
+            return None;
+        }
+        NonNull::new(header.run.load(Ordering::Acquire))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RunId {
@@ -177,13 +221,22 @@ struct RunState {
 }
 
 impl Run {
-    /// Bytes for one run mapping: `RUN_SIZE` payload plus one `AtomicU8` per block.
+    /// Bytes for one run segment: header page + `RUN_SIZE` payload + state tail,
+    /// rounded up to [`SEGMENT_SIZE`].
     pub(crate) fn mapping_len(class: SizeClassId) -> Option<usize> {
         let block_size = SizeClasses::block_size(class);
         let capacity = RUN_SIZE
             .checked_div(block_size)
             .filter(|&count| count > 0)?;
-        RUN_SIZE.checked_add(capacity)
+        let need = SEGMENT_HEADER_SIZE
+            .checked_add(RUN_SIZE)?
+            .checked_add(capacity)?;
+        if need > SEGMENT_SIZE {
+            return None;
+        }
+        // Prove header fits without overlapping payload.
+        debug_assert!(size_of::<SegmentHeader>() <= SEGMENT_HEADER_SIZE);
+        Some(SEGMENT_SIZE)
     }
 
     pub(crate) fn new(
@@ -196,22 +249,29 @@ impl Run {
         let capacity = RUN_SIZE
             .checked_div(block_size)
             .filter(|&count| count > 0)?;
-        let need = RUN_SIZE.checked_add(capacity)?;
+        let need = SEGMENT_HEADER_SIZE
+            .checked_add(RUN_SIZE)?
+            .checked_add(capacity)?;
         if mapping.len().get() < need {
             return None;
         }
+        if mapping.base().as_ptr().addr() & (SEGMENT_SIZE - 1) != 0 {
+            return None;
+        }
 
-        // SAFETY: `mapping` covers at least `need` bytes. The state tail
-        // `[RUN_SIZE, RUN_SIZE + capacity)` is exclusively remote-pending bits,
-        // zero-filled as clear, and outlives `blocks` because `Self` owns
-        // `mapping`.
-        let state_base = unsafe { NonNull::new_unchecked(mapping.base().as_ptr().add(RUN_SIZE)) };
+        // SAFETY: `mapping` covers at least `need` bytes. Payload starts after
+        // the header page; the state tail follows payload, zero-filled as clear,
+        // and outlives `blocks` because `Self` owns `mapping`.
+        let payload_base =
+            unsafe { NonNull::new_unchecked(mapping.base().as_ptr().add(SEGMENT_HEADER_SIZE)) };
+        // SAFETY: `need` includes `RUN_SIZE` after the header; payload+RUN_SIZE is in-bounds.
+        let state_base = unsafe { NonNull::new_unchecked(payload_base.as_ptr().add(RUN_SIZE)) };
         let blocks = BlockStates {
             bytes: AddressRange::new(state_base, capacity),
         };
         Some(Self {
             state: UnsafeCell::new(RunState::new(block_size)),
-            payload_base: mapping.base(),
+            payload_base,
             blocks,
             block_shift: block_size_shift(block_size),
             class,
@@ -222,6 +282,31 @@ impl Run {
             mapping,
             issued: AtomicUsize::new(0),
         })
+    }
+
+    /// Install the segment header so `from_block_ptr` can recover `run`.
+    pub(crate) fn publish_segment(run: NonNull<Run>) {
+        // SAFETY: `run` is a live arena entry that owns its segment mapping.
+        let base = unsafe { run.as_ref() }.mapping().base();
+        SegmentHeader::install(base, run);
+    }
+
+    /// Mask → segment header → arena `Run` for a block pointer (no `PageMap`).
+    #[inline]
+    pub(crate) fn from_block_ptr(ptr: NonNull<u8>) -> Option<NonNull<Run>> {
+        let addr = ptr.as_ptr().addr();
+        let base_addr = addr & !(SEGMENT_SIZE - 1);
+        let base = NonNull::new(core::ptr::with_exposed_provenance_mut(base_addr))?;
+        let run = SegmentHeader::load(base)?;
+        // SAFETY: header magic matched; `run` was installed from a live arena entry.
+        let run_ref = unsafe { run.as_ref() };
+        if run_ref.mapping().base() != base {
+            return None;
+        }
+        // Reject pointers outside the payload span (incl. header / state tail).
+        let _ = run_ref.range().offset_of(ptr)?;
+        run_ref.block_at(ptr)?;
+        Some(run)
     }
 
     #[cfg(test)]
@@ -567,7 +652,7 @@ mod tests {
     }
 
     fn map_for_class(class: SizeClassId) -> Mapping {
-        OsMemory::map(Run::mapping_len(class).unwrap()).unwrap()
+        OsMemory::map_aligned(Run::mapping_len(class).unwrap(), SEGMENT_SIZE).unwrap()
     }
 
     #[test]
@@ -829,7 +914,9 @@ mod tests {
         )
         .expect("test run");
 
-        assert_eq!(run.range().base(), base);
+        // SAFETY: payload starts one header page after the segment base.
+        let payload = unsafe { NonNull::new_unchecked(base.as_ptr().add(SEGMENT_HEADER_SIZE)) };
+        assert_eq!(run.range().base(), payload);
         assert_eq!(run.range().len(), RUN_SIZE);
         assert!(run.mapping().len().get() >= Run::mapping_len(class).unwrap());
     }

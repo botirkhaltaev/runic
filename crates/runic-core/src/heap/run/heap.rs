@@ -4,7 +4,7 @@ use crate::{
     arena::Arena,
     heap::{HeapId, Run, RunError, RunId},
     layout::LayoutSpec,
-    memory::{OsMemory, PageMap},
+    memory::OsMemory,
     size_class::{SizeClassId, SizeClasses},
 };
 
@@ -40,14 +40,9 @@ impl RunHeap {
         }
     }
 
-    pub(crate) fn allocate(
-        &mut self,
-        class: SizeClassId,
-        heap_id: HeapId,
-        pages: &PageMap,
-    ) -> Option<NonNull<Run>> {
+    pub(crate) fn allocate(&mut self, class: SizeClassId, heap_id: HeapId) -> Option<NonNull<Run>> {
         self.take_available(class)
-            .or_else(|| self.allocate_run(class, heap_id, pages))
+            .or_else(|| self.allocate_run(class, heap_id))
     }
 
     pub(crate) fn take_available(&mut self, class: SizeClassId) -> Option<NonNull<Run>> {
@@ -59,9 +54,8 @@ impl RunHeap {
         &mut self,
         class: SizeClassId,
         heap_id: HeapId,
-        pages: &PageMap,
     ) -> Option<NonNull<Run>> {
-        let mapping = OsMemory::map(Run::mapping_len(class)?)?;
+        let mapping = OsMemory::map_aligned(Run::mapping_len(class)?, crate::heap::SEGMENT_SIZE)?;
         let index = self.runs.claim()?;
         let Some(id) = RunId::from_index(u32::try_from(index).ok()?) else {
             self.runs.release(index);
@@ -72,11 +66,11 @@ impl RunHeap {
             self.runs.release(index);
             return None;
         };
-        self.insert_run(index, id, run, pages)
+        self.insert_run(index, id, run)
     }
 
     pub(crate) fn free(&mut self, run: NonNull<Run>, ptr: NonNull<u8>) -> Result<(), RunHeapError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
+        // SAFETY: `run` is a live arena entry recovered from sticky / segment header.
         let run_ref = unsafe { run.as_ref() };
         let was_full = run_ref.is_full();
         run_ref.free(ptr).map_err(RunHeapError::from)?;
@@ -92,7 +86,7 @@ impl RunHeap {
         run: NonNull<Run>,
         ptr: NonNull<u8>,
     ) -> Result<(), RunHeapError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
+        // SAFETY: `run` is a live arena entry recovered from segment header / inbox flush.
         let run_ref = unsafe { run.as_ref() };
         let was_full = run_ref.is_full();
         run_ref.accept(ptr).map_err(RunHeapError::from)?;
@@ -138,7 +132,7 @@ impl RunHeap {
         ptr: NonNull<u8>,
         spec: LayoutSpec,
     ) -> Result<bool, RunHeapError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
+        // SAFETY: `run` is a live arena entry recovered from segment header.
         let run = unsafe { run.as_ref() };
 
         run.resize_in_place(ptr, spec).map_err(RunHeapError::from)
@@ -194,13 +188,7 @@ impl RunHeap {
         Ok(())
     }
 
-    fn insert_run(
-        &mut self,
-        index: usize,
-        id: RunId,
-        run: Run,
-        pages: &PageMap,
-    ) -> Option<NonNull<Run>> {
+    fn insert_run(&mut self, index: usize, id: RunId, run: Run) -> Option<NonNull<Run>> {
         if self.runs.insert(index, run).is_none() {
             self.runs.release(index);
             return None;
@@ -213,12 +201,8 @@ impl RunHeap {
         debug_assert_eq!(inserted_run.id, id);
         let run_ptr = NonNull::from(&mut *inserted_run);
 
-        debug_assert_eq!(inserted_run.range().base(), inserted_run.mapping().base());
-        if pages.publish_run(inserted_run.mapping(), run_ptr).is_err() {
-            let _removed = self.runs.remove(usize::try_from(id.index()).ok()?);
-            return None;
-        }
-
+        // Segment header at mapping base → mask recover; runs do not stamp PageMap.
+        Run::publish_segment(run_ptr);
         Some(run_ptr)
     }
 }
@@ -238,7 +222,7 @@ mod tests {
 
     use crate::{
         heap::{HeapId, Run, RunId},
-        memory::{OsMemory, PageMap, PageOwner},
+        memory::{OsMemory, PageMap},
         size_class::SizeClasses,
     };
 
@@ -251,7 +235,9 @@ mod tests {
 
     fn reusable_run(id: RunId) -> Run {
         let class = class_id(64, 8);
-        let mapping = OsMemory::map(Run::mapping_len(class).unwrap()).unwrap();
+        let mapping =
+            OsMemory::map_aligned(Run::mapping_len(class).unwrap(), crate::heap::SEGMENT_SIZE)
+                .unwrap();
         let heap = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
 
         Run::new(id, heap, mapping, class).expect("reusable test run")
@@ -267,10 +253,9 @@ mod tests {
     fn allocate_block(
         allocator: &mut RunHeap,
         class: SizeClassId,
-        pages: &PageMap,
     ) -> Option<(NonNull<Run>, NonNull<u8>)> {
         let heap = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
-        let mut run = allocator.allocate(class, heap, pages)?;
+        let mut run = allocator.allocate(class, heap)?;
         // SAFETY: RunHeap returns pointers to live runs from its arena.
         let ptr = unsafe { run.as_mut() }.allocate()?;
         // SAFETY: RunHeap returns pointers to live runs from its arena.
@@ -283,58 +268,62 @@ mod tests {
     #[test]
     fn run_heap_relinks_previously_full_run_after_free() {
         let mut allocator = RunHeap::new(2);
-        let pages = PageMap::new();
         let class = class_id(64, 8);
         let class_index = class.index();
         let capacity = RUN_SIZE / SizeClasses::block_size(class);
-        let (_run, first) = allocate_block(&mut allocator, class, &pages).unwrap();
-        let PageOwner::Run(run_ptr) = pages.get(first).unwrap() else {
-            panic!("small allocation should publish a run entry");
-        };
-        // SAFETY: run_ptr came from the allocator's live page map entry above.
+        let (_run, first) = allocate_block(&mut allocator, class).unwrap();
+        let run_ptr = Run::from_block_ptr(first).expect("small allocation should mask to a run");
+        // SAFETY: run_ptr came from the live segment header above.
         let id = unsafe { run_ptr.as_ref().id() };
 
         for _ in 1..capacity {
-            assert!(allocate_block(&mut allocator, class, &pages).is_some());
+            assert!(allocate_block(&mut allocator, class).is_some());
         }
 
         assert_eq!(available_run_id(&allocator, class_index), None);
         assert_eq!(allocator.free(run_ptr, first), Ok(()));
         assert_eq!(available_run_id(&allocator, class_index), Some(id));
 
-        let (_run, reused) = allocate_block(&mut allocator, class, &pages).unwrap();
+        let (_run, reused) = allocate_block(&mut allocator, class).unwrap();
 
         assert_eq!(reused, first);
         assert_eq!(available_run_id(&allocator, class_index), None);
     }
 
     #[test]
-    fn failed_run_page_publication_removes_table_entry() {
+    fn segment_header_recovers_run_from_block_ptr() {
+        let mut allocator = RunHeap::new(2);
+        let pages = PageMap::new();
+        let class = class_id(64, 8);
+        let (run, ptr) = allocate_block(&mut allocator, class).unwrap();
+
+        assert_eq!(Run::from_block_ptr(ptr), Some(run));
+        assert!(pages.get(ptr).is_none());
+    }
+
+    #[test]
+    fn insert_run_publishes_segment_without_pagemap() {
         let mut allocator = RunHeap::new(4);
         let pages = PageMap::new();
         let index = allocator.runs.claim().unwrap();
         let id = RunId::from_index(u32::try_from(index).unwrap()).unwrap();
         assert_eq!(usize::try_from(id.index()).unwrap(), index);
         let run = reusable_run(id);
-        let existing = NonNull::dangling();
         let base = run.range().base();
 
-        pages.publish_run(run.mapping(), existing).unwrap();
-
-        assert_eq!(allocator.insert_run(index, id, run, &pages), None);
-        assert!(allocator.runs.get_mut(index).is_none());
-        assert_eq!(pages.get(base), Some(PageOwner::Run(existing)));
+        let run_ptr = allocator.insert_run(index, id, run).unwrap();
+        assert_eq!(Run::from_block_ptr(base), Some(run_ptr));
+        assert!(pages.get(base).is_none());
     }
 
     #[test]
     fn rebind_heap_id_rebinds_runs_off_the_available_list() {
         let mut allocator = RunHeap::new(2);
-        let pages = PageMap::new();
         let class = class_id(64, 8);
         let old = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
         let new = HeapId::new(0, core::num::NonZeroU32::new(2).unwrap()).unwrap();
 
-        let run = allocator.allocate(class, old, &pages).unwrap();
+        let run = allocator.allocate(class, old).unwrap();
         // Leave the run checked out (sticky-style): never return_available.
         // SAFETY: run came from this heap's live arena.
         assert_eq!(unsafe { run.as_ref() }.heap_id(), old);

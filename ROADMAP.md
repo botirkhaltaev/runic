@@ -52,10 +52,10 @@ Linux x86_64
 Rust stable
 GlobalAlloc
 owner-local heaps via HeapTable / ThreadHeap
-mmap-backed runs for size-classed allocations
+mmap-backed runs for size-classed allocations (segment-aligned + header)
 mmap-backed extents for dedicated allocations (heap-local)
 out-of-line metadata
-page-indexed pointer lookup
+page-indexed extent lookup (runs use segment mask → header)
 per-size-class available run lists
 per-block AtomicU8 run block state with remote-pending
 lock-free remote-free Treiber inboxes per heap
@@ -86,12 +86,13 @@ stats dashboard
 ## Core Invariants
 
 ```text
-Every returned pointer maps to exactly one page-map entry.
-Runs own one mapping and divide it into fixed-size reusable blocks from one size class.
+Every returned small block maps to exactly one live run segment header.
+Every returned extent maps to exactly one page-map entry.
+Runs own one segment-aligned mapping and divide the payload into fixed-size reusable blocks from one size class.
 Extents own one mapping dedicated to exactly one returned allocation.
-Every free must map back to a known entry.
-Run frees must be valid block boundaries.
-Extent frees must be the exact returned pointer.
+Every free must map back to a known owner.
+Run frees must be valid block boundaries (sticky / segment mask → header).
+Extent frees must be the exact returned pointer (PageMap).
 Cached mappings are not live allocations.
 Cached blocks must have exactly one owner and must not be accepted as stale user frees.
 ```
@@ -121,7 +122,8 @@ GlobalAlloc
 
 Keep one global lock around `HeapTable` for v0.5 slow paths; same-thread
 small-run hits may use thread-owned heap metadata without entering that lock.
-`PageMap` stays outside that mutex so dealloc lookup is not table-locked.
+`PageMap` stays outside that mutex for extent lookup; run ownership uses
+segment-aligned VA + mask→header (`Run::from_block_ptr`) and does not stamp PageMap.
 
 ## Entity Responsibilities
 
@@ -134,10 +136,10 @@ HeapTable      owns slots Arena<Heap>, generations[], acquire/retire/reclaim, he
 Arena          owns fixed-capacity freelist metadata storage.
 LayoutSpec     owns normalized layout semantics.
 SizeClasses    owns size-class selection.
-OsMemory       maps anonymous pages; Mapping owns the mmap lifecycle (Drop munmaps).
-PageMap        owns page-indexed owner-pointer lookup.
-RunHeap        owns Arena<Run>, small-allocation policy, and available run lists.
-Run            owns fixed-block allocation metadata, freelist-primary Free/Live, and bump.
+OsMemory       maps anonymous pages (`map` / `map_aligned`); Mapping owns the mmap lifecycle (Drop munmaps).
+PageMap        owns page-indexed extent owner-pointer lookup (runs use segment headers).
+RunHeap        owns Arena<Run>, small-allocation policy, available run lists, and segment publish.
+Run            owns fixed-block allocation metadata, freelist-primary Free/Live, bump, and segment header.
 BlockStates    owns RemotePending-only per-block bits (one AtomicU8 per block); not Free/Allocated.
 ExtentHeap     owns Arena<Extent>, dedicated allocation policy, and mapping reuse.
 ExtentCache    owns retained extent mappings, eviction, and reuse lookup.

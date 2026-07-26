@@ -18,7 +18,7 @@ pub(crate) mod table;
 pub(crate) use extent::Extent;
 pub(crate) use extent::heap::{ExtentHeap, ExtentHeapError, ExtentInit};
 pub(crate) use id::HeapId;
-pub(crate) use run::{Run, RunError, RunHeap, RunHeapError, RunId};
+pub(crate) use run::{Run, RunError, RunHeap, RunHeapError, RunId, SEGMENT_SIZE};
 pub(crate) use table::{HeapError, HeapTable, Inbox, THREAD_HEAP, ThreadFreeError};
 
 #[repr(u8)]
@@ -130,7 +130,7 @@ impl Heap {
             self.flush(pages).ok()?;
         }
 
-        self.runs.allocate(class, self.id, pages)
+        self.runs.allocate(class, self.id)
     }
 
     /// One-shot small alloc without holding a sticky run: acquire, take one block, return run.
@@ -158,7 +158,7 @@ impl Heap {
         self.extents.allocate(spec, self.id, pages, init)
     }
 
-    /// Owner-local free for a resolved `PageMap` owner (run or extent).
+    /// Owner-local free for a resolved owner (run from sticky/segment, or extent from `PageMap`).
     ///
     /// Callable via a TLS-bound `Heap` without taking the table mutex. Does not wrap the
     /// sticky-run hit (`Run::free`); that path stays on `ThreadHeap::free` for minimal work.
@@ -183,14 +183,15 @@ impl Heap {
     pub(crate) fn flush(&mut self, pages: &PageMap) -> Result<(), HeapError> {
         while let Some(list) = self.inbox.drain() {
             for ptr in list {
+                if let Some(run) = Run::from_block_ptr(ptr) {
+                    self.runs.accept(run, ptr)?;
+                    continue;
+                }
                 match pages.get(ptr) {
-                    Some(PageOwner::Run(run)) => {
-                        self.runs.accept(run, ptr)?;
-                    }
                     Some(PageOwner::Extent(extent)) => {
                         self.extents.accept(extent, ptr, pages)?;
                     }
-                    None => return Err(HeapError::InvalidPointer),
+                    Some(PageOwner::Run(_)) | None => return Err(HeapError::InvalidPointer),
                 }
             }
         }
