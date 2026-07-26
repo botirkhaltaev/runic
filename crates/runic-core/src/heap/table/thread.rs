@@ -108,7 +108,7 @@ pub(crate) struct ThreadHeap {
     heap_id: Cell<Option<HeapId>>,
     heap: Cell<*mut Heap>,
     runs: [Cell<*mut Run>; SizeClasses::COUNT],
-    /// Last `PageMap::get` page number (`usize::MAX` = empty).
+    /// Last cached run page number (`usize::MAX` = empty). See `lookup_owner`.
     page_cache_page: Cell<usize>,
     page_cache_owner: Cell<Option<PageOwner>>,
     remote: UnsafeCell<RemoteBatch>,
@@ -133,7 +133,10 @@ impl ThreadHeap {
         }
     }
 
-    /// `PageMap` lookup with a one-entry TLS page→owner cache (miss fills from `pages`).
+    /// `PageMap` lookup with a one-entry TLS page→run cache (miss fills from `pages`).
+    ///
+    /// Only **run** owners are cached: runs stay published for the heap lifetime in
+    /// v0.5. Extents may `unpublish` / reuse VA, so caching them would go stale.
     #[inline]
     pub(crate) fn lookup_owner(&self, pages: &PageMap, ptr: NonNull<u8>) -> Option<PageOwner> {
         let page = ptr.as_ptr().addr() / crate::memory::PAGE_SIZE;
@@ -142,8 +145,10 @@ impl ThreadHeap {
         }
 
         let owner = pages.get(ptr)?;
-        self.page_cache_page.set(page);
-        self.page_cache_owner.set(Some(owner));
+        if matches!(owner, PageOwner::Run(_)) {
+            self.page_cache_page.set(page);
+            self.page_cache_owner.set(Some(owner));
+        }
         Some(owner)
     }
 
