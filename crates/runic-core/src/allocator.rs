@@ -116,19 +116,22 @@ impl Allocator {
         let Some(ptr) = NonNull::new(ptr) else {
             return;
         };
-        // One TLS entry: page→owner lookup + owner-local free (do not nest a second `with`).
-        THREAD_HEAP.with(|tls| {
-            let Some(owner) = tls.lookup_owner(inner_ref.pages(), ptr) else {
+        // One TLS entry for lookup + owner-local free; remote/abort runs after `with`.
+        let not_local = THREAD_HEAP.with(|tls| {
+            let Some(owner) = tls.lookup_owner(inner, inner_ref.pages(), ptr) else {
                 Self::abort();
             };
-            let result = match owner {
-                PageOwner::Run(run) => tls.free(inner, run, ptr),
-                PageOwner::Extent(extent) => tls.free_extent(inner, extent, ptr),
-            };
-            if let Err(error) = result {
-                Self::dealloc_not_local(inner, inner_ref, owner, ptr, error);
+            match owner {
+                PageOwner::Run(run) => tls.free(inner, run, ptr).map_err(|error| (owner, error)),
+                PageOwner::Extent(extent) => tls
+                    .free_extent(inner, extent, ptr)
+                    .map_err(|error| (owner, error)),
             }
+            .err()
         });
+        if let Some((owner, error)) = not_local {
+            Self::dealloc_not_local(inner, inner_ref, owner, ptr, error);
+        }
     }
 
     #[cold]

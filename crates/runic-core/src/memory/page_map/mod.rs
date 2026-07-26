@@ -65,7 +65,7 @@ impl PageMap {
     /// Lock-free ownership lookup: L1 root → `tables[l1]` → page entry → [`PageOwner`].
     #[inline]
     pub(crate) fn get(&self, ptr: NonNull<u8>) -> Option<PageOwner> {
-        let (l1_index, l2_index) = Page::split(ptr);
+        let (l1_index, l2_index) = Page::split(ptr)?;
         self.l1()?.owner(l1_index, l2_index)
     }
 

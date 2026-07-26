@@ -15,18 +15,20 @@ fn extent(raw: u32) -> PageOwner {
 }
 
 fn has_l2_table(map: &PageMap, ptr: NonNull<u8>) -> bool {
-    let (l1_index, _) = Page::split(ptr);
+    let Some((l1_index, _)) = Page::split(ptr) else {
+        return false;
+    };
     map.l1()
         .is_some_and(|l1| l1.l2_table_ref(l1_index).is_some())
 }
 
 fn l2_table_for(map: &PageMap, ptr: NonNull<u8>) -> Option<&L2Table> {
-    let (l1_index, _) = Page::split(ptr);
+    let (l1_index, _) = Page::split(ptr)?;
     map.l1()?.l2_table_ref(l1_index)
 }
 
 fn direct_entry(map: &PageMap, ptr: NonNull<u8>) -> Option<MapEntry> {
-    let (_, l2_index) = Page::split(ptr);
+    let (_, l2_index) = Page::split(ptr)?;
     Some(l2_table_for(map, ptr)?.entry(l2_index))
 }
 
@@ -58,7 +60,7 @@ impl TestMapping {
     }
 
     fn first_l2_boundary_offset(&self) -> usize {
-        let (_, base_l2) = Page::split(self.base());
+        let (_, base_l2) = Page::split(self.base()).unwrap();
 
         (L2_ENTRIES - base_l2.get()) * PAGE_SIZE
     }
@@ -78,6 +80,16 @@ fn page_map_new_lookup_returns_none() {
     let map = PageMap::new();
     let ptr = NonNull::dangling();
 
+    assert!(map.get(ptr).is_none());
+}
+
+#[test]
+fn page_map_get_rejects_out_of_addressable_page() {
+    let map = PageMap::new();
+    let addr = ADDRESSABLE_PAGES << PAGE_SHIFT;
+    let ptr = NonNull::new(core::ptr::with_exposed_provenance_mut::<u8>(addr)).unwrap();
+
+    assert!(Page::split(ptr).is_none());
     assert!(map.get(ptr).is_none());
 }
 
@@ -371,7 +383,7 @@ fn page_map_insert_range_rejects_existing_same_entry() {
 fn page_map_overlap_rejects_under_write_exclusion_and_retains_l2() {
     let mapping = TestMapping::new((L2_ENTRIES * 2 + 2) * PAGE_SIZE);
     let map = PageMap::new();
-    let (_, base_l2) = Page::split(mapping.base());
+    let (_, base_l2) = Page::split(mapping.base()).unwrap();
     let pages_to_next_l2 = L2_ENTRIES - base_l2.get();
     let overlap = mapping.ptr_at(pages_to_next_l2 * PAGE_SIZE);
 

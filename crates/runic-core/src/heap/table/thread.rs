@@ -141,17 +141,24 @@ impl ThreadHeap {
 
     /// `PageMap` lookup with a one-entry TLS page→run cache (miss fills from `pages`).
     ///
-    /// Only **run** owners are cached: runs stay published for the heap lifetime in
-    /// v0.5. Extents may `unpublish` / reuse VA, so caching them would go stale.
+    /// Cache hit/fill only while bound to `inner` (retained allocator). Only **run**
+    /// owners are cached: runs stay published for the heap lifetime in v0.5. Extents
+    /// may `unpublish` / reuse VA, so caching them would go stale.
     #[inline]
-    pub(crate) fn lookup_owner(&self, pages: &PageMap, ptr: NonNull<u8>) -> Option<PageOwner> {
+    pub(crate) fn lookup_owner(
+        &self,
+        inner: NonNull<AllocatorInner>,
+        pages: &PageMap,
+        ptr: NonNull<u8>,
+    ) -> Option<PageOwner> {
         let page = ptr.as_ptr().addr() / crate::memory::PAGE_SIZE;
-        if self.page_cache_page.get() == page {
+        let bound = self.matches(inner);
+        if bound && self.page_cache_page.get() == page {
             return self.page_cache_owner.get();
         }
 
         let owner = pages.get(ptr)?;
-        if matches!(owner, PageOwner::Run(_)) {
+        if bound && matches!(owner, PageOwner::Run(_)) {
             self.page_cache_page.set(page);
             self.page_cache_owner.set(Some(owner));
         }
