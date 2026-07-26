@@ -81,9 +81,7 @@ pub(crate) enum RunError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BlockStateError {
-    AlreadyFree,
-    AlreadyPending,
-    NotPending,
+    Conflict,
 }
 
 /// Per-block clear / Free / `RemotePending`.
@@ -131,70 +129,21 @@ impl BlockStates {
         BlockState::from_raw(raw).unwrap_or(BlockState::Free)
     }
 
-    /// Freelist pop: Free → clear (live).
-    fn take_free(&self, index: BlockIndex) {
-        let atom = self.state_unchecked(index);
-        debug_assert_eq!(self.state(index), BlockState::Free);
-        atom.store(BlockState::Clear.raw(), Ordering::Relaxed);
-    }
-
-    /// Owner free: clear → Free. Fails if already free or remote-pending.
-    fn mark_free(&self, index: BlockIndex) -> Result<(), BlockStateError> {
-        let atom = self.state_unchecked(index);
-        match atom.compare_exchange(
-            BlockState::Clear.raw(),
-            BlockState::Free.raw(),
+    /// CAS `from` → `to` for a capacity-proven index.
+    fn update(
+        &self,
+        index: BlockIndex,
+        from: BlockState,
+        to: BlockState,
+    ) -> Result<(), BlockStateError> {
+        match self.state_unchecked(index).compare_exchange(
+            from.raw(),
+            to.raw(),
             Ordering::Relaxed,
             Ordering::Relaxed,
         ) {
             Ok(_) => Ok(()),
-            Err(raw) if raw == BlockState::RemotePending.raw() => {
-                Err(BlockStateError::AlreadyPending)
-            }
-            Err(_) => Err(BlockStateError::AlreadyFree),
-        }
-    }
-
-    /// Live (clear) → `RemotePending`.
-    fn mark_remote_pending(&self, index: BlockIndex) -> Result<(), BlockStateError> {
-        let atom = self.state_unchecked(index);
-        match atom.compare_exchange(
-            BlockState::Clear.raw(),
-            BlockState::RemotePending.raw(),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => Ok(()),
-            Err(raw) if raw == BlockState::Free.raw() => Err(BlockStateError::AlreadyFree),
-            Err(_) => Err(BlockStateError::AlreadyPending),
-        }
-    }
-
-    /// `RemotePending` → Free (about to freelist-push on accept).
-    fn accept_remote_pending(&self, index: BlockIndex) -> Result<(), BlockStateError> {
-        let atom = self.state_unchecked(index);
-        match atom.compare_exchange(
-            BlockState::RemotePending.raw(),
-            BlockState::Free.raw(),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => Ok(()),
-            Err(_) => Err(BlockStateError::NotPending),
-        }
-    }
-
-    /// `RemotePending` → clear (live again).
-    fn unclaim_remote_pending(&self, index: BlockIndex) -> Result<(), BlockStateError> {
-        let atom = self.state_unchecked(index);
-        match atom.compare_exchange(
-            BlockState::RemotePending.raw(),
-            BlockState::Clear.raw(),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => Ok(()),
-            Err(_) => Err(BlockStateError::NotPending),
+            Err(_) => Err(BlockStateError::Conflict),
         }
     }
 
@@ -361,7 +310,12 @@ impl Run {
         let state = unsafe { &mut *self.state.get() };
         let index = match self.pop_free(state) {
             Some(index) => {
-                self.blocks.take_free(index);
+                // Freelist entries are owner-published Free bits.
+                let cleared = self
+                    .blocks
+                    .update(index, BlockState::Free, BlockState::Clear)
+                    .is_ok();
+                debug_assert!(cleared);
                 index
             }
             None => self.allocate_fresh(state)?,
@@ -384,7 +338,8 @@ impl Run {
             return Err(RunError::DoubleFree);
         }
 
-        self.blocks.mark_free(block.index())?;
+        self.blocks
+            .update(block.index(), BlockState::Clear, BlockState::Free)?;
 
         debug_assert!(state.live > 0);
         state.live -= 1;
@@ -399,13 +354,15 @@ impl Run {
             return Err(RunError::DoubleFree);
         }
 
-        self.blocks.mark_remote_pending(block.index())?;
+        self.blocks
+            .update(block.index(), BlockState::Clear, BlockState::RemotePending)?;
         Ok(())
     }
 
     pub(crate) fn unclaim(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
         let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
-        self.blocks.unclaim_remote_pending(block.index())?;
+        self.blocks
+            .update(block.index(), BlockState::RemotePending, BlockState::Clear)?;
         Ok(())
     }
 
@@ -415,7 +372,8 @@ impl Run {
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
 
-        self.blocks.accept_remote_pending(block.index())?;
+        self.blocks
+            .update(block.index(), BlockState::RemotePending, BlockState::Free)?;
 
         debug_assert!(state.live > 0);
         state.live -= 1;
@@ -543,12 +501,8 @@ impl Run {
 }
 
 impl From<BlockStateError> for RunError {
-    fn from(error: BlockStateError) -> Self {
-        match error {
-            BlockStateError::AlreadyFree
-            | BlockStateError::AlreadyPending
-            | BlockStateError::NotPending => Self::DoubleFree,
-        }
+    fn from(_error: BlockStateError) -> Self {
+        Self::DoubleFree
     }
 }
 
