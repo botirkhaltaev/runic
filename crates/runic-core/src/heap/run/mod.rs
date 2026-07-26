@@ -86,72 +86,96 @@ enum BlockStateError {
     NotPending,
 }
 
-/// Per-block Free / clear / `RemotePending` bits.
+/// Per-block clear / Free / `RemotePending`.
 ///
 /// Free/Live **authority** is freelist membership (+ bump). These bits keep
 /// double-free and remote CAS fail-closed without restoring owner Allocated
 /// stores on the bump allocate path (zero-filled ⇒ clear = live-or-never).
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlockState {
+    Clear = 0,
+    RemotePending = 1,
+    Free = 2,
+}
+
+impl BlockState {
+    const fn raw(self) -> u8 {
+        match self {
+            Self::Clear => 0,
+            Self::RemotePending => 1,
+            Self::Free => 2,
+        }
+    }
+
+    const fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            value if value == Self::Clear.raw() => Some(Self::Clear),
+            value if value == Self::RemotePending.raw() => Some(Self::RemotePending),
+            value if value == Self::Free.raw() => Some(Self::Free),
+            _ => None,
+        }
+    }
+}
+
 struct BlockStates {
     bytes: AddressRange,
 }
 
 impl BlockStates {
-    const CLEAR: u8 = 0;
-    const REMOTE_PENDING: u8 = 1;
-    const FREE: u8 = 2;
-
     /// `index` must be capacity-proven.
-    fn is_remote_pending(&self, index: BlockIndex) -> bool {
-        self.state_unchecked(index).load(Ordering::Relaxed) == Self::REMOTE_PENDING
-    }
-
-    fn is_free(&self, index: BlockIndex) -> bool {
-        self.state_unchecked(index).load(Ordering::Relaxed) == Self::FREE
+    fn state(&self, index: BlockIndex) -> BlockState {
+        let raw = self.state_unchecked(index).load(Ordering::Relaxed);
+        debug_assert!(BlockState::from_raw(raw).is_some());
+        // Only `Clear` / `Free` / `RemotePending` are ever stored; corrupt → Free (fail closed).
+        BlockState::from_raw(raw).unwrap_or(BlockState::Free)
     }
 
     /// Freelist pop: Free → clear (live).
     fn take_free(&self, index: BlockIndex) {
-        let state = self.state_unchecked(index);
-        debug_assert_eq!(state.load(Ordering::Relaxed), Self::FREE);
-        state.store(Self::CLEAR, Ordering::Relaxed);
+        let atom = self.state_unchecked(index);
+        debug_assert_eq!(self.state(index), BlockState::Free);
+        atom.store(BlockState::Clear.raw(), Ordering::Relaxed);
     }
 
     /// Owner free: clear → Free. Fails if already free or remote-pending.
     fn mark_free(&self, index: BlockIndex) -> Result<(), BlockStateError> {
-        let state = self.state_unchecked(index);
-        match state.compare_exchange(
-            Self::CLEAR,
-            Self::FREE,
+        let atom = self.state_unchecked(index);
+        match atom.compare_exchange(
+            BlockState::Clear.raw(),
+            BlockState::Free.raw(),
             Ordering::Relaxed,
             Ordering::Relaxed,
         ) {
             Ok(_) => Ok(()),
-            Err(Self::REMOTE_PENDING) => Err(BlockStateError::AlreadyPending),
+            Err(raw) if raw == BlockState::RemotePending.raw() => {
+                Err(BlockStateError::AlreadyPending)
+            }
             Err(_) => Err(BlockStateError::AlreadyFree),
         }
     }
 
     /// Live (clear) → `RemotePending`.
     fn mark_remote_pending(&self, index: BlockIndex) -> Result<(), BlockStateError> {
-        let state = self.state_unchecked(index);
-        match state.compare_exchange(
-            Self::CLEAR,
-            Self::REMOTE_PENDING,
+        let atom = self.state_unchecked(index);
+        match atom.compare_exchange(
+            BlockState::Clear.raw(),
+            BlockState::RemotePending.raw(),
             Ordering::Relaxed,
             Ordering::Relaxed,
         ) {
             Ok(_) => Ok(()),
-            Err(Self::FREE) => Err(BlockStateError::AlreadyFree),
+            Err(raw) if raw == BlockState::Free.raw() => Err(BlockStateError::AlreadyFree),
             Err(_) => Err(BlockStateError::AlreadyPending),
         }
     }
 
     /// `RemotePending` → Free (about to freelist-push on accept).
     fn accept_remote_pending(&self, index: BlockIndex) -> Result<(), BlockStateError> {
-        let state = self.state_unchecked(index);
-        match state.compare_exchange(
-            Self::REMOTE_PENDING,
-            Self::FREE,
+        let atom = self.state_unchecked(index);
+        match atom.compare_exchange(
+            BlockState::RemotePending.raw(),
+            BlockState::Free.raw(),
             Ordering::Relaxed,
             Ordering::Relaxed,
         ) {
@@ -162,10 +186,10 @@ impl BlockStates {
 
     /// `RemotePending` → clear (live again).
     fn unclaim_remote_pending(&self, index: BlockIndex) -> Result<(), BlockStateError> {
-        let state = self.state_unchecked(index);
-        match state.compare_exchange(
-            Self::REMOTE_PENDING,
-            Self::CLEAR,
+        let atom = self.state_unchecked(index);
+        match atom.compare_exchange(
+            BlockState::RemotePending.raw(),
+            BlockState::Clear.raw(),
             Ordering::Relaxed,
             Ordering::Relaxed,
         ) {
@@ -403,13 +427,13 @@ impl Run {
         let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &*self.state.get() };
-        if block.index().get() >= state.bump
-            || self.blocks.is_remote_pending(block.index())
-            || self.blocks.is_free(block.index())
-        {
+        if block.index().get() >= state.bump {
             return Err(RunError::DoubleFree);
         }
-        Ok(block)
+        match self.blocks.state(block.index()) {
+            BlockState::Clear => Ok(block),
+            BlockState::Free | BlockState::RemotePending => Err(RunError::DoubleFree),
+        }
     }
 
     pub(crate) fn resize_in_place(
