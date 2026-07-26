@@ -6,6 +6,8 @@ Scope: `crates/runic-core/src/`.
 - Keep module boundaries direct: `Heap`, `PageMap`, `RunHeap`, `ExtentHeap`, `Arena`, `Run`, `Extent`, `OsMemory`, and `SizeClasses` should own their responsibilities.
 - Prefer `NonZero*`, `NonNull`, and named-field domain types over sentinel values or ambiguous tuple structs.
 - `SizeClassId` is a bounded index into `SizeClasses::SIZES`; only `SizeClasses` constructs it. Prefer `SizeClasses::block_size(id)` over result-bag wrappers. Do not hand-maintain a second align-size table — const-generate the align remap from `SIZES`.
+- `SizeClasses::id_for` keeps default-align (`align <= 8`) as a direct `CLASS_FOR_SIZE` lookup after the small-max check; do not reintroduce a second bounds check via `lower_bound_index` on that path.
+- `Allocator::alloc_zeroed` classifies once, then allocates (run or extent) and zeros run blocks at this boundary; do not call `alloc` from `alloc_zeroed` (that double-classifies).
 - Do not put `#[cfg(test)]` constructors on production `LayoutSpec` / entity impls; tests build specs via `Layout` + `from_layout`.
 - Unsafe blocks must be narrow and adjacent to the safety reasoning.
 - Keep owner-local and remote-free responsibilities separated in type APIs; there is no central/root ownership heap.
