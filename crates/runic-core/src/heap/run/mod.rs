@@ -49,13 +49,11 @@ impl BlockIndex {
         self.get().checked_mul(block_size)
     }
 
-    fn byte_in(self, bytes: AddressRange) -> Option<NonNull<u8>> {
-        if self.get() >= bytes.len() {
-            return None;
-        }
-
-        // SAFETY: `get()` is in `0..bytes.len()`, so the byte is inside the span.
-        Some(unsafe { NonNull::new_unchecked(bytes.base().as_ptr().add(self.get())) })
+    /// State-tail byte for an index already proven in `0..bytes.len()` (capacity).
+    fn byte_unchecked(self, bytes: AddressRange) -> NonNull<u8> {
+        debug_assert!(self.get() < bytes.len());
+        // SAFETY: caller proved `get() < bytes.len()` via `block_at` / freelist / bump.
+        unsafe { NonNull::new_unchecked(bytes.base().as_ptr().add(self.get())) }
     }
 }
 
@@ -140,20 +138,31 @@ struct BlockStates {
 }
 
 impl BlockStates {
-    fn allocate(&self, index: BlockIndex) -> Result<(), BlockStateError> {
-        let state = self.state(index)?;
-        debug_assert_eq!(self.load(index)?, BlockState::Free);
+    /// Owner-local Free → Allocated. `index` must be capacity-proven.
+    fn allocate(&self, index: BlockIndex) {
+        let state = self.state_unchecked(index);
+        debug_assert_eq!(
+            BlockState::from_raw(state.load(Ordering::Relaxed)),
+            Some(BlockState::Free)
+        );
         state.store(BlockState::Allocated.raw(), Ordering::Relaxed);
-        Ok(())
     }
 
-    fn is_allocated(&self, index: BlockIndex) -> Result<bool, BlockStateError> {
-        Ok(self.load(index)? == BlockState::Allocated)
+    /// `index` must be capacity-proven (`block_at` / freelist / bump).
+    ///
+    /// Corrupt state bytes are not Allocated (`false`); they are not an index error.
+    fn is_allocated(&self, index: BlockIndex) -> bool {
+        let raw = self.state_unchecked(index).load(Ordering::Relaxed);
+        debug_assert!(BlockState::from_raw(raw).is_some());
+        BlockState::from_raw(raw) == Some(BlockState::Allocated)
     }
 
+    /// Owner-local Allocated → Free. `index` must be capacity-proven.
     fn release(&self, index: BlockIndex) -> Result<(), BlockStateError> {
-        let state = self.state(index)?;
-        match self.load(index)? {
+        let state = self.state_unchecked(index);
+        match BlockState::from_raw(state.load(Ordering::Relaxed))
+            .ok_or(BlockStateError::InvalidIndex)?
+        {
             BlockState::Allocated => {
                 state.store(BlockState::Free.raw(), Ordering::Relaxed);
                 Ok(())
@@ -164,7 +173,7 @@ impl BlockStates {
     }
 
     fn mark_remote_pending(&self, index: BlockIndex) -> Result<(), BlockStateError> {
-        let state = self.state(index)?;
+        let state = self.state_unchecked(index);
         match state.compare_exchange(
             BlockState::Allocated.raw(),
             BlockState::RemotePending.raw(),
@@ -177,7 +186,7 @@ impl BlockStates {
     }
 
     fn release_remote_pending(&self, index: BlockIndex) -> Result<(), BlockStateError> {
-        let state = self.state(index)?;
+        let state = self.state_unchecked(index);
         match state.compare_exchange(
             BlockState::RemotePending.raw(),
             BlockState::Free.raw(),
@@ -190,7 +199,7 @@ impl BlockStates {
     }
 
     fn unclaim_remote_pending(&self, index: BlockIndex) -> Result<(), BlockStateError> {
-        let state = self.state(index)?;
+        let state = self.state_unchecked(index);
         match state.compare_exchange(
             BlockState::RemotePending.raw(),
             BlockState::Allocated.raw(),
@@ -202,11 +211,6 @@ impl BlockStates {
         }
     }
 
-    fn load(&self, index: BlockIndex) -> Result<BlockState, BlockStateError> {
-        let raw = self.state(index)?.load(Ordering::Relaxed);
-        BlockState::from_raw(raw).ok_or(BlockStateError::InvalidIndex)
-    }
-
     fn state_error(raw: u8) -> Result<(), BlockStateError> {
         match BlockState::from_raw(raw) {
             Some(BlockState::Free) => Err(BlockStateError::AlreadyFree),
@@ -216,16 +220,14 @@ impl BlockStates {
         }
     }
 
-    fn state(&self, index: BlockIndex) -> Result<&AtomicU8, BlockStateError> {
-        let ptr = index
-            .byte_in(self.bytes)
-            .ok_or(BlockStateError::InvalidIndex)?;
+    /// Atom for a capacity-proven block index (one address calc per op).
+    fn state_unchecked(&self, index: BlockIndex) -> &AtomicU8 {
+        let ptr = index.byte_unchecked(self.bytes);
 
-        // SAFETY: `byte_in` selected a byte in the run mapping's state tail,
-        // zero-filled as Free, owned by `Run` for this value's lifetime, and
-        // shared only through owner-local / atomic remote protocols. That byte
-        // is accessed as `AtomicU8`.
-        Ok(unsafe { &*ptr.as_ptr().cast::<AtomicU8>() })
+        // SAFETY: `byte_unchecked` selected a byte in the run mapping's state
+        // tail, zero-filled as Free, owned by `Run` for this value's lifetime,
+        // and shared only through owner-local / atomic remote protocols.
+        unsafe { &*ptr.as_ptr().cast::<AtomicU8>() }
     }
 }
 
@@ -245,24 +247,16 @@ pub(crate) struct Run {
 // block state and never mutate RunState.
 unsafe impl Sync for Run {}
 
-/// Sentinel stored in a free block's intrusive next slot when the list ends.
+/// Empty freelist head / end-of-list link. Index `0` is a valid block, so this
+/// is a deliberate sentinel (same pattern as `Arena`'s freelist).
 const FREE_END: usize = usize::MAX;
 
 struct RunState {
     live: usize,
     bump: usize,
     available_next: Option<NonNull<Run>>,
-    free: Option<BlockIndex>,
-}
-
-pub(crate) struct RunFreeStatus {
-    was_full: bool,
-}
-
-impl RunFreeStatus {
-    pub(crate) const fn was_full(&self) -> bool {
-        self.was_full
-    }
+    /// `FREE_END` or a capacity-proven block index.
+    free: usize,
 }
 
 impl Run {
@@ -333,6 +327,14 @@ impl Run {
         unsafe { &*self.state.get() }.live < self.capacity
     }
 
+    /// True when every block is outstanding (allocated or remote-pending).
+    ///
+    /// Used by `RunHeap` before `free` / `accept` for available-list relink.
+    pub(crate) fn is_full(&self) -> bool {
+        // SAFETY: owner-local methods are called only by the owning heap.
+        unsafe { &*self.state.get() }.live == self.capacity
+    }
+
     /// Outstanding blocks on this run (allocated or remote-pending).
     pub(crate) fn has_live_blocks(&self) -> bool {
         // SAFETY: read under owner-local access or table-locked reclaim.
@@ -364,7 +366,7 @@ impl Run {
             .pop_free(state)
             .or_else(|| state.allocate_fresh(self.capacity))?;
         let ptr = self.block_ptr(index);
-        self.blocks.allocate(index).ok()?;
+        self.blocks.allocate(index);
 
         debug_assert!(state.live < self.capacity);
         state.live += 1;
@@ -372,11 +374,10 @@ impl Run {
     }
 
     /// Owner-local: Allocated → Free, push freelist.
-    pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<RunFreeStatus, RunError> {
+    pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
         let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
-        let was_full = state.live == self.capacity;
 
         match self.blocks.release(block.index()) {
             Ok(()) => {}
@@ -393,9 +394,8 @@ impl Run {
         };
 
         state.live = live;
-        self.push_free(state, block.index());
-
-        Ok(RunFreeStatus { was_full })
+        Self::push_free(state, block);
+        Ok(())
     }
 
     /// Freer: Allocated → `RemotePending` (before batch/publish).
@@ -428,11 +428,10 @@ impl Run {
     }
 
     /// Owner: `RemotePending` → Free (inbox flush / publish Draining complete).
-    pub(crate) fn accept(&self, ptr: NonNull<u8>) -> Result<RunFreeStatus, RunError> {
+    pub(crate) fn accept(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
         let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
-        let was_full = state.live == self.capacity;
 
         match self.blocks.release_remote_pending(block.index()) {
             Ok(()) => {}
@@ -449,23 +448,16 @@ impl Run {
         };
 
         state.live = live;
-        self.push_free(state, block.index());
-
-        Ok(RunFreeStatus { was_full })
+        Self::push_free(state, block);
+        Ok(())
     }
 
     pub(crate) fn allocated_block_at(&self, ptr: NonNull<u8>) -> Result<RunBlock, RunError> {
         let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
-
-        match self.blocks.is_allocated(block.index()) {
-            Ok(true) => Ok(block),
-            Ok(false) => Err(RunError::DoubleFree),
-            Err(
-                BlockStateError::InvalidIndex
-                | BlockStateError::AlreadyFree
-                | BlockStateError::AlreadyAllocated
-                | BlockStateError::AlreadyPending,
-            ) => Err(RunError::InvalidPointer),
+        if self.blocks.is_allocated(block.index()) {
+            Ok(block)
+        } else {
+            Err(RunError::DoubleFree)
         }
     }
 
@@ -502,33 +494,32 @@ impl Run {
     }
 
     fn pop_free(&self, state: &mut RunState) -> Option<BlockIndex> {
-        let index = state.free?;
+        let raw = state.free;
+        if raw == FREE_END {
+            return None;
+        }
+
+        let index = BlockIndex::new(raw);
         let ptr = self.block_ptr(index);
         state.free = Self::read_free_next(ptr);
         Some(index)
     }
 
-    fn push_free(&self, state: &mut RunState, index: BlockIndex) {
-        let ptr = self.block_ptr(index);
-        Self::write_free_next(ptr, state.free);
-        state.free = Some(index);
+    /// Push using the payload pointer already proven by `block_at` / `RunBlock`.
+    fn push_free(state: &mut RunState, block: RunBlock) {
+        Self::write_free_next(block.ptr(), state.free);
+        state.free = block.index().get();
     }
 
-    fn read_free_next(ptr: NonNull<u8>) -> Option<BlockIndex> {
+    fn read_free_next(ptr: NonNull<u8>) -> usize {
         // SAFETY: free-list links are stored only in reusable blocks owned by this run.
-        let raw = unsafe { ptr.cast::<usize>().as_ptr().read() };
-        if raw == FREE_END {
-            None
-        } else {
-            Some(BlockIndex::new(raw))
-        }
+        unsafe { ptr.cast::<usize>().as_ptr().read() }
     }
 
-    fn write_free_next(ptr: NonNull<u8>, next: Option<BlockIndex>) {
-        let raw = next.map_or(FREE_END, BlockIndex::get);
+    fn write_free_next(ptr: NonNull<u8>, next: usize) {
         // SAFETY: free-list links are stored only in reusable blocks owned by this run.
         unsafe {
-            ptr.cast::<usize>().as_ptr().write(raw);
+            ptr.cast::<usize>().as_ptr().write(next);
         }
     }
 
@@ -557,7 +548,7 @@ impl RunState {
             live: 0,
             bump: 0,
             available_next: None,
-            free: None,
+            free: FREE_END,
         }
     }
 
