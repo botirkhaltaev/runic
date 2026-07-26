@@ -411,25 +411,12 @@ impl Run {
         Ok(())
     }
 
-    pub(crate) fn allocated_block_at(&self, ptr: NonNull<u8>) -> Result<RunBlock, RunError> {
-        let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
-        // SAFETY: owner-local methods are called only by the owning heap.
-        let state = unsafe { &*self.state.get() };
-        if block.index().get() >= state.bump {
-            return Err(RunError::DoubleFree);
-        }
-        match self.blocks.state(block.index()) {
-            BlockState::Clear => Ok(block),
-            BlockState::Free | BlockState::RemotePending => Err(RunError::DoubleFree),
-        }
-    }
-
     pub(crate) fn resize_in_place(
         &self,
         ptr: NonNull<u8>,
         spec: LayoutSpec,
     ) -> Result<bool, RunError> {
-        self.allocated_block_at(ptr)?;
+        self.owner_block(ptr)?;
 
         Ok(self.block_size >= spec.size() && spec.is_addr_aligned(ptr.as_ptr().addr()))
     }
