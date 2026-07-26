@@ -395,14 +395,9 @@ impl ThreadHeap {
 
         // Inbox is empty after the optional flush above, so acquire_run will not flush again.
         let run = heap_mut.acquire_run(class, pages)?;
-        self.park_run(class, run);
+        cell.set(run.as_ptr());
         // SAFETY: run was just returned by this heap's live arena.
         unsafe { run.as_ref() }.allocate()
-    }
-
-    /// Park `run` as the sticky run for `class`.
-    pub(crate) fn park_run(&self, class: SizeClassId, run: NonNull<Run>) {
-        self.run_cell(class).set(run.as_ptr());
     }
 
     fn run_cell(&self, class: SizeClassId) -> &Cell<*mut Run> {
