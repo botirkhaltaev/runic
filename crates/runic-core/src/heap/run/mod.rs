@@ -129,8 +129,16 @@ impl BlockStates {
         BlockState::from_raw(raw).unwrap_or(BlockState::Free)
     }
 
-    /// CAS `from` → `to` for a capacity-proven index.
-    fn update(
+    /// Unconditional write (owner freelist allocate after observing Free).
+    #[inline]
+    fn set(&self, index: BlockIndex, to: BlockState) {
+        self.state_unchecked(index)
+            .store(to.raw(), Ordering::Relaxed);
+    }
+
+    /// Compare-exchange `from` → `to` (owner free / claim / unclaim / accept).
+    #[inline]
+    fn cas(
         &self,
         index: BlockIndex,
         from: BlockState,
@@ -145,13 +153,6 @@ impl BlockStates {
             Ok(_) => Ok(()),
             Err(_) => Err(BlockStateError::Conflict),
         }
-    }
-
-    /// Owner-only write after a production state check (freelist allocate).
-    #[inline]
-    fn store(&self, index: BlockIndex, to: BlockState) {
-        self.state_unchecked(index)
-            .store(to.raw(), Ordering::Relaxed);
     }
 
     /// Atom for a capacity-proven block index (one address calc per op).
@@ -318,12 +319,12 @@ impl Run {
         let index = match self.pop_free(state) {
             Some(index) => {
                 // Freelist membership is Free/Live authority on the owner path.
-                // Only clear the DF bit after observing Free; never CAS here —
-                // remote claim races Free↔Clear only against owner free, not alloc.
+                // Clear the DF bit with `set` (no CAS) — remote claim races
+                // Free↔Clear only against owner free, not allocate.
                 if self.blocks.state(index) != BlockState::Free {
                     return None;
                 }
-                self.blocks.store(index, BlockState::Clear);
+                self.blocks.set(index, BlockState::Clear);
                 index
             }
             None => self.allocate_fresh(state)?,
@@ -347,7 +348,7 @@ impl Run {
         }
 
         self.blocks
-            .update(block.index(), BlockState::Clear, BlockState::Free)?;
+            .cas(block.index(), BlockState::Clear, BlockState::Free)?;
 
         debug_assert!(state.live > 0);
         state.live -= 1;
@@ -363,14 +364,14 @@ impl Run {
         }
 
         self.blocks
-            .update(block.index(), BlockState::Clear, BlockState::RemotePending)?;
+            .cas(block.index(), BlockState::Clear, BlockState::RemotePending)?;
         Ok(())
     }
 
     pub(crate) fn unclaim(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
         let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
         self.blocks
-            .update(block.index(), BlockState::RemotePending, BlockState::Clear)?;
+            .cas(block.index(), BlockState::RemotePending, BlockState::Clear)?;
         Ok(())
     }
 
@@ -381,7 +382,7 @@ impl Run {
         let state = unsafe { &mut *self.state.get() };
 
         self.blocks
-            .update(block.index(), BlockState::RemotePending, BlockState::Free)?;
+            .cas(block.index(), BlockState::RemotePending, BlockState::Free)?;
 
         debug_assert!(state.live > 0);
         state.live -= 1;
@@ -613,7 +614,7 @@ mod tests {
         assert!(run.free(ptr).is_ok());
         let index = run.block_at(ptr).unwrap().index();
         // Corrupt DF bit while the block remains on the freelist.
-        run.blocks.store(index, BlockState::Clear);
+        run.blocks.set(index, BlockState::Clear);
         assert!(run.allocate().is_none());
     }
 
