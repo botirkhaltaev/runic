@@ -53,7 +53,7 @@ Build only:
 Linux x86_64
 Rust stable
 GlobalAlloc
-owner-local heaps via HeapTable / ThreadHeap
+owner-local heaps via HeapDirectory / ThreadHeap
 mmap-backed runs for size-classed allocations
 mmap-backed extents for dedicated allocations (heap-local)
 out-of-line metadata
@@ -110,10 +110,11 @@ Use this architecture first:
 GlobalAlloc
   -> RunicAlloc
       -> Allocator
-          -> AllocatorInner { refs, pages: PageMap, table: Mutex<HeapTable> }
-              -> HeapTable { generations[], slots: Arena<Heap> }
+          -> AllocatorInner { refs, pages: PageMap, directory: Mutex<HeapDirectory> }
+              -> HeapDirectory { published[], slots: Arena<HeapSlot> }
                   -> ThreadHeap
-              -> Heap { RunHeap, ExtentHeap, Inbox }
+              -> HeapSlot { HeapRoute, Inbox, publishers, Heap }
+                  -> Heap { RunHeap, ExtentHeap }
                   -> RunHeap { Arena<Run>, available[] }
                   -> ExtentHeap { Arena<Extent>, cache }
               -> Run
@@ -121,18 +122,19 @@ GlobalAlloc
               -> OsMemory
 ```
 
-Keep one global lock around `HeapTable` for v0.5 slow paths; same-thread
+Keep one global lock around `HeapDirectory` for v0.5 slow paths; same-thread
 small-run hits may use thread-owned heap metadata without entering that lock.
-`PageMap` stays outside that mutex so dealloc lookup is not table-locked.
+`PageMap` stays outside that mutex so dealloc lookup is not directory-locked.
 
 ## Entity Responsibilities
 
 ```text
 RunicAlloc     owns the Rust GlobalAlloc boundary.
 Allocator      owns the core public allocator API and abort boundary.
-AllocatorInner owns the refcounted mmap instance: PageMap, Mutex<HeapTable>, and self-hosting Mapping.
-Heap           owns run and extent allocation policy for one heap identity.
-HeapTable      owns slots Arena<Heap>, generations[], acquire/retire/reclaim, heap/mode, and publish.
+AllocatorInner owns the refcounted mmap instance: PageMap, Mutex<HeapDirectory>, and self-hosting Mapping.
+Heap           owns run and extent allocation policy for one heap identity (no mode/inbox).
+HeapDirectory  owns published slot pointers, Arena<HeapSlot>, acquire/retire/reclaim/publish.
+HeapSlot       owns HeapRoute (gen+mode+retired), Inbox, publishers, and Heap metadata.
 Arena          owns fixed-capacity freelist metadata storage.
 LayoutSpec     owns normalized layout semantics.
 SizeClasses    owns size-class selection.
@@ -282,9 +284,9 @@ Delivered:
 ```text
 HeapId ownership on Run and Extent (no Owner/root heap)
 ThreadHeap frontend for small and large allocations
-per-thread heap ownership through HeapTable slots
+per-thread heap ownership through HeapDirectory / HeapSlot
 explicit block states for reusable, allocated, and remote-pending blocks
-lock-free remote-free Treiber inbox on each Heap
+lock-free remote-free Treiber inbox on each HeapSlot
 claim → batch → publish → flush/accept remote-free protocol
 alloc-miss flush then retry before mmap
 thread-exit Draining mode with orphan flush and generation bump

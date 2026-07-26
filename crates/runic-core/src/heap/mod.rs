@@ -1,7 +1,4 @@
-use core::{
-    ptr::NonNull,
-    sync::atomic::{AtomicU8, Ordering},
-};
+use core::ptr::NonNull;
 
 use crate::{
     config::AllocatorConfig,
@@ -19,7 +16,7 @@ pub(crate) use extent::Extent;
 pub(crate) use extent::heap::{ExtentHeap, ExtentHeapError, ExtentInit};
 pub(crate) use id::HeapId;
 pub(crate) use run::{Run, RunError, RunHeap, RunHeapError, RunId};
-pub(crate) use table::{HeapError, HeapTable, Inbox, THREAD_HEAP, ThreadFreeError};
+pub(crate) use table::{HeapDirectory, HeapError, HeapSlot, THREAD_HEAP, ThreadFreeError};
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,29 +45,25 @@ impl HeapMode {
     }
 }
 
+/// Owner-local run/extent metadata. Lifecycle (mode/gen/inbox) lives on [`HeapSlot`].
 pub(crate) struct Heap {
-    mode: AtomicU8,
     id: HeapId,
     pub(crate) runs: RunHeap,
     pub(crate) extents: ExtentHeap,
-    inbox: Inbox,
 }
 
 // SAFETY: Heap mutation is serialized by the owning thread through TLS exclusive access,
-// or by allocator-state-serialized lifecycle paths while a heap is draining.
+// or by directory-locked Draining paths.
 unsafe impl Send for Heap {}
-// SAFETY: Inbox producers use atomics; mode is atomic; owner-local metadata mutation
-// requires exclusive access via TLS Active or table-locked Draining.
+// SAFETY: same invariants as `Send`; shared reads only under directory lock or owner TLS.
 unsafe impl Sync for Heap {}
 
 impl Heap {
     pub(crate) fn new(id: HeapId, capacity: u32, config: AllocatorConfig) -> Self {
         Self {
-            mode: AtomicU8::new(HeapMode::Active.raw()),
             id,
             runs: RunHeap::new(capacity),
             extents: ExtentHeap::new(capacity, config.extent()),
-            inbox: Inbox::new(),
         }
     }
 
@@ -78,62 +71,22 @@ impl Heap {
         self.id
     }
 
-    pub(crate) fn set_id(&mut self, id: HeapId) {
+    pub(crate) fn rebind_heap_id(&mut self, id: HeapId) {
         self.id = id;
-    }
-
-    pub(crate) fn inbox(&self) -> &Inbox {
-        &self.inbox
-    }
-
-    pub(crate) fn is_active(&self) -> bool {
-        self.mode() == HeapMode::Active
-    }
-
-    pub(crate) fn is_free(&self) -> bool {
-        self.mode() == HeapMode::Free
-    }
-
-    pub(crate) fn begin_drain(&self) {
-        self.mode.store(HeapMode::Draining.raw(), Ordering::Release);
-    }
-
-    pub(crate) fn reactivate(&mut self, id: HeapId) {
-        self.mode.store(HeapMode::Active.raw(), Ordering::Release);
-        self.set_id(id);
         self.runs.rebind_heap_id(id);
         self.extents.rebind_heap_id(id);
     }
 
-    /// Mark Free when empty; caller bumps table generation.
-    pub(crate) fn try_reclaim(&mut self) -> bool {
-        if self.has_live_allocations() || !self.inbox.is_empty() {
-            return false;
-        }
-
-        self.mode.store(HeapMode::Free.raw(), Ordering::Release);
-        true
-    }
-
-    /// Snapshot of this heap's Free/Active/Draining lifecycle state.
-    pub(crate) fn mode(&self) -> HeapMode {
-        HeapMode::from_raw(self.mode.load(Ordering::Acquire)).unwrap_or(HeapMode::Free)
-    }
-
-    /// Obtain a run for `class`: flush inbox once if needed, then available or cold mmap.
+    /// Obtain a run for `class`: available list or cold mmap. Caller flushes inbox first.
     pub(crate) fn acquire_run(
         &mut self,
         class: SizeClassId,
         pages: &PageMap,
     ) -> Option<NonNull<Run>> {
-        if !self.inbox.is_empty() {
-            self.flush(pages).ok()?;
-        }
-
         self.runs.allocate(class, self.id, pages)
     }
 
-    /// One-shot small alloc without holding a sticky run: acquire, take one block, return run.
+    /// One-shot small alloc without sticky: acquire, take one block, return run.
     pub(crate) fn alloc_run(&mut self, class: SizeClassId, pages: &PageMap) -> Option<NonNull<u8>> {
         let run = self.acquire_run(class, pages)?;
         // SAFETY: run was just returned by this heap's live arena.
@@ -151,26 +104,16 @@ impl Heap {
         pages: &PageMap,
         init: ExtentInit,
     ) -> Option<NonNull<u8>> {
-        if !self.inbox.is_empty() {
-            self.flush(pages).ok()?;
-        }
-
         self.extents.allocate(spec, self.id, pages, init)
     }
 
     /// Owner-local free for a resolved `PageMap` owner (run or extent).
-    ///
-    /// Callable via a TLS-bound `Heap` without taking the table mutex. Does not wrap the
-    /// sticky-run hit (`Run::free`); that path stays on `ThreadHeap::free` for minimal work.
     pub(crate) fn free(
         &mut self,
         owner: PageOwner,
         ptr: NonNull<u8>,
         pages: &PageMap,
     ) -> Result<(), HeapError> {
-        if !self.inbox.is_empty() {
-            self.flush(pages)?;
-        }
         match owner {
             PageOwner::Run(run) => self.runs.free(run, ptr).map_err(HeapError::from),
             PageOwner::Extent(extent) => self
@@ -178,24 +121,6 @@ impl Heap {
                 .free(extent, ptr, pages)
                 .map_err(HeapError::from),
         }
-    }
-
-    pub(crate) fn flush(&mut self, pages: &PageMap) -> Result<(), HeapError> {
-        while let Some(list) = self.inbox.drain() {
-            for ptr in list {
-                match pages.get(ptr) {
-                    Some(PageOwner::Run(run)) => {
-                        self.runs.accept(run, ptr)?;
-                    }
-                    Some(PageOwner::Extent(extent)) => {
-                        self.extents.accept(extent, ptr, pages)?;
-                    }
-                    None => return Err(HeapError::InvalidPointer),
-                }
-            }
-        }
-
-        Ok(())
     }
 
     /// Live ownership for Draining reclaim: any run with outstanding blocks, or any extent.

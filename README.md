@@ -35,7 +35,7 @@ fn main() {
 Runic v0.5 implements:
 
 - `GlobalAlloc`
-- owner-local heaps via `HeapTable` / `ThreadHeap`
+- owner-local heaps via `HeapDirectory` / `ThreadHeap`
 - `HeapId` ownership on runs and extents
 - lock-free remote-free Treiber inboxes with claim → batch → publish → flush/`accept`
 - Free | Active | Draining heap-slot lifecycle after thread exit
