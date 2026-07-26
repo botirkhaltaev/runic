@@ -147,6 +147,13 @@ impl BlockStates {
         }
     }
 
+    /// Owner-only write after a production state check (freelist allocate).
+    #[inline]
+    fn store(&self, index: BlockIndex, to: BlockState) {
+        self.state_unchecked(index)
+            .store(to.raw(), Ordering::Relaxed);
+    }
+
     /// Atom for a capacity-proven block index (one address calc per op).
     fn state_unchecked(&self, index: BlockIndex) -> &AtomicU8 {
         let ptr = index.byte_unchecked(self.bytes);
@@ -310,12 +317,13 @@ impl Run {
         let state = unsafe { &mut *self.state.get() };
         let index = match self.pop_free(state) {
             Some(index) => {
-                // Freelist entries are owner-published Free bits.
-                let cleared = self
-                    .blocks
-                    .update(index, BlockState::Free, BlockState::Clear)
-                    .is_ok();
-                debug_assert!(cleared);
+                // Freelist membership is Free/Live authority on the owner path.
+                // Only clear the DF bit after observing Free; never CAS here —
+                // remote claim races Free↔Clear only against owner free, not alloc.
+                if self.blocks.state(index) != BlockState::Free {
+                    return None;
+                }
+                self.blocks.store(index, BlockState::Clear);
                 index
             }
             None => self.allocate_fresh(state)?,
@@ -588,6 +596,25 @@ mod tests {
         assert!(run.free(ptr).is_ok());
 
         assert_eq!(run.allocate(), Some(ptr));
+    }
+
+    #[test]
+    fn freelist_allocate_rejects_non_free_state() {
+        let class = class_id(64, 8);
+        let run = Run::new(
+            RunId::from_index(2).unwrap(),
+            test_heap_id(),
+            map_for_class(class),
+            class,
+        )
+        .expect("test run");
+
+        let ptr = run.allocate().unwrap();
+        assert!(run.free(ptr).is_ok());
+        let index = run.block_at(ptr).unwrap().index();
+        // Corrupt DF bit while the block remains on the freelist.
+        run.blocks.store(index, BlockState::Clear);
+        assert!(run.allocate().is_none());
     }
 
     #[test]

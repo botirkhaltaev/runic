@@ -50,11 +50,16 @@ Preferred: `scripts/profile.sh` (builds once, runs the resolved bench binary und
 
 ```sh
 scripts/profile.sh -l baseline explicit 'explicit/single_size_churn/runic/64'
+scripts/profile.sh -l baseline explicit 'explicit/recycled_live_churn/runic/64/live:1'
 scripts/profile.sh -l baseline -t 20 \
   threaded 'threaded/persistent_remote_fan_in/runic/4/live:256'
 scripts/profile.sh -t 20 -a 'runic_core::heap::run::Run::free' \
   explicit 'explicit/alloc_zeroed/runic/64'
 ```
+
+Recycled live-set matrix (all 27 size classes × depths 1 / 32 / 256):
+
+- `explicit/recycled_live_churn/runic/{size}/live:{depth}`
 
 Artifacts land under `target/runic-profiles/` (override with `RUNIC_PROFILE_DIR` or `-o`).
 Each run writes `manifest.txt`, `metrics.txt`, and `summary.txt`.
