@@ -11,8 +11,9 @@ Run metadata owns small size-class allocations.
 
 - A run owns one mapping and one size class. The mapping is `RUN_SIZE` payload bytes plus one `AtomicU8` per block for remote-pending bits; `Run::range` is the payload span only.
 - Returned blocks must be valid block boundaries inside the payload span.
-- Owner Free/Live is freelist membership (+ bump). Freelist head uses raw `usize` / `FREE_END`; intrusive payload links are tagged for double-free detection. Allocate pops/bumps then `live++` with no owner `BlockStates` store.
-- `BlockStates` tracks RemotePending only (clear ↔ pending CAS). Never-issued indices are rejected via atomic `bump`; already-free via freelist tag.
+- Owner Free/Live is freelist membership (+ bump). Freelist head and intrusive payload links use raw `usize` / `FREE_END`. Allocate pops/bumps then `live++` with no owner `BlockStates` store.
+- Owner double-free poison is freelist-head identity (immediate double-free).
+- `BlockStates` tracks RemotePending only (clear ↔ pending CAS). Never-issued indices are rejected via owner `bump` / cold `issued`.
 - `Run::free` / `accept` return `Result<(), RunError>`; `RunHeap` reads `is_full()` before those ops for available-list `finish_free`. Sticky TLS free calls `Run::free` only.
 - `RunHeap` available-list pointers must refer to live `Arena<Run>` entries.
 - Sticky TLS caches hold a run checked out from `available[]`; reincarnation rebinds every occupied arena run, including sticky ones.
