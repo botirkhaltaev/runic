@@ -181,20 +181,6 @@ impl Extent {
         }
     }
 
-    pub(crate) fn unclaim(&self) -> Result<(), ExtentError> {
-        match self.state.compare_exchange(
-            ExtentState::RemotePending.raw(),
-            ExtentState::Allocated.raw(),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => Ok(()),
-            Err(value) if value == ExtentState::RemotePending.raw() => Err(ExtentError::DoubleFree),
-            Err(value) if value == ExtentState::Free.raw() => Err(ExtentError::DoubleFree),
-            Err(_) => Err(ExtentError::InvalidPointer),
-        }
-    }
-
     /// Owner: exact pointer, then `RemotePending → Free`.
     pub(crate) fn accept(&self, ptr: NonNull<u8>) -> Result<(), ExtentError> {
         self.validate_exact(ptr)?;
@@ -313,23 +299,6 @@ mod tests {
         .unwrap();
 
         assert!(extent.starts_at(extent.ptr()));
-        assert_eq!(extent.free(extent.ptr()), Ok(()));
-    }
-
-    #[test]
-    fn extent_unclaim_restores_allocated() {
-        let spec = layout_spec(128 * 1024, 4096);
-        let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
-        let extent = Extent::new(
-            ExtentId::from_index(7).unwrap(),
-            test_heap_id(),
-            mapping,
-            spec,
-        )
-        .unwrap();
-
-        assert_eq!(extent.claim(extent.ptr()), Ok(()));
-        assert_eq!(extent.unclaim(), Ok(()));
         assert_eq!(extent.free(extent.ptr()), Ok(()));
     }
 

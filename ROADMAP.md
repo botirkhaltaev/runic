@@ -110,10 +110,10 @@ Use this architecture first:
 GlobalAlloc
   -> RunicAlloc
       -> Allocator
-          -> AllocatorInner { refs, pages: PageMap, directory: Mutex<HeapDirectory> }
-              -> HeapDirectory { published[], slots: Arena<HeapSlot> }
+          -> AllocatorInner { refs, pages: PageMap, directory: HeapDirectory }
+              -> HeapDirectory { published[], state: Mutex<Arena<HeapSlot>> }
                   -> ThreadHeap
-              -> HeapSlot { HeapRoute, Inbox, publishers, Heap }
+              -> HeapSlot { SlotState, Inbox, UnsafeCell<Heap> }
                   -> Heap { RunHeap, ExtentHeap }
                   -> RunHeap { Arena<Run>, available[] }
                   -> ExtentHeap { Arena<Extent>, cache }
@@ -122,8 +122,9 @@ GlobalAlloc
               -> OsMemory
 ```
 
-Keep one global lock around `HeapDirectory` for v0.5 slow paths; same-thread
-small-run hits may use thread-owned heap metadata without entering that lock.
+`HeapDirectory::slot` / Active `publish` are lock-free via published pointers and
+SlotState publisher leases. Acquire, retire, Draining accept/free, and reclaim take the private
+directory lifecycle mutex. Same-thread small-run hits use TLS-owned heap metadata.
 `PageMap` stays outside that mutex so dealloc lookup is not directory-locked.
 
 ## Entity Responsibilities
@@ -131,10 +132,10 @@ small-run hits may use thread-owned heap metadata without entering that lock.
 ```text
 RunicAlloc     owns the Rust GlobalAlloc boundary.
 Allocator      owns the core public allocator API and abort boundary.
-AllocatorInner owns the refcounted mmap instance: PageMap, Mutex<HeapDirectory>, and self-hosting Mapping.
+AllocatorInner owns the refcounted mmap instance: PageMap, HeapDirectory, and self-hosting Mapping.
 Heap           owns run and extent allocation policy for one heap identity (no mode/inbox).
-HeapDirectory  owns published slot pointers, Arena<HeapSlot>, acquire/retire/reclaim/publish.
-HeapSlot       owns HeapRoute (gen+mode+retired), Inbox, publishers, and Heap metadata.
+HeapDirectory  owns published slot pointers, lock-free lookup/Active publish, and locked acquire/retire/Draining/reclaim.
+HeapSlot       owns SlotState (gen+mode+retired+publishers), Inbox, and UnsafeCell<Heap> metadata.
 Arena          owns fixed-capacity freelist metadata storage.
 LayoutSpec     owns normalized layout semantics.
 SizeClasses    owns size-class selection.
@@ -188,6 +189,8 @@ realloc prefix preservation and in-place growth
 subprocess abort cases
 Box, Vec, String, HashMap, Arc smoke tests
 deterministic randomized allocation traces
+Active publisher-lease remote free and Draining late free
+thread-exit / never-bound freer TLS batch publish
 ```
 
 Abort tests must run in subprocesses, not inside the test harness process.
@@ -288,7 +291,7 @@ per-thread heap ownership through HeapDirectory / HeapSlot
 explicit block states for reusable, allocated, and remote-pending blocks
 lock-free remote-free Treiber inbox on each HeapSlot
 claim → batch → publish → flush/accept remote-free protocol
-alloc-miss flush then retry before mmap
+alloc-miss prefers local/OS run acquire, then flush+retry before mmap
 thread-exit Draining mode with orphan flush and generation bump
 heap-local extents
 freelist-primary run allocate/free and page-map atomic publish

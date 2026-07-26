@@ -16,7 +16,7 @@ pub(crate) use extent::Extent;
 pub(crate) use extent::heap::{ExtentHeap, ExtentHeapError, ExtentInit};
 pub(crate) use id::HeapId;
 pub(crate) use run::{Run, RunError, RunHeap, RunHeapError, RunId};
-pub(crate) use table::{HeapDirectory, HeapError, HeapSlot, THREAD_HEAP, ThreadFreeError};
+pub(crate) use table::{HeapDirectory, HeapError, HeapSlot};
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,17 +67,13 @@ impl Heap {
         }
     }
 
-    pub(crate) const fn id(&self) -> HeapId {
-        self.id
-    }
-
     pub(crate) fn rebind_heap_id(&mut self, id: HeapId) {
         self.id = id;
         self.runs.rebind_heap_id(id);
         self.extents.rebind_heap_id(id);
     }
 
-    /// Obtain a run for `class`: available list or cold mmap. Caller flushes inbox first.
+    /// Obtain a run for `class`: available list or cold mmap.
     pub(crate) fn acquire_run(
         &mut self,
         class: SizeClassId,

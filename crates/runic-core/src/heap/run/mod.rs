@@ -136,7 +136,7 @@ impl BlockStates {
             .store(to.raw(), Ordering::Relaxed);
     }
 
-    /// Compare-exchange `from` → `to` (owner free / claim / unclaim / accept).
+    /// Compare-exchange `from` → `to` (owner free / claim / accept).
     #[inline]
     fn cas(
         &self,
@@ -365,13 +365,6 @@ impl Run {
 
         self.blocks
             .cas(block.index(), BlockState::Clear, BlockState::RemotePending)?;
-        Ok(())
-    }
-
-    pub(crate) fn unclaim(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
-        let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
-        self.blocks
-            .cas(block.index(), BlockState::RemotePending, BlockState::Clear)?;
         Ok(())
     }
 
@@ -731,23 +724,6 @@ mod tests {
 
         assert_eq!(run.claim(ptr), Ok(()));
         assert_eq!(run.claim(ptr), Err(RunError::DoubleFree));
-    }
-
-    #[test]
-    fn remote_pending_run_unclaim_restores_allocated() {
-        let class = class_id(64, 8);
-        let run = Run::new(
-            RunId::from_index(12).unwrap(),
-            test_heap_id(),
-            map_for_class(class),
-            class,
-        )
-        .expect("test run");
-        let ptr = run.allocate().unwrap();
-
-        assert_eq!(run.claim(ptr), Ok(()));
-        assert_eq!(run.unclaim(ptr), Ok(()));
-        assert!(run.free(ptr).is_ok());
     }
 
     #[test]

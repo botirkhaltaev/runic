@@ -11,7 +11,7 @@ Run metadata owns small size-class allocations.
 
 - A run owns one mapping and one size class. The mapping is `RUN_SIZE` payload bytes plus one `AtomicU8` per block for Free/pending bits; `Run::range` is the payload span only.
 - Returned blocks must be valid block boundaries inside the payload span.
-- Owner Free/Live **authority** is freelist membership (+ bump). Allocate pops/bumps then `live++`; bump allocate stores no `BlockStates`; freelist allocate `state`+`set(Clear)`; owner free / claim / unclaim / accept use `cas`.
+- Owner Free/Live **authority** is freelist membership (+ bump). Allocate pops/bumps then `live++`; bump allocate stores no `BlockStates`; freelist allocate `state`+`set(Clear)`; owner free / claim / accept use `cas`.
 - Freelist head and intrusive payload links use raw `usize` / `FREE_END`.
 - `BlockStates` Free bit keeps delayed double-free fail-closed (clear ↔ Free ↔ RemotePending). Never-issued indices are rejected via owner `bump` / cold `issued`.
 - `Run::free` / `accept` return `Result<(), RunError>`; `RunHeap` reads `is_full()` before those ops for available-list `finish_free`. Sticky TLS free calls `Run::free` only.
