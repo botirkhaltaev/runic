@@ -82,7 +82,7 @@ impl Allocator {
         // `Layout` stays at the GlobalAlloc boundary; internals use `LayoutSpec`.
         let spec = LayoutSpec::from_layout(layout);
         if let Some(class) = SizeClasses::id_for(spec) {
-            let Some(inner) = self.inner() else {
+            let Some(inner) = self.inner().or_else(|| self.init()) else {
                 return null_mut();
             };
             // SAFETY: inner is retained by this Allocator while installed from self.inner.
@@ -94,7 +94,7 @@ impl Allocator {
             return Self::alloc_remote(inner, inner_ref, class);
         }
 
-        let Some(inner) = self.inner() else {
+        let Some(inner) = self.inner().or_else(|| self.init()) else {
             return null_mut();
         };
         // SAFETY: inner is retained by this Allocator while installed from self.inner.
@@ -119,7 +119,7 @@ impl Allocator {
             return;
         }
 
-        let Some(inner) = self.loaded() else {
+        let Some(inner) = self.inner() else {
             Self::abort();
         };
         // SAFETY: inner is retained by this Allocator while installed from self.inner.
@@ -187,7 +187,7 @@ impl Allocator {
             return null_mut();
         }
 
-        let Some(inner) = self.loaded() else {
+        let Some(inner) = self.inner() else {
             Self::abort();
         };
         // SAFETY: inner is retained by this Allocator while installed from self.inner.
@@ -245,7 +245,7 @@ impl Allocator {
         // One classify: small → allocate then zero; large → extent path owns zeroing.
         let spec = LayoutSpec::from_layout(layout);
         let Some(class) = SizeClasses::id_for(spec) else {
-            let Some(inner) = self.inner() else {
+            let Some(inner) = self.inner().or_else(|| self.init()) else {
                 return null_mut();
             };
             // SAFETY: inner is retained by this Allocator while installed from self.inner.
@@ -258,7 +258,7 @@ impl Allocator {
             return Self::alloc_extent_remote(inner, inner_ref, spec, ExtentInit::Zeroed);
         };
 
-        let Some(inner) = self.inner() else {
+        let Some(inner) = self.inner().or_else(|| self.init()) else {
             return null_mut();
         };
         // SAFETY: inner is retained by this Allocator while installed from self.inner.
@@ -286,16 +286,12 @@ impl Allocator {
     }
 
     fn inner(&self) -> Option<NonNull<AllocatorInner>> {
-        if let Some(inner) = self.loaded() {
-            return Some(inner);
-        }
-
-        self.init_inner()
+        NonNull::new(self.inner.load(Ordering::Acquire))
     }
 
     #[cold]
     #[inline(never)]
-    fn init_inner(&self) -> Option<NonNull<AllocatorInner>> {
+    fn init(&self) -> Option<NonNull<AllocatorInner>> {
         let inner = AllocatorInner::new(self.config)?;
         match self.inner.compare_exchange(
             core::ptr::null_mut(),
@@ -309,10 +305,6 @@ impl Allocator {
                 NonNull::new(existing)
             }
         }
-    }
-
-    fn loaded(&self) -> Option<NonNull<AllocatorInner>> {
-        NonNull::new(self.inner.load(Ordering::Acquire))
     }
 
     /// Not owner-local on TLS: bind a heap via the table and allocate a small run block.
@@ -617,7 +609,7 @@ mod tests {
 
     /// Lazily-initialized inner for an `Allocator` created in this test.
     fn allocator_inner(allocator: &Allocator) -> &AllocatorInner {
-        let inner = allocator.inner().unwrap();
+        let inner = allocator.inner().or_else(|| allocator.init()).unwrap();
         // SAFETY: inner is retained by `allocator` for the lifetime of this borrow.
         unsafe { inner.as_ref() }
     }
@@ -771,7 +763,7 @@ mod tests {
     #[test]
     fn allocator_rejects_duplicate_remote_free() {
         let allocator = Allocator::new();
-        let inner = allocator.inner().unwrap();
+        let inner = allocator.inner().or_else(|| allocator.init()).unwrap();
         // SAFETY: inner is retained by `allocator` for the lifetime of this borrow.
         let inner_ref = unsafe { inner.as_ref() };
         let id = acquire_id(inner_ref);
@@ -815,7 +807,7 @@ mod tests {
     #[test]
     fn target_change_publishes_previous_batch_under_draining() {
         let allocator = Allocator::new();
-        let inner = allocator.inner().unwrap();
+        let inner = allocator.inner().or_else(|| allocator.init()).unwrap();
         // SAFETY: inner is retained by `allocator` for the lifetime of this borrow.
         let inner_ref = unsafe { inner.as_ref() };
         let first = acquire_id(inner_ref);
