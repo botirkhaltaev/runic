@@ -128,7 +128,7 @@ impl Allocator {
             return;
         };
         // One TLS entry for lookup + owner-local free; remote/abort runs after `with`.
-        let not_local = THREAD_HEAP.with(|tls| {
+        let remote = THREAD_HEAP.with(|tls| {
             let Some(owner) = tls.lookup_owner(inner, inner_ref.pages(), ptr) else {
                 Self::abort();
             };
@@ -140,14 +140,15 @@ impl Allocator {
             }
             .err()
         });
-        if let Some((owner, error)) = not_local {
-            Self::dealloc_not_local(inner, inner_ref, owner, ptr, error);
+        if let Some((owner, error)) = remote {
+            Self::dealloc_remote(inner, inner_ref, owner, ptr, error);
         }
     }
 
+    /// TLS free was not owner-local: `free_remote`, or abort on heap-domain errors.
     #[cold]
     #[inline(never)]
-    fn dealloc_not_local(
+    fn dealloc_remote(
         inner: NonNull<AllocatorInner>,
         inner_ref: &AllocatorInner,
         owner: PageOwner,

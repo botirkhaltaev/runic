@@ -24,8 +24,11 @@ owned entities, and makes correctness measurable before adding concurrency,
 hardening, or backend complexity.
 ```
 
-Correctness comes before speed. Architecture should stay simple until a new
-entity owns a real lifecycle, invariant, or policy.
+Correctness is mandatory (auditable ownership, fail-closed frees). Within that,
+performance is the primary design goal: keep hot paths simple and prefer safe
+idiomatic Rust, with `unsafe` only where ownership/OS boundaries or measured
+hot paths require it. Architecture should stay simple until a new entity owns a
+real lifecycle, invariant, or policy.
 
 ## Current Status
 
@@ -57,7 +60,7 @@ mmap-backed extents for dedicated allocations (heap-local)
 out-of-line metadata
 page-indexed pointer lookup
 per-size-class available run lists
-per-block AtomicU8 run block state with remote-pending
+per-block AtomicU8 clear/Free/RemotePending (Free bit DF fail-closed; freelist+bump own Free/Live)
 lock-free remote-free Treiber inboxes per heap
 configurable extent mapping retention and reuse
 runs retained for the heap lifetime (no empty-run OS release in v0.5)
