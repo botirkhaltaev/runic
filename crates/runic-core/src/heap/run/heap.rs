@@ -76,8 +76,29 @@ impl RunHeap {
     }
 
     pub(crate) fn free(&mut self, run: NonNull<Run>, ptr: NonNull<u8>) -> Result<(), RunHeapError> {
-        let freed = Self::free_block(run, ptr)?;
-        self.finish_free(freed)
+        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
+        let run_ref = unsafe { run.as_ref() };
+        let status = run_ref.free(ptr).map_err(RunHeapError::from)?;
+        self.finish_free(FreedRun {
+            class: run_ref.class(),
+            run,
+            was_full: status.was_full(),
+        })
+    }
+
+    pub(crate) fn accept(
+        &mut self,
+        run: NonNull<Run>,
+        ptr: NonNull<u8>,
+    ) -> Result<(), RunHeapError> {
+        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
+        let run_ref = unsafe { run.as_ref() };
+        let status = run_ref.accept(ptr).map_err(RunHeapError::from)?;
+        self.finish_free(FreedRun {
+            class: run_ref.class(),
+            run,
+            was_full: status.was_full(),
+        })
     }
 
     pub(crate) fn rebind_heap_id(&mut self, heap_id: HeapId) {
@@ -100,44 +121,6 @@ impl RunHeap {
             }
         }
         false
-    }
-
-    pub(crate) fn complete_remote_free(
-        &mut self,
-        run: NonNull<Run>,
-        ptr: NonNull<u8>,
-    ) -> Result<(), RunHeapError> {
-        let freed = Self::complete_remote_block(run, ptr)?;
-        self.finish_free(freed)
-    }
-
-    fn free_block(mut run: NonNull<Run>, ptr: NonNull<u8>) -> Result<FreedRun, RunHeapError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
-        let run_ref = unsafe { run.as_mut() };
-        let status = run_ref.free_local(ptr).map_err(RunHeapError::from)?;
-
-        Ok(FreedRun {
-            class: run_ref.class(),
-            run: NonNull::from(&mut *run_ref),
-            was_full: status.was_full(),
-        })
-    }
-
-    fn complete_remote_block(
-        mut run: NonNull<Run>,
-        ptr: NonNull<u8>,
-    ) -> Result<FreedRun, RunHeapError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
-        let run_ref = unsafe { run.as_mut() };
-        let status = run_ref
-            .complete_remote_free(ptr)
-            .map_err(RunHeapError::from)?;
-
-        Ok(FreedRun {
-            class: run_ref.class(),
-            run: NonNull::from(&mut *run_ref),
-            was_full: status.was_full(),
-        })
     }
 
     fn finish_free(&mut self, freed: FreedRun) -> Result<(), RunHeapError> {

@@ -165,8 +165,8 @@ impl Extent {
         }
     }
 
-    /// Remote free claim: exact pointer, then `Allocated → RemotePending`.
-    pub(crate) fn claim_free(&self, ptr: NonNull<u8>) -> Result<(), ExtentError> {
+    /// Freer: exact pointer, then `Allocated → RemotePending`.
+    pub(crate) fn claim(&self, ptr: NonNull<u8>) -> Result<(), ExtentError> {
         self.validate_exact(ptr)?;
         match self.state.compare_exchange(
             ExtentState::Allocated.raw(),
@@ -195,8 +195,8 @@ impl Extent {
         }
     }
 
-    /// Owner drain of a remote claim: exact pointer, then `RemotePending → Free`.
-    pub(crate) fn complete_remote_free(&self, ptr: NonNull<u8>) -> Result<(), ExtentError> {
+    /// Owner: exact pointer, then `RemotePending → Free`.
+    pub(crate) fn accept(&self, ptr: NonNull<u8>) -> Result<(), ExtentError> {
         self.validate_exact(ptr)?;
         match self.state.compare_exchange(
             ExtentState::RemotePending.raw(),
@@ -328,7 +328,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(extent.claim_free(extent.ptr()), Ok(()));
+        assert_eq!(extent.claim(extent.ptr()), Ok(()));
         assert_eq!(extent.unclaim(), Ok(()));
         assert_eq!(extent.free(extent.ptr()), Ok(()));
     }
@@ -347,10 +347,7 @@ mod tests {
         // SAFETY: adding one stays within the mapped extent for this non-zero allocation.
         let interior = unsafe { NonNull::new_unchecked(extent.ptr().as_ptr().add(1)) };
 
-        assert_eq!(
-            extent.claim_free(interior),
-            Err(ExtentError::InvalidPointer)
-        );
+        assert_eq!(extent.claim(interior), Err(ExtentError::InvalidPointer));
         assert_eq!(extent.free(extent.ptr()), Ok(()));
     }
 

@@ -128,19 +128,6 @@ impl ExtentHeap {
         Some(ptr)
     }
 
-    pub(crate) fn complete_remote_free(
-        &mut self,
-        extent_ptr: NonNull<Extent>,
-        ptr: NonNull<u8>,
-        pages: &PageMap,
-    ) -> Result<(), ExtentHeapError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
-        unsafe { extent_ptr.as_ref() }
-            .complete_remote_free(ptr)
-            .map_err(ExtentHeapError::from)?;
-        self.retire(extent_ptr, pages)
-    }
-
     pub(crate) fn free(
         &mut self,
         extent_ptr: NonNull<Extent>,
@@ -150,6 +137,19 @@ impl ExtentHeap {
         // SAFETY: PageMap stores only pointers published from this allocator's live arena.
         unsafe { extent_ptr.as_ref() }
             .free(ptr)
+            .map_err(ExtentHeapError::from)?;
+        self.retire(extent_ptr, pages)
+    }
+
+    pub(crate) fn accept(
+        &mut self,
+        extent_ptr: NonNull<Extent>,
+        ptr: NonNull<u8>,
+        pages: &PageMap,
+    ) -> Result<(), ExtentHeapError> {
+        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
+        unsafe { extent_ptr.as_ref() }
+            .accept(ptr)
             .map_err(ExtentHeapError::from)?;
         self.retire(extent_ptr, pages)
     }

@@ -6,13 +6,21 @@ use core::{
 
 use crate::{
     allocator::{Allocator, AllocatorInner},
-    heap::{Extent, ExtentInit, Heap, HeapId, HeapTable, Run, RunHeapError},
+    heap::{Extent, ExtentInit, Heap, HeapId, HeapTable, Run},
     layout::LayoutSpec,
-    memory::PageMap,
+    memory::{PageMap, PageOwner},
     size_class::{SizeClassId, SizeClasses},
 };
 
 use super::{inbox::RemoteList, slot::HeapError};
+
+/// Owner-local TLS free failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ThreadFreeError {
+    /// Unbound or bound to a different heap — caller takes `free_remote`.
+    NotBound,
+    Heap(HeapError),
+}
 
 const REMOTE_BATCH_CAPACITY: u32 = 32;
 
@@ -167,63 +175,61 @@ impl ThreadHeap {
 
     /// Owner-local free for a run owned by the bound heap.
     ///
-    /// Returns `Ok(false)` when unbound or bound to a different heap (slow path).
-    /// Sticky hit is the straight-line body; non-cached owner free is cold.
+    /// Sticky hit is the straight-line body; non-cached owner free goes through `Heap::free`.
     pub(crate) fn free(
         &self,
         inner: NonNull<AllocatorInner>,
-        heap: HeapId,
         run: NonNull<Run>,
         ptr: NonNull<u8>,
-    ) -> Result<bool, HeapError> {
-        if !self.matches(inner) || self.heap_id.get() != Some(heap) {
-            return Ok(false);
+    ) -> Result<(), ThreadFreeError> {
+        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
+        let run_ref = unsafe { run.as_ref() };
+        if !self.matches(inner) || self.heap_id.get() != Some(run_ref.heap_id()) {
+            return Err(ThreadFreeError::NotBound);
         }
 
-        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
-        let class = unsafe { run.as_ref() }.class();
-
+        let class = run_ref.class();
         if self.run_cell(class).get() == run.as_ptr() {
-            // SAFETY: sticky run pointers are published from this heap's live arena.
-            unsafe { run.as_ref() }
-                .free_local(ptr)
-                .map_err(RunHeapError::from)
-                .map_err(HeapError::from)?;
-            return Ok(true);
+            // Sticky hit: Run only — do not finish_free / push_available.
+            run_ref
+                .free(ptr)
+                .map_err(|error| ThreadFreeError::Heap(error.into()))?;
+            return Ok(());
         }
 
         // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
-        unsafe { self.bound_heap().as_mut() }.free_run_owner(
-            run,
-            ptr,
-            // SAFETY: inner is retained by this TLS entry while bound.
-            unsafe { inner.as_ref().pages() },
-        )?;
-        Ok(true)
+        unsafe { self.bound_heap().as_mut() }
+            .free(
+                PageOwner::Run(run),
+                ptr,
+                // SAFETY: inner is retained by this TLS entry while bound.
+                unsafe { inner.as_ref().pages() },
+            )
+            .map_err(ThreadFreeError::Heap)
     }
 
     /// Owner-local free for an extent owned by the bound heap.
-    ///
-    /// Returns `Ok(false)` when unbound or bound to a different heap (slow path).
     pub(crate) fn free_extent(
         &self,
         inner: NonNull<AllocatorInner>,
-        heap: HeapId,
         extent: NonNull<Extent>,
         ptr: NonNull<u8>,
-    ) -> Result<bool, HeapError> {
-        if !self.matches(inner) || self.heap_id.get() != Some(heap) {
-            return Ok(false);
+    ) -> Result<(), ThreadFreeError> {
+        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
+        let heap_id = unsafe { extent.as_ref() }.heap_id();
+        if !self.matches(inner) || self.heap_id.get() != Some(heap_id) {
+            return Err(ThreadFreeError::NotBound);
         }
 
         // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
-        unsafe { self.bound_heap().as_mut() }.free_extent_owner(
-            extent,
-            ptr,
-            // SAFETY: inner is retained by this TLS entry while bound.
-            unsafe { inner.as_ref().pages() },
-        )?;
-        Ok(true)
+        unsafe { self.bound_heap().as_mut() }
+            .free(
+                PageOwner::Extent(extent),
+                ptr,
+                // SAFETY: inner is retained by this TLS entry while bound.
+                unsafe { inner.as_ref().pages() },
+            )
+            .map_err(ThreadFreeError::Heap)
     }
 
     /// Bound heap id when this TLS entry is attached to `inner`.

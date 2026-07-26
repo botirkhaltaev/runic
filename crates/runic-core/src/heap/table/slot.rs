@@ -195,6 +195,12 @@ impl From<RunHeapError> for HeapError {
     }
 }
 
+impl From<crate::heap::RunError> for HeapError {
+    fn from(error: crate::heap::RunError) -> Self {
+        Self::from(RunHeapError::from(error))
+    }
+}
+
 impl From<ExtentHeapError> for HeapError {
     fn from(error: ExtentHeapError) -> Self {
         match error {
