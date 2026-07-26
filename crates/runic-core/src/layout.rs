@@ -25,6 +25,10 @@ impl LayoutSpec {
         self.size
     }
 
+    pub(crate) const fn align(self) -> NonZeroUsize {
+        self.align
+    }
+
     pub(crate) fn align_addr(self, addr: usize) -> Option<usize> {
         let mask = self.align.get() - 1;
         addr.checked_add(mask).map(|value| value & !mask)
