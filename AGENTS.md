@@ -1,104 +1,23 @@
 # AGENTS.md
 
-## Project Truth
+## Goals
 
-- Runic is a Rust-native allocator project; build a correct allocator core with explicit, auditable invariants rather than porting another allocator line-for-line.
-- Current milestone: v0.5 owner-local heap frontend with heap-owned runs and extents, explicit ownership, remote-free correctness, retained/reused metadata, bounded caches, and profile-backed optimization.
-- Use `ROADMAP.md` as the source of truth for thesis, scope, architecture, testing direction, and later milestones.
-- Treat this file as a non-deterministic test suite for agents: each bullet is an assertion about acceptable work; if code or plans violate it, refactor instead of working around it.
+- Performance is the top design priority on hot paths (simple, direct, minimal work).
+- Prefer safe idiomatic Rust; use `unsafe` only where needed for OS/ownership contracts or measured hot-path performance (narrow blocks + SAFETY comments).
+- Best-practice allocator design: explicit ownership entities, fail-closed frees, auditable invariants — not line-for-line ports.
+- General composable clean APIs; no one-caller overfit methods, shims, or `*_slow` / `*_miss` / `*_nonlocal` names (`#[cold]` only).
 
-## Design Rules
+## Conventions
 
-- Prefer entity-based architecture; put behavior on the type that owns the data, lifecycle, or invariant.
-- Model real domain concepts as explicit entity types when they own state, invariants, or behavior.
-- Prefer small cohesive types with clear responsibilities over broad manager APIs.
-- Prefer clean, general, composable APIs over narrow methods tailored to one caller or one current call path.
-- Use simple, clear names for public and internal APIs; avoid names that encode implementation details, transient benchmark work, compatibility shims, or a single use site.
-- Make invalid states hard to express with `NonZero*`, `NonNull`, named domain types, and checked construction.
-- Avoid tuple structs with unnamed fields for domain entities; use named fields when field meaning matters.
-- Prefer simple, direct code; add complexity (extra types, helper splits, caches, dual encodings) only when correctness or measured performance requires it.
-- Avoid free helpers and one-line pass-through methods; call the owning entity directly unless the helper removes real duplication or encodes an invariant.
-- Avoid passive adapter, wrapper, or compatibility layers unless they encode a real invariant or remove meaningful duplication.
-- Avoid callback-style helper patterns for ordinary control flow; prefer direct calls and explicit results.
-- Keep code and architecture simple; introduce abstractions only when they reduce complexity or clarify invariants.
-- Optimize for the best allocator architecture rather than backward compatibility or temporary migration paths.
-- Keep hot paths simple, direct, and minimal-instruction while preserving explicit correctness invariants.
-- Separate owner-local and remote-free paths in type APIs; do not hide cross-thread behavior behind broad manager methods.
-- Keep exactly one claim → batch → `HeapTable::publish` → flush/`accept` remote-free protocol; do not grow a second, parallel remote-free implementation alongside it (e.g. an unbatched or lock-scoped shortcut) for `realloc`, tests, or any other caller. `publish` must complete retained batches against `Draining` heaps (late frees after owner exit), not only `Active` inbox enqueue. Allocator routing is owner-local free (one `THREAD_HEAP.with`: lookup + `ThreadHeap::free` / `free_extent`) / `Allocator::free_remote`; domain ops on `Run`/`Extent` are `free` / `claim` / `accept`.
-- Do not model small or large allocation ownership as a shared/root heap; every run and extent is stamped with a `HeapId`, and sharing uses remote-free coordination or backend reuse.
-- Treat caches as allocator-domain ownership structures, not benchmark-specific shortcuts.
-- Do not deepen the extent path into a lock-only design; same-thread extent allocate/free must flow through owner-local `ThreadHeap`/`Heap` state, mirroring the run frontend, and only fall back to the table mutex on TLS miss or cross-thread routing.
-- After code or API changes, revamp nearest subtree `AGENTS.md` files so rules match the new architecture; rewrite or delete stale bullets.
-- Update nearest subtree `README.md` files when module layout, APIs, or invariants they describe changed.
-
-## API Policy
-
-- No backward compatibility is required for public or internal APIs.
-- Prefer modifying existing APIs over adding new methods; reshape, rename, delete, or refactor directly instead of growing parallel surfaces.
-- Avoid compatibility shims throughout the codebase.
-- Review API shape repository-wide when architectural feedback applies; do not fix only the call site where the issue was noticed.
-- During planning and implementation, critique the design against idiomatic Rust, allocator invariants, composability, and overfitting before treating it as done.
-- Use profiling to choose optimization order; do not add benchmark-specific hacks.
-
-## v0.5 Scope
-
-- Build only: Linux x86_64, Rust stable, `GlobalAlloc`, owner-local heaps, heap-owned small runs, and heap-local extent caches backed by global OS/page coordination.
-- Include mmap-backed runs, mmap-backed extents, out-of-line metadata, page-indexed pointer lookup, run block-boundary checks, extent exact-pointer checks, owner-local small hot paths, remote-free coordination, bounded run/extent retention, `realloc`, `alloc_zeroed`, randomized tests, and benchmarks.
-- Do not add per-CPU/RSEQ frontends, quarantine, canaries, hugepages, NUMA, C ABI support, ML placement, dashboards, or background purge yet.
-
-## Core Invariants
-
-- Every returned pointer maps to exactly one page-map entry.
-- Runs own one mapping and divide it into fixed-size reusable blocks from one size class.
-- Extents own one mapping dedicated to exactly one returned allocation.
-- Every free must map back to a known entry: run frees must be valid block boundaries, and extent frees must be the exact returned pointer.
-- Correctness comes before speed.
-
-## Architecture
-
-Use this first:
-
-```text
-GlobalAlloc
- -> Allocator
-     -> AllocatorInner { refs, pages: PageMap, table: Mutex<HeapTable> }
-     -> OsMemory
-     -> HeapTable { generations[], slots: Arena<Heap> }
-         -> ThreadHeap
-     -> Heap { mode, RunHeap, ExtentHeap, Inbox }
-         -> RunHeap { Arena<Run>, available[] } -> Run (HeapId, BlockStates)
-         -> ExtentHeap { Arena<Extent>, cache } -> Extent (HeapId)
-```
-
-- `AllocatorInner` is the refcounted mmap instance behind lazy `AtomicPtr` init — not a domain entity. `PageMap` stays outside the table mutex so owner-local TLS hits never take that lock.
-- `HeapTable` owns slot identity (`acquire`/`retire`/`reclaim`), generation-checked `heap`/`heap_mut`/`mode`, and mode-aware remote `publish` only — not allocate/dealloc routers.
-
-## Allocator Boundary Scars
-
-Durable lessons from past boundary bugs; do not reintroduce these shapes.
-
-- Exactly one abort sink: `Allocator::abort`. `Heap`, `ThreadHeap`, and `AllocatorInner` return domain `Result`s or call `Allocator::abort` directly; do not add a second private `abort()` copy.
-- `AllocatorInner` owns refs + `PageMap` + `Mutex<HeapTable>` + self-hosting `Mapping` — not a broad alloc/free/realloc manager. Call `HeapTable` / `Heap` / `ThreadHeap` methods from `Allocator` (and TLS) instead of growing pass-through routers on `AllocatorInner`.
-- Never hold `Mutex<HeapTable>` across a user-memory copy (e.g. `realloc`'s `copy_nonoverlapping`). Compose `alloc` / `dealloc` (or lock only for metadata), release, then copy.
-
-## Rust Rules
-
-- Prefer safe, idiomatic Rust: entity methods, `?`, `From`/`map_err`, explicit `match`, and checked construction. Reach for clever control-flow or micro-split helpers only when a simpler form is wrong or a profile proves it.
-- Use `unsafe` only for OS/FFI boundaries, ownership contracts the type system cannot express, or hot-path operations where safe code cannot meet needed performance. Keep unsafe blocks small, explicit, local, and adjacent to SAFETY comments — do not widen unsafe to avoid refactoring.
-- Do not add `#[cold]` / `#[inline(never)]` one-line pass-through helpers to “protect” a hot path; prefer idiomatic error conversion at the call site unless profiling shows a real win that cannot stay simple.
-- Use `#![deny(unsafe_op_in_unsafe_fn)]`.
-- Prefer methods on `Allocator`, `Heap`, `RunHeap`, `ExtentHeap`, `Run`, `Extent`, `Arena`, `PageMap`, `OsMemory`, and `SizeClasses`.
-- Avoid allocator-internal `Vec`, `Box`, `HashMap`, `String`, formatting, or panic paths unless recursion risk is addressed.
-- Abort on invalid frees in v0.1.
-- Do not unwind across allocator boundaries.
-- Do not add test-only methods to production `impl` blocks; tests inside the owning module can inspect private state directly.
-- Avoid lint workarounds that reduce code quality; do not use `#[allow]` or `#[expect]` when a cleaner design or refactor is reasonable.
-
-## References
-
-- `allocator-refs/` is read-only inspiration for tests, invariants, workload shapes, and benchmark categories; do not copy implementation code.
-- `ROADMAP.md` owns project direction and milestone boundaries.
-- File out-of-scope issues on GitHub; keep durable policy here, not follow-up lists.
+- Put behavior on the owning entity; prefer `NonZero*` / `NonNull` / named fields; avoid free one-line helpers and pass-throughs.
+- Owner-local TLS vs remote table: `ThreadHeap::{alloc,alloc_extent,free,free_extent}` / `Allocator::{alloc_remote,alloc_extent_remote,free_remote}`; domain ops `free` / `claim` / `accept`.
+- One remote-free protocol: claim → batch → `HeapTable::publish` → flush/`accept` (including `Draining` late frees).
+- `Layout` only at the public boundary; convert once to `LayoutSpec` and pass it inward (`SizeClasses::id_for`, extents, resize).
+- No shared/root ownership heap; every run/extent is stamped with `HeapId`.
+- Exactly one abort sink: `Allocator::abort`. Never hold `Mutex<HeapTable>` across a user-memory copy.
+- No allocator-internal `Vec` / `Box` / `HashMap` / `String` / formatting / panic unless recursion risk is addressed.
+- `#![deny(unsafe_op_in_unsafe_fn)]`. No test-only methods on production `impl` blocks.
+- When editing any `AGENTS.md`, follow `.agents/skills/agents-md`: nested files only for subtree-specific rules; closest wins; shorter than root; no root duplication; target <60 lines (hard cap 100). Revamp/clean the nearest file when APIs change; update the matching `README.md`.
 
 ## Commands
 
@@ -106,5 +25,22 @@ Durable lessons from past boundary bugs; do not reintroduce these shapes.
 |------|---------|
 | Check | `cargo check --workspace` |
 | Test | `cargo test --workspace` |
+| Test crate | `cargo test -p <crate>` |
 | Format | `cargo fmt --all` |
 | Lint | `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
+| Bench build | `cargo bench -p runic-bench --no-run` |
+
+## External References
+
+| Need | File |
+|------|------|
+| Thesis, milestones, architecture | `ROADMAP.md` |
+| Install / usage | `README.md` |
+| Core crate | `crates/runic-core/README.md` |
+| Public `GlobalAlloc` crate | `crates/runic/README.md` |
+| Inspiration only (do not copy code) | `allocator-refs/` |
+
+## v0.5 Scope
+
+- In: Linux x86_64, Rust stable, `GlobalAlloc`, owner-local heaps, run/extent retention, remote-free, `realloc` / `alloc_zeroed`, tests, benches.
+- Out: per-CPU/RSEQ, quarantine, canaries, hugepages, NUMA, C ABI, ML placement, dashboards, background purge.

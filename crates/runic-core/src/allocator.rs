@@ -79,8 +79,9 @@ impl Allocator {
     /// only according to `layout`, avoid out-of-bounds access, and eventually
     /// pass the same pointer and a compatible layout back to this allocator.
     pub unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // Classify before `LayoutSpec` — small path never builds a spec.
-        if let Some(class) = SizeClasses::id_for(layout) {
+        // `Layout` stays at the GlobalAlloc boundary; internals use `LayoutSpec`.
+        let spec = LayoutSpec::from_layout(layout);
+        if let Some(class) = SizeClasses::id_for(spec) {
             let Some(inner) = self.ensure_inner() else {
                 return null_mut();
             };
@@ -89,16 +90,21 @@ impl Allocator {
             if let Some(ptr) = THREAD_HEAP.with(|tls| tls.alloc(inner, class, inner_ref.pages())) {
                 return ptr.as_ptr();
             }
-            return Self::alloc_slow(inner, inner_ref, class);
+            // Unbound / no owner-local heap: bind via the table and allocate there.
+            return Self::alloc_remote(inner, inner_ref, class);
         }
 
-        let spec = LayoutSpec::from_layout(layout);
         let Some(inner) = self.ensure_inner() else {
             return null_mut();
         };
         // SAFETY: inner is retained by this Allocator while installed from self.inner.
         let inner_ref = unsafe { inner.as_ref() };
-        Self::allocate_extent(inner, inner_ref, spec, ExtentInit::Uninit)
+        if let Some(ptr) = THREAD_HEAP
+            .with(|tls| tls.alloc_extent(inner, spec, inner_ref.pages(), ExtentInit::Uninit))
+        {
+            return ptr.as_ptr();
+        }
+        Self::alloc_extent_remote(inner, inner_ref, spec, ExtentInit::Uninit)
     }
 
     /// Deallocates memory previously returned by this allocator.
@@ -122,7 +128,7 @@ impl Allocator {
             return;
         };
         // One TLS entry for lookup + owner-local free; remote/abort runs after `with`.
-        let not_local = THREAD_HEAP.with(|tls| {
+        let remote = THREAD_HEAP.with(|tls| {
             let Some(owner) = tls.lookup_owner(inner, inner_ref.pages(), ptr) else {
                 Self::abort();
             };
@@ -134,14 +140,15 @@ impl Allocator {
             }
             .err()
         });
-        if let Some((owner, error)) = not_local {
-            Self::dealloc_not_local(inner, inner_ref, owner, ptr, error);
+        if let Some((owner, error)) = remote {
+            Self::dealloc_remote(inner, inner_ref, owner, ptr, error);
         }
     }
 
+    /// TLS free was not owner-local: `free_remote`, or abort on heap-domain errors.
     #[cold]
     #[inline(never)]
-    fn dealloc_not_local(
+    fn dealloc_remote(
         inner: NonNull<AllocatorInner>,
         inner_ref: &AllocatorInner,
         owner: PageOwner,
@@ -236,14 +243,19 @@ impl Allocator {
     /// compatible layout.
     pub unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         // One classify: small → allocate then zero; large → extent path owns zeroing.
-        let Some(class) = SizeClasses::id_for(layout) else {
-            let spec = LayoutSpec::from_layout(layout);
+        let spec = LayoutSpec::from_layout(layout);
+        let Some(class) = SizeClasses::id_for(spec) else {
             let Some(inner) = self.ensure_inner() else {
                 return null_mut();
             };
             // SAFETY: inner is retained by this Allocator while installed from self.inner.
             let inner_ref = unsafe { inner.as_ref() };
-            return Self::allocate_extent(inner, inner_ref, spec, ExtentInit::Zeroed);
+            if let Some(ptr) = THREAD_HEAP
+                .with(|tls| tls.alloc_extent(inner, spec, inner_ref.pages(), ExtentInit::Zeroed))
+            {
+                return ptr.as_ptr();
+            }
+            return Self::alloc_extent_remote(inner, inner_ref, spec, ExtentInit::Zeroed);
         };
 
         let Some(inner) = self.ensure_inner() else {
@@ -255,7 +267,7 @@ impl Allocator {
             if let Some(ptr) = THREAD_HEAP.with(|tls| tls.alloc(inner, class, inner_ref.pages())) {
                 ptr.as_ptr()
             } else {
-                Self::alloc_slow(inner, inner_ref, class)
+                Self::alloc_remote(inner, inner_ref, class)
             };
         if !ptr.is_null() {
             // SAFETY: ptr was just allocated for layout and is valid for layout.size() bytes.
@@ -303,37 +315,10 @@ impl Allocator {
         NonNull::new(self.inner.load(Ordering::Acquire))
     }
 
-    /// Owner-local large alloc (TLS hit) or bind + locked allocate (miss).
-    fn allocate_extent(
-        inner: NonNull<AllocatorInner>,
-        inner_ref: &AllocatorInner,
-        spec: LayoutSpec,
-        init: ExtentInit,
-    ) -> *mut u8 {
-        if let Some(ptr) =
-            THREAD_HEAP.with(|tls| tls.alloc_extent(inner, spec, inner_ref.pages(), init))
-        {
-            return ptr.as_ptr();
-        }
-
-        let mut table = inner_ref.table.lock();
-        let heap_id = THREAD_HEAP.with(|tls| tls.bind(inner, &mut table));
-        let Some(heap_id) = heap_id else {
-            return null_mut();
-        };
-        let Some(heap) = table.heap_mut(heap_id) else {
-            return null_mut();
-        };
-        if !heap.is_active() {
-            return null_mut();
-        }
-        heap.allocate_extent(spec, inner_ref.pages(), init)
-            .map_or(null_mut(), NonNull::as_ptr)
-    }
-
+    /// Not owner-local on TLS: bind a heap via the table and allocate a small run block.
     #[cold]
     #[inline(never)]
-    fn alloc_slow(
+    fn alloc_remote(
         inner: NonNull<AllocatorInner>,
         inner_ref: &AllocatorInner,
         class: SizeClassId,
@@ -351,6 +336,30 @@ impl Allocator {
             return null_mut();
         }
         heap.alloc_run(class, pages)
+            .map_or(null_mut(), NonNull::as_ptr)
+    }
+
+    /// Not owner-local on TLS: bind a heap via the table and allocate an extent.
+    #[cold]
+    #[inline(never)]
+    fn alloc_extent_remote(
+        inner: NonNull<AllocatorInner>,
+        inner_ref: &AllocatorInner,
+        spec: LayoutSpec,
+        init: ExtentInit,
+    ) -> *mut u8 {
+        let mut table = inner_ref.table.lock();
+        let heap_id = THREAD_HEAP.with(|tls| tls.bind(inner, &mut table));
+        let Some(heap_id) = heap_id else {
+            return null_mut();
+        };
+        let Some(heap) = table.heap_mut(heap_id) else {
+            return null_mut();
+        };
+        if !heap.is_active() {
+            return null_mut();
+        }
+        heap.allocate_extent(spec, inner_ref.pages(), init)
             .map_or(null_mut(), NonNull::as_ptr)
     }
 
@@ -622,8 +631,11 @@ mod tests {
         let mut table = inner_ref.table.lock();
         let heap = table.heap_mut(id).unwrap();
         assert!(heap.is_active());
-        heap.alloc_run(SizeClasses::id_for(layout).unwrap(), inner_ref.pages())
-            .unwrap()
+        heap.alloc_run(
+            SizeClasses::id_for(LayoutSpec::from_layout(layout)).unwrap(),
+            inner_ref.pages(),
+        )
+        .unwrap()
     }
 
     fn allocate_extent(

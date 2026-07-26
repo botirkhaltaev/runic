@@ -2,6 +2,5 @@
 
 Scope: `crates/runic/tests/`.
 
-- Use subprocesses for tests that expect aborts.
-- Keep smoke tests focused on public `RunicAlloc` behavior.
-- Avoid assumptions about exact pointer reuse in the shared global heap.
+- Expect aborts only in subprocesses.
+- Smoke-test public `RunicAlloc`; do not assume exact pointer reuse on the shared global heap.

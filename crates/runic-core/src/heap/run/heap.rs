@@ -238,6 +238,7 @@ mod tests {
 
     use crate::{
         heap::{HeapId, Run, RunId},
+        layout::LayoutSpec,
         memory::{OsMemory, PageMap, PageOwner},
         size_class::SizeClasses,
     };
@@ -246,7 +247,10 @@ mod tests {
     use super::*;
 
     fn class_id(size: usize, align: usize) -> SizeClassId {
-        SizeClasses::id_for(Layout::from_size_align(size, align).unwrap()).unwrap()
+        SizeClasses::id_for(LayoutSpec::from_layout(
+            Layout::from_size_align(size, align).unwrap(),
+        ))
+        .unwrap()
     }
 
     fn reusable_run(id: RunId) -> Run {

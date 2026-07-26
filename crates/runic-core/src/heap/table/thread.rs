@@ -168,7 +168,7 @@ impl ThreadHeap {
     /// Owner-local small allocation via the TLS run cache.
     ///
     /// Returns `None` when this thread is not bound to `inner` (caller should `bind`).
-    /// Sticky hit is the straight-line body; inbox flush / acquire is cold.
+    /// Sticky hit is the straight-line body; empty sticky goes through `acquire_alloc`.
     pub(crate) fn alloc(
         &self,
         inner: NonNull<AllocatorInner>,
@@ -189,7 +189,7 @@ impl ThreadHeap {
             }
         }
 
-        self.alloc_miss(class, pages, self.bound_heap())
+        self.acquire_alloc(class, pages, self.bound_heap())
     }
 
     /// Owner-local large allocation via the bound heap (no sticky extent cache).
@@ -335,8 +335,9 @@ impl ThreadHeap {
         self.inner.get().is_null()
     }
 
+    /// Sticky empty: flush inbox once if needed, `acquire_run`, park sticky, allocate.
     #[cold]
-    fn alloc_miss(
+    fn acquire_alloc(
         &self,
         class: SizeClassId,
         pages: &PageMap,
