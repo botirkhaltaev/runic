@@ -149,12 +149,12 @@ impl BlockStates {
     }
 
     /// `index` must be capacity-proven (`block_at` / freelist / bump).
-    fn is_allocated(&self, index: BlockIndex) -> Result<bool, BlockStateError> {
+    ///
+    /// Corrupt state bytes are not Allocated (`false`); they are not an index error.
+    fn is_allocated(&self, index: BlockIndex) -> bool {
         let raw = self.state_unchecked(index).load(Ordering::Relaxed);
-        Ok(
-            BlockState::from_raw(raw).ok_or(BlockStateError::InvalidIndex)?
-                == BlockState::Allocated,
-        )
+        debug_assert!(BlockState::from_raw(raw).is_some());
+        BlockState::from_raw(raw) == Some(BlockState::Allocated)
     }
 
     /// Owner-local Allocated → Free. `index` must be capacity-proven.
@@ -454,16 +454,10 @@ impl Run {
 
     pub(crate) fn allocated_block_at(&self, ptr: NonNull<u8>) -> Result<RunBlock, RunError> {
         let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
-
-        match self.blocks.is_allocated(block.index()) {
-            Ok(true) => Ok(block),
-            Ok(false) => Err(RunError::DoubleFree),
-            Err(
-                BlockStateError::InvalidIndex
-                | BlockStateError::AlreadyFree
-                | BlockStateError::AlreadyAllocated
-                | BlockStateError::AlreadyPending,
-            ) => Err(RunError::InvalidPointer),
+        if self.blocks.is_allocated(block.index()) {
+            Ok(block)
+        } else {
+            Err(RunError::DoubleFree)
         }
     }
 
