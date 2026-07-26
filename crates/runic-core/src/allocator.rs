@@ -87,7 +87,11 @@ impl Allocator {
             };
             // SAFETY: inner is retained by this Allocator while installed from self.inner.
             let inner_ref = unsafe { inner.as_ref() };
-            return Self::allocate_run(inner, inner_ref, class);
+            if let Some(ptr) = THREAD_HEAP.with(|tls| tls.alloc(inner, class, inner_ref.pages())) {
+                return ptr.as_ptr();
+            }
+            // Unbound / no owner-local heap: bind via the table and allocate there.
+            return Self::alloc_remote(inner, inner_ref, class);
         }
 
         let Some(inner) = self.ensure_inner() else {
@@ -95,7 +99,12 @@ impl Allocator {
         };
         // SAFETY: inner is retained by this Allocator while installed from self.inner.
         let inner_ref = unsafe { inner.as_ref() };
-        Self::allocate_extent(inner, inner_ref, spec, ExtentInit::Uninit)
+        if let Some(ptr) = THREAD_HEAP
+            .with(|tls| tls.alloc_extent(inner, spec, inner_ref.pages(), ExtentInit::Uninit))
+        {
+            return ptr.as_ptr();
+        }
+        Self::alloc_extent_remote(inner, inner_ref, spec, ExtentInit::Uninit)
     }
 
     /// Deallocates memory previously returned by this allocator.
@@ -240,7 +249,12 @@ impl Allocator {
             };
             // SAFETY: inner is retained by this Allocator while installed from self.inner.
             let inner_ref = unsafe { inner.as_ref() };
-            return Self::allocate_extent(inner, inner_ref, spec, ExtentInit::Zeroed);
+            if let Some(ptr) = THREAD_HEAP
+                .with(|tls| tls.alloc_extent(inner, spec, inner_ref.pages(), ExtentInit::Zeroed))
+            {
+                return ptr.as_ptr();
+            }
+            return Self::alloc_extent_remote(inner, inner_ref, spec, ExtentInit::Zeroed);
         };
 
         let Some(inner) = self.ensure_inner() else {
@@ -248,7 +262,12 @@ impl Allocator {
         };
         // SAFETY: inner is retained by this Allocator while installed from self.inner.
         let inner_ref = unsafe { inner.as_ref() };
-        let ptr = Self::allocate_run(inner, inner_ref, class);
+        let ptr =
+            if let Some(ptr) = THREAD_HEAP.with(|tls| tls.alloc(inner, class, inner_ref.pages())) {
+                ptr.as_ptr()
+            } else {
+                Self::alloc_remote(inner, inner_ref, class)
+            };
         if !ptr.is_null() {
             // SAFETY: ptr was just allocated for layout and is valid for layout.size() bytes.
             unsafe { write_bytes(ptr, 0, layout.size()) };
@@ -295,16 +314,14 @@ impl Allocator {
         NonNull::new(self.inner.load(Ordering::Acquire))
     }
 
-    /// Owner-local small alloc (TLS sticky / acquire) or bind + locked `alloc_run`.
-    fn allocate_run(
+    /// Not owner-local on TLS: bind a heap via the table and allocate a small run block.
+    #[cold]
+    #[inline(never)]
+    fn alloc_remote(
         inner: NonNull<AllocatorInner>,
         inner_ref: &AllocatorInner,
         class: SizeClassId,
     ) -> *mut u8 {
-        if let Some(ptr) = THREAD_HEAP.with(|tls| tls.alloc(inner, class, inner_ref.pages())) {
-            return ptr.as_ptr();
-        }
-
         let mut table = inner_ref.table.lock();
         let heap_id = THREAD_HEAP.with(|tls| tls.bind(inner, &mut table));
         let pages = inner_ref.pages();
@@ -321,19 +338,15 @@ impl Allocator {
             .map_or(null_mut(), NonNull::as_ptr)
     }
 
-    /// Owner-local large alloc (TLS hit) or bind + locked allocate.
-    fn allocate_extent(
+    /// Not owner-local on TLS: bind a heap via the table and allocate an extent.
+    #[cold]
+    #[inline(never)]
+    fn alloc_extent_remote(
         inner: NonNull<AllocatorInner>,
         inner_ref: &AllocatorInner,
         spec: LayoutSpec,
         init: ExtentInit,
     ) -> *mut u8 {
-        if let Some(ptr) =
-            THREAD_HEAP.with(|tls| tls.alloc_extent(inner, spec, inner_ref.pages(), init))
-        {
-            return ptr.as_ptr();
-        }
-
         let mut table = inner_ref.table.lock();
         let heap_id = THREAD_HEAP.with(|tls| tls.bind(inner, &mut table));
         let Some(heap_id) = heap_id else {
