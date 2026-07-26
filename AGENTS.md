@@ -2,9 +2,10 @@
 
 ## Goals
 
-- Correct ownership and fail-closed frees first; within that, maximize performance.
-- Safe idiomatic Rust by default; `unsafe` only for OS/ownership boundaries or profiled hot paths (narrow blocks + SAFETY comments).
-- General composable entity APIs — no one-caller overfit methods, shims, or `*_slow` / `*_miss` / `*_nonlocal` names (`#[cold]` only).
+- Performance is the top design priority on hot paths (simple, direct, minimal work).
+- Prefer safe idiomatic Rust; use `unsafe` only where needed for OS/ownership contracts or measured hot-path performance (narrow blocks + SAFETY comments).
+- Best-practice allocator design: explicit ownership entities, fail-closed frees, auditable invariants — not line-for-line ports.
+- General composable clean APIs; no one-caller overfit methods, shims, or `*_slow` / `*_miss` / `*_nonlocal` names (`#[cold]` only).
 
 ## Conventions
 
@@ -16,7 +17,7 @@
 - Exactly one abort sink: `Allocator::abort`. Never hold `Mutex<HeapTable>` across a user-memory copy.
 - No allocator-internal `Vec` / `Box` / `HashMap` / `String` / formatting / panic unless recursion risk is addressed.
 - `#![deny(unsafe_op_in_unsafe_fn)]`. No test-only methods on production `impl` blocks.
-- Nested `AGENTS.md` only for subtree-specific rules; closest file wins; keep nested files shorter than root; do not repeat root. Target <60 lines (hard cap 100). Revamp the nearest file when APIs change; update the matching `README.md`.
+- When editing any `AGENTS.md`, follow `.agents/skills/agents-md`: nested files only for subtree-specific rules; closest wins; shorter than root; no root duplication; target <60 lines (hard cap 100). Revamp/clean the nearest file when APIs change; update the matching `README.md`.
 
 ## Commands
 
