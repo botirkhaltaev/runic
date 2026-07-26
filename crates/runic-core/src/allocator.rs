@@ -120,14 +120,27 @@ impl Allocator {
             Self::abort();
         };
 
-        match Self::free_local(inner, owner, ptr) {
-            Ok(()) => {}
-            Err(ThreadFreeError::NotBound) => {
+        if let Err(error) = Self::free_local(inner, owner, ptr) {
+            Self::dealloc_not_local(inner, inner_ref, owner, ptr, error);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn dealloc_not_local(
+        inner: NonNull<AllocatorInner>,
+        inner_ref: &AllocatorInner,
+        owner: PageOwner,
+        ptr: NonNull<u8>,
+        error: ThreadFreeError,
+    ) {
+        match error {
+            ThreadFreeError::NotBound => {
                 if Self::free_remote(inner, inner_ref, owner, ptr).is_err() {
                     Self::abort();
                 }
             }
-            Err(ThreadFreeError::Heap(_)) => Self::abort(),
+            ThreadFreeError::Heap(_) => Self::abort(),
         }
     }
 

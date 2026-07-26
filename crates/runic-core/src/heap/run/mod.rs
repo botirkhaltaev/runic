@@ -160,15 +160,22 @@ impl BlockStates {
     /// Owner-local Allocated → Free. `index` must be capacity-proven.
     fn release(&self, index: BlockIndex) -> Result<(), BlockStateError> {
         let state = self.state_unchecked(index);
-        match BlockState::from_raw(state.load(Ordering::Relaxed))
-            .ok_or(BlockStateError::InvalidIndex)?
-        {
-            BlockState::Allocated => {
-                state.store(BlockState::Free.raw(), Ordering::Relaxed);
-                Ok(())
-            }
-            BlockState::Free => Err(BlockStateError::AlreadyFree),
-            BlockState::RemotePending => Err(BlockStateError::AlreadyPending),
+        let raw = state.load(Ordering::Relaxed);
+        if raw != BlockState::Allocated.raw() {
+            return Err(Self::release_err(raw));
+        }
+
+        state.store(BlockState::Free.raw(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn release_err(raw: u8) -> BlockStateError {
+        match BlockState::from_raw(raw) {
+            Some(BlockState::Free) => BlockStateError::AlreadyFree,
+            Some(BlockState::RemotePending) => BlockStateError::AlreadyPending,
+            Some(BlockState::Allocated) | None => BlockStateError::InvalidIndex,
         }
     }
 
@@ -362,9 +369,10 @@ impl Run {
     pub(crate) fn allocate(&self) -> Option<NonNull<u8>> {
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
-        let index = self
-            .pop_free(state)
-            .or_else(|| state.allocate_fresh(self.capacity))?;
+        let index = match self.pop_free(state) {
+            Some(index) => index,
+            None => state.allocate_fresh(self.capacity)?,
+        };
         let ptr = self.block_ptr(index);
         self.blocks.allocate(index);
 
@@ -375,27 +383,38 @@ impl Run {
 
     /// Owner-local: Allocated → Free, push freelist.
     pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
-        let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
+        let Some(block) = self.block_at(ptr) else {
+            return Err(Self::free_invalid());
+        };
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
 
-        match self.blocks.release(block.index()) {
-            Ok(()) => {}
-            Err(
-                BlockStateError::AlreadyFree
-                | BlockStateError::AlreadyAllocated
-                | BlockStateError::AlreadyPending,
-            ) => return Err(RunError::DoubleFree),
-            Err(BlockStateError::InvalidIndex) => return Err(RunError::InvalidPointer),
+        if let Err(error) = self.blocks.release(block.index()) {
+            return Err(Self::free_state_err(error));
         }
 
-        let Some(live) = state.live.checked_sub(1) else {
-            return Err(RunError::FreeUnderflow);
-        };
-
-        state.live = live;
+        // Allocated ⇒ live > 0; underflow is an invariant break caught above as double-free.
+        debug_assert!(state.live > 0);
+        state.live -= 1;
         Self::push_free(state, block);
         Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn free_invalid() -> RunError {
+        RunError::InvalidPointer
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn free_state_err(error: BlockStateError) -> RunError {
+        match error {
+            BlockStateError::AlreadyFree
+            | BlockStateError::AlreadyAllocated
+            | BlockStateError::AlreadyPending => RunError::DoubleFree,
+            BlockStateError::InvalidIndex => RunError::InvalidPointer,
+        }
     }
 
     /// Freer: Allocated → `RemotePending` (before batch/publish).
