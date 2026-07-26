@@ -116,11 +116,20 @@ impl Allocator {
         let Some(ptr) = NonNull::new(ptr) else {
             return;
         };
-        let Some(owner) = inner_ref.pages().get(ptr) else {
-            Self::abort();
-        };
-
-        if let Err(error) = Self::free_local(inner, owner, ptr) {
+        // One TLS entry for lookup + owner-local free; remote/abort runs after `with`.
+        let not_local = THREAD_HEAP.with(|tls| {
+            let Some(owner) = tls.lookup_owner(inner, inner_ref.pages(), ptr) else {
+                Self::abort();
+            };
+            match owner {
+                PageOwner::Run(run) => tls.free(inner, run, ptr).map_err(|error| (owner, error)),
+                PageOwner::Extent(extent) => tls
+                    .free_extent(inner, extent, ptr)
+                    .map_err(|error| (owner, error)),
+            }
+            .err()
+        });
+        if let Some((owner, error)) = not_local {
             Self::dealloc_not_local(inner, inner_ref, owner, ptr, error);
         }
     }
@@ -334,20 +343,6 @@ impl Allocator {
         }
         heap.alloc_run(class, pages)
             .map_or(null_mut(), NonNull::as_ptr)
-    }
-
-    /// Owner-local free via TLS (sticky run or bound Heap).
-    fn free_local(
-        inner: NonNull<AllocatorInner>,
-        owner: PageOwner,
-        ptr: NonNull<u8>,
-    ) -> Result<(), ThreadFreeError> {
-        match owner {
-            PageOwner::Run(run) => THREAD_HEAP.with(|tls| tls.free(inner, run, ptr)),
-            PageOwner::Extent(extent) => {
-                THREAD_HEAP.with(|tls| tls.free_extent(inner, extent, ptr))
-            }
-        }
     }
 
     /// Not owner-local on TLS: table-locked same-heap free, Active claim→publish,

@@ -22,6 +22,12 @@ pub(crate) enum ThreadFreeError {
     Heap(HeapError),
 }
 
+impl From<RunError> for ThreadFreeError {
+    fn from(error: RunError) -> Self {
+        Self::Heap(error.into())
+    }
+}
+
 const REMOTE_BATCH_CAPACITY: u32 = 32;
 
 /// Producer-side coalesce buffer for remote frees.
@@ -108,6 +114,9 @@ pub(crate) struct ThreadHeap {
     heap_id: Cell<Option<HeapId>>,
     heap: Cell<*mut Heap>,
     runs: [Cell<*mut Run>; SizeClasses::COUNT],
+    /// Last cached run page number (`usize::MAX` = empty). See `lookup_owner`.
+    page_cache_page: Cell<usize>,
+    page_cache_owner: Cell<Option<PageOwner>>,
     remote: UnsafeCell<RemoteBatch>,
 }
 
@@ -124,8 +133,36 @@ impl ThreadHeap {
             heap_id: Cell::new(None),
             heap: Cell::new(core::ptr::null_mut()),
             runs: [const { Cell::new(core::ptr::null_mut()) }; SizeClasses::COUNT],
+            page_cache_page: Cell::new(usize::MAX),
+            page_cache_owner: Cell::new(None),
             remote: UnsafeCell::new(RemoteBatch::new()),
         }
+    }
+
+    /// `PageMap` lookup with a one-entry TLS page→run cache (miss fills from `pages`).
+    ///
+    /// Cache hit/fill only while bound to `inner` (retained allocator). Only **run**
+    /// owners are cached: runs stay published for the heap lifetime in v0.5. Extents
+    /// may `unpublish` / reuse VA, so caching them would go stale.
+    #[inline]
+    pub(crate) fn lookup_owner(
+        &self,
+        inner: NonNull<AllocatorInner>,
+        pages: &PageMap,
+        ptr: NonNull<u8>,
+    ) -> Option<PageOwner> {
+        let page = ptr.as_ptr().addr() / crate::memory::PAGE_SIZE;
+        let bound = self.matches(inner);
+        if bound && self.page_cache_page.get() == page {
+            return self.page_cache_owner.get();
+        }
+
+        let owner = pages.get(ptr)?;
+        if bound && matches!(owner, PageOwner::Run(_)) {
+            self.page_cache_page.set(page);
+            self.page_cache_owner.set(Some(owner));
+        }
+        Some(owner)
     }
 
     /// Owner-local small allocation via the TLS run cache.
@@ -175,7 +212,9 @@ impl ThreadHeap {
 
     /// Owner-local free for a run owned by the bound heap.
     ///
-    /// Sticky hit is the straight-line body; non-cached owner free goes through `Heap::free`.
+    /// Sticky hit is the straight-line body (unbind clears sticky ⇒ sticky implies bound);
+    /// non-cached owner free goes through `Heap::free` after `matches` / `HeapId`.
+    #[inline]
     pub(crate) fn free(
         &self,
         inner: NonNull<AllocatorInner>,
@@ -184,21 +223,14 @@ impl ThreadHeap {
     ) -> Result<(), ThreadFreeError> {
         // SAFETY: PageMap stores only pointers published from this allocator's live arena.
         let run_ref = unsafe { run.as_ref() };
-        if !self.matches(inner) {
-            return Err(ThreadFreeError::NotBound);
-        }
-
         let class = run_ref.class();
-        // Sticky slots only park this heap's runs — pointer-eq before HeapId.
+        // Sticky before matches: slots only park this heap's runs and are cleared on unbind.
         if self.run_cell(class).get() == run.as_ptr() {
             // Sticky hit: Run only — do not finish_free / push_available.
-            return match run_ref.free(ptr) {
-                Ok(()) => Ok(()),
-                Err(error) => Err(Self::sticky_free_err(error)),
-            };
+            return run_ref.free(ptr).map_err(ThreadFreeError::from);
         }
 
-        if self.heap_id.get() != Some(run_ref.heap_id()) {
+        if !self.matches(inner) || self.heap_id.get() != Some(run_ref.heap_id()) {
             return Err(ThreadFreeError::NotBound);
         }
 
@@ -211,12 +243,6 @@ impl ThreadHeap {
                 unsafe { inner.as_ref().pages() },
             )
             .map_err(ThreadFreeError::Heap)
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn sticky_free_err(error: RunError) -> ThreadFreeError {
-        ThreadFreeError::Heap(error.into())
     }
 
     /// Owner-local free for an extent owned by the bound heap.
@@ -379,6 +405,8 @@ impl ThreadHeap {
     #[cold]
     fn unbind(&self) {
         self.return_cached_runs();
+        self.page_cache_page.set(usize::MAX);
+        self.page_cache_owner.set(None);
         let Some(inner) = NonNull::new(self.inner.replace(core::ptr::null_mut())) else {
             return;
         };

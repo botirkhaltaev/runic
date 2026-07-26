@@ -65,7 +65,7 @@ impl PageMap {
     /// Lock-free ownership lookup: L1 root → `tables[l1]` → page entry → [`PageOwner`].
     #[inline]
     pub(crate) fn get(&self, ptr: NonNull<u8>) -> Option<PageOwner> {
-        let (l1_index, l2_index) = Page::containing(ptr).indexes()?;
+        let (l1_index, l2_index) = Page::split(ptr)?;
         self.l1()?.owner(l1_index, l2_index)
     }
 
@@ -178,5 +178,5 @@ impl Drop for PageMap {
 
 const _: () = assert!(
     PAGE_SIZE == 1 << PAGE_SHIFT,
-    "PAGE_SHIFT must match PAGE_SIZE"
+    "page-map geometry assumes PAGE_SIZE is 1 << PAGE_SHIFT"
 );

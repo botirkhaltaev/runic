@@ -51,17 +51,15 @@ impl MapEntry {
         Some(Self { raw: ptr | kind })
     }
 
-    pub(super) const fn is_empty(self) -> bool {
-        self.raw == 0
-    }
-
     pub(super) fn owner(self) -> Option<PageOwner> {
-        if self.is_empty() {
+        if self.raw == 0 {
             return None;
         }
 
-        let raw = self.raw & Self::POINTER_MASK;
-        let ptr = NonNull::new(core::ptr::with_exposed_provenance_mut::<()>(raw))?;
+        let addr = self.raw & Self::POINTER_MASK;
+        // SAFETY: `from_owner` only stores nonzero `NonNull` addresses; empty is `raw == 0`.
+        let ptr =
+            unsafe { NonNull::new_unchecked(core::ptr::with_exposed_provenance_mut::<()>(addr)) };
 
         if self.raw & Self::KIND_EXTENT == 0 {
             Some(PageOwner::Run(ptr.cast()))

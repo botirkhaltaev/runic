@@ -132,7 +132,7 @@ impl SizeClasses {
     ///
     /// Default-align (`align <= 8`) is the hot path: size bound + `CLASS_FOR_SIZE`
     /// only — no `PAGE_SIZE` check (align 8 is always ≤ page). Higher alignments
-    /// take the cold remap path.
+    /// take the align-remap table.
     #[inline]
     pub(crate) fn id_for(spec: LayoutSpec) -> Option<SizeClassId> {
         let align = spec.align();
@@ -151,12 +151,6 @@ impl SizeClasses {
             return Some(unsafe { SizeClassId::new_unchecked(index) });
         }
 
-        Self::id_for_aligned(required, align)
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn id_for_aligned(required: usize, align: usize) -> Option<SizeClassId> {
         if align > PAGE_SIZE || required > Self::SMALL_MAX {
             return None;
         }

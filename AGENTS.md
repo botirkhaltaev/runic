@@ -16,6 +16,7 @@
 - Use simple, clear names for public and internal APIs; avoid names that encode implementation details, transient benchmark work, compatibility shims, or a single use site.
 - Make invalid states hard to express with `NonZero*`, `NonNull`, named domain types, and checked construction.
 - Avoid tuple structs with unnamed fields for domain entities; use named fields when field meaning matters.
+- Prefer simple, direct code; add complexity (extra types, helper splits, caches, dual encodings) only when correctness or measured performance requires it.
 - Avoid free helpers and one-line pass-through methods; call the owning entity directly unless the helper removes real duplication or encodes an invariant.
 - Avoid passive adapter, wrapper, or compatibility layers unless they encode a real invariant or remove meaningful duplication.
 - Avoid callback-style helper patterns for ordinary control flow; prefer direct calls and explicit results.
@@ -23,7 +24,7 @@
 - Optimize for the best allocator architecture rather than backward compatibility or temporary migration paths.
 - Keep hot paths simple, direct, and minimal-instruction while preserving explicit correctness invariants.
 - Separate owner-local and remote-free paths in type APIs; do not hide cross-thread behavior behind broad manager methods.
-- Keep exactly one claim → batch → `HeapTable::publish` → flush/`accept` remote-free protocol; do not grow a second, parallel remote-free implementation alongside it (e.g. an unbatched or lock-scoped shortcut) for `realloc`, tests, or any other caller. `publish` must complete retained batches against `Draining` heaps (late frees after owner exit), not only `Active` inbox enqueue. Allocator routing is `free_local` / `free_remote`; domain ops on `Run`/`Extent` are `free` / `claim` / `accept`.
+- Keep exactly one claim → batch → `HeapTable::publish` → flush/`accept` remote-free protocol; do not grow a second, parallel remote-free implementation alongside it (e.g. an unbatched or lock-scoped shortcut) for `realloc`, tests, or any other caller. `publish` must complete retained batches against `Draining` heaps (late frees after owner exit), not only `Active` inbox enqueue. Allocator routing is owner-local free (one `THREAD_HEAP.with`: lookup + `ThreadHeap::free` / `free_extent`) / `Allocator::free_remote`; domain ops on `Run`/`Extent` are `free` / `claim` / `accept`.
 - Do not model small or large allocation ownership as a shared/root heap; every run and extent is stamped with a `HeapId`, and sharing uses remote-free coordination or backend reuse.
 - Treat caches as allocator-domain ownership structures, not benchmark-specific shortcuts.
 - Do not deepen the extent path into a lock-only design; same-thread extent allocate/free must flow through owner-local `ThreadHeap`/`Heap` state, mirroring the run frontend, and only fall back to the table mutex on TLS miss or cross-thread routing.
@@ -82,8 +83,10 @@ Durable lessons from past boundary bugs; do not reintroduce these shapes.
 
 ## Rust Rules
 
+- Prefer safe, idiomatic Rust: entity methods, `?`, `From`/`map_err`, explicit `match`, and checked construction. Reach for clever control-flow or micro-split helpers only when a simpler form is wrong or a profile proves it.
+- Use `unsafe` only for OS/FFI boundaries, ownership contracts the type system cannot express, or hot-path operations where safe code cannot meet needed performance. Keep unsafe blocks small, explicit, local, and adjacent to SAFETY comments — do not widen unsafe to avoid refactoring.
+- Do not add `#[cold]` / `#[inline(never)]` one-line pass-through helpers to “protect” a hot path; prefer idiomatic error conversion at the call site unless profiling shows a real win that cannot stay simple.
 - Use `#![deny(unsafe_op_in_unsafe_fn)]`.
-- Keep unsafe code small, explicit, local, and adjacent to the safety reasoning.
 - Prefer methods on `Allocator`, `Heap`, `RunHeap`, `ExtentHeap`, `Run`, `Extent`, `Arena`, `PageMap`, `OsMemory`, and `SizeClasses`.
 - Avoid allocator-internal `Vec`, `Box`, `HashMap`, `String`, formatting, or panic paths unless recursion risk is addressed.
 - Abort on invalid frees in v0.1.
