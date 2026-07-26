@@ -49,6 +49,23 @@ impl Iterator for RemoteList {
     }
 }
 
+/// Null-terminated intrusive chain detached by [`Inbox::drain`] (single walk for accept).
+pub(crate) struct RemoteChain {
+    cursor: Option<NonNull<u8>>,
+}
+
+impl Iterator for RemoteChain {
+    type Item = NonNull<u8>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let ptr = self.cursor?;
+        // SAFETY: drained nodes keep producer-linked next words until the owner accepts them.
+        let next = unsafe { &*ptr.as_ptr().cast::<AtomicPtr<u8>>() }.load(Ordering::Acquire);
+        self.cursor = NonNull::new(next);
+        Some(ptr)
+    }
+}
+
 /// Lock-free MPSC inbox. Producers may only use shared references.
 pub(crate) struct Inbox {
     /// Head of the pending intrusive chain (newer publishes link in front).
@@ -100,19 +117,14 @@ impl Inbox {
 
     /// Detach the entire pending chain. Single-consumer only.
     ///
-    /// Across publishes the order is LIFO; within a batch it stays FIFO. Empty → `None`.
-    pub(crate) fn drain(&self) -> Option<RemoteList> {
+    /// Returns a null-terminated walk (one pass). Across publishes the order is LIFO;
+    /// within a batch it stays FIFO. Empty → `None`.
+    pub(crate) fn drain(&self) -> Option<RemoteChain> {
         let first_ptr = self.head.swap(ptr::null_mut(), Ordering::AcqRel);
         let first = NonNull::new(first_ptr)?;
-        let mut last = first;
-        loop {
-            let next = Self::next_of(last.as_ptr()).load(Ordering::Acquire);
-            let Some(next) = NonNull::new(next) else {
-                break;
-            };
-            last = next;
-        }
-        Some(RemoteList::from_ends(first, last))
+        Some(RemoteChain {
+            cursor: Some(first),
+        })
     }
 }
 
@@ -143,7 +155,7 @@ mod tests {
         NonNull::new(core::ptr::from_ref(node).cast::<u8>().cast_mut()).unwrap()
     }
 
-    fn collect_list(list: RemoteList) -> [Option<NonNull<u8>>; 4] {
+    fn collect_list(list: impl Iterator<Item = NonNull<u8>>) -> [Option<NonNull<u8>>; 4] {
         let mut out = [None; 4];
         for (i, ptr) in list.enumerate() {
             out[i] = Some(ptr);
@@ -151,7 +163,7 @@ mod tests {
         out
     }
 
-    fn accept_all(list: RemoteList, pool: &[TestNode]) {
+    fn accept_all(list: impl Iterator<Item = NonNull<u8>>, pool: &[TestNode]) {
         for ptr in list {
             let node = pool
                 .iter()
@@ -171,8 +183,6 @@ mod tests {
         let ptr = node_ptr(&node);
         inbox.push_batch(&RemoteList::from_ends(ptr, ptr));
         let list = inbox.drain().unwrap();
-        assert_eq!(list.first, ptr);
-        assert_eq!(list.last, ptr);
         assert_eq!(collect_list(list), [Some(ptr), None, None, None]);
         assert!(inbox.is_empty());
     }
@@ -214,8 +224,7 @@ mod tests {
         let ptr = node_ptr(&node);
         moved.push_batch(&RemoteList::from_ends(ptr, ptr));
         let list = moved.drain().unwrap();
-        assert_eq!(list.first, ptr);
-        assert_eq!(list.last, ptr);
+        assert_eq!(collect_list(list), [Some(ptr), None, None, None]);
         assert!(moved.is_empty());
     }
 

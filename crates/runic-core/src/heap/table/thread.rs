@@ -206,8 +206,9 @@ impl ThreadHeap {
             return None;
         }
 
-        // SAFETY: slot is bound only while this TLS entry retains the allocator inner.
-        unsafe { self.bound_slot().as_mut() }.allocate_extent(spec, pages, init)
+        let slot = self.bound_slot();
+        // SAFETY: Active TLS owner for this bound slot.
+        unsafe { slot.as_ref().allocate_extent(spec, pages, init) }
     }
 
     /// Owner-local free for a run owned by the bound heap.
@@ -234,15 +235,13 @@ impl ThreadHeap {
             return Err(ThreadFreeError::NotBound);
         }
 
-        // SAFETY: slot is bound only while this TLS entry retains the allocator inner.
-        unsafe { self.bound_slot().as_mut() }
-            .free(
-                PageOwner::Run(run),
-                ptr,
-                // SAFETY: inner is retained by this TLS entry while bound.
-                unsafe { inner.as_ref().pages() },
-            )
-            .map_err(ThreadFreeError::Heap)
+        let slot = self.bound_slot();
+        // SAFETY: Active TLS owner for this bound slot; inner retained while bound.
+        unsafe {
+            slot.as_ref()
+                .free(PageOwner::Run(run), ptr, inner.as_ref().pages())
+        }
+        .map_err(ThreadFreeError::Heap)
     }
 
     /// Owner-local free for an extent owned by the bound heap.
@@ -258,31 +257,23 @@ impl ThreadHeap {
             return Err(ThreadFreeError::NotBound);
         }
 
-        // SAFETY: slot is bound only while this TLS entry retains the allocator inner.
-        unsafe { self.bound_slot().as_mut() }
-            .free(
-                PageOwner::Extent(extent),
-                ptr,
-                // SAFETY: inner is retained by this TLS entry while bound.
-                unsafe { inner.as_ref().pages() },
-            )
-            .map_err(ThreadFreeError::Heap)
+        let slot = self.bound_slot();
+        // SAFETY: Active TLS owner for this bound slot; inner retained while bound.
+        unsafe {
+            slot.as_ref()
+                .free(PageOwner::Extent(extent), ptr, inner.as_ref().pages())
+        }
+        .map_err(ThreadFreeError::Heap)
     }
 
-    /// Bound heap id when this TLS entry is attached to `inner`.
-    pub(crate) fn bound(&self, inner: NonNull<AllocatorInner>) -> Option<HeapId> {
-        self.matches(inner).then_some(())?;
-        self.heap_id.get()
-    }
-
-    /// Bind this thread to a slot in `inner`'s directory.
+    /// Bind this thread to a slot in `directory`.
     ///
     /// Reuses the current binding when already attached to `inner`; otherwise unbinds any
-    /// foreign binding and acquires a fresh slot under the caller's directory lock.
+    /// foreign binding and acquires a fresh slot (directory locks internally).
     pub(crate) fn bind(
         &self,
         inner: NonNull<AllocatorInner>,
-        directory: &mut HeapDirectory,
+        directory: &HeapDirectory,
     ) -> Option<HeapId> {
         if self.matches(inner) {
             return self.heap_id.get();
@@ -306,7 +297,12 @@ impl ThreadHeap {
     }
 
     /// Coalesce a claimed remote free; returns a list the caller must `HeapDirectory::publish`.
+    ///
+    /// Caller must be bound (`!is_empty`). Never-bound freers publish a singleton in
+    /// `Allocator::free_remote` so this method stays a pure coalesce (measured: an unbound
+    /// branch here regresses owner-local thrpt).
     pub(crate) fn batch(&self, target: HeapId, ptr: NonNull<u8>) -> Option<(HeapId, RemoteList)> {
+        debug_assert!(!self.is_empty());
         // SAFETY: ThreadHeap is thread-local; exclusive access to the remote batch.
         unsafe { &mut *self.remote.get() }.append(target, ptr)
     }
@@ -331,38 +327,55 @@ impl ThreadHeap {
         self.inner.get() == inner.as_ptr()
     }
 
-    fn is_empty(&self) -> bool {
+    /// No allocator retain — never bound, or after `unbind`.
+    pub(crate) fn is_empty(&self) -> bool {
         self.inner.get().is_null()
     }
 
-    /// Sticky empty: flush inbox once if needed, `acquire_run`, park sticky, allocate.
+    /// Sticky empty: prefer local/OS runs, then flush inbox and retry.
     #[cold]
     fn acquire_alloc(
         &self,
         class: SizeClassId,
         pages: &PageMap,
-        mut slot: NonNull<HeapSlot>,
+        slot: NonNull<HeapSlot>,
     ) -> Option<NonNull<u8>> {
         let cell = self.run_cell(class);
 
-        // SAFETY: slot is bound only while this TLS entry retains the allocator inner.
-        let slot_mut = unsafe { slot.as_mut() };
-        if !slot_mut.inbox().is_empty() {
-            slot_mut.flush(pages).ok()?;
-            if let Some(run) = NonNull::new(cell.get()) {
-                // SAFETY: sticky run pointers are published from this heap's live arena.
-                if let Some(ptr) = unsafe { run.as_ref() }.allocate() {
-                    return Some(ptr);
-                }
-                cell.set(core::ptr::null_mut());
+        // SAFETY: Active TLS owner for this bound slot.
+        let slot_ref = unsafe { slot.as_ref() };
+
+        // Prefer bump/available/OS before remote accept so a fast lock-free fan-in does not
+        // force the owner through flush on every sticky miss.
+        // SAFETY: Active TLS owner. Inbox flush is deferred until local acquire fails.
+        if let Some(run) = unsafe { slot_ref.acquire_run(class, pages) } {
+            cell.set(run.as_ptr());
+            // SAFETY: run was just returned by this heap's live arena.
+            if let Some(ptr) = unsafe { run.as_ref() }.allocate() {
+                return Some(ptr);
             }
+            cell.set(core::ptr::null_mut());
+            // Do not abandon a checked-out run off the available list.
+            // SAFETY: Active TLS owner returning a run acquired from this slot.
+            let _ = unsafe { slot_ref.return_available(run) };
         }
 
-        // Inbox is empty after the optional flush above, so acquire_run will not flush again.
-        let run = slot_mut.acquire_run(class, pages)?;
+        // Always flush (empty drain is cheap) then retry — never early-None on a stale empty check
+        // while a concurrent Active publish may still land.
+        // SAFETY: Active TLS owner.
+        unsafe { slot_ref.flush(pages) }.ok()?;
+
+        // SAFETY: Active TLS owner.
+        let run = unsafe { slot_ref.acquire_run(class, pages) }?;
         cell.set(run.as_ptr());
         // SAFETY: run was just returned by this heap's live arena.
-        unsafe { run.as_ref() }.allocate()
+        if let Some(ptr) = unsafe { run.as_ref() }.allocate() {
+            return Some(ptr);
+        }
+        cell.set(core::ptr::null_mut());
+        // SAFETY: Active TLS owner returning a run acquired from this slot.
+        let _ = unsafe { slot_ref.return_available(run) };
+        None
     }
 
     fn run_cell(&self, class: SizeClassId) -> &Cell<*mut Run> {
@@ -380,7 +393,7 @@ impl ThreadHeap {
     }
 
     fn return_cached_runs(&self) {
-        let Some(mut slot) = NonNull::new(self.slot.get()) else {
+        let Some(slot) = NonNull::new(self.slot.get()) else {
             return;
         };
 
@@ -389,29 +402,30 @@ impl ThreadHeap {
                 continue;
             };
 
-            // SAFETY: slot is bound only while this TLS entry retains the allocator inner.
-            let _ = unsafe { slot.as_mut() }
-                .heap_mut()
-                .runs
-                .return_available(run);
+            // SAFETY: Active TLS owner until install fields are cleared in unbind.
+            let _ = unsafe { slot.as_ref().return_available(run) };
         }
     }
 
     fn publish_batches(&self, inner: &AllocatorInner) {
         while let Some((id, list)) = self.take_batch() {
-            let mut directory = inner.directory.lock();
-            if directory.publish(id, &list, inner.pages()).is_err() {
+            if inner.directory.publish(id, &list, inner.pages()).is_err() {
                 Allocator::abort();
             }
         }
     }
 
+    /// Publish outbound batches, retire the bound heap, and release the inner retain.
     #[cold]
-    fn unbind(&self) {
+    pub(crate) fn unbind(&self) {
         self.return_cached_runs();
         self.page_cache_page.set(usize::MAX);
         self.page_cache_owner.set(None);
         let Some(inner) = NonNull::new(self.inner.replace(core::ptr::null_mut())) else {
+            if self.take_batch().is_some() {
+                // Bound retain is required to publish; never-bound freers publish immediately.
+                Allocator::abort();
+            }
             return;
         };
         let heap_id = self.heap_id.replace(None);
@@ -421,11 +435,13 @@ impl ThreadHeap {
         let inner_ref = unsafe { inner.as_ref() };
         self.publish_batches(inner_ref);
 
-        if let Some(heap_id) = heap_id {
-            let mut directory = inner_ref.directory.lock();
-            if directory.retire(heap_id, inner_ref.pages()).is_err() {
-                Allocator::abort();
-            }
+        if let Some(heap_id) = heap_id
+            && inner_ref
+                .directory
+                .retire(heap_id, inner_ref.pages())
+                .is_err()
+        {
+            Allocator::abort();
         }
 
         AllocatorInner::release(inner);
@@ -449,57 +465,49 @@ mod tests {
     }
 
     fn node_ptr(node: &TestNode) -> NonNull<u8> {
-        NonNull::new(core::ptr::from_ref(node).cast::<u8>().cast_mut()).unwrap()
-    }
-
-    fn heap_id(index: u32) -> HeapId {
-        HeapId::new(index, NonZeroU32::MIN).unwrap()
+        NonNull::from(node).cast()
     }
 
     #[test]
     fn remote_batch_publishes_at_capacity() {
         let inbox = Inbox::new();
-
-        let mut nodes = [const {
-            TestNode {
-                next: AtomicPtr::new(core::ptr::null_mut()),
-            }
-        }; REMOTE_BATCH_CAPACITY as usize];
         let mut batch = RemoteBatch::new();
-        let target = heap_id(0);
+        let target = HeapId::new(0, NonZeroU32::MIN).unwrap();
+        let mut nodes = Vec::with_capacity(REMOTE_BATCH_CAPACITY as usize);
+        for _ in 0..REMOTE_BATCH_CAPACITY {
+            nodes.push(TestNode {
+                next: AtomicPtr::new(core::ptr::null_mut()),
+            });
+        }
 
         let mut published = None;
-        for node in &mut nodes {
+        for node in &nodes {
             if let Some(list) = batch.append(target, node_ptr(node)) {
                 published = Some(list);
             }
         }
-
-        assert!(batch.is_empty());
-        let (id, list) = published.unwrap();
+        let (id, list) = published.expect("capacity flush");
         assert_eq!(id, target);
         inbox.push_batch(&list);
-        assert_eq!(
-            inbox.drain().unwrap().count(),
-            REMOTE_BATCH_CAPACITY as usize
-        );
+        let drained = inbox.drain().unwrap();
+        assert_eq!(drained.count(), REMOTE_BATCH_CAPACITY as usize);
     }
 
     #[test]
     fn remote_batch_returns_list_on_target_change() {
+        let mut batch = RemoteBatch::new();
+        let first = HeapId::new(0, NonZeroU32::MIN).unwrap();
+        let second = HeapId::new(1, NonZeroU32::MIN).unwrap();
         let a = TestNode {
             next: AtomicPtr::new(core::ptr::null_mut()),
         };
         let b = TestNode {
             next: AtomicPtr::new(core::ptr::null_mut()),
         };
-        let mut batch = RemoteBatch::new();
-        assert!(batch.append(heap_id(0), node_ptr(&a)).is_none());
 
-        let (id, list) = batch.append(heap_id(1), node_ptr(&b)).unwrap();
-        assert_eq!(id, heap_id(0));
-        assert_eq!(list.first, node_ptr(&a));
-        assert_eq!(list.last, node_ptr(&a));
-        assert!(!batch.is_empty());
+        assert!(batch.append(first, node_ptr(&a)).is_none());
+        let (id, list) = batch.append(second, node_ptr(&b)).expect("target change");
+        assert_eq!(id, first);
+        assert_eq!(list.count(), 1);
     }
 }

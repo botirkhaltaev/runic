@@ -1,10 +1,6 @@
 use core::alloc::Layout;
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
+    sync::{Arc, mpsc},
     thread,
     time::Duration,
 };
@@ -490,7 +486,7 @@ fn allocator_drains_remote_free_when_owner_thread_exits() {
 #[test]
 fn allocator_publishes_retained_remote_batch_after_owner_exits() {
     // Freer claims while owner is Active (TLS batch retains below capacity), owner then
-    // exits to Draining, and freer TLS teardown must complete the batch without abort.
+    // exits to Draining, and freer TLS teardown must publish the batch without abort.
     let allocator = Allocator::new();
     let layout = Layout::from_size_align(64, 8).unwrap();
     let (ptr_tx, ptr_rx) = mpsc::channel();
@@ -502,6 +498,7 @@ fn allocator_publishes_retained_remote_batch_after_owner_exits() {
         scope.spawn(move || {
             let ptr = unsafe { allocator.alloc(layout) };
             assert!(!ptr.is_null());
+            unsafe { ptr.write(0x5a) };
             ptr_tx.send(ptr.addr()).unwrap();
             batched_rx.recv().unwrap();
             owner_done_tx.send(()).unwrap();
@@ -509,10 +506,149 @@ fn allocator_publishes_retained_remote_batch_after_owner_exits() {
 
         scope.spawn(move || {
             let ptr = ptr_rx.recv().unwrap() as *mut u8;
+            assert_eq!(unsafe { ptr.read() }, 0x5a);
             unsafe { allocator.dealloc(ptr, layout) };
             batched_tx.send(()).unwrap();
             owner_done_rx.recv().unwrap();
         });
+    });
+
+    // After freer TLS teardown published the batch and Draining accept ran, the original
+    // block is usable again (pattern write must not fault).
+    let ptr = unsafe { allocator.alloc(layout) };
+    assert!(!ptr.is_null());
+    unsafe { ptr.write(0xa5) };
+    assert_eq!(unsafe { ptr.read() }, 0xa5);
+    unsafe { allocator.dealloc(ptr, layout) };
+}
+
+#[test]
+fn unbound_remote_freer_publishes_without_binding() {
+    // Never-bound freer must not strand RemotePending across exit: each claim publishes
+    // immediately (no TLS batch retain without a directory retain).
+    let allocator = Allocator::new();
+    let layout = Layout::from_size_align(64, 8).unwrap();
+
+    let addrs = thread::scope(|scope| {
+        let allocator = &allocator;
+        scope
+            .spawn(move || {
+                let mut addrs = Vec::with_capacity(8);
+                for _ in 0..8 {
+                    let ptr = unsafe { allocator.alloc(layout) };
+                    assert!(!ptr.is_null());
+                    unsafe { ptr.write(0x3c) };
+                    addrs.push(ptr.addr());
+                }
+                addrs
+            })
+            .join()
+            .unwrap()
+    });
+
+    thread::scope(|scope| {
+        let allocator = &allocator;
+        scope
+            .spawn(move || {
+                for addr in addrs {
+                    let ptr = addr as *mut u8;
+                    assert_eq!(unsafe { ptr.read() }, 0x3c);
+                    unsafe { allocator.dealloc(ptr, layout) };
+                }
+            })
+            .join()
+            .unwrap();
+    });
+
+    let ptr = unsafe { allocator.alloc(layout) };
+    assert!(!ptr.is_null());
+    unsafe { ptr.write(0xc3) };
+    assert_eq!(unsafe { ptr.read() }, 0xc3);
+    unsafe { allocator.dealloc(ptr, layout) };
+}
+
+#[test]
+fn concurrent_active_remote_frees_through_public_dealloc() {
+    const FREERS: usize = 4;
+    const PER_FREER: usize = 64;
+    let allocator = Allocator::new();
+    let layout = Layout::from_size_align(64, 8).unwrap();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let start = Arc::new(std::sync::Barrier::new(FREERS + 1));
+    let done = Arc::new(std::sync::Barrier::new(FREERS + 1));
+
+    thread::scope(|scope| {
+        let allocator = &allocator;
+        let start_owner = Arc::clone(&start);
+        let done_owner = Arc::clone(&done);
+        scope.spawn(move || {
+            let mut addrs = Vec::with_capacity(FREERS * PER_FREER);
+            for _ in 0..(FREERS * PER_FREER) {
+                let ptr = unsafe { allocator.alloc(layout) };
+                assert!(!ptr.is_null());
+                unsafe { ptr.write(0x11) };
+                addrs.push(ptr.addr());
+            }
+            ready_tx.send(addrs).unwrap();
+            start_owner.wait();
+            // Stay Active until every freer finishes publishing.
+            done_owner.wait();
+        });
+
+        let addrs = ready_rx.recv().unwrap();
+        for t in 0..FREERS {
+            let start = Arc::clone(&start);
+            let done = Arc::clone(&done);
+            let chunk: Vec<usize> = addrs[t * PER_FREER..(t + 1) * PER_FREER].to_vec();
+            scope.spawn(move || {
+                start.wait();
+                for addr in chunk {
+                    let ptr = addr as *mut u8;
+                    assert_eq!(unsafe { ptr.read() }, 0x11);
+                    unsafe { allocator.dealloc(ptr, layout) };
+                }
+                done.wait();
+            });
+        }
+    });
+
+    for _ in 0..(FREERS * PER_FREER) {
+        let ptr = unsafe { allocator.alloc(layout) };
+        assert!(!ptr.is_null());
+        unsafe { ptr.write(0x22) };
+        assert_eq!(unsafe { ptr.read() }, 0x22);
+        unsafe { allocator.dealloc(ptr, layout) };
+    }
+}
+
+#[test]
+fn remote_batch_capacity_flush_via_public_dealloc() {
+    // Exactly one over the TLS remote batch capacity forces a publish while the owner
+    // stays Active and makes no progress.
+    const COUNT: usize = 33;
+    let allocator = Allocator::new();
+    let layout = Layout::from_size_align(64, 8).unwrap();
+    let (ptrs_tx, ptrs_rx) = mpsc::channel::<Vec<usize>>();
+    let (done_tx, done_rx) = mpsc::channel();
+
+    thread::scope(|scope| {
+        let allocator = &allocator;
+        scope.spawn(move || {
+            let mut addrs = Vec::with_capacity(COUNT);
+            for _ in 0..COUNT {
+                let ptr = unsafe { allocator.alloc(layout) };
+                assert!(!ptr.is_null());
+                addrs.push(ptr.addr());
+            }
+            ptrs_tx.send(addrs).unwrap();
+            done_rx.recv().unwrap();
+        });
+
+        let addrs = ptrs_rx.recv().unwrap();
+        for addr in addrs {
+            unsafe { allocator.dealloc(addr as *mut u8, layout) };
+        }
+        done_tx.send(()).unwrap();
     });
 }
 
@@ -545,25 +681,13 @@ fn allocator_completes_remote_free_burst_without_owner_progress() {
     // return without deadlock even while the owner thread makes no allocator
     // progress of its own.
     const BURST: usize = 4 * 1024;
-    const WATCHDOG_SECONDS: u64 = 60;
+    const TIMEOUT: Duration = Duration::from_secs(5);
 
     let allocator = Allocator::new();
     let layout = Layout::from_size_align(64, 8).unwrap();
     let (ptr_tx, ptr_rx) = mpsc::channel();
     let (park_tx, park_rx) = mpsc::channel();
-    let disarmed = Arc::new(AtomicBool::new(false));
-
-    // A deadlock in the free path must abort the test process quickly instead
-    // of hanging the suite until the CI job timeout (see issue #60).
-    thread::spawn({
-        let disarmed = Arc::clone(&disarmed);
-        move || {
-            thread::sleep(Duration::from_secs(WATCHDOG_SECONDS));
-            if !disarmed.load(Ordering::Acquire) {
-                std::process::abort();
-            }
-        }
-    });
+    let (done_tx, done_rx) = mpsc::channel();
 
     thread::scope(|scope| {
         let allocator = &allocator;
@@ -579,28 +703,34 @@ fn allocator_completes_remote_free_burst_without_owner_progress() {
             park_rx.recv().unwrap();
         });
 
-        let mut pointers = Vec::with_capacity(BURST);
-        for _ in 0..BURST {
-            pointers.push(ptr_rx.recv().unwrap() as *mut u8);
-        }
+        let freer = scope.spawn(move || {
+            let mut pointers = Vec::with_capacity(BURST);
+            for _ in 0..BURST {
+                pointers.push(ptr_rx.recv().unwrap() as *mut u8);
+            }
 
-        for ptr in pointers {
-            assert_eq!(unsafe { ptr.read() }, 0x5a);
+            for ptr in pointers {
+                assert_eq!(unsafe { ptr.read() }, 0x5a);
+                unsafe { allocator.dealloc(ptr, layout) };
+            }
+
+            // The allocator must still make forward progress after the burst.
+            let ptr = unsafe { allocator.alloc(layout) };
+            assert!(!ptr.is_null());
+            unsafe { ptr.write(0xa5) };
+            assert_eq!(unsafe { ptr.read() }, 0xa5);
             unsafe { allocator.dealloc(ptr, layout) };
-        }
 
-        // The allocator must still make forward progress after the burst.
-        let ptr = unsafe { allocator.alloc(layout) };
-        assert!(!ptr.is_null());
-        unsafe { ptr.write(0xa5) };
-        assert_eq!(unsafe { ptr.read() }, 0xa5);
-        unsafe { allocator.dealloc(ptr, layout) };
+            park_tx.send(()).unwrap();
+            done_tx.send(()).unwrap();
+        });
 
-        park_tx.send(()).unwrap();
+        done_rx
+            .recv_timeout(TIMEOUT)
+            .expect("remote free burst timed out");
+        freer.join().unwrap();
         owner.join().unwrap();
     });
-
-    disarmed.store(true, Ordering::Release);
 }
 
 struct AllocationRecord {

@@ -11,10 +11,10 @@
 
 - Put behavior on the owning entity; prefer `NonZero*` / `NonNull` / named fields; avoid free one-line helpers and pass-throughs.
 - Owner-local TLS vs remote table: `ThreadHeap::{alloc,alloc_extent,free,free_extent}` / `Allocator::{alloc_remote,alloc_extent_remote,free_remote}`; domain ops `free` / `claim` / `accept`.
-- One remote-free protocol: claim → batch → `HeapDirectory::publish` → flush/`accept` (including `Draining` late frees).
+- One remote-free protocol: claim → batch → `HeapDirectory::publish` (Active lease / Draining locked accept) → flush/`accept`. Never-bound freers publish each claim in `free_remote` so Drop cannot strand `RemotePending`.
 - `Layout` only at the public boundary; convert once to `LayoutSpec` and pass it inward (`SizeClasses::id_for`, extents, resize).
 - No shared/root ownership heap; every run/extent is stamped with `HeapId`.
-- Exactly one abort sink: `Allocator::abort`. Never hold `Mutex<HeapDirectory>` across a user-memory copy.
+- Exactly one abort sink: `Allocator::abort`. Never hold the directory lifecycle mutex across a user-memory copy.
 - No allocator-internal `Vec` / `Box` / `HashMap` / `String` / formatting / panic unless recursion risk is addressed.
 - `#![deny(unsafe_op_in_unsafe_fn)]`. No test-only methods on production `impl` blocks.
 - When editing any `AGENTS.md`, follow `.agents/skills/agents-md`: nested files only for subtree-specific rules; closest wins; shorter than root; no root duplication; target <60 lines (hard cap 100). Revamp/clean the nearest file when APIs change; update the matching `README.md`.
