@@ -25,14 +25,6 @@ impl LayoutSpec {
         self.size
     }
 
-    pub(crate) const fn align(self) -> usize {
-        self.align.get()
-    }
-
-    pub(crate) fn minimum_block_size(self) -> usize {
-        self.size.max(self.align.get())
-    }
-
     pub(crate) fn align_addr(self, addr: usize) -> Option<usize> {
         let mask = self.align.get() - 1;
         addr.checked_add(mask).map(|value| value & !mask)
@@ -82,14 +74,8 @@ mod tests {
     fn layout_spec_preserves_alignment() {
         let spec = layout_spec(32, 64);
 
-        assert_eq!(spec.align(), 64);
-    }
-
-    #[test]
-    fn layout_spec_minimum_block_size_is_max_size_or_align() {
-        let spec = layout_spec(17, 64);
-
-        assert_eq!(spec.minimum_block_size(), 64);
+        assert!(spec.is_addr_aligned(64));
+        assert!(!spec.is_addr_aligned(32));
     }
 
     #[test]
