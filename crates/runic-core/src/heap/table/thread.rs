@@ -147,6 +147,29 @@ impl ThreadHeap {
         Some(owner)
     }
 
+    /// Lookup + owner-local free for one TLS entry (`Allocator::dealloc` must not nest another `with`).
+    ///
+    /// `Err(None)` = unknown pointer. `Err(Some(_))` = not owner-local (caller → `free_remote`).
+    #[inline]
+    pub(crate) fn free_local(
+        &self,
+        inner: NonNull<AllocatorInner>,
+        pages: &PageMap,
+        ptr: NonNull<u8>,
+    ) -> Result<(), Option<(PageOwner, ThreadFreeError)>> {
+        let Some(owner) = self.lookup_owner(pages, ptr) else {
+            return Err(None);
+        };
+        match owner {
+            PageOwner::Run(run) => self
+                .free(inner, run, ptr)
+                .map_err(|error| Some((owner, error))),
+            PageOwner::Extent(extent) => self
+                .free_extent(inner, extent, ptr)
+                .map_err(|error| Some((owner, error))),
+        }
+    }
+
     fn clear_page_cache(&self) {
         self.page_cache_page.set(usize::MAX);
         self.page_cache_owner.set(None);
@@ -199,7 +222,8 @@ impl ThreadHeap {
 
     /// Owner-local free for a run owned by the bound heap.
     ///
-    /// Sticky hit is the straight-line body; non-cached owner free goes through `Heap::free`.
+    /// Sticky hit is the straight-line body (unbind clears sticky ⇒ sticky implies bound);
+    /// non-cached owner free goes through `Heap::free` after `matches` / `HeapId`.
     pub(crate) fn free(
         &self,
         inner: NonNull<AllocatorInner>,
@@ -208,12 +232,8 @@ impl ThreadHeap {
     ) -> Result<(), ThreadFreeError> {
         // SAFETY: PageMap stores only pointers published from this allocator's live arena.
         let run_ref = unsafe { run.as_ref() };
-        if !self.matches(inner) {
-            return Err(ThreadFreeError::NotBound);
-        }
-
         let class = run_ref.class();
-        // Sticky slots only park this heap's runs — pointer-eq before HeapId.
+        // Sticky before matches: slots only park this heap's runs and are cleared on unbind.
         if self.run_cell(class).get() == run.as_ptr() {
             // Sticky hit: Run only — do not finish_free / push_available.
             return match run_ref.free(ptr) {
@@ -222,7 +242,7 @@ impl ThreadHeap {
             };
         }
 
-        if self.heap_id.get() != Some(run_ref.heap_id()) {
+        if !self.matches(inner) || self.heap_id.get() != Some(run_ref.heap_id()) {
             return Err(ThreadFreeError::NotBound);
         }
 
