@@ -62,15 +62,19 @@ impl Page {
         }
     }
 
-    pub(super) const fn indexes(self) -> Option<(L1Index, L2Index)> {
-        let l2 = self.number & (L2_ENTRIES - 1);
-        let l1 = self.number >> L2_BITS;
-
-        if l1 >= L1_ENTRIES {
-            return None;
-        }
-
-        Some((L1Index { index: l1 }, L2Index { index: l2 }))
+    /// Infallible L1/L2 split for canonical 48-bit user VA (l1 always `< L1_ENTRIES`).
+    #[inline]
+    pub(super) fn split(ptr: NonNull<u8>) -> (L1Index, L2Index) {
+        let page = ptr.as_ptr().addr() >> PAGE_SHIFT;
+        debug_assert!(page >> L2_BITS < L1_ENTRIES);
+        (
+            L1Index {
+                index: page >> L2_BITS,
+            },
+            L2Index {
+                index: page & (L2_ENTRIES - 1),
+            },
+        )
     }
 }
 
