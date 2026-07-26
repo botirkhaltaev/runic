@@ -11,7 +11,7 @@ Run metadata owns small size-class allocations.
 
 - A run owns one mapping and one size class. The mapping is `RUN_SIZE` payload bytes plus one `AtomicU8` per block for state; `Run::range` is the payload span only.
 - Returned blocks must be valid block boundaries inside the payload span.
-- Freelist head and intrusive links use one `usize` / `FREE_END` encoding; allocate pops/bumps an index then resolves a payload pointer. Frees of user pointers validate block boundaries via `block_at`.
+- Freelist head and intrusive links use one `usize` / `FREE_END` encoding; allocate pops/bumps an index then resolves a payload pointer via cached `payload_base`. Frees of user pointers validate block boundaries via `block_at`.
 - `BlockStates` is the only free / allocated / remote-pending tracker (one `AtomicU8` per block for the run's capacity, viewed as an `AddressRange` over the mapping's state tail). Owner and remote paths each resolve that atom once for a capacity-proven index.
 - `Run::free` / `accept` return `Result<(), RunError>`; `RunHeap` reads `is_full()` before those ops for available-list `finish_free`. Sticky TLS free calls `Run::free` only.
 - `RunHeap` available-list pointers must refer to live `Arena<Run>` entries.
