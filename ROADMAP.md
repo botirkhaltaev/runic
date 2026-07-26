@@ -137,8 +137,8 @@ SizeClasses    owns size-class selection.
 OsMemory       maps anonymous pages; Mapping owns the mmap lifecycle (Drop munmaps).
 PageMap        owns page-indexed owner-pointer lookup.
 RunHeap        owns Arena<Run>, small-allocation policy, and available run lists.
-Run            owns fixed-block allocation metadata and per-block state.
-BlockStates    owns reusable, allocated, and remote-pending block state (one AtomicU8 per block).
+Run            owns fixed-block allocation metadata, freelist-primary Free/Live, and bump.
+BlockStates    owns clear/Free/RemotePending per-block bits (one AtomicU8 per block); Free bit is DF fail-closed, not Free/Live authority (freelist + bump owns that).
 ExtentHeap     owns Arena<Extent>, dedicated allocation policy, and mapping reuse.
 ExtentCache    owns retained extent mappings, eviction, and reuse lookup.
 Extent         owns dedicated allocation metadata.

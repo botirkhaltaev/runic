@@ -66,7 +66,7 @@ GlobalAlloc
      -> HeapTable { generations[], slots: Arena<Heap> }
          -> ThreadHeap
      -> Heap { mode, RunHeap, ExtentHeap, Inbox }
-         -> RunHeap { Arena<Run>, available[] } -> Run (HeapId, BlockStates)
+         -> RunHeap { Arena<Run>, available[] } -> Run (HeapId, freelist, RemotePending BlockStates)
          -> ExtentHeap { Arena<Extent>, cache } -> Extent (HeapId)
 ```
 
