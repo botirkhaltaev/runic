@@ -210,6 +210,41 @@ impl ThreadHeap {
         unsafe { self.bound_heap().as_mut() }.allocate_extent(spec, pages, init)
     }
 
+    /// Layout-directed free: sticky for `class`, else `PageMap`. Keeps hot path in one fn.
+    #[inline]
+    pub(crate) fn dealloc(
+        &self,
+        inner: NonNull<AllocatorInner>,
+        pages: &PageMap,
+        class: Option<SizeClassId>,
+        ptr: NonNull<u8>,
+    ) -> Result<(), (PageOwner, ThreadFreeError)> {
+        if let Some(class) = class
+            && let Some(run) = NonNull::new(self.run_cell(class).get())
+        {
+            // SAFETY: sticky run pointers are published from this heap's live arena.
+            match unsafe { run.as_ref() }.free(ptr) {
+                Ok(()) => return Ok(()),
+                Err(RunError::InvalidPointer) => {}
+                Err(error) => {
+                    return Err((PageOwner::Run(run), ThreadFreeError::from(error)));
+                }
+            }
+        }
+
+        let Some(owner) = self.lookup_owner(inner, pages, ptr) else {
+            Allocator::abort();
+        };
+        let result = match owner {
+            PageOwner::Run(run) => self.free(inner, run, ptr),
+            PageOwner::Extent(extent) => self.free_extent(inner, extent, ptr),
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => Err((owner, error)),
+        }
+    }
+
     /// Owner-local free for a run owned by the bound heap.
     ///
     /// Sticky hit is the straight-line body (unbind clears sticky ⇒ sticky implies bound);
@@ -360,9 +395,14 @@ impl ThreadHeap {
 
         // Inbox is empty after the optional flush above, so acquire_run will not flush again.
         let run = heap_mut.acquire_run(class, pages)?;
-        cell.set(run.as_ptr());
+        self.park_run(class, run);
         // SAFETY: run was just returned by this heap's live arena.
         unsafe { run.as_ref() }.allocate()
+    }
+
+    /// Park `run` as the sticky run for `class`.
+    pub(crate) fn park_run(&self, class: SizeClassId, run: NonNull<Run>) {
+        self.run_cell(class).set(run.as_ptr());
     }
 
     fn run_cell(&self, class: SizeClassId) -> &Cell<*mut Run> {
