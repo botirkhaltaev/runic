@@ -23,6 +23,12 @@ impl SizeClassId {
             None
         }
     }
+
+    /// `index` must be in `0..SizeClasses::COUNT` (e.g. from `CLASS_FOR_SIZE`).
+    const unsafe fn new_unchecked(index: usize) -> Self {
+        debug_assert!(index < SizeClasses::COUNT);
+        Self { index }
+    }
 }
 
 pub(crate) struct SizeClasses;
@@ -122,28 +128,35 @@ impl SizeClasses {
         table
     }
 
-    /// Map a layout to a small size class, or `None` for large/over-aligned requests.
+    /// Map a normalized layout to a small size class, or `None` for large/over-aligned.
     ///
-    /// Default-align (`align <= 8`) is the hot path: one bounds check, then a direct
-    /// `CLASS_FOR_SIZE` lookup. Higher alignments take the const align-remap table.
+    /// Default-align (`align <= 8`) is the hot path: size bound + `CLASS_FOR_SIZE`
+    /// only — no `PAGE_SIZE` check (align 8 is always ≤ page). Higher alignments
+    /// take the align-remap table. Zero-size is already normalized by `LayoutSpec`.
+    #[inline]
     pub(crate) fn id_for(spec: LayoutSpec) -> Option<SizeClassId> {
-        let align = spec.align();
-        if align > PAGE_SIZE {
-            return None;
+        let size = spec.size();
+        let align = spec.align().get();
+        let required = size.max(align);
+
+        if align <= Self::MIN_ALIGNMENT {
+            if required > Self::SMALL_MAX {
+                return None;
+            }
+
+            // SAFETY: `required` is in `1..=SMALL_MAX`, so the table slot is
+            // initialized; every stored class index is `< COUNT`.
+            let index = usize::from(unsafe { *Self::CLASS_FOR_SIZE.get_unchecked(required) });
+            // SAFETY: `index` came from `CLASS_FOR_SIZE` and is `< COUNT`.
+            return Some(unsafe { SizeClassId::new_unchecked(index) });
         }
 
-        // `LayoutSpec` normalizes zero size to 1; align is a nonzero power of two.
-        let required = spec.minimum_block_size();
-        if required > Self::SMALL_MAX {
+        if align > PAGE_SIZE || required > Self::SMALL_MAX {
             return None;
         }
 
         // SAFETY: `required` is in `1..=SMALL_MAX`, so the table slot is initialized.
         let lower_bound = usize::from(unsafe { *Self::CLASS_FOR_SIZE.get_unchecked(required) });
-        if align <= Self::MIN_ALIGNMENT {
-            return SizeClassId::new(lower_bound);
-        }
-
         Self::aligned_class_from(lower_bound, align)
     }
 
@@ -181,13 +194,20 @@ mod tests {
 
     use super::*;
 
-    fn layout_spec(size: usize, align: usize) -> LayoutSpec {
+    fn spec(size: usize, align: usize) -> LayoutSpec {
         LayoutSpec::from_layout(Layout::from_size_align(size, align).unwrap())
     }
 
     #[test]
     fn size_classes_map_one_byte_to_eight() {
-        let id = SizeClasses::id_for(layout_spec(1, 1)).unwrap();
+        let id = SizeClasses::id_for(spec(1, 1)).unwrap();
+
+        assert_eq!(SizeClasses::block_size(id), 8);
+    }
+
+    #[test]
+    fn size_classes_normalize_zero_size_via_layout_spec() {
+        let id = SizeClasses::id_for(spec(0, 8)).unwrap();
 
         assert_eq!(SizeClasses::block_size(id), 8);
     }
@@ -195,7 +215,7 @@ mod tests {
     #[test]
     fn size_classes_map_exact_boundaries_to_themselves() {
         for &size in &SizeClasses::SIZES {
-            let id = SizeClasses::id_for(layout_spec(size, 1)).unwrap();
+            let id = SizeClasses::id_for(spec(size, 1)).unwrap();
 
             assert_eq!(SizeClasses::block_size(id), size);
         }
@@ -203,17 +223,17 @@ mod tests {
 
     #[test]
     fn size_classes_reject_larger_than_small_max() {
-        assert!(SizeClasses::id_for(layout_spec(SizeClasses::SMALL_MAX + 1, 1)).is_none());
+        assert!(SizeClasses::id_for(spec(SizeClasses::SMALL_MAX + 1, 1)).is_none());
     }
 
     #[test]
     fn size_classes_reject_over_page_alignment() {
-        assert!(SizeClasses::id_for(layout_spec(1, PAGE_SIZE * 2)).is_none());
+        assert!(SizeClasses::id_for(spec(1, PAGE_SIZE * 2)).is_none());
     }
 
     #[test]
     fn size_classes_choose_naturally_aligned_block() {
-        let id = SizeClasses::id_for(layout_spec(17, 16)).unwrap();
+        let id = SizeClasses::id_for(spec(17, 16)).unwrap();
 
         assert_eq!(SizeClasses::block_size(id), 32);
     }
@@ -224,8 +244,7 @@ mod tests {
             for align in [
                 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
             ] {
-                let class =
-                    SizeClasses::id_for(layout_spec(size, align)).map(SizeClasses::block_size);
+                let class = SizeClasses::id_for(spec(size, align)).map(SizeClasses::block_size);
                 let reference = if align > PAGE_SIZE {
                     None
                 } else {

@@ -4,17 +4,18 @@ Run metadata owns small size-class allocations.
 
 ## Files
 
-- `mod.rs`: `Run`, `RunId`, and per-block `AtomicU8` state (`BlockStates`).
+- `mod.rs`: `Run`, `RunId`, freelist-primary ownership, and clear/Free/RemotePending `BlockStates`.
 - `heap.rs`: `RunHeap` with `Arena<Run>`, available-run lists, page-map publication, and arena-wide `HeapId` rebind.
 
 ## Invariants
 
-- A run owns one mapping and one size class. The mapping is `RUN_SIZE` payload bytes plus one `AtomicU8` per block for state; `Run::range` is the payload span only.
+- A run owns one mapping and one size class. The mapping is `RUN_SIZE` payload bytes plus one `AtomicU8` per block for Free/pending bits; `Run::range` is the payload span only.
 - Returned blocks must be valid block boundaries inside the payload span.
-- Freelist head and intrusive links use one `usize` / `FREE_END` encoding; allocate pops/bumps an index then resolves a payload pointer. Frees of user pointers validate block boundaries via `block_at`.
-- `BlockStates` is the only free / allocated / remote-pending tracker (one `AtomicU8` per block for the run's capacity, viewed as an `AddressRange` over the mapping's state tail). Owner and remote paths each resolve that atom once for a capacity-proven index.
+- Owner Free/Live **authority** is freelist membership (+ bump). Allocate pops/bumps then `live++`; bump allocate stores no `BlockStates`; freelist allocate clears Free.
+- Freelist head and intrusive payload links use raw `usize` / `FREE_END`.
+- `BlockStates` Free bit keeps delayed double-free fail-closed (clear ↔ Free ↔ RemotePending). Never-issued indices are rejected via owner `bump` / cold `issued`.
 - `Run::free` / `accept` return `Result<(), RunError>`; `RunHeap` reads `is_full()` before those ops for available-list `finish_free`. Sticky TLS free calls `Run::free` only.
 - `RunHeap` available-list pointers must refer to live `Arena<Run>` entries.
 - Sticky TLS caches hold a run checked out from `available[]`; reincarnation rebinds every occupied arena run, including sticky ones.
-- Live small ownership for reclaim is `RunHeap::has_live_blocks` over occupied arena runs (allocated + remote-pending).
+- Live small ownership for reclaim is `RunHeap::has_live_blocks` over occupied arena runs (live + remote-pending).
 - Runs stay published and arena-resident for the heap lifetime in v0.5 (no empty-run OS release).

@@ -2,26 +2,9 @@
 
 Scope: `crates/runic-core/src/memory/`.
 
-- Keep OS mapping lifecycle in `OsMemory` and `Mapping`.
-- `Mapping` construction is private to `os.rs`; every `Mapping` must come from `OsMemory::map` so its `(base, len)` always describes a live, uniquely-owned mmap region (`NonZeroUsize` length, page-aligned base, page-multiple len). Do not widen this constructor's visibility as a shortcut.
-- `OsMemory` has no raw `unmap` escape hatch. Anything that owns mmap'd storage must hold a `Mapping` (or a type that owns one) and rely on `Drop` to release it; do not reintroduce `mem::forget`-plus-manual-`munmap` patterns.
-- `AddressRange` is ownership-free `(base, len)` geometry (e.g. extent user sub-ranges). Do not put munmap or uniqueness on it.
-- Keep pointer lookup and ownership publication in `PageMap`.
-- `L1Table` is a three-array root: hot `tables: [AtomicPtr<L2Table>; L1_ENTRIES]` for lock-free `get`, cold `writes: [AtomicBool; L1_ENTRIES]` for per-L2 stamp exclusion, cold `mappings: [UnsafeCell<Option<Mapping>>; L1_ENTRIES]` for L2 mmap ownership. Do not put write locks or `Mapping` on the get-indexed `tables` words. Do not put `AtomicBool` on `L2Table` — that rounds each L2 mmap past eight pages (`0x9000`) and regresses large churn.
-- `PageMap` install is once-only via `AtomicPtr` CAS (L1 root and each L2 pointer in `tables`). Page stamps use **per-L2** write exclusion on `writes[l1]` (zero-filled ⇒ unlocked) plus `AtomicMapEntry::store`. Do not reintroduce a global PageMap stamp mutex, occupancy counters, tip-bit locks, or per-page CAS as the stamp protocol.
-- L1 mmap ownership lives in `PageMap::l1_mapping`; each L2 mmap lives in `L1Table::mappings[i]`. Install protocol: mmap → CAS-publish pointer in `tables[i]` → only the CAS winner stores `Mapping` in `mappings[i]`; loser drops its `Mapping`. Cold arrays are install/stamp/drop only — `get` never touches them.
-- L2 tables are retained for the `PageMap` lifetime (no empty-L2 reclaim in v0.5). `L2Table` is page stamps only and must stay `size_of::<L2Table>() == 0x8000`.
-- Multi-page insert/remove: install L2s (insert), take `L1WriteGuard` over touched `writes[l1]` locks in ascending L1 order (Drop unlocks), validate under the guard, store. Failed validate writes nothing; Drop still unlocks. Do not pair manual unlock at call sites. Remove rejects a missing L2 before locking.
-- Zero-fill (anonymous mmap) must stay a valid empty state: null `tables` slots, unlocked `writes`, `Option<Mapping>` niche `None`, empty L2 page entries. Prove niches with unit tests when changing the layout.
-- `get` stays lock-free: Acquire loads on L1 root → `tables[l1]` → page entry only; never takes `writes` or reads `mappings`. Compose as `PageMap::get` → `L1Table::owner` → `L2Table::owner`.
-- `PageMap::{publish_run,publish_extent,unpublish_extent}` take `&Mapping` (not a raw `AddressRange`). Preserve `PageOwner` pointer lifetime assumptions: owners stay live until their page-map range is removed.
-- `PageMap` has exactly one in-memory representation per published range: every page in a run or extent range gets a direct per-page entry. Do not add a second encoding (e.g. a span/run-length record) that `PageMap` silently falls back to when the primary one is exhausted or unavailable; if a future optimization needs a denser encoding, replace the representation everywhere rather than layering a fallback next to it.
-- Extents use `publish_extent` / `unpublish_extent`. Runs only `publish_run` today: empty-run reclaim is not implemented, so do not add a dead `unpublish_run` (or `#[allow(dead_code)]`) ahead of that work. When reclaim lands, add `unpublish_run` with its first real caller in the same change.
-- `PageOwner` stays a concrete `Run`/`Extent` enum rather than an opaque `NonNull` + kind tag: callers in `allocator.rs`, `heap/run/heap.rs`, and `heap/extent/heap.rs` pattern-match on it and immediately dereference the typed pointer, so erasing the type would only add casts at every call site without removing any duplication. `MapEntry` already carries the kind bit needed for compact storage; revisit `PageOwner` only if a caller needs to hold page-map results without knowing the arena type.
-- Put page-map behavior on the owning type: `AtomicMapEntry` (load/store), `L2Table` (owner + segment match/write under caller-held write lock), `L1Table` / `L1WriteGuard` (dense `tables`, cold `writes`/`mappings`, install, ordered range lock + stamp), `PageMap` (publish/get composition). Write exclusion lives on `L1Table` because the SoA layout parks the flag beside L1 state, not inside the L2 page-stamp mmap.
-- `L1Table` is sized for the full 48-bit address space and relies on the OS to lazily back it with physical pages; densifying `get` means a hot pointer array only (not shrinking the VA). Revisit VA shape only with a profile showing L1 reservation or first-touch cost matters.
-- Do not embed large registries (`Arena`, fat mutex state) inside `PageMap` / `AllocatorInner` — that bloats the allocator header and regresses the small churn path.
-- Add concurrent publish smoke tests (disjoint ranges, same-L2 disjoint pages, overlapping race) when changing stamp exclusion or install protocol.
-- Keep unsafe pointer/provenance code narrow and adjacent to safety comments.
-- Add page-map tests for overlap, removal, and L2 boundary behavior when changing lookup logic.
-- When changing get/stamp layout, re-measure `single_size_churn/64` and `large_alloc_churn/65536` and confirm with `perf` annotate (L2 mmap size, `tables` stride) before keeping the change.
+- Every `Mapping` from `OsMemory::map` only; no raw `unmap` / `mem::forget`+munmap.
+- `PageMap::get` lock-free via hot `tables` only; never touches cold `writes`/`mappings`.
+- Checked `Page::split` on untrusted pointers (fail closed outside 48-bit geometry).
+- One in-memory encoding per published range — no layered span fallback beside per-page stamps.
+- No dead `unpublish_run` until empty-run reclaim lands with a real caller.
+- Details: `crates/runic-core/src/memory/README.md`.

@@ -277,7 +277,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(extent.ptr().as_ptr() as usize % spec.align(), 0);
+        assert!(spec.is_addr_aligned(extent.ptr().as_ptr() as usize));
         assert_eq!(extent.range.len(), spec.size());
         assert!(mapping_range.offset_of(extent.ptr()).is_some());
     }

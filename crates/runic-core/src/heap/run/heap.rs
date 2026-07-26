@@ -213,6 +213,7 @@ impl RunHeap {
         debug_assert_eq!(inserted_run.id, id);
         let run_ptr = NonNull::from(&mut *inserted_run);
 
+        debug_assert_eq!(inserted_run.range().base(), inserted_run.mapping().base());
         if pages.publish_run(inserted_run.mapping(), run_ptr).is_err() {
             let _removed = self.runs.remove(usize::try_from(id.index()).ok()?);
             return None;
@@ -227,7 +228,6 @@ impl From<RunError> for RunHeapError {
         match error {
             RunError::InvalidPointer => Self::InvalidPointer,
             RunError::DoubleFree => Self::DoubleFree,
-            RunError::FreeUnderflow => Self::InvalidMetadata,
         }
     }
 }
@@ -246,12 +246,11 @@ mod tests {
     use super::super::RUN_SIZE;
     use super::*;
 
-    fn layout_spec(size: usize, align: usize) -> LayoutSpec {
-        LayoutSpec::from_layout(Layout::from_size_align(size, align).unwrap())
-    }
-
     fn class_id(size: usize, align: usize) -> SizeClassId {
-        SizeClasses::id_for(layout_spec(size, align)).unwrap()
+        SizeClasses::id_for(LayoutSpec::from_layout(
+            Layout::from_size_align(size, align).unwrap(),
+        ))
+        .unwrap()
     }
 
     fn reusable_run(id: RunId) -> Run {

@@ -62,15 +62,24 @@ impl Page {
         }
     }
 
-    pub(super) const fn indexes(self) -> Option<(L1Index, L2Index)> {
-        let l2 = self.number & (L2_ENTRIES - 1);
-        let l1 = self.number >> L2_BITS;
-
+    /// L1/L2 split for an addressable user page, or `None` when `l1 >= L1_ENTRIES`.
+    ///
+    /// `PageMap::get` takes untrusted dealloc pointers — fail closed instead of
+    /// unchecked L1 indexing outside the 48-bit map geometry.
+    #[inline]
+    pub(super) fn split(ptr: NonNull<u8>) -> Option<(L1Index, L2Index)> {
+        let page = ptr.as_ptr().addr() >> PAGE_SHIFT;
+        let l1 = page >> L2_BITS;
         if l1 >= L1_ENTRIES {
             return None;
         }
 
-        Some((L1Index { index: l1 }, L2Index { index: l2 }))
+        Some((
+            L1Index { index: l1 },
+            L2Index {
+                index: page & (L2_ENTRIES - 1),
+            },
+        ))
     }
 }
 

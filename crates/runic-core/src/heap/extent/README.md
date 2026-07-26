@@ -10,7 +10,7 @@ Extent metadata owns dedicated large allocations.
 
 ## Same-thread fast path
 
-`ThreadHeap::alloc_extent` / `ThreadHeap::free_extent` call `Heap::allocate_extent` / `Heap::free(PageOwner::Extent)` on the bound heap without taking the table mutex. Extents have no sticky TLS slot cache (unlike runs) because `ExtentCache` already owns reuse. `Allocator::alloc`, `alloc_zeroed`, and `dealloc` try this path first and fall back to `bind` + locked heap work only on TLS miss or cross-heap pointers.
+`ThreadHeap::alloc_extent` / `ThreadHeap::free_extent` call `Heap::allocate_extent` / `Heap::free(PageOwner::Extent)` on the bound heap without taking the table mutex. Extents have no sticky TLS slot cache (unlike runs) because `ExtentCache` already owns reuse. `Allocator::alloc` / `alloc_zeroed` try the TLS path first and fall back to `alloc_extent_remote` (bind + locked heap) when unbound; `dealloc` uses `free_remote` for cross-heap pointers.
 
 ## Invariants
 
