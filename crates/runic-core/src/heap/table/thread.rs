@@ -147,29 +147,6 @@ impl ThreadHeap {
         Some(owner)
     }
 
-    /// Lookup + owner-local free for one TLS entry (`Allocator::dealloc` must not nest another `with`).
-    ///
-    /// `Err(None)` = unknown pointer. `Err(Some(_))` = not owner-local (caller → `free_remote`).
-    #[inline]
-    pub(crate) fn free_local(
-        &self,
-        inner: NonNull<AllocatorInner>,
-        pages: &PageMap,
-        ptr: NonNull<u8>,
-    ) -> Result<(), Option<(PageOwner, ThreadFreeError)>> {
-        let Some(owner) = self.lookup_owner(pages, ptr) else {
-            return Err(None);
-        };
-        match owner {
-            PageOwner::Run(run) => self
-                .free(inner, run, ptr)
-                .map_err(|error| Some((owner, error))),
-            PageOwner::Extent(extent) => self
-                .free_extent(inner, extent, ptr)
-                .map_err(|error| Some((owner, error))),
-        }
-    }
-
     fn clear_page_cache(&self) {
         self.page_cache_page.set(usize::MAX);
         self.page_cache_owner.set(None);
@@ -224,6 +201,7 @@ impl ThreadHeap {
     ///
     /// Sticky hit is the straight-line body (unbind clears sticky ⇒ sticky implies bound);
     /// non-cached owner free goes through `Heap::free` after `matches` / `HeapId`.
+    #[inline]
     pub(crate) fn free(
         &self,
         inner: NonNull<AllocatorInner>,
