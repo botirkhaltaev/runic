@@ -45,10 +45,6 @@ impl BlockIndex {
         self.index
     }
 
-    fn offset(self, block_size: usize) -> Option<usize> {
-        self.get().checked_mul(block_size)
-    }
-
     /// State-tail byte for an index already proven in `0..bytes.len()` (capacity).
     fn byte_unchecked(self, bytes: AddressRange) -> NonNull<u8> {
         debug_assert!(self.get() < bytes.len());
@@ -75,21 +71,12 @@ impl RunBlock {
     pub(crate) const fn ptr(self) -> NonNull<u8> {
         self.ptr
     }
-
-    fn at_offset(index: BlockIndex, base: NonNull<u8>, block_size: usize) -> Option<Self> {
-        let offset = index.offset(block_size)?;
-        // SAFETY: caller constructs indexes from this run's capacity, so offset is in range.
-        let ptr = unsafe { NonNull::new_unchecked(base.as_ptr().add(offset)) };
-
-        Some(Self::new(index, ptr))
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RunError {
     InvalidPointer,
     DoubleFree,
-    FreeUnderflow,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -160,15 +147,29 @@ impl BlockStates {
     /// Owner-local Allocated → Free. `index` must be capacity-proven.
     fn release(&self, index: BlockIndex) -> Result<(), BlockStateError> {
         let state = self.state_unchecked(index);
-        match BlockState::from_raw(state.load(Ordering::Relaxed))
-            .ok_or(BlockStateError::InvalidIndex)?
-        {
-            BlockState::Allocated => {
-                state.store(BlockState::Free.raw(), Ordering::Relaxed);
-                Ok(())
+        let raw = state.load(Ordering::Relaxed);
+        if raw != BlockState::Allocated.raw() {
+            return Err(Self::release_err(raw));
+        }
+
+        state.store(BlockState::Free.raw(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn release_err(raw: u8) -> BlockStateError {
+        // Caller already proved `raw != Allocated`; remaining cases are domain
+        // errors or corrupt bytes (not an index failure after `state_unchecked`).
+        match BlockState::from_raw(raw) {
+            Some(BlockState::Free) => BlockStateError::AlreadyFree,
+            Some(BlockState::RemotePending) => BlockStateError::AlreadyPending,
+            Some(BlockState::Allocated) => {
+                debug_assert!(false, "release_err after Allocated check");
+                BlockStateError::AlreadyAllocated
             }
-            BlockState::Free => Err(BlockStateError::AlreadyFree),
-            BlockState::RemotePending => Err(BlockStateError::AlreadyPending),
+            // Corrupt state after a capacity-proven index.
+            None => BlockStateError::InvalidIndex,
         }
     }
 
@@ -235,6 +236,8 @@ pub(crate) struct Run {
     id: RunId,
     heap: HeapId,
     mapping: Mapping,
+    /// Cached `mapping.base()` — payload span start (`RUN_SIZE` bytes).
+    payload_base: NonNull<u8>,
     class: SizeClassId,
     block_size: usize,
     block_shift: Option<u32>,
@@ -295,6 +298,7 @@ impl Run {
         Some(Self {
             id,
             heap,
+            payload_base: mapping.base(),
             mapping,
             class,
             block_size,
@@ -356,15 +360,17 @@ impl Run {
     }
 
     pub(crate) fn range(&self) -> AddressRange {
-        AddressRange::new(self.mapping.base(), RUN_SIZE)
+        AddressRange::new(self.payload_base, RUN_SIZE)
     }
 
+    #[inline]
     pub(crate) fn allocate(&self) -> Option<NonNull<u8>> {
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
-        let index = self
-            .pop_free(state)
-            .or_else(|| state.allocate_fresh(self.capacity))?;
+        let index = match self.pop_free(state) {
+            Some(index) => index,
+            None => state.allocate_fresh(self.capacity)?,
+        };
         let ptr = self.block_ptr(index);
         self.blocks.allocate(index);
 
@@ -374,28 +380,40 @@ impl Run {
     }
 
     /// Owner-local: Allocated → Free, push freelist.
+    #[inline]
     pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
-        let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
+        let Some(block) = self.block_at(ptr) else {
+            return Err(Self::free_invalid());
+        };
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
 
-        match self.blocks.release(block.index()) {
-            Ok(()) => {}
-            Err(
-                BlockStateError::AlreadyFree
-                | BlockStateError::AlreadyAllocated
-                | BlockStateError::AlreadyPending,
-            ) => return Err(RunError::DoubleFree),
-            Err(BlockStateError::InvalidIndex) => return Err(RunError::InvalidPointer),
+        if let Err(error) = self.blocks.release(block.index()) {
+            return Err(Self::free_state_err(error));
         }
 
-        let Some(live) = state.live.checked_sub(1) else {
-            return Err(RunError::FreeUnderflow);
-        };
-
-        state.live = live;
+        // Allocated ⇒ live > 0; underflow is an invariant break caught above as double-free.
+        debug_assert!(state.live > 0);
+        state.live -= 1;
         Self::push_free(state, block);
         Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn free_invalid() -> RunError {
+        RunError::InvalidPointer
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn free_state_err(error: BlockStateError) -> RunError {
+        match error {
+            BlockStateError::AlreadyFree
+            | BlockStateError::AlreadyAllocated
+            | BlockStateError::AlreadyPending => RunError::DoubleFree,
+            BlockStateError::InvalidIndex => RunError::InvalidPointer,
+        }
     }
 
     /// Freer: Allocated → `RemotePending` (before batch/publish).
@@ -443,11 +461,9 @@ impl Run {
             Err(BlockStateError::InvalidIndex) => return Err(RunError::InvalidPointer),
         }
 
-        let Some(live) = state.live.checked_sub(1) else {
-            return Err(RunError::FreeUnderflow);
-        };
-
-        state.live = live;
+        // RemotePending ⇒ live > 0 (same invariant as owner free).
+        debug_assert!(state.live > 0);
+        state.live -= 1;
         Self::push_free(state, block);
         Ok(())
     }
@@ -471,10 +487,18 @@ impl Run {
         Ok(self.block_size >= spec.size() && spec.is_addr_aligned(ptr.as_ptr().addr()))
     }
 
+    #[inline]
     pub(crate) fn block_at(&self, ptr: NonNull<u8>) -> Option<RunBlock> {
-        let offset = self.range().offset_of(ptr)?;
-        let index = self.block_index(offset)?;
+        // Out-of-span (incl. below base) wraps to a large offset ≥ `RUN_SIZE`.
+        let offset = ptr
+            .as_ptr()
+            .addr()
+            .wrapping_sub(self.payload_base.as_ptr().addr());
+        if offset >= RUN_SIZE {
+            return None;
+        }
 
+        let index = self.block_index(offset)?;
         if index >= self.capacity {
             return None;
         }
@@ -483,16 +507,19 @@ impl Run {
     }
 
     /// Payload pointer for a freelist or bump index in `0..capacity`.
+    #[inline]
     fn block_ptr(&self, index: BlockIndex) -> NonNull<u8> {
         debug_assert!(index.get() < self.capacity);
-        // SAFETY: freelist / `allocate_fresh` only yield `index < capacity`.
-        unsafe {
-            RunBlock::at_offset(index, self.range().base(), self.block_size)
-                .unwrap_unchecked()
-                .ptr()
-        }
+        let byte_offset = match self.block_shift {
+            Some(shift) => index.get() << shift,
+            None => index.get() * self.block_size,
+        };
+        // SAFETY: freelist / `allocate_fresh` only yield `index < capacity`, so
+        // `byte_offset < RUN_SIZE` inside the payload span.
+        unsafe { NonNull::new_unchecked(self.payload_base.as_ptr().add(byte_offset)) }
     }
 
+    #[inline]
     fn pop_free(&self, state: &mut RunState) -> Option<BlockIndex> {
         let raw = state.free;
         if raw == FREE_END {
@@ -523,6 +550,7 @@ impl Run {
         }
     }
 
+    #[inline]
     fn block_index(&self, offset: usize) -> Option<usize> {
         if let Some(shift) = self.block_shift {
             if offset & (self.block_size - 1) != 0 {
@@ -532,11 +560,17 @@ impl Run {
             return Some(offset >> shift);
         }
 
-        if !offset.is_multiple_of(self.block_size) {
+        Self::block_index_non_pow2(offset, self.block_size)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn block_index_non_pow2(offset: usize, block_size: usize) -> Option<usize> {
+        if !offset.is_multiple_of(block_size) {
             return None;
         }
 
-        offset.checked_div(self.block_size)
+        offset.checked_div(block_size)
     }
 }
 

@@ -213,6 +213,7 @@ impl RunHeap {
         debug_assert_eq!(inserted_run.id, id);
         let run_ptr = NonNull::from(&mut *inserted_run);
 
+        debug_assert_eq!(inserted_run.range().base(), inserted_run.mapping().base());
         if pages.publish_run(inserted_run.mapping(), run_ptr).is_err() {
             let _removed = self.runs.remove(usize::try_from(id.index()).ok()?);
             return None;
@@ -227,7 +228,6 @@ impl From<RunError> for RunHeapError {
         match error {
             RunError::InvalidPointer => Self::InvalidPointer,
             RunError::DoubleFree => Self::DoubleFree,
-            RunError::FreeUnderflow => Self::InvalidMetadata,
         }
     }
 }
