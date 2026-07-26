@@ -371,7 +371,8 @@ impl Run {
         Some(ptr)
     }
 
-    pub(crate) fn free_local(&self, ptr: NonNull<u8>) -> Result<RunFreeStatus, RunError> {
+    /// Owner-local: Allocated → Free, push freelist.
+    pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<RunFreeStatus, RunError> {
         let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
@@ -397,7 +398,8 @@ impl Run {
         Ok(RunFreeStatus { was_full })
     }
 
-    pub(crate) fn claim_free(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
+    /// Freer: Allocated → `RemotePending` (before batch/publish).
+    pub(crate) fn claim(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
         let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
 
         match self.blocks.mark_remote_pending(block.index()) {
@@ -425,7 +427,8 @@ impl Run {
         }
     }
 
-    pub(crate) fn complete_remote_free(&self, ptr: NonNull<u8>) -> Result<RunFreeStatus, RunError> {
+    /// Owner: `RemotePending` → Free (inbox flush / publish Draining complete).
+    pub(crate) fn accept(&self, ptr: NonNull<u8>) -> Result<RunFreeStatus, RunError> {
         let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
@@ -643,7 +646,7 @@ mod tests {
 
         let ptr = run.allocate().unwrap();
 
-        assert!(run.free_local(ptr).is_ok());
+        assert!(run.free(ptr).is_ok());
 
         assert_eq!(run.allocate(), Some(ptr));
     }
@@ -725,8 +728,8 @@ mod tests {
         .expect("test run");
         let ptr = run.allocate().unwrap();
 
-        assert!(run.free_local(ptr).is_ok());
-        assert!(matches!(run.free_local(ptr), Err(RunError::DoubleFree)));
+        assert!(run.free(ptr).is_ok());
+        assert!(matches!(run.free(ptr), Err(RunError::DoubleFree)));
     }
 
     #[test]
@@ -741,8 +744,8 @@ mod tests {
         .expect("test run");
         let ptr = run.allocate().unwrap();
 
-        assert_eq!(run.claim_free(ptr), Ok(()));
-        assert_eq!(run.claim_free(ptr), Err(RunError::DoubleFree));
+        assert_eq!(run.claim(ptr), Ok(()));
+        assert_eq!(run.claim(ptr), Err(RunError::DoubleFree));
     }
 
     #[test]
@@ -757,9 +760,9 @@ mod tests {
         .expect("test run");
         let ptr = run.allocate().unwrap();
 
-        assert_eq!(run.claim_free(ptr), Ok(()));
+        assert_eq!(run.claim(ptr), Ok(()));
         assert_eq!(run.unclaim(ptr), Ok(()));
-        assert!(run.free_local(ptr).is_ok());
+        assert!(run.free(ptr).is_ok());
     }
 
     #[test]
@@ -774,8 +777,8 @@ mod tests {
         .expect("test run");
         let ptr = run.allocate().unwrap();
 
-        assert_eq!(run.claim_free(ptr), Ok(()));
-        assert!(matches!(run.free_local(ptr), Err(RunError::DoubleFree)));
+        assert_eq!(run.claim(ptr), Ok(()));
+        assert!(matches!(run.free(ptr), Err(RunError::DoubleFree)));
     }
 
     #[test]
@@ -790,8 +793,8 @@ mod tests {
         .expect("test run");
         let ptr = run.allocate().unwrap();
 
-        assert_eq!(run.claim_free(ptr), Ok(()));
-        assert!(run.complete_remote_free(ptr).is_ok());
+        assert_eq!(run.claim(ptr), Ok(()));
+        assert!(run.accept(ptr).is_ok());
         assert_eq!(run.allocate(), Some(ptr));
     }
 
@@ -807,7 +810,7 @@ mod tests {
         .expect("test run");
 
         assert!(matches!(
-            run.free_local(run.range().base()),
+            run.free(run.range().base()),
             Err(RunError::DoubleFree)
         ));
     }

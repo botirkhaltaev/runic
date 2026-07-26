@@ -4,7 +4,10 @@ use core::{
 };
 
 use crate::{
-    config::AllocatorConfig, layout::LayoutSpec, memory::PageMap, size_class::SizeClassId,
+    config::AllocatorConfig,
+    layout::LayoutSpec,
+    memory::{PageMap, PageOwner},
+    size_class::SizeClassId,
 };
 
 pub(crate) mod extent;
@@ -16,7 +19,7 @@ pub(crate) use extent::Extent;
 pub(crate) use extent::heap::{ExtentHeap, ExtentHeapError, ExtentInit};
 pub(crate) use id::HeapId;
 pub(crate) use run::{Run, RunError, RunHeap, RunHeapError, RunId};
-pub(crate) use table::{HeapError, HeapTable, Inbox, THREAD_HEAP};
+pub(crate) use table::{HeapError, HeapTable, Inbox, THREAD_HEAP, ThreadFreeError};
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,46 +158,37 @@ impl Heap {
         self.extents.allocate(spec, self.id, pages, init)
     }
 
-    /// Owner-local non-cached free: flush inbox if needed, then free.
+    /// Owner-local free for a resolved `PageMap` owner (run or extent).
     ///
     /// Callable via a TLS-bound `Heap` without taking the table mutex. Does not wrap the
-    /// cached-run hit (`Run::free_local`); that path stays on `ThreadHeap::free` for minimal work.
-    pub(crate) fn free_run_owner(
+    /// sticky-run hit (`Run::free`); that path stays on `ThreadHeap::free` for minimal work.
+    pub(crate) fn free(
         &mut self,
-        run: NonNull<Run>,
+        owner: PageOwner,
         ptr: NonNull<u8>,
         pages: &PageMap,
     ) -> Result<(), HeapError> {
         if !self.inbox.is_empty() {
             self.flush(pages)?;
         }
-        self.runs.free(run, ptr).map_err(HeapError::from)
-    }
-
-    /// Owner-local extent free: flush inbox if needed, then free.
-    pub(crate) fn free_extent_owner(
-        &mut self,
-        extent: NonNull<Extent>,
-        ptr: NonNull<u8>,
-        pages: &PageMap,
-    ) -> Result<(), HeapError> {
-        if !self.inbox.is_empty() {
-            self.flush(pages)?;
+        match owner {
+            PageOwner::Run(run) => self.runs.free(run, ptr).map_err(HeapError::from),
+            PageOwner::Extent(extent) => self
+                .extents
+                .free(extent, ptr, pages)
+                .map_err(HeapError::from),
         }
-        self.extents
-            .free(extent, ptr, pages)
-            .map_err(HeapError::from)
     }
 
     pub(crate) fn flush(&mut self, pages: &PageMap) -> Result<(), HeapError> {
         while let Some(list) = self.inbox.drain() {
             for ptr in list {
                 match pages.get(ptr) {
-                    Some(crate::memory::PageOwner::Run(run)) => {
-                        self.runs.complete_remote_free(run, ptr)?;
+                    Some(PageOwner::Run(run)) => {
+                        self.runs.accept(run, ptr)?;
                     }
-                    Some(crate::memory::PageOwner::Extent(extent)) => {
-                        self.extents.complete_remote_free(extent, ptr, pages)?;
+                    Some(PageOwner::Extent(extent)) => {
+                        self.extents.accept(extent, ptr, pages)?;
                     }
                     None => return Err(HeapError::InvalidPointer),
                 }
