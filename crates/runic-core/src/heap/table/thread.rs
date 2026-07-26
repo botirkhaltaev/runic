@@ -6,7 +6,7 @@ use core::{
 
 use crate::{
     allocator::{Allocator, AllocatorInner},
-    heap::{Extent, ExtentInit, Heap, HeapId, HeapTable, Run},
+    heap::{Extent, ExtentInit, Heap, HeapId, HeapTable, Run, RunError},
     layout::LayoutSpec,
     memory::{PageMap, PageOwner},
     size_class::{SizeClassId, SizeClasses},
@@ -191,10 +191,10 @@ impl ThreadHeap {
         let class = run_ref.class();
         if self.run_cell(class).get() == run.as_ptr() {
             // Sticky hit: Run only — do not finish_free / push_available.
-            run_ref
-                .free(ptr)
-                .map_err(|error| ThreadFreeError::Heap(error.into()))?;
-            return Ok(());
+            return match run_ref.free(ptr) {
+                Ok(()) => Ok(()),
+                Err(error) => Err(Self::sticky_free_err(error)),
+            };
         }
 
         // SAFETY: heap is bound only while this TLS entry retains the allocator inner.
@@ -206,6 +206,12 @@ impl ThreadHeap {
                 unsafe { inner.as_ref().pages() },
             )
             .map_err(ThreadFreeError::Heap)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn sticky_free_err(error: RunError) -> ThreadFreeError {
+        ThreadFreeError::Heap(error.into())
     }
 
     /// Owner-local free for an extent owned by the bound heap.

@@ -78,11 +78,12 @@ impl RunHeap {
     pub(crate) fn free(&mut self, run: NonNull<Run>, ptr: NonNull<u8>) -> Result<(), RunHeapError> {
         // SAFETY: PageMap stores only pointers published from this allocator's live arena.
         let run_ref = unsafe { run.as_ref() };
-        let status = run_ref.free(ptr).map_err(RunHeapError::from)?;
+        let was_full = run_ref.is_full();
+        run_ref.free(ptr).map_err(RunHeapError::from)?;
         self.finish_free(FreedRun {
             class: run_ref.class(),
             run,
-            was_full: status.was_full(),
+            was_full,
         })
     }
 
@@ -93,11 +94,12 @@ impl RunHeap {
     ) -> Result<(), RunHeapError> {
         // SAFETY: PageMap stores only pointers published from this allocator's live arena.
         let run_ref = unsafe { run.as_ref() };
-        let status = run_ref.accept(ptr).map_err(RunHeapError::from)?;
+        let was_full = run_ref.is_full();
+        run_ref.accept(ptr).map_err(RunHeapError::from)?;
         self.finish_free(FreedRun {
             class: run_ref.class(),
             run,
-            was_full: status.was_full(),
+            was_full,
         })
     }
 

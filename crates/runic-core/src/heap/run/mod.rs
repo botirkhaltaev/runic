@@ -259,16 +259,6 @@ struct RunState {
     free: usize,
 }
 
-pub(crate) struct RunFreeStatus {
-    was_full: bool,
-}
-
-impl RunFreeStatus {
-    pub(crate) const fn was_full(&self) -> bool {
-        self.was_full
-    }
-}
-
 impl Run {
     /// Bytes for one run mapping: `RUN_SIZE` payload plus one `AtomicU8` per block.
     pub(crate) fn mapping_len(class: SizeClassId) -> Option<usize> {
@@ -337,6 +327,14 @@ impl Run {
         unsafe { &*self.state.get() }.live < self.capacity
     }
 
+    /// True when every block is outstanding (allocated or remote-pending).
+    ///
+    /// Used by `RunHeap` before `free` / `accept` for available-list relink.
+    pub(crate) fn is_full(&self) -> bool {
+        // SAFETY: owner-local methods are called only by the owning heap.
+        unsafe { &*self.state.get() }.live == self.capacity
+    }
+
     /// Outstanding blocks on this run (allocated or remote-pending).
     pub(crate) fn has_live_blocks(&self) -> bool {
         // SAFETY: read under owner-local access or table-locked reclaim.
@@ -376,11 +374,10 @@ impl Run {
     }
 
     /// Owner-local: Allocated → Free, push freelist.
-    pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<RunFreeStatus, RunError> {
+    pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
         let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
-        let was_full = state.live == self.capacity;
 
         match self.blocks.release(block.index()) {
             Ok(()) => {}
@@ -398,8 +395,7 @@ impl Run {
 
         state.live = live;
         Self::push_free(state, block);
-
-        Ok(RunFreeStatus { was_full })
+        Ok(())
     }
 
     /// Freer: Allocated → `RemotePending` (before batch/publish).
@@ -432,11 +428,10 @@ impl Run {
     }
 
     /// Owner: `RemotePending` → Free (inbox flush / publish Draining complete).
-    pub(crate) fn accept(&self, ptr: NonNull<u8>) -> Result<RunFreeStatus, RunError> {
+    pub(crate) fn accept(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
         let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
-        let was_full = state.live == self.capacity;
 
         match self.blocks.release_remote_pending(block.index()) {
             Ok(()) => {}
@@ -454,8 +449,7 @@ impl Run {
 
         state.live = live;
         Self::push_free(state, block);
-
-        Ok(RunFreeStatus { was_full })
+        Ok(())
     }
 
     pub(crate) fn allocated_block_at(&self, ptr: NonNull<u8>) -> Result<RunBlock, RunError> {
