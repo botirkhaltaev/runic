@@ -108,6 +108,9 @@ pub(crate) struct ThreadHeap {
     heap_id: Cell<Option<HeapId>>,
     heap: Cell<*mut Heap>,
     runs: [Cell<*mut Run>; SizeClasses::COUNT],
+    /// Last `PageMap::get` page number (`usize::MAX` = empty).
+    page_cache_page: Cell<usize>,
+    page_cache_owner: Cell<Option<PageOwner>>,
     remote: UnsafeCell<RemoteBatch>,
 }
 
@@ -124,8 +127,29 @@ impl ThreadHeap {
             heap_id: Cell::new(None),
             heap: Cell::new(core::ptr::null_mut()),
             runs: [const { Cell::new(core::ptr::null_mut()) }; SizeClasses::COUNT],
+            page_cache_page: Cell::new(usize::MAX),
+            page_cache_owner: Cell::new(None),
             remote: UnsafeCell::new(RemoteBatch::new()),
         }
+    }
+
+    /// `PageMap` lookup with a one-entry TLS page→owner cache (miss fills from `pages`).
+    #[inline]
+    pub(crate) fn lookup_owner(&self, pages: &PageMap, ptr: NonNull<u8>) -> Option<PageOwner> {
+        let page = ptr.as_ptr().addr() / crate::memory::PAGE_SIZE;
+        if self.page_cache_page.get() == page {
+            return self.page_cache_owner.get();
+        }
+
+        let owner = pages.get(ptr)?;
+        self.page_cache_page.set(page);
+        self.page_cache_owner.set(Some(owner));
+        Some(owner)
+    }
+
+    fn clear_page_cache(&self) {
+        self.page_cache_page.set(usize::MAX);
+        self.page_cache_owner.set(None);
     }
 
     /// Owner-local small allocation via the TLS run cache.
@@ -379,6 +403,7 @@ impl ThreadHeap {
     #[cold]
     fn unbind(&self) {
         self.return_cached_runs();
+        self.clear_page_cache();
         let Some(inner) = NonNull::new(self.inner.replace(core::ptr::null_mut())) else {
             return;
         };
