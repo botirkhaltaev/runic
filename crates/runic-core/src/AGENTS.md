@@ -6,10 +6,11 @@ Scope: `crates/runic-core/src/`.
 - Keep module boundaries direct: `Heap`, `PageMap`, `RunHeap`, `ExtentHeap`, `Arena`, `Run`, `Extent`, `OsMemory`, and `SizeClasses` should own their responsibilities.
 - Prefer `NonZero*`, `NonNull`, and named-field domain types over sentinel values or ambiguous tuple structs.
 - `SizeClassId` is a bounded index into `SizeClasses::SIZES`; only `SizeClasses` constructs it. Prefer `SizeClasses::block_size(id)` over result-bag wrappers. Do not hand-maintain a second align-size table — const-generate the align remap from `SIZES`.
-- `SizeClasses::id_for` keeps default-align (`align <= 8`) as the hot fall-through: small-max check + `CLASS_FOR_SIZE` only (no `PAGE_SIZE` probe on that path). Over-aligned / large-align remap is cold. Do not reintroduce a second bounds check via `lower_bound_index` on the default-align path.
+- `SizeClasses::id_for` keeps default-align (`align <= 8`) as the hot fall-through: small-max check + `CLASS_FOR_SIZE` only (no `PAGE_SIZE` probe on that path). Over-aligned / large-align remap stays in the same method (no cold one-line helper split). Do not reintroduce a second bounds check via `lower_bound_index` on the default-align path.
 - `Allocator::alloc_zeroed` classifies once, then allocates (run or extent) and zeros run blocks at this boundary; do not call `alloc` from `alloc_zeroed` (that double-classifies).
 - Do not put `#[cfg(test)]` constructors on production `LayoutSpec` / entity impls; tests build specs via `Layout` + `from_layout`.
-- Unsafe blocks must be narrow and adjacent to the safety reasoning.
+- Prefer safe idiomatic Rust in this crate; use `unsafe` only at OS/ownership boundaries or measured hot-path needs, with narrow blocks next to SAFETY comments.
+- Prefer simple direct code; do not add cold one-line helpers or dual encodings unless correctness or a profile requires them.
 - Keep owner-local and remote-free responsibilities separated in type APIs; there is no central/root ownership heap.
 - A cache is acceptable only when owned by the entity whose lifecycle makes cached pointers valid.
 - Avoid free helper functions for allocator behavior; put allocation, free, cache, and lifecycle operations on the owning entity.

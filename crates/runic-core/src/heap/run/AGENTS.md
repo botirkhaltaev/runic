@@ -13,4 +13,4 @@ Scope: `crates/runic-core/src/heap/run/`.
 - Domain free ops: `Run::free` / `accept` return `Result<(), RunError>` (Allocated→Free / RemotePending→Free); `claim` (Allocated→RemotePending); `unclaim` (rollback). `RunHeap::{free,accept}` read `Run::is_full()` before the domain op, then share private `finish_free` for available-list bookkeeping. Sticky TLS free calls `Run::free` only (no `was_full` / `finish_free`).
 - `Run::has_live_blocks` / `RunHeap::has_live_blocks` are the reclaim model for outstanding small ownership (including remote-pending); do not reintroduce a heap-level alloc side counter.
 - Runs are retained in v0.5: no empty-run PageMap unpublish or OS release.
-- Prefer entity methods over free helpers for allocate/free/remote paths.
+- Prefer entity methods over free helpers for allocate/free/remote paths. Map `BlockStateError` → `RunError` with `From` / `?` (no cold one-line error wrappers).

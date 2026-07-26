@@ -149,28 +149,13 @@ impl BlockStates {
         let state = self.state_unchecked(index);
         let raw = state.load(Ordering::Relaxed);
         if raw != BlockState::Allocated.raw() {
-            return Err(Self::release_err(raw));
+            // `state_error` covers Free / RemotePending / corrupt; Allocated is
+            // unreachable after the check above (owner-local).
+            return Self::state_error(raw);
         }
 
         state.store(BlockState::Free.raw(), Ordering::Relaxed);
         Ok(())
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn release_err(raw: u8) -> BlockStateError {
-        // Caller already proved `raw != Allocated`; remaining cases are domain
-        // errors or corrupt bytes (not an index failure after `state_unchecked`).
-        match BlockState::from_raw(raw) {
-            Some(BlockState::Free) => BlockStateError::AlreadyFree,
-            Some(BlockState::RemotePending) => BlockStateError::AlreadyPending,
-            Some(BlockState::Allocated) => {
-                debug_assert!(false, "release_err after Allocated check");
-                BlockStateError::AlreadyAllocated
-            }
-            // Corrupt state after a capacity-proven index.
-            None => BlockStateError::InvalidIndex,
-        }
     }
 
     fn mark_remote_pending(&self, index: BlockIndex) -> Result<(), BlockStateError> {
@@ -272,6 +257,14 @@ impl Run {
         RUN_SIZE.checked_add(capacity)
     }
 
+    const fn block_size_shift(block_size: usize) -> Option<u32> {
+        if block_size.is_power_of_two() {
+            Some(block_size.trailing_zeros())
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn new(
         id: RunId,
         heap: HeapId,
@@ -302,7 +295,7 @@ impl Run {
             mapping,
             class,
             block_size,
-            block_shift: block_size_shift(block_size),
+            block_shift: Self::block_size_shift(block_size),
             capacity,
             state: UnsafeCell::new(RunState::new(block_size)),
             blocks,
@@ -382,15 +375,11 @@ impl Run {
     /// Owner-local: Allocated → Free, push freelist.
     #[inline]
     pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
-        let Some(block) = self.block_at(ptr) else {
-            return Err(Self::free_invalid());
-        };
+        let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
 
-        if let Err(error) = self.blocks.release(block.index()) {
-            return Err(Self::free_state_err(error));
-        }
+        self.blocks.release(block.index())?;
 
         // Allocated ⇒ live > 0; underflow is an invariant break caught above as double-free.
         debug_assert!(state.live > 0);
@@ -399,50 +388,17 @@ impl Run {
         Ok(())
     }
 
-    #[cold]
-    #[inline(never)]
-    fn free_invalid() -> RunError {
-        RunError::InvalidPointer
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn free_state_err(error: BlockStateError) -> RunError {
-        match error {
-            BlockStateError::AlreadyFree
-            | BlockStateError::AlreadyAllocated
-            | BlockStateError::AlreadyPending => RunError::DoubleFree,
-            BlockStateError::InvalidIndex => RunError::InvalidPointer,
-        }
-    }
-
     /// Freer: Allocated → `RemotePending` (before batch/publish).
     pub(crate) fn claim(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
         let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
-
-        match self.blocks.mark_remote_pending(block.index()) {
-            Ok(()) => Ok(()),
-            Err(
-                BlockStateError::AlreadyFree
-                | BlockStateError::AlreadyAllocated
-                | BlockStateError::AlreadyPending,
-            ) => Err(RunError::DoubleFree),
-            Err(BlockStateError::InvalidIndex) => Err(RunError::InvalidPointer),
-        }
+        self.blocks.mark_remote_pending(block.index())?;
+        Ok(())
     }
 
     pub(crate) fn unclaim(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
         let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
-
-        match self.blocks.unclaim_remote_pending(block.index()) {
-            Ok(()) => Ok(()),
-            Err(
-                BlockStateError::AlreadyFree
-                | BlockStateError::AlreadyAllocated
-                | BlockStateError::AlreadyPending,
-            ) => Err(RunError::DoubleFree),
-            Err(BlockStateError::InvalidIndex) => Err(RunError::InvalidPointer),
-        }
+        self.blocks.unclaim_remote_pending(block.index())?;
+        Ok(())
     }
 
     /// Owner: `RemotePending` → Free (inbox flush / publish Draining complete).
@@ -451,15 +407,7 @@ impl Run {
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
 
-        match self.blocks.release_remote_pending(block.index()) {
-            Ok(()) => {}
-            Err(
-                BlockStateError::AlreadyFree
-                | BlockStateError::AlreadyAllocated
-                | BlockStateError::AlreadyPending,
-            ) => return Err(RunError::DoubleFree),
-            Err(BlockStateError::InvalidIndex) => return Err(RunError::InvalidPointer),
-        }
+        self.blocks.release_remote_pending(block.index())?;
 
         // RemotePending ⇒ live > 0 (same invariant as owner free).
         debug_assert!(state.live > 0);
@@ -560,17 +508,23 @@ impl Run {
             return Some(offset >> shift);
         }
 
-        Self::block_index_non_pow2(offset, self.block_size)
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn block_index_non_pow2(offset: usize, block_size: usize) -> Option<usize> {
-        if !offset.is_multiple_of(block_size) {
+        if !offset.is_multiple_of(self.block_size) {
             return None;
         }
 
-        offset.checked_div(block_size)
+        offset.checked_div(self.block_size)
+    }
+}
+
+impl From<BlockStateError> for RunError {
+    fn from(error: BlockStateError) -> Self {
+        match error {
+            BlockStateError::AlreadyFree
+            | BlockStateError::AlreadyAllocated
+            | BlockStateError::AlreadyPending => Self::DoubleFree,
+            // Corrupt state after a capacity-proven index — not a user-pointer miss.
+            BlockStateError::InvalidIndex => Self::InvalidPointer,
+        }
     }
 }
 
@@ -594,14 +548,6 @@ impl RunState {
         let index = BlockIndex::new(self.bump);
         self.bump += 1;
         Some(index)
-    }
-}
-
-const fn block_size_shift(block_size: usize) -> Option<u32> {
-    if block_size.is_power_of_two() {
-        Some(block_size.trailing_zeros())
-    } else {
-        None
     }
 }
 

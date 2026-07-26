@@ -22,6 +22,12 @@ pub(crate) enum ThreadFreeError {
     Heap(HeapError),
 }
 
+impl From<RunError> for ThreadFreeError {
+    fn from(error: RunError) -> Self {
+        Self::Heap(error.into())
+    }
+}
+
 const REMOTE_BATCH_CAPACITY: u32 = 32;
 
 /// Producer-side coalesce buffer for remote frees.
@@ -152,11 +158,6 @@ impl ThreadHeap {
         Some(owner)
     }
 
-    fn clear_page_cache(&self) {
-        self.page_cache_page.set(usize::MAX);
-        self.page_cache_owner.set(None);
-    }
-
     /// Owner-local small allocation via the TLS run cache.
     ///
     /// Returns `None` when this thread is not bound to `inner` (caller should `bind`).
@@ -219,10 +220,7 @@ impl ThreadHeap {
         // Sticky before matches: slots only park this heap's runs and are cleared on unbind.
         if self.run_cell(class).get() == run.as_ptr() {
             // Sticky hit: Run only — do not finish_free / push_available.
-            return match run_ref.free(ptr) {
-                Ok(()) => Ok(()),
-                Err(error) => Err(Self::sticky_free_err(error)),
-            };
+            return run_ref.free(ptr).map_err(ThreadFreeError::from);
         }
 
         if !self.matches(inner) || self.heap_id.get() != Some(run_ref.heap_id()) {
@@ -238,12 +236,6 @@ impl ThreadHeap {
                 unsafe { inner.as_ref().pages() },
             )
             .map_err(ThreadFreeError::Heap)
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn sticky_free_err(error: RunError) -> ThreadFreeError {
-        ThreadFreeError::Heap(error.into())
     }
 
     /// Owner-local free for an extent owned by the bound heap.
@@ -406,7 +398,8 @@ impl ThreadHeap {
     #[cold]
     fn unbind(&self) {
         self.return_cached_runs();
-        self.clear_page_cache();
+        self.page_cache_page.set(usize::MAX);
+        self.page_cache_owner.set(None);
         let Some(inner) = NonNull::new(self.inner.replace(core::ptr::null_mut())) else {
             return;
         };
