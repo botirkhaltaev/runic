@@ -247,14 +247,16 @@ pub(crate) struct Run {
 // block state and never mutate RunState.
 unsafe impl Sync for Run {}
 
-/// Sentinel stored in a free block's intrusive next slot when the list ends.
+/// Empty freelist head / end-of-list link. Index `0` is a valid block, so this
+/// is a deliberate sentinel (same pattern as `Arena`'s freelist).
 const FREE_END: usize = usize::MAX;
 
 struct RunState {
     live: usize,
     bump: usize,
     available_next: Option<NonNull<Run>>,
-    free: Option<BlockIndex>,
+    /// `FREE_END` or a capacity-proven block index.
+    free: usize,
 }
 
 pub(crate) struct RunFreeStatus {
@@ -395,7 +397,7 @@ impl Run {
         };
 
         state.live = live;
-        self.push_free(state, block.index());
+        Self::push_free(state, block);
 
         Ok(RunFreeStatus { was_full })
     }
@@ -451,7 +453,7 @@ impl Run {
         };
 
         state.live = live;
-        self.push_free(state, block.index());
+        Self::push_free(state, block);
 
         Ok(RunFreeStatus { was_full })
     }
@@ -504,33 +506,32 @@ impl Run {
     }
 
     fn pop_free(&self, state: &mut RunState) -> Option<BlockIndex> {
-        let index = state.free?;
+        let raw = state.free;
+        if raw == FREE_END {
+            return None;
+        }
+
+        let index = BlockIndex::new(raw);
         let ptr = self.block_ptr(index);
         state.free = Self::read_free_next(ptr);
         Some(index)
     }
 
-    fn push_free(&self, state: &mut RunState, index: BlockIndex) {
-        let ptr = self.block_ptr(index);
-        Self::write_free_next(ptr, state.free);
-        state.free = Some(index);
+    /// Push using the payload pointer already proven by `block_at` / `RunBlock`.
+    fn push_free(state: &mut RunState, block: RunBlock) {
+        Self::write_free_next(block.ptr(), state.free);
+        state.free = block.index().get();
     }
 
-    fn read_free_next(ptr: NonNull<u8>) -> Option<BlockIndex> {
+    fn read_free_next(ptr: NonNull<u8>) -> usize {
         // SAFETY: free-list links are stored only in reusable blocks owned by this run.
-        let raw = unsafe { ptr.cast::<usize>().as_ptr().read() };
-        if raw == FREE_END {
-            None
-        } else {
-            Some(BlockIndex::new(raw))
-        }
+        unsafe { ptr.cast::<usize>().as_ptr().read() }
     }
 
-    fn write_free_next(ptr: NonNull<u8>, next: Option<BlockIndex>) {
-        let raw = next.map_or(FREE_END, BlockIndex::get);
+    fn write_free_next(ptr: NonNull<u8>, next: usize) {
         // SAFETY: free-list links are stored only in reusable blocks owned by this run.
         unsafe {
-            ptr.cast::<usize>().as_ptr().write(raw);
+            ptr.cast::<usize>().as_ptr().write(next);
         }
     }
 
@@ -559,7 +560,7 @@ impl RunState {
             live: 0,
             bump: 0,
             available_next: None,
-            free: None,
+            free: FREE_END,
         }
     }
 
