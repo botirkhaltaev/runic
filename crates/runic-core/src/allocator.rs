@@ -212,17 +212,20 @@ impl Allocator {
         let Some(inner) = self.ensure_inner() else {
             return null_mut();
         };
+        // SAFETY: inner is retained by this Allocator while installed from self.inner.
+        let inner_ref = unsafe { inner.as_ref() };
 
-        // Extents: ExtentHeap owns cache-vs-fresh zeroing (skip memset on fresh maps).
-        if SizeClasses::id_for(spec).is_none() {
-            // SAFETY: inner is retained by this Allocator while installed from self.inner.
-            let inner_ref = unsafe { inner.as_ref() };
+        // One classify: small → allocate then zero; large → extent path owns zeroing.
+        let Some(class) = SizeClasses::id_for(spec) else {
             return Self::allocate_extent(inner, inner_ref, spec, ExtentInit::Zeroed);
-        }
+        };
 
-        // Runs: blocks are reused memory; allocate then zero once at this boundary.
-        // SAFETY: alloc returns a valid pointer for layout or null; we only use it if non-null.
-        let ptr = unsafe { self.alloc(layout) };
+        let ptr =
+            if let Some(ptr) = THREAD_HEAP.with(|tls| tls.alloc(inner, class, inner_ref.pages())) {
+                ptr.as_ptr()
+            } else {
+                Self::alloc_slow(inner, inner_ref, class)
+            };
         if !ptr.is_null() {
             // SAFETY: ptr was just allocated for layout and is valid for layout.size() bytes.
             unsafe { write_bytes(ptr, 0, layout.size()) };

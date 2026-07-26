@@ -122,23 +122,29 @@ impl SizeClasses {
         table
     }
 
+    /// Map a layout to a small size class, or `None` for large/over-aligned requests.
+    ///
+    /// Default-align (`align <= 8`) is the hot path: one bounds check, then a direct
+    /// `CLASS_FOR_SIZE` lookup. Higher alignments take the const align-remap table.
     pub(crate) fn id_for(spec: LayoutSpec) -> Option<SizeClassId> {
+        let align = spec.align();
+        if align > PAGE_SIZE {
+            return None;
+        }
+
+        // `LayoutSpec` normalizes zero size to 1; align is a nonzero power of two.
         let required = spec.minimum_block_size();
-
-        if required == 0 || required > Self::SMALL_MAX {
+        if required > Self::SMALL_MAX {
             return None;
         }
 
-        if spec.align() > PAGE_SIZE {
-            return None;
-        }
-
-        let lower_bound = Self::lower_bound_index(required)?;
-        if spec.align() <= Self::MIN_ALIGNMENT {
+        // SAFETY: `required` is in `1..=SMALL_MAX`, so the table slot is initialized.
+        let lower_bound = usize::from(unsafe { *Self::CLASS_FOR_SIZE.get_unchecked(required) });
+        if align <= Self::MIN_ALIGNMENT {
             return SizeClassId::new(lower_bound);
         }
 
-        Self::aligned_class_from(lower_bound, spec.align())
+        Self::aligned_class_from(lower_bound, align)
     }
 
     /// Block size for a trusted [`SizeClassId`].
@@ -147,12 +153,16 @@ impl SizeClasses {
         unsafe { *Self::SIZES.get_unchecked(id.index()) }
     }
 
+    #[cfg(test)]
     fn lower_bound_index(required: usize) -> Option<usize> {
         if required == 0 || required > Self::SMALL_MAX {
             return None;
         }
 
-        Some(usize::from(*Self::CLASS_FOR_SIZE.get(required)?))
+        // SAFETY: bounds checked above.
+        Some(usize::from(unsafe {
+            *Self::CLASS_FOR_SIZE.get_unchecked(required)
+        }))
     }
 
     /// Smallest class index at or after `start` whose block size is a multiple
