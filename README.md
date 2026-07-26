@@ -2,7 +2,7 @@
 
 Runic is a correctness-first Rust allocator with a small auditable unsafe core, out-of-line metadata, and explicit allocation invariants.
 
-The current release is an experimental v0.4 global-lock allocator for Linux x86_64. It is useful for allocator development, single-thread performance work, retention-policy experiments, tests, and architecture iteration; it is not yet a production allocator.
+The current release is an experimental v0.5 owner-local heap allocator for Linux x86_64. It is useful for allocator development, threaded performance work, remote-free protocol experiments, tests, and architecture iteration; it is not yet a production allocator.
 
 ## Install
 
@@ -32,16 +32,19 @@ fn main() {
 
 ## Status
 
-Runic v0.4 implements:
+Runic v0.5 implements:
 
 - `GlobalAlloc`
-- one global heap lock
+- owner-local heaps via `HeapTable` / `ThreadHeap`
+- `HeapId` ownership on runs and extents
+- lock-free remote-free Treiber inboxes with claim → batch → publish → flush/`accept`
+- Free | Active | Draining heap-slot lifecycle after thread exit
 - mmap-backed runs for small size classes
-- mmap-backed extents for dedicated allocations
+- mmap-backed extents for dedicated allocations (heap-local)
 - out-of-line metadata
 - page-indexed owner-pointer lookup
 - per-size-class available run lists
-- per-block AtomicU8 run block state (reusable / allocated / remote-pending)
+- per-block AtomicU8 run block state (clear / Free / RemotePending)
 - configurable extent mapping retention and reuse policies
 - runs retained for the heap lifetime (no empty-run OS release in v0.5)
 - run block-boundary checks
@@ -86,7 +89,7 @@ perf stat -r 3 -e task-clock,cycles,instructions,branches,branch-misses,cache-mi
 
 ## Release
 
-Release tags use plain semver, for example `0.4.0`.
+Release tags use plain semver, for example `0.5.0`.
 
 Release `runic-core` before `runic-alloc`, because `runic-alloc` depends on the published `runic-core` version during package verification.
 

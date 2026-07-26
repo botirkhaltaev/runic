@@ -32,18 +32,17 @@ real lifecycle, invariant, or policy.
 
 ## Current Status
 
-Latest published release: `0.4.0`.
+Latest published release: `0.5.0`.
 
-Current v0.5 development is an owner-local heap frontend: TLS heaps own runs and
+Current `master` ships the v0.5 owner-local heap frontend: TLS heaps own runs and
 extents stamped with `HeapId`, lock-free remote-free inboxes, and Draining
 lifecycle after thread exit, with explicit page-map ownership.
 
-The current milestone is:
+The next milestone is:
 
 ```text
-TLS-owned heaps for small runs and large extents, HeapId ownership on entities,
-claim→inbox→flush remote frees, Alloc miss flush-before-mmap, Free|Active|Draining
-slot lifecycle, deterministic mapping retention, and randomized trace coverage.
+Optimize remote-free reuse latency after ownership and Draining are stable,
+while keeping owner-side validation mandatory on every remote free.
 ```
 
 ## Supported Scope
@@ -276,16 +275,9 @@ RSS checks confirm bounded retention
 runs remain retained by default (empty-run OS release not shipped)
 ```
 
-### v0.5 Next: Full Thread-Local Heaps
+### v0.5 Released: Full Thread-Local Heaps
 
-Goal:
-
-```text
-Make same-thread small allocation hits avoid global metadata work while preserving
-block-boundary, double-free, stale-free, remote-free, and thread-exit correctness.
-```
-
-In scope:
+Delivered:
 
 ```text
 HeapId ownership on Run and Extent (no Owner/root heap)
@@ -293,36 +285,24 @@ ThreadHeap frontend for small and large allocations
 per-thread heap ownership through HeapTable slots
 explicit block states for reusable, allocated, and remote-pending blocks
 lock-free remote-free Treiber inbox on each Heap
+claim → batch → publish → flush/accept remote-free protocol
 alloc-miss flush then retry before mmap
 thread-exit Draining mode with orphan flush and generation bump
 heap-local extents
-threaded benchmark reporting
+freelist-primary run allocate/free and page-map atomic publish
+grow-on-demand metadata arenas
+single Allocator::abort sink
+threaded benchmark reporting and local profile.sh
 ```
 
-Out of scope:
+Release artifacts:
 
 ```text
-NUMA
-hugepages
-adaptive cache sizing
-hardening profiles
-concurrent per-run remote freelists
-per-CPU/RSEQ frontends
-steal/adopt of live runs between heaps
+tag: 0.5.0
+crates: runic-core 0.5.0, runic-alloc 0.5.0
 ```
 
-Acceptance gate:
-
-```text
-same-thread local small allocation/free improves threaded churn
-cross-thread frees remain validated and do not mutate owner freelists directly
-thread exit with live allocations remains valid; late remote frees complete under Draining
-existing abort tests pass
-randomized cross-thread traces pass
-no allocator-internal heap allocation is introduced
-```
-
-### v0.6 Later: Remote Free Queue Optimization
+### v0.6 Next: Remote Free Queue Optimization
 
 Goal:
 
