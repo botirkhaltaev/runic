@@ -554,7 +554,7 @@ mod tests {
     }
 
     fn class_id(size: usize, align: usize) -> SizeClassId {
-        SizeClasses::id_for(Layout::from_size_align(size, align).unwrap()).unwrap()
+        SizeClasses::id_for(layout_spec(size, align)).unwrap()
     }
 
     fn test_heap_id() -> HeapId {
