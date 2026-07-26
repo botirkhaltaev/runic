@@ -15,22 +15,18 @@ fn extent(raw: u32) -> PageOwner {
 }
 
 fn has_l2_table(map: &PageMap, ptr: NonNull<u8>) -> bool {
-    let Some((l1_index, _)) = Page::containing(ptr).indexes() else {
-        return false;
-    };
-
+    let (l1_index, _) = Page::split(ptr);
     map.l1()
         .is_some_and(|l1| l1.l2_table_ref(l1_index).is_some())
 }
 
 fn l2_table_for(map: &PageMap, ptr: NonNull<u8>) -> Option<&L2Table> {
-    let (l1_index, _) = Page::containing(ptr).indexes()?;
-
+    let (l1_index, _) = Page::split(ptr);
     map.l1()?.l2_table_ref(l1_index)
 }
 
 fn direct_entry(map: &PageMap, ptr: NonNull<u8>) -> Option<MapEntry> {
-    let (_, l2_index) = Page::containing(ptr).indexes()?;
+    let (_, l2_index) = Page::split(ptr);
     Some(l2_table_for(map, ptr)?.entry(l2_index))
 }
 
@@ -62,7 +58,7 @@ impl TestMapping {
     }
 
     fn first_l2_boundary_offset(&self) -> usize {
-        let (_, base_l2) = Page::containing(self.base()).indexes().unwrap();
+        let (_, base_l2) = Page::split(self.base());
 
         (L2_ENTRIES - base_l2.get()) * PAGE_SIZE
     }
@@ -375,7 +371,7 @@ fn page_map_insert_range_rejects_existing_same_entry() {
 fn page_map_overlap_rejects_under_write_exclusion_and_retains_l2() {
     let mapping = TestMapping::new((L2_ENTRIES * 2 + 2) * PAGE_SIZE);
     let map = PageMap::new();
-    let (_, base_l2) = Page::containing(mapping.base()).indexes().unwrap();
+    let (_, base_l2) = Page::split(mapping.base());
     let pages_to_next_l2 = L2_ENTRIES - base_l2.get();
     let overlap = mapping.ptr_at(pages_to_next_l2 * PAGE_SIZE);
 
