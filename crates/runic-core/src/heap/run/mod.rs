@@ -1,6 +1,10 @@
-use core::{cell::UnsafeCell, mem::size_of, num::NonZeroU32, ptr::NonNull};
-
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use core::{
+    cell::UnsafeCell,
+    mem::size_of,
+    num::NonZeroU32,
+    ptr::NonNull,
+    sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
+};
 
 pub(crate) mod heap;
 
@@ -15,6 +19,8 @@ use super::HeapId;
 pub(crate) use heap::{RunHeap, RunHeapError};
 
 pub(crate) const RUN_SIZE: usize = 64 * 1024;
+/// Bits per claim-bitmap word (`AtomicU64`).
+const CLAIM_WORD_BITS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RunId {
@@ -51,6 +57,13 @@ impl BlockIndex {
         // SAFETY: caller proved `get() < bytes.len()` via `locate` / freelist / bump.
         unsafe { NonNull::new_unchecked(bytes.base().as_ptr().add(self.get())) }
     }
+
+    fn claim_word_bit(self) -> (usize, u64) {
+        let index = self.get();
+        let word = index / CLAIM_WORD_BITS;
+        let bit = index % CLAIM_WORD_BITS;
+        (word, 1_u64 << bit)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -79,21 +92,15 @@ pub(crate) enum RunError {
     DoubleFree,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BlockStateError {
-    Conflict,
-}
-
-/// Per-block clear / Free / `RemotePending`.
+/// Per-block clear / Free.
 ///
-/// Free/Live **authority** is freelist membership (+ bump). These bits keep
-/// double-free and remote CAS fail-closed without restoring owner Allocated
-/// stores on the bump allocate path (zero-filled ⇒ clear = live-or-never).
+/// Free/Live **authority** is freelist membership (+ bump). The Free bit keeps
+/// delayed double-free fail-closed. Remote admission is owned exclusively by
+/// [`ClaimBits`] — there is no third byte state.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BlockState {
     Clear = 0,
-    RemotePending = 1,
     Free = 2,
 }
 
@@ -101,7 +108,6 @@ impl BlockState {
     const fn raw(self) -> u8 {
         match self {
             Self::Clear => 0,
-            Self::RemotePending => 1,
             Self::Free => 2,
         }
     }
@@ -109,7 +115,6 @@ impl BlockState {
     const fn from_raw(raw: u8) -> Option<Self> {
         match raw {
             value if value == Self::Clear.raw() => Some(Self::Clear),
-            value if value == Self::RemotePending.raw() => Some(Self::RemotePending),
             value if value == Self::Free.raw() => Some(Self::Free),
             _ => None,
         }
@@ -122,37 +127,17 @@ struct BlockStates {
 
 impl BlockStates {
     /// `index` must be capacity-proven.
-    fn state(&self, index: BlockIndex) -> BlockState {
-        let raw = self.state_unchecked(index).load(Ordering::Relaxed);
+    fn state(&self, index: BlockIndex, order: Ordering) -> BlockState {
+        let raw = self.state_unchecked(index).load(order);
         debug_assert!(BlockState::from_raw(raw).is_some());
-        // Only `Clear` / `Free` / `RemotePending` are ever stored; corrupt → Free (fail closed).
+        // Only `Clear` / `Free` are ever stored; corrupt → Free (fail closed).
         BlockState::from_raw(raw).unwrap_or(BlockState::Free)
     }
 
-    /// Unconditional write (owner freelist allocate after observing Free).
+    /// Unconditional write (owner freelist allocate / free handshake / accept).
     #[inline]
-    fn set(&self, index: BlockIndex, to: BlockState) {
-        self.state_unchecked(index)
-            .store(to.raw(), Ordering::Relaxed);
-    }
-
-    /// Compare-exchange `from` → `to` (owner free / claim / accept).
-    #[inline]
-    fn cas(
-        &self,
-        index: BlockIndex,
-        from: BlockState,
-        to: BlockState,
-    ) -> Result<(), BlockStateError> {
-        match self.state_unchecked(index).compare_exchange(
-            from.raw(),
-            to.raw(),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => Ok(()),
-            Err(_) => Err(BlockStateError::Conflict),
-        }
+    fn set(&self, index: BlockIndex, to: BlockState, order: Ordering) {
+        self.state_unchecked(index).store(to.raw(), order);
     }
 
     /// Atom for a capacity-proven block index (one address calc per op).
@@ -166,6 +151,71 @@ impl BlockStates {
     }
 }
 
+/// Run-owned remote-admission bitmap.
+///
+/// Exactly one of owner `free` or remote `claim` linearizes a live block:
+/// - `claim`: `try_set` then Acquire-load Free; undo bit if Free already.
+/// - `free`: store Free (Release) then Acquire-load bit; undo Free if claimed.
+/// - `accept`: `test_and_clear` then publish to freelist.
+struct ClaimBits {
+    /// 8-aligned claim words in the run mapping tail.
+    words: NonNull<AtomicU64>,
+    word_count: usize,
+}
+
+impl ClaimBits {
+    fn byte_len(capacity: usize) -> Option<usize> {
+        let words = capacity.div_ceil(CLAIM_WORD_BITS);
+        words.checked_mul(size_of::<u64>())
+    }
+
+    /// Byte offset of the claim span from the mapping base (`RUN_SIZE + capacity`, 8-aligned).
+    fn mapping_offset(capacity: usize) -> Option<usize> {
+        RUN_SIZE
+            .checked_add(capacity)?
+            .checked_next_multiple_of(size_of::<u64>())
+    }
+
+    fn word_count(capacity: usize) -> usize {
+        capacity.div_ceil(CLAIM_WORD_BITS)
+    }
+
+    #[inline]
+    fn try_set(&self, index: BlockIndex) -> bool {
+        let (word, mask) = index.claim_word_bit();
+        let prev = self.word_unchecked(word).fetch_or(mask, Ordering::AcqRel);
+        prev & mask == 0
+    }
+
+    #[inline]
+    fn is_set(&self, index: BlockIndex) -> bool {
+        let (word, mask) = index.claim_word_bit();
+        self.word_unchecked(word).load(Ordering::Acquire) & mask != 0
+    }
+
+    #[inline]
+    fn clear(&self, index: BlockIndex) {
+        let (word, mask) = index.claim_word_bit();
+        self.word_unchecked(word)
+            .fetch_and(!mask, Ordering::Release);
+    }
+
+    /// Clears the bit; returns whether it was set.
+    #[inline]
+    fn test_and_clear(&self, index: BlockIndex) -> bool {
+        let (word, mask) = index.claim_word_bit();
+        let prev = self.word_unchecked(word).fetch_and(!mask, Ordering::AcqRel);
+        prev & mask != 0
+    }
+
+    fn word_unchecked(&self, word: usize) -> &AtomicU64 {
+        debug_assert!(word < self.word_count);
+        // SAFETY: `word < word_count`; `words` points at the claim span carved
+        // from this run's mapping and aligned for `AtomicU64`.
+        unsafe { &*self.words.as_ptr().add(word) }
+    }
+}
+
 pub(crate) struct Run {
     /// Owner-local freelist / live / bump — field order prefers sticky locality under
     /// `repr(Rust)` (not a layout guarantee; do not treat as ABI).
@@ -173,6 +223,7 @@ pub(crate) struct Run {
     /// Cached `mapping.base()` — payload span start (`RUN_SIZE` bytes).
     base: NonNull<u8>,
     blocks: BlockStates,
+    claims: ClaimBits,
     /// `trailing_zeros(stride)` when power-of-two; `None` means multiply.
     stride_shift: Option<NonZeroU32>,
     class: SizeClass,
@@ -186,7 +237,7 @@ pub(crate) struct Run {
 }
 
 // SAFETY: owner-local methods are called only by the owning heap. Remote methods only touch
-// `BlockStates`, load `issued`, and never mutate `RunState`.
+// `BlockStates` / `ClaimBits`, load `issued`, and never mutate `RunState`.
 unsafe impl Sync for Run {}
 
 /// Empty freelist head / end-of-list link. Index `0` is a valid block, so this
@@ -202,28 +253,49 @@ struct RunState {
 }
 
 impl Run {
-    /// Bytes for one run mapping: `RUN_SIZE` payload plus one `AtomicU8` per block.
+    /// Bytes for one run mapping: payload + Free bytes + pad + claim bitmap words.
     pub(crate) fn mapping_len(class: SizeClass) -> Option<usize> {
         let stride = class.size();
         let capacity = RUN_SIZE.checked_div(stride).filter(|&count| count > 0)?;
-        RUN_SIZE.checked_add(capacity)
+        let claim_bytes = ClaimBits::byte_len(capacity)?;
+        let claim_offset = ClaimBits::mapping_offset(capacity)?;
+        claim_offset.checked_add(claim_bytes)
     }
 
     pub(crate) fn new(id: RunId, heap: HeapId, mapping: Mapping, class: SizeClass) -> Option<Self> {
         let stride = class.size();
         let capacity = RUN_SIZE.checked_div(stride).filter(|&count| count > 0)?;
-        let need = RUN_SIZE.checked_add(capacity)?;
+        let claim_bytes = ClaimBits::byte_len(capacity)?;
+        let claim_offset = ClaimBits::mapping_offset(capacity)?;
+        let need = claim_offset.checked_add(claim_bytes)?;
         if mapping.len().get() < need {
             return None;
         }
 
-        // SAFETY: `mapping` covers at least `need` bytes. The state tail
-        // `[RUN_SIZE, RUN_SIZE + capacity)` is exclusively Free/pending bits,
-        // zero-filled as clear, and outlives `blocks` because `Self` owns
-        // `mapping`.
+        // SAFETY: `mapping` covers at least `need` bytes. The Free-byte tail
+        // starts at `RUN_SIZE` and the claim-word span at `claim_offset`
+        // (8-aligned). Both are zero-filled and outlive `blocks` / `claims`
+        // because `Self` owns `mapping`.
         let state_base = unsafe { NonNull::new_unchecked(mapping.base().as_ptr().add(RUN_SIZE)) };
+        #[allow(clippy::cast_ptr_alignment)] // `claim_offset` is 8-aligned above.
+        // SAFETY: `claim_offset` is 8-aligned (`mapping_offset`) and within
+        // `need`; the span holds `word_count` zeroed `AtomicU64` slots for this
+        // run's lifetime.
+        let claim_words = unsafe {
+            NonNull::new_unchecked(
+                mapping
+                    .base()
+                    .as_ptr()
+                    .add(claim_offset)
+                    .cast::<AtomicU64>(),
+            )
+        };
         let blocks = BlockStates {
             bytes: AddressRange::new(state_base, capacity),
+        };
+        let claims = ClaimBits {
+            words: claim_words,
+            word_count: ClaimBits::word_count(capacity),
         };
         // Min size class is 8 (`trailing_zeros` ≥ 3); never zero for our table.
         let stride_shift = stride
@@ -234,6 +306,7 @@ impl Run {
             state: UnsafeCell::new(RunState::new(stride)),
             base: mapping.base(),
             blocks,
+            claims,
             stride_shift,
             class,
             capacity,
@@ -262,7 +335,7 @@ impl Run {
         self.class
     }
 
-    /// True when every block is outstanding (allocated or remote-pending).
+    /// True when every block is outstanding (allocated or remote-claimed).
     ///
     /// Used by `RunHeap` before `free` / `accept` for available-list relink.
     pub(crate) fn is_full(&self) -> bool {
@@ -270,7 +343,7 @@ impl Run {
         unsafe { &*self.state.get() }.live == self.capacity
     }
 
-    /// Outstanding blocks on this run (allocated or remote-pending).
+    /// Outstanding blocks on this run (allocated or remote-claimed).
     pub(crate) fn has_live_blocks(&self) -> bool {
         // SAFETY: read under owner-local access or table-locked reclaim.
         unsafe { &*self.state.get() }.live != 0
@@ -301,12 +374,14 @@ impl Run {
         let index = match self.pop_free(state) {
             Some(index) => {
                 // Freelist membership is Free/Live authority on the owner path.
-                // Clear the DF bit with `set` (no CAS) — remote claim races
-                // Free↔Clear only against owner free, not allocate.
-                if self.blocks.state(index) != BlockState::Free {
+                // Reject an in-flight remote claim (should be empty ∩ freelist).
+                if self.claims.is_set(index) {
                     return None;
                 }
-                self.blocks.set(index, BlockState::Clear);
+                if self.blocks.state(index, Ordering::Relaxed) != BlockState::Free {
+                    return None;
+                }
+                self.blocks.set(index, BlockState::Clear, Ordering::Relaxed);
                 index
             }
             None => self.allocate_fresh(state)?,
@@ -318,8 +393,11 @@ impl Run {
         Some(ptr)
     }
 
-    /// Owner-local: live → freelist. Freelist (+ bump) is Free/Live authority;
-    /// Free bit keeps delayed double-free fail-closed without bump-path stores.
+    /// Owner-local: live → freelist without locked RMW.
+    ///
+    /// Handshake vs remote `claim`: store Free (Release), then recheck claim bit
+    /// (Acquire). If the bit is set, undo Free→Clear and fail closed — `accept`
+    /// owns the freelist publish.
     #[inline]
     pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
         let block = self.locate(ptr).ok_or(RunError::InvalidPointer)?;
@@ -329,8 +407,16 @@ impl Run {
             return Err(RunError::DoubleFree);
         }
 
+        if self.blocks.state(block.index(), Ordering::Relaxed) != BlockState::Clear {
+            return Err(RunError::DoubleFree);
+        }
         self.blocks
-            .cas(block.index(), BlockState::Clear, BlockState::Free)?;
+            .set(block.index(), BlockState::Free, Ordering::Release);
+        if self.claims.is_set(block.index()) {
+            self.blocks
+                .set(block.index(), BlockState::Clear, Ordering::Relaxed);
+            return Err(RunError::DoubleFree);
+        }
 
         debug_assert!(state.live > 0);
         state.live -= 1;
@@ -338,26 +424,37 @@ impl Run {
         Ok(())
     }
 
-    /// Freer: live → `RemotePending` (before batch/publish).
+    /// Freer: reserve remote admission before batch/publish payload reuse.
+    ///
+    /// Handshake vs owner `free`: set claim bit, then Acquire-load Free. If Free
+    /// already, clear the bit and fail closed.
     pub(crate) fn claim(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
         let block = self.locate(ptr).ok_or(RunError::InvalidPointer)?;
         if block.index().get() >= self.issued.load(Ordering::Relaxed) {
             return Err(RunError::DoubleFree);
         }
 
-        self.blocks
-            .cas(block.index(), BlockState::Clear, BlockState::RemotePending)?;
+        if !self.claims.try_set(block.index()) {
+            return Err(RunError::DoubleFree);
+        }
+        if self.blocks.state(block.index(), Ordering::Acquire) == BlockState::Free {
+            self.claims.clear(block.index());
+            return Err(RunError::DoubleFree);
+        }
         Ok(())
     }
 
-    /// Owner: `RemotePending` → freelist (inbox flush / publish Draining complete).
+    /// Owner: consume a successful remote claim and publish to freelist.
     pub(crate) fn accept(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
         let block = self.locate(ptr).ok_or(RunError::InvalidPointer)?;
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
 
+        if !self.claims.test_and_clear(block.index()) {
+            return Err(RunError::DoubleFree);
+        }
         self.blocks
-            .cas(block.index(), BlockState::RemotePending, BlockState::Free)?;
+            .set(block.index(), BlockState::Free, Ordering::Relaxed);
 
         debug_assert!(state.live > 0);
         state.live -= 1;
@@ -372,9 +469,12 @@ impl Run {
         if block.index().get() >= state.bump {
             return Err(RunError::DoubleFree);
         }
-        match self.blocks.state(block.index()) {
+        if self.claims.is_set(block.index()) {
+            return Err(RunError::DoubleFree);
+        }
+        match self.blocks.state(block.index(), Ordering::Relaxed) {
             BlockState::Clear => Ok(block),
-            BlockState::Free | BlockState::RemotePending => Err(RunError::DoubleFree),
+            BlockState::Free => Err(RunError::DoubleFree),
         }
     }
 
@@ -461,12 +561,6 @@ impl Run {
         unsafe {
             ptr.cast::<usize>().as_ptr().write(word);
         }
-    }
-}
-
-impl From<BlockStateError> for RunError {
-    fn from(_error: BlockStateError) -> Self {
-        Self::DoubleFree
     }
 }
 
@@ -569,7 +663,7 @@ mod tests {
         assert!(run.free(ptr).is_ok());
         let index = run.locate(ptr).unwrap().index();
         // Corrupt DF bit while the block remains on the freelist.
-        run.blocks.set(index, BlockState::Clear);
+        run.blocks.set(index, BlockState::Clear, Ordering::Relaxed);
         assert!(run.allocate().is_none());
     }
 
@@ -744,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_pending_run_reports_duplicate_remote_free() {
+    fn claim_run_reports_duplicate_remote_free() {
         let class = class_id(64, 8);
         let run = Run::new(
             RunId::from_index(9).unwrap(),
@@ -760,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_pending_run_reports_local_free_as_double_free() {
+    fn claim_then_owner_free_reports_double_free_and_accept_completes() {
         let class = class_id(64, 8);
         let run = Run::new(
             RunId::from_index(10).unwrap(),
@@ -773,10 +867,12 @@ mod tests {
 
         assert_eq!(run.claim(ptr), Ok(()));
         assert!(matches!(run.free(ptr), Err(RunError::DoubleFree)));
+        assert!(run.accept(ptr).is_ok());
+        assert_eq!(run.allocate(), Some(ptr));
     }
 
     #[test]
-    fn remote_pending_run_completes_to_reusable() {
+    fn claim_run_completes_to_reusable() {
         let class = class_id(64, 8);
         let run = Run::new(
             RunId::from_index(11).unwrap(),
@@ -790,6 +886,125 @@ mod tests {
         assert_eq!(run.claim(ptr), Ok(()));
         assert!(run.accept(ptr).is_ok());
         assert_eq!(run.allocate(), Some(ptr));
+    }
+
+    #[test]
+    fn free_then_claim_reports_double_free_and_bit_clears() {
+        let class = class_id(64, 8);
+        let run = Run::new(
+            RunId::from_index(12).unwrap(),
+            test_heap_id(),
+            map_for_class(class),
+            class,
+        )
+        .expect("test run");
+        let ptr = run.allocate().unwrap();
+        let index = run.locate(ptr).unwrap().index();
+
+        assert!(run.free(ptr).is_ok());
+        assert_eq!(run.claim(ptr), Err(RunError::DoubleFree));
+        assert!(!run.claims.is_set(index));
+        assert_eq!(run.allocate(), Some(ptr));
+    }
+
+    #[test]
+    fn free_after_claim_bit_set_before_free_store_loses_to_claim() {
+        // Deterministic interleaving: claim bit is set before owner Free store.
+        let class = class_id(64, 8);
+        let run = Run::new(
+            RunId::from_index(13).unwrap(),
+            test_heap_id(),
+            map_for_class(class),
+            class,
+        )
+        .expect("test run");
+        let ptr = run.allocate().unwrap();
+        let index = run.locate(ptr).unwrap().index();
+
+        assert!(run.claims.try_set(index));
+        assert!(matches!(run.free(ptr), Err(RunError::DoubleFree)));
+        assert!(run.claims.is_set(index));
+        assert_eq!(
+            run.blocks.state(index, Ordering::Relaxed),
+            BlockState::Clear
+        );
+        assert!(run.accept(ptr).is_ok());
+        assert_eq!(run.allocate(), Some(ptr));
+    }
+
+    #[test]
+    fn claim_after_free_store_before_claim_bit_loses_to_free() {
+        // Deterministic interleaving: Free is stored before claim try_set.
+        let class = class_id(64, 8);
+        let run = Run::new(
+            RunId::from_index(14).unwrap(),
+            test_heap_id(),
+            map_for_class(class),
+            class,
+        )
+        .expect("test run");
+        let ptr = run.allocate().unwrap();
+        let index = run.locate(ptr).unwrap().index();
+
+        run.blocks.set(index, BlockState::Free, Ordering::Release);
+        assert_eq!(run.claim(ptr), Err(RunError::DoubleFree));
+        assert!(!run.claims.is_set(index));
+        // Owner already linearized Free; finish the freelist publish that a
+        // full `free` would have done after a successful handshake.
+        // SAFETY: owner-local test harness.
+        let state = unsafe { &mut *run.state.get() };
+        state.live -= 1;
+        Run::push_free(state, run.locate(ptr).unwrap());
+        assert_eq!(run.allocate(), Some(ptr));
+    }
+
+    #[test]
+    fn allocate_rejects_freelist_candidate_with_in_flight_claim() {
+        let class = class_id(64, 8);
+        let run = Run::new(
+            RunId::from_index(15).unwrap(),
+            test_heap_id(),
+            map_for_class(class),
+            class,
+        )
+        .expect("test run");
+        let ptr = run.allocate().unwrap();
+        let index = run.locate(ptr).unwrap().index();
+        assert!(run.free(ptr).is_ok());
+        assert!(run.claims.try_set(index));
+        assert!(run.allocate().is_none());
+    }
+
+    #[test]
+    fn accept_without_claim_reports_double_free() {
+        let class = class_id(64, 8);
+        let run = Run::new(
+            RunId::from_index(16).unwrap(),
+            test_heap_id(),
+            map_for_class(class),
+            class,
+        )
+        .expect("test run");
+        let ptr = run.allocate().unwrap();
+        assert_eq!(run.accept(ptr), Err(RunError::DoubleFree));
+    }
+
+    #[test]
+    fn claim_accept_works_for_all_size_classes() {
+        for (run_index, &size) in SizeClasses::SIZES.iter().enumerate() {
+            let class = class_id(size, 8);
+            let run = Run::new(
+                RunId::from_index(u32::try_from(run_index).unwrap()).unwrap(),
+                test_heap_id(),
+                map_for_class(class),
+                class,
+            )
+            .expect("test run");
+            let ptr = run.allocate().unwrap();
+            assert_eq!(run.claim(ptr), Ok(()), "size={size}");
+            assert!(run.accept(ptr).is_ok(), "size={size}");
+            assert_eq!(run.allocate(), Some(ptr), "size={size}");
+        }
     }
 
     #[test]
