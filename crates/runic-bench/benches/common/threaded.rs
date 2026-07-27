@@ -31,6 +31,7 @@ pub fn register(c: &mut Criterion, suite: &str, targets: &[AllocatorTarget]) {
     register_persistent_remote_reuse_latency(c, suite, targets);
     register_persistent_bound_remote_batch(c, suite, targets);
     register_persistent_unbound_remote_singleton(c, suite, targets);
+    register_persistent_owner_accept(c, suite, targets);
 }
 
 fn register_setup_lifecycle_thread_local_churn(
@@ -202,18 +203,16 @@ fn register_persistent_remote_fan_in(c: &mut Criterion, suite: &str, targets: &[
     for &target in targets {
         for &threads in THREAD_COUNTS {
             for &live in LIVE_DEPTHS {
-                // `live` is recorded in the id for matrix parity; fan-in rounds are depth-free.
-                let _ = live;
                 group.throughput(Throughput::Elements((threads * PERSISTENT_OPS) as u64));
                 group.bench_with_input(
                     BenchmarkId::new(target.name(), format!("{threads}/live:{live}")),
                     &(target, threads, live),
-                    |bench, &(target, threads, _live)| {
+                    |bench, &(target, threads, live)| {
                         bench.iter_custom(|iters| {
                             let workers = threaded::PersistentRemoteFanIn::spawn(target, threads);
                             let start = Instant::now();
                             for _ in 0..iters {
-                                black_box(workers.run_round(PERSISTENT_OPS));
+                                black_box(workers.run_round(PERSISTENT_OPS, live));
                             }
                             let elapsed = start.elapsed();
                             drop(workers);
@@ -239,18 +238,20 @@ fn register_persistent_owner_concurrent(
     for &target in targets {
         for &threads in THREAD_COUNTS {
             for &live in LIVE_DEPTHS {
-                let _ = live;
-                group.throughput(Throughput::Elements((threads * PERSISTENT_OPS) as u64));
+                // Elements: owner local churn steps + remote frees (ops * freers).
+                group.throughput(Throughput::Elements(
+                    (PERSISTENT_OPS + threads * PERSISTENT_OPS) as u64,
+                ));
                 group.bench_with_input(
                     BenchmarkId::new(target.name(), format!("{threads}/live:{live}")),
                     &(target, threads, live),
-                    |bench, &(target, threads, _live)| {
+                    |bench, &(target, threads, live)| {
                         bench.iter_custom(|iters| {
                             let workers =
                                 threaded::PersistentOwnerConcurrent::spawn(target, threads);
                             let start = Instant::now();
                             for _ in 0..iters {
-                                black_box(workers.run_round(PERSISTENT_OPS));
+                                black_box(workers.run_round(PERSISTENT_OPS, live));
                             }
                             let elapsed = start.elapsed();
                             drop(workers);
@@ -282,11 +283,17 @@ fn register_persistent_remote_reuse_latency(
                 |bench, &(target, live)| {
                     bench.iter_custom(|iters| {
                         let workers = threaded::PersistentRemoteReuse::spawn(target);
-                        let start = Instant::now();
+                        let mut elapsed = Duration::ZERO;
                         for _ in 0..iters {
                             black_box(workers.run_round(PERSISTENT_OPS, live));
+                            if let Some(ns) = workers.last_round_reuse_ns() {
+                                elapsed += Duration::from_nanos(ns);
+                            }
                         }
-                        let elapsed = start.elapsed();
+                        if let Some(mean_ns) = workers.mean_reuse_ns() {
+                            // Parseable marker for scripts/profile.sh → metrics.txt.
+                            eprintln!("runic_mean_reuse_ns={mean_ns}");
+                        }
                         drop(workers);
                         elapsed
                     });
@@ -358,6 +365,39 @@ fn register_persistent_unbound_remote_singleton(
                             black_box(workers.prepare_round(PERSISTENT_OPS));
                             let start = Instant::now();
                             black_box(workers.run_free_round());
+                            elapsed += start.elapsed();
+                        }
+                        drop(workers);
+                        elapsed
+                    });
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
+fn register_persistent_owner_accept(c: &mut Criterion, suite: &str, targets: &[AllocatorTarget]) {
+    let mut group = c.benchmark_group(format!("{suite}/persistent_owner_accept"));
+    configure_group(&mut group);
+
+    for &target in targets {
+        for &threads in THREAD_COUNTS {
+            group.throughput(Throughput::Elements(PERSISTENT_OPS as u64));
+            group.bench_with_input(
+                BenchmarkId::new(target.name(), threads),
+                &(target, threads),
+                |bench, &(target, threads)| {
+                    bench.iter_custom(|iters| {
+                        let workers =
+                            threaded::PersistentBoundRemoteBatch::spawn_bound(target, threads);
+                        let mut elapsed = Duration::ZERO;
+                        for _ in 0..iters {
+                            black_box(workers.prepare_round(PERSISTENT_OPS));
+                            black_box(workers.run_free_round());
+                            let start = Instant::now();
+                            black_box(workers.run_accept_round(PERSISTENT_OPS));
                             elapsed += start.elapsed();
                         }
                         drop(workers);

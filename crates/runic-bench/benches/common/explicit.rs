@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    hint::black_box,
+    time::{Duration, Instant},
+};
 
 use criterion::{BenchmarkId, Criterion, Throughput};
 use runic_bench::{allocator_target::AllocatorTarget, workload};
@@ -20,6 +23,8 @@ pub fn register(c: &mut Criterion, suite: &str, targets: &[AllocatorTarget]) {
     register_single_size_churn(c, suite, targets);
     register_recycled_live_churn(c, suite, targets);
     register_recycled_live_hotspot(c, suite, targets);
+    register_owner_free_only(c, suite, targets);
+    register_freelist_allocate_only(c, suite, targets);
     register_size_boundary_sweep(c, suite, targets);
     register_small_biased_random(c, suite, targets);
     register_alignment_stress(c, suite, targets);
@@ -90,6 +95,72 @@ fn register_recycled_live_hotspot(c: &mut Criterion, suite: &str, targets: &[All
                     },
                 );
             }
+        }
+    }
+
+    group.finish();
+}
+
+fn register_owner_free_only(c: &mut Criterion, suite: &str, targets: &[AllocatorTarget]) {
+    let mut group = c.benchmark_group(format!("{suite}/owner_free_only"));
+    configure_group(&mut group);
+    group.throughput(Throughput::Elements(workload::PHASE_BATCH as u64));
+
+    for &target in targets {
+        for &size in workload::LOCAL_PHASE_SIZES {
+            group.bench_with_input(
+                BenchmarkId::new(target.name(), size),
+                &(target, size),
+                |bench, &(target, size)| {
+                    bench.iter_custom(|iters| {
+                        let mut slots = workload::fill_live(target, size, workload::PHASE_BATCH);
+                        let mut elapsed = Duration::ZERO;
+                        for _ in 0..iters {
+                            let start = Instant::now();
+                            black_box(workload::owner_free_only(target, size, &mut slots));
+                            elapsed += start.elapsed();
+                            black_box(workload::refill_live(target, size, &mut slots));
+                        }
+                        for slot in slots {
+                            let layout = std::alloc::Layout::from_size_align(size, 8).unwrap();
+                            target.dealloc(slot, layout);
+                        }
+                        elapsed
+                    });
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
+fn register_freelist_allocate_only(c: &mut Criterion, suite: &str, targets: &[AllocatorTarget]) {
+    let mut group = c.benchmark_group(format!("{suite}/freelist_allocate_only"));
+    configure_group(&mut group);
+    group.throughput(Throughput::Elements(workload::PHASE_BATCH as u64));
+
+    for &target in targets {
+        for &size in workload::LOCAL_PHASE_SIZES {
+            group.bench_with_input(
+                BenchmarkId::new(target.name(), size),
+                &(target, size),
+                |bench, &(target, size)| {
+                    bench.iter_custom(|iters| {
+                        let mut slots = workload::fill_live(target, size, workload::PHASE_BATCH);
+                        black_box(workload::seed_freelist(target, size, &mut slots));
+                        let mut elapsed = Duration::ZERO;
+                        for _ in 0..iters {
+                            let start = Instant::now();
+                            black_box(workload::freelist_allocate_only(target, size, &mut slots));
+                            elapsed += start.elapsed();
+                            black_box(workload::seed_freelist(target, size, &mut slots));
+                        }
+                        // Final seed left slots dangling; nothing live to free.
+                        elapsed
+                    });
+                },
+            );
         }
     }
 

@@ -32,11 +32,17 @@ Persistent workers (preferred for allocator profiles):
 
 - `threaded/persistent_local_churn/runic/4`
 - `threaded/persistent_cross_thread_ring/runic/4/live:256`
-- `threaded/persistent_remote_fan_in/runic/4/live:256`
-- `threaded/persistent_owner_concurrent/runic/4/live:256`
-- `threaded/persistent_remote_reuse_latency/runic/live:1` (also `live:32`, `live:256`)
+- `threaded/persistent_remote_fan_in/runic/4/live:256` — freer backlog depth is real
+- `threaded/persistent_owner_concurrent/runic/4/live:256` — owner-local churn + remote frees
+- `threaded/persistent_remote_reuse_latency/runic/live:1` (also `live:32`, `live:256`) — Criterion time is measured reuse latency; emits `runic_mean_reuse_ns=`
 - `threaded/persistent_bound_remote_batch/runic/4` — channel-free bound batch frees
 - `threaded/persistent_unbound_remote_singleton/runic/4` — channel-free unbound singletons
+- `threaded/persistent_owner_accept/runic/4` — prepare+free outside timing; owner accept/flush only
+
+Phase-isolated local free/alloc (setup outside timed window):
+
+- `explicit/owner_free_only/runic/{8|64|80|4096}`
+- `explicit/freelist_allocate_only/runic/{8|64|80|4096}`
 
 Local size-class matrix (full + focused hotspot subset):
 
@@ -57,6 +63,8 @@ Preferred: `scripts/profile.sh` (builds once, runs the resolved bench binary und
 
 ```sh
 scripts/profile.sh -l baseline explicit 'explicit/single_size_churn/runic/64'
+scripts/profile.sh -l baseline explicit 'explicit/owner_free_only/runic/64'
+scripts/profile.sh -l baseline explicit 'explicit/freelist_allocate_only/runic/64'
 scripts/profile.sh -l baseline explicit 'explicit/recycled_live_churn/runic/64/live:1'
 scripts/profile.sh -l baseline -t 20 \
   threaded 'threaded/persistent_remote_fan_in/runic/4/live:256'
@@ -79,9 +87,18 @@ scripts/profile.sh -l post-pr5-pr1 -t 20 \
   threaded 'threaded/persistent_bound_remote_batch/runic/4'
 scripts/profile.sh -l post-pr5-pr1 -t 20 \
   threaded 'threaded/persistent_unbound_remote_singleton/runic/4'
+scripts/profile.sh -l baseline -t 20 \
+  threaded 'threaded/persistent_owner_accept/runic/4'
 ```
 
 Artifacts land under `target/runic-profiles/` (override with `RUNIC_PROFILE_DIR` or `-o`).
 Each run writes `manifest.txt`, `metrics.txt`, and `summary.txt`.
+
+Compare two labeled runs (ratios + % delta from `metrics.txt`):
+
+```sh
+scripts/profile.sh --compare \
+  target/runic-profiles/run-before target/runic-profiles/run-after
+```
 
 Compare base and head on the same machine, preferably from separate git worktrees built from exact commits.

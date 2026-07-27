@@ -10,6 +10,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage: scripts/profile.sh [options] <bench-target> <criterion-filter>
+       scripts/profile.sh --compare <before-dir> <after-dir>
 
 Positional:
   bench-target       Criterion bench binary (explicit, threaded, compare_explicit, ...)
@@ -20,6 +21,7 @@ Options:
   -a, --annotate SYM     perf annotate for SYM (also positional arg 4)
   -o, --output-dir DIR   Profile output root for this run
   -l, --label NAME       Manifest label (e.g. before, after, baseline)
+  --compare A B          Diff two profile dirs' metrics.txt (ratios + % delta)
   --with LIST            Extra/optional tools, comma-separated:
                            flamegraph (default on when available)
                            samply     (Firefox Profiler JSON; skipped if missing)
@@ -44,6 +46,8 @@ Examples:
     threaded 'threaded/persistent_remote_fan_in/runic/4/live:256'
   scripts/profile.sh -a 'ThreadHeap>::alloc' \
     explicit 'explicit/single_size_churn/runic/64'
+  scripts/profile.sh --compare \
+    target/runic-profiles/foo-before target/runic-profiles/foo-after
 EOF
 }
 
@@ -113,6 +117,8 @@ WITH_TOOLS=flamegraph
 SKIP_STAGES=
 BENCH_TARGET=
 CRITERION_FILTER=
+COMPARE_BEFORE=
+COMPARE_AFTER=
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -140,6 +146,12 @@ while [[ $# -gt 0 ]]; do
       RUN_LABEL=$2
       shift 2
       ;;
+    --compare)
+      [[ $# -ge 3 ]] || die "$1 requires <before-dir> <after-dir>"
+      COMPARE_BEFORE=$2
+      COMPARE_AFTER=$3
+      shift 3
+      ;;
     --with)
       [[ $# -ge 2 ]] || die "$1 requires a value"
       WITH_TOOLS=$(normalize_csv "$2")
@@ -162,6 +174,77 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+compare_metrics() {
+  local before=$1
+  local after=$2
+  [[ -f $before/metrics.txt ]] || die "missing $before/metrics.txt"
+  [[ -f $after/metrics.txt ]] || die "missing $after/metrics.txt"
+  python3 - "$before" "$after" <<'PY'
+import sys
+from pathlib import Path
+
+before_dir, after_dir = Path(sys.argv[1]), Path(sys.argv[2])
+
+def load_kv(path: Path) -> dict[str, str]:
+    out = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+before = load_kv(before_dir / "metrics.txt")
+after = load_kv(after_dir / "metrics.txt")
+manifest_b = load_kv(before_dir / "manifest.txt") if (before_dir / "manifest.txt").exists() else {}
+manifest_a = load_kv(after_dir / "manifest.txt") if (after_dir / "manifest.txt").exists() else {}
+
+keys = [
+    "cycles_per_elem",
+    "instructions_per_elem",
+    "branches_per_elem",
+    "elems_per_sec",
+    "ipc",
+    "mean_reuse_ns",
+    "cycles",
+    "instructions",
+    "seconds",
+]
+
+print("Runic profile compare")
+print("=====================")
+print(f"before: {before_dir}")
+print(f"  label={manifest_b.get('label', '')} sha={manifest_b.get('git_sha', '')} filter={manifest_b.get('criterion_filter', '')}")
+print(f"  binary={manifest_b.get('bench_bin', '')}")
+print(f"after:  {after_dir}")
+print(f"  label={manifest_a.get('label', '')} sha={manifest_a.get('git_sha', '')} filter={manifest_a.get('criterion_filter', '')}")
+print(f"  binary={manifest_a.get('bench_bin', '')}")
+print()
+print(f"{'metric':<28} {'before':>14} {'after':>14} {'ratio':>10} {'delta%':>10}")
+print("-" * 80)
+
+for key in keys:
+    if key not in before or key not in after:
+        continue
+    try:
+        b = float(before[key])
+        a = float(after[key])
+    except ValueError:
+        continue
+    if b == 0:
+        continue
+    # Higher elems_per_sec / ipc is better → invert ratio display sense via delta only.
+    ratio = a / b
+    delta = (a - b) / b * 100.0
+    print(f"{key:<28} {b:14.4f} {a:14.4f} {ratio:10.4f} {delta:9.2f}%")
+PY
+}
+
+if [[ -n $COMPARE_BEFORE ]]; then
+  [[ $# -eq 0 ]] || die "unexpected arguments after --compare: $*"
+  compare_metrics "$COMPARE_BEFORE" "$COMPARE_AFTER"
+  exit 0
+fi
 
 [[ $# -ge 2 ]] || {
   usage >&2
@@ -438,14 +521,21 @@ def first_number(pattern: str):
 cycles = first_number(r"([\d,]+)\s+cycles:u")
 insns = first_number(r"([\d,]+)\s+instructions:u")
 branches = first_number(r"([\d,]+)\s+branches:u")
+cache_refs = first_number(r"([\d,]+)\s+cache-references:u")
+cache_misses = first_number(r"([\d,]+)\s+cache-misses:u")
 task = first_number(r"([\d,.]+)\s+msec task-clock")
 
 elems_per_s = None
-blocks = re.findall(r"thrpt:\s*\[([^\]]+)\]", text)
-if blocks:
-    vals = [float(v) for v in re.findall(r"([\d.]+)\s*Melem/s", blocks[-1])]
-    if vals:
-        elems_per_s = vals[len(vals) // 2] * 1e6
+# Prefer absolute thrpt lines; skip Criterion "change" percentage blocks.
+# Criterion scales units: Kelem/s, Melem/s, Gelem/s.
+triples = re.findall(
+    r"thrpt:\s*\[([\d.]+)\s*([KMG]?)elem/s\s+([\d.]+)\s*([KMG]?)elem/s\s+([\d.]+)\s*([KMG]?)elem/s\]",
+    text,
+)
+scale = {"": 1.0, "K": 1e3, "M": 1e6, "G": 1e9}
+if triples:
+    medians = [float(t[2]) * scale.get(t[3], 1.0) for t in triples]
+    elems_per_s = medians[len(medians) // 2]
 
 seconds = None
 m = re.search(r"([\d.]+)\s+\+-.*?seconds time elapsed", text)
@@ -454,6 +544,11 @@ if m:
 elif task is not None:
     seconds = task / 1000.0
 
+mean_reuse = None
+reuse_vals = [float(v) for v in re.findall(r"runic_mean_reuse_ns=(\d+(?:\.\d+)?)", text)]
+if reuse_vals:
+    mean_reuse = reuse_vals[-1]
+
 lines = []
 if cycles is not None:
     lines.append(f"cycles={cycles:.0f}")
@@ -461,6 +556,10 @@ if insns is not None:
     lines.append(f"instructions={insns:.0f}")
 if branches is not None:
     lines.append(f"branches={branches:.0f}")
+if cache_refs is not None:
+    lines.append(f"cache_references={cache_refs:.0f}")
+if cache_misses is not None:
+    lines.append(f"cache_misses={cache_misses:.0f}")
 if seconds is not None and seconds > 0:
     lines.append(f"seconds={seconds:.6f}")
     if cycles is not None:
@@ -476,8 +575,12 @@ if elems_per_s is not None:
                 lines.append(f"instructions_per_elem={insns / total_elems:.3f}")
             if branches is not None:
                 lines.append(f"branches_per_elem={branches / total_elems:.3f}")
+            if cache_misses is not None:
+                lines.append(f"cache_misses_per_elem={cache_misses / total_elems:.6f}")
 if cycles is not None and insns is not None and cycles > 0:
     lines.append(f"ipc={insns / cycles:.4f}")
+if mean_reuse is not None:
+    lines.append(f"mean_reuse_ns={mean_reuse:.0f}")
 
 open(out_path, "w", encoding="utf-8").write("\n".join(lines) + ("\n" if lines else ""))
 PY
@@ -612,7 +715,7 @@ else
 fi
 info "Resolved bench binary: $BENCH_BIN"
 
-STAT_ARGS=("$BENCH_BIN" "$CRITERION_FILTER" --exact --profile-time "$STAT_PROFILE_SECONDS" --noplot --bench --quiet)
+STAT_ARGS=("$BENCH_BIN" "$CRITERION_FILTER" --exact --warm-up-time 0.25 --measurement-time "$STAT_PROFILE_SECONDS" --sample-size 10 --noplot --bench)
 PROFILE_ARGS=("$BENCH_BIN" "$CRITERION_FILTER" --exact --profile-time "$PROFILE_SECONDS" --noplot --bench --quiet)
 
 {
