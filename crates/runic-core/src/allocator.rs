@@ -11,8 +11,8 @@ use crate::{
     heap::table::inbox::RemoteList,
     heap::table::{THREAD_HEAP, ThreadFreeError, ThreadHeap},
     heap::{
-        ExtentHeap, ExtentHeapError, ExtentInit, HeapDirectory, HeapError, RunError, RunHeap,
-        RunHeapError,
+        ExtentHeap, ExtentHeapError, ExtentInit, HeapDirectory, HeapError, HeapId, RunError,
+        RunHeap, RunHeapError,
     },
     layout::LayoutSpec,
     memory::{Mapping, OsMemory, PageMap, PageOwner},
@@ -353,11 +353,11 @@ impl Allocator {
             .map_or(null_mut(), NonNull::as_ptr)
     }
 
-    /// Cross-heap free: Active claim→batch→publish, or Draining late free.
+    /// Cross-heap free: Active claim→batch→publish-on-flush, or Draining late free.
     ///
-    /// Active admission is a packed CAS on `SlotState` publishers for this attempt's publish
-    /// admit (in-flight lease counting — not serialization of concurrent freer bodies, and not
-    /// unpublished TLS batch size; those stay live via `RemotePending`).
+    /// Bound coalesce-only frees do not acquire a `PublisherLease`. Admission is only for
+    /// actual inbox publication (`HeapDirectory::publish` / unbound singleton). In-flight
+    /// unpublished TLS batches stay live via `RemotePending` (not the publisher count).
     #[cold]
     #[inline(never)]
     fn free_remote(
@@ -383,60 +383,96 @@ impl Allocator {
             .slot(heap_id)
             .ok_or(AllocatorError::InvalidMetadata)?;
 
-        match slot.publisher(heap_id) {
-            Ok(lease) => {
-                match owner {
-                    PageOwner::Run(run) => {
-                        // SAFETY: PageMap stores only pointers published from this allocator's live arenas.
-                        unsafe { run.as_ref() }
-                            .claim(ptr)
-                            .map_err(AllocatorError::from)?;
-                    }
-                    PageOwner::Extent(extent) => {
-                        // SAFETY: PageMap stores only pointers published from this allocator's live arenas.
-                        unsafe { extent.as_ref() }
-                            .claim(ptr)
-                            .map_err(AllocatorError::from)?;
-                    }
-                }
-                // Bound freers coalesce via TLS batch. Never-bound freers publish a singleton
-                // here (cold path) so `ThreadHeap::batch` stays unbound-free for local codegen.
-                let pending = THREAD_HEAP.with(|tls| {
-                    if tls.is_empty() {
-                        Some((heap_id, RemoteList::from_ends(ptr, ptr)))
-                    } else {
-                        tls.batch(heap_id, ptr)
-                    }
-                });
-                match pending {
-                    Some((id, list)) if id == heap_id => lease.publish(&list),
-                    Some((id, list)) => {
-                        drop(lease);
+        if !slot.state().is_active() {
+            return Self::free_remote_draining(inner_ref, heap_id, owner, ptr, pages);
+        }
+
+        match owner {
+            PageOwner::Run(run) => {
+                // SAFETY: PageMap stores only pointers published from this allocator's live arenas.
+                unsafe { run.as_ref() }
+                    .claim(ptr)
+                    .map_err(AllocatorError::from)?;
+            }
+            PageOwner::Extent(extent) => {
+                // SAFETY: PageMap stores only pointers published from this allocator's live arenas.
+                unsafe { extent.as_ref() }
+                    .claim(ptr)
+                    .map_err(AllocatorError::from)?;
+            }
+        }
+
+        // Bound freers coalesce via TLS batch. Never-bound freers publish a singleton
+        // here (cold path) so `ThreadHeap::batch` stays unbound-free for local codegen.
+        let pending = THREAD_HEAP.with(|tls| {
+            if tls.is_empty() {
+                Some((heap_id, RemoteList::from_ends(ptr, ptr)))
+            } else {
+                tls.batch(heap_id, ptr)
+            }
+        });
+        // After a same-target flush the TLS batch is empty. Target-change leaves the new
+        // claim coalesced; coalesce-only (`None`) always retains a partial batch.
+        let mut may_hold_partial = pending.is_none();
+        if let Some((id, list)) = pending {
+            if id == heap_id {
+                // Same-target flush: admit on the already-resolved slot (unbound singleton /
+                // capacity). Avoid a second directory lookup on the publish hot path.
+                match slot.publisher(heap_id) {
+                    Ok(lease) => lease.publish(&list),
+                    Err(HeapError::InvalidHeap) => {
                         inner_ref
                             .directory
                             .publish(id, &list, pages)
                             .map_err(AllocatorError::from)?;
                     }
-                    None => drop(lease),
+                    Err(error) => return Err(AllocatorError::from(error)),
                 }
-                Ok(())
-            }
-            Err(HeapError::InvalidHeap) => {
-                let mut pending = THREAD_HEAP.with(ThreadHeap::take_batch);
-                while let Some((id, list)) = pending {
-                    inner_ref
-                        .directory
-                        .publish(id, &list, pages)
-                        .map_err(AllocatorError::from)?;
-                    pending = THREAD_HEAP.with(ThreadHeap::take_batch);
-                }
+            } else {
+                may_hold_partial = true;
                 inner_ref
                     .directory
-                    .free_draining(heap_id, owner, ptr, pages)
-                    .map_err(AllocatorError::from)
+                    .publish(id, &list, pages)
+                    .map_err(AllocatorError::from)?;
             }
-            Err(error) => Err(AllocatorError::from(error)),
         }
+
+        // Capacity / target-change flushes already published above. A later Active→Draining
+        // close under a coalesce-only free must push the partial TLS batch immediately.
+        if may_hold_partial
+            && !slot.state().is_active()
+            && let Some((id, list)) = THREAD_HEAP.with(ThreadHeap::take_batch)
+        {
+            inner_ref
+                .directory
+                .publish(id, &list, pages)
+                .map_err(AllocatorError::from)?;
+        }
+
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn free_remote_draining(
+        inner: &AllocatorInner,
+        heap_id: HeapId,
+        owner: PageOwner,
+        ptr: NonNull<u8>,
+        pages: &PageMap,
+    ) -> Result<(), AllocatorError> {
+        let mut pending = THREAD_HEAP.with(ThreadHeap::take_batch);
+        while let Some((id, list)) = pending {
+            inner
+                .directory
+                .publish(id, &list, pages)
+                .map_err(AllocatorError::from)?;
+            pending = THREAD_HEAP.with(ThreadHeap::take_batch);
+        }
+        inner
+            .directory
+            .free_draining(heap_id, owner, ptr, pages)
+            .map_err(AllocatorError::from)
     }
 }
 

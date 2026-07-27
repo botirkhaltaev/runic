@@ -568,6 +568,53 @@ fn unbound_remote_freer_publishes_without_binding() {
 }
 
 #[test]
+fn draining_observation_publishes_partial_bound_batch() {
+    // Bound freer coalesces below capacity, owner closes to Draining, then another remote
+    // free must publish the retained batch (and accept the new free) without stranding
+    // RemotePending.
+    let allocator = Allocator::new();
+    let layout = Layout::from_size_align(64, 8).unwrap();
+    let (ptrs_tx, ptrs_rx) = mpsc::channel();
+    let (batched_tx, batched_rx) = mpsc::channel();
+    let (closed_tx, closed_rx) = mpsc::channel();
+
+    thread::scope(|scope| {
+        let allocator = &allocator;
+        scope.spawn(move || {
+            let a = unsafe { allocator.alloc(layout) };
+            let b = unsafe { allocator.alloc(layout) };
+            assert!(!a.is_null() && !b.is_null());
+            unsafe {
+                a.write(0x41);
+                b.write(0x42);
+            }
+            ptrs_tx.send((a.addr(), b.addr())).unwrap();
+            batched_rx.recv().unwrap();
+            closed_tx.send(()).unwrap();
+        });
+
+        scope.spawn(move || {
+            // Bind freer TLS so the first free coalesces instead of singleton-publishing.
+            let binder = unsafe { allocator.alloc(layout) };
+            assert!(!binder.is_null());
+            unsafe { allocator.dealloc(binder, layout) };
+
+            let (a, b) = ptrs_rx.recv().unwrap();
+            unsafe { allocator.dealloc(a as *mut u8, layout) };
+            batched_tx.send(()).unwrap();
+            closed_rx.recv().unwrap();
+            unsafe { allocator.dealloc(b as *mut u8, layout) };
+        });
+    });
+
+    let ptr = unsafe { allocator.alloc(layout) };
+    assert!(!ptr.is_null());
+    unsafe { ptr.write(0x43) };
+    assert_eq!(unsafe { ptr.read() }, 0x43);
+    unsafe { allocator.dealloc(ptr, layout) };
+}
+
+#[test]
 fn concurrent_active_remote_frees_through_public_dealloc() {
     const FREERS: usize = 4;
     const PER_FREER: usize = 64;
