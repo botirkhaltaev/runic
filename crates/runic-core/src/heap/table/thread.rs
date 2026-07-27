@@ -1,8 +1,4 @@
-use core::{
-    cell::{Cell, UnsafeCell},
-    ptr::NonNull,
-    sync::atomic::{AtomicPtr, Ordering},
-};
+use core::{cell::Cell, ptr::NonNull};
 
 use crate::{
     allocator::{Allocator, AllocatorInner},
@@ -12,7 +8,7 @@ use crate::{
     size_class::{SizeClass, SizeClasses},
 };
 
-use super::{inbox::RemoteList, slot::HeapError};
+use super::slot::HeapError;
 
 /// Owner-local TLS free failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28,87 +24,11 @@ impl From<RunError> for ThreadFreeError {
     }
 }
 
-const REMOTE_BATCH_CAPACITY: u32 = 32;
-
-/// Producer-side coalesce buffer for remote frees.
-struct RemoteBatch {
-    target: Option<HeapId>,
-    first: Option<NonNull<u8>>,
-    last: Option<NonNull<u8>>,
-    len: u32,
-}
-
-impl RemoteBatch {
-    const fn new() -> Self {
-        Self {
-            target: None,
-            first: None,
-            last: None,
-            len: 0,
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// Append `ptr` for `target`.
-    ///
-    /// Returns a list that must be published to the returned `HeapId`'s inbox when the
-    /// previous batch is full or the target changes.
-    fn append(&mut self, target: HeapId, ptr: NonNull<u8>) -> Option<(HeapId, RemoteList)> {
-        let pending = if self.target.is_some_and(|current| current != target) {
-            self.take()
-        } else {
-            None
-        };
-
-        self.target = Some(target);
-        Self::store_next(ptr, core::ptr::null_mut());
-
-        if let Some(last) = self.last {
-            Self::store_next(last, ptr.as_ptr());
-            self.last = Some(ptr);
-        } else {
-            self.first = Some(ptr);
-            self.last = Some(ptr);
-        }
-
-        self.len += 1;
-        if self.len >= REMOTE_BATCH_CAPACITY {
-            // After a target-change take, len is 1, so this cannot coincide with `pending`.
-            debug_assert!(pending.is_none());
-            return self.take();
-        }
-
-        pending
-    }
-
-    /// Take any pending nodes for publish (partial flush).
-    fn take(&mut self) -> Option<(HeapId, RemoteList)> {
-        let target = self.target?;
-        let first = self.first?;
-        let last = self.last?;
-        self.clear();
-        Some((target, RemoteList::from_ends(first, last)))
-    }
-
-    fn clear(&mut self) {
-        self.target = None;
-        self.first = None;
-        self.last = None;
-        self.len = 0;
-    }
-
-    fn store_next(ptr: NonNull<u8>, next: *mut u8) {
-        // SAFETY: remote-pending blocks store the intrusive next at the base address.
-        unsafe {
-            (*ptr.as_ptr().cast::<AtomicPtr<u8>>()).store(next, Ordering::Relaxed);
-        }
-    }
-}
-
-/// Thread-local frontend: bound slot, cached runs, and outbound remote batch.
+/// Thread-local frontend: bound slot and cached runs.
+///
+/// Remote frees no longer retain a TLS batch: `Allocator::free_remote` claims and
+/// `HeapSlot::enqueue`s the affected run/extent immediately — coalescing is by owner
+/// (`Inbox`), not by producer batch, so no per-thread flush is needed here.
 pub(crate) struct ThreadHeap {
     inner: Cell<*mut AllocatorInner>,
     heap_id: Cell<Option<HeapId>>,
@@ -117,7 +37,6 @@ pub(crate) struct ThreadHeap {
     /// Last cached run page number (`usize::MAX` = empty). See `lookup_owner`.
     page_cache_page: Cell<usize>,
     page_cache_owner: Cell<Option<PageOwner>>,
-    remote: UnsafeCell<RemoteBatch>,
 }
 
 impl Drop for ThreadHeap {
@@ -135,7 +54,6 @@ impl ThreadHeap {
             runs: [const { Cell::new(core::ptr::null_mut()) }; SizeClasses::COUNT],
             page_cache_page: Cell::new(usize::MAX),
             page_cache_owner: Cell::new(None),
-            remote: UnsafeCell::new(RemoteBatch::new()),
         }
     }
 
@@ -208,7 +126,7 @@ impl ThreadHeap {
 
         let slot = self.bound_slot();
         // SAFETY: Active TLS owner for this bound slot.
-        unsafe { slot.as_ref().allocate_extent(spec, pages, init) }
+        unsafe { slot.as_ref().alloc_extent(spec, pages, init) }
     }
 
     /// Owner-local free for a run owned by the bound heap.
@@ -294,27 +212,6 @@ impl ThreadHeap {
         self.install(inner, slot, id);
 
         Some(id)
-    }
-
-    /// Coalesce a claimed remote free; returns a list the caller must `HeapDirectory::publish`.
-    ///
-    /// Caller must be bound (`!is_empty`). Never-bound freers publish a singleton in
-    /// `Allocator::free_remote` so this method stays a pure coalesce (measured: an unbound
-    /// branch here regresses owner-local thrpt).
-    pub(crate) fn batch(&self, target: HeapId, ptr: NonNull<u8>) -> Option<(HeapId, RemoteList)> {
-        debug_assert!(!self.is_empty());
-        // SAFETY: ThreadHeap is thread-local; exclusive access to the remote batch.
-        unsafe { &mut *self.remote.get() }.append(target, ptr)
-    }
-
-    /// Take any pending outbound remote frees (unbind / protocol flush).
-    pub(crate) fn take_batch(&self) -> Option<(HeapId, RemoteList)> {
-        // SAFETY: ThreadHeap is thread-local; exclusive access to the remote batch.
-        let batch = unsafe { &mut *self.remote.get() };
-        if batch.is_empty() {
-            return None;
-        }
-        batch.take()
     }
 
     fn install(&self, inner: NonNull<AllocatorInner>, slot: NonNull<HeapSlot>, id: HeapId) {
@@ -407,25 +304,13 @@ impl ThreadHeap {
         }
     }
 
-    fn publish_batches(&self, inner: &AllocatorInner) {
-        while let Some((id, list)) = self.take_batch() {
-            if inner.directory.publish(id, &list, inner.pages()).is_err() {
-                Allocator::abort();
-            }
-        }
-    }
-
-    /// Publish outbound batches, retire the bound heap, and release the inner retain.
+    /// Retire the bound heap and release the inner retain.
     #[cold]
     pub(crate) fn unbind(&self) {
         self.return_cached_runs();
         self.page_cache_page.set(usize::MAX);
         self.page_cache_owner.set(None);
         let Some(inner) = NonNull::new(self.inner.replace(core::ptr::null_mut())) else {
-            if self.take_batch().is_some() {
-                // Bound retain is required to publish; never-bound freers publish immediately.
-                Allocator::abort();
-            }
             return;
         };
         let heap_id = self.heap_id.replace(None);
@@ -433,7 +318,6 @@ impl ThreadHeap {
 
         // SAFETY: this TLS entry retained inner while bound.
         let inner_ref = unsafe { inner.as_ref() };
-        self.publish_batches(inner_ref);
 
         if let Some(heap_id) = heap_id
             && inner_ref
@@ -450,64 +334,4 @@ impl ThreadHeap {
 
 std::thread_local! {
     pub(crate) static THREAD_HEAP: ThreadHeap = const { ThreadHeap::new() };
-}
-
-#[cfg(test)]
-mod tests {
-    use core::num::NonZeroU32;
-
-    use super::*;
-    use crate::heap::table::inbox::Inbox;
-
-    #[repr(C)]
-    struct TestNode {
-        next: AtomicPtr<u8>,
-    }
-
-    fn node_ptr(node: &TestNode) -> NonNull<u8> {
-        NonNull::from(node).cast()
-    }
-
-    #[test]
-    fn remote_batch_publishes_at_capacity() {
-        let inbox = Inbox::new();
-        let mut batch = RemoteBatch::new();
-        let target = HeapId::new(0, NonZeroU32::MIN).unwrap();
-        let mut nodes = Vec::with_capacity(REMOTE_BATCH_CAPACITY as usize);
-        for _ in 0..REMOTE_BATCH_CAPACITY {
-            nodes.push(TestNode {
-                next: AtomicPtr::new(core::ptr::null_mut()),
-            });
-        }
-
-        let mut published = None;
-        for node in &nodes {
-            if let Some(list) = batch.append(target, node_ptr(node)) {
-                published = Some(list);
-            }
-        }
-        let (id, list) = published.expect("capacity flush");
-        assert_eq!(id, target);
-        inbox.push_batch(&list);
-        let drained = inbox.drain().unwrap();
-        assert_eq!(drained.count(), REMOTE_BATCH_CAPACITY as usize);
-    }
-
-    #[test]
-    fn remote_batch_returns_list_on_target_change() {
-        let mut batch = RemoteBatch::new();
-        let first = HeapId::new(0, NonZeroU32::MIN).unwrap();
-        let second = HeapId::new(1, NonZeroU32::MIN).unwrap();
-        let a = TestNode {
-            next: AtomicPtr::new(core::ptr::null_mut()),
-        };
-        let b = TestNode {
-            next: AtomicPtr::new(core::ptr::null_mut()),
-        };
-
-        assert!(batch.append(first, node_ptr(&a)).is_none());
-        let (id, list) = batch.append(second, node_ptr(&b)).expect("target change");
-        assert_eq!(id, first);
-        assert_eq!(list.count(), 1);
-    }
 }

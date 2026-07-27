@@ -3,4 +3,4 @@ mod slot;
 mod thread;
 
 pub(crate) use slot::{HeapDirectory, HeapError, HeapSlot};
-pub(crate) use thread::{THREAD_HEAP, ThreadFreeError, ThreadHeap};
+pub(crate) use thread::{THREAD_HEAP, ThreadFreeError};

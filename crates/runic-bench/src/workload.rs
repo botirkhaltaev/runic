@@ -1,4 +1,4 @@
-use std::{alloc::Layout, hint::black_box};
+use std::{alloc::Layout, hint::black_box, ptr::NonNull};
 
 use crate::{allocation::AllocationRecord, allocator_target::AllocatorTarget, rng::TraceRng};
 
@@ -7,16 +7,20 @@ pub const SIZE_CLASSES: &[usize] = &[
     4096, 6144, 8192, 12288, 16384, 24576, 32768,
 ];
 
-pub const SINGLE_SIZE_CHURN: &[usize] = &[8, 16, 32, 64, 128, 256, 512, 1024, 4096];
+pub const SINGLE_SIZE_CHURN: &[usize] = &[8, 16, 32, 64, 80, 128, 256, 512, 1024, 4096];
 /// Live-set depths for freelist-heavy recycled churn (gate matrix).
 pub const RECYCLED_LIVE_DEPTHS: &[usize] = &[1, 32, 256];
 /// Focused local free/index hotspot sizes for profile gates (power-of-two and non-power-of-two requests).
 ///
 /// `72` / `88` round into classes `80` / `96` and exercise non-power-of-two `locate`.
 pub const LOCAL_HOTSPOT_SIZES: &[usize] = &[64, 72, 80, 88];
+/// Phase-isolated local free/alloc probe sizes (small power-of-two, sticky, non-power-of-two, page-ish).
+pub const LOCAL_PHASE_SIZES: &[usize] = &[8, 64, 80, 4096];
 pub const LARGE_SIZES: &[usize] = &[32769, 64 * 1024, 256 * 1024, 1024 * 1024];
 pub const ALIGNMENT_CASES: &[(usize, usize)] =
     &[(1, 8), (1, 64), (1, 4096), (64, 64), (4096, 4096)];
+/// Batch size for phase-isolated owner-free / freelist-allocate benches.
+pub const PHASE_BATCH: usize = 512;
 
 /// Runs repeated allocate/write/free operations for one size.
 ///
@@ -89,6 +93,108 @@ pub fn single_size_recycled_churn(
         target.dealloc(ptr, layout);
     }
 
+    black_box(checksum)
+}
+
+/// Fills `count` live allocations (setup; keep outside the timed window).
+///
+/// # Panics
+///
+/// Panics if `size`/`count` are invalid or allocation fails.
+#[must_use]
+pub fn fill_live(target: AllocatorTarget, size: usize, count: usize) -> Vec<NonNull<u8>> {
+    assert!(count > 0, "live count must be non-zero");
+    let layout = Layout::from_size_align(size, 8).unwrap();
+    let mut slots = Vec::with_capacity(count);
+    for i in 0..count {
+        let ptr = target.alloc(black_box(layout));
+        unsafe {
+            ptr.as_ptr().write(byte(i));
+        }
+        slots.push(ptr);
+    }
+    slots
+}
+
+/// Owner-free-only: deallocates every live slot (timed phase).
+///
+/// Caller must refill via [`fill_live`] or [`refill_live`] before the next free phase.
+///
+/// # Panics
+///
+/// Panics if `size` is invalid.
+#[must_use]
+pub fn owner_free_only(target: AllocatorTarget, size: usize, slots: &mut [NonNull<u8>]) -> usize {
+    let layout = Layout::from_size_align(size, 8).unwrap();
+    let mut checksum = 0_usize;
+    for (i, slot) in slots.iter_mut().enumerate() {
+        let ptr = *slot;
+        unsafe {
+            checksum ^= ptr.as_ptr().read() as usize;
+            checksum ^= i;
+        }
+        target.dealloc(ptr, layout);
+        // Leave a dangling placeholder; refill restores valid pointers.
+        *slot = NonNull::dangling();
+    }
+    black_box(checksum)
+}
+
+/// Allocates into every slot (setup refill after [`owner_free_only`]).
+///
+/// # Panics
+///
+/// Panics if `size` is invalid or allocation fails.
+#[must_use]
+pub fn refill_live(target: AllocatorTarget, size: usize, slots: &mut [NonNull<u8>]) -> usize {
+    let layout = Layout::from_size_align(size, 8).unwrap();
+    let mut checksum = 0_usize;
+    for (i, slot) in slots.iter_mut().enumerate() {
+        let ptr = target.alloc(black_box(layout));
+        unsafe {
+            ptr.as_ptr().write(byte(i));
+            checksum ^= ptr.as_ptr().read() as usize;
+        }
+        *slot = ptr;
+    }
+    black_box(checksum)
+}
+
+/// Seeds the freelist by freeing every live slot (setup; keep outside timed allocate).
+///
+/// # Panics
+///
+/// Panics if `size` is invalid.
+#[must_use]
+pub fn seed_freelist(target: AllocatorTarget, size: usize, slots: &mut [NonNull<u8>]) -> usize {
+    owner_free_only(target, size, slots)
+}
+
+/// Freelist-allocate-only: allocates into every slot from a seeded freelist (timed phase).
+///
+/// Call [`fill_live`] then [`seed_freelist`] before the first timed call. After timing,
+/// either free the slots for cleanup or re-seed for the next sample.
+///
+/// # Panics
+///
+/// Panics if `size` is invalid or allocation fails.
+#[must_use]
+pub fn freelist_allocate_only(
+    target: AllocatorTarget,
+    size: usize,
+    slots: &mut [NonNull<u8>],
+) -> usize {
+    let layout = Layout::from_size_align(size, 8).unwrap();
+    let mut checksum = 0_usize;
+    for (i, slot) in slots.iter_mut().enumerate() {
+        let ptr = target.alloc(black_box(layout));
+        unsafe {
+            ptr.as_ptr().write(byte(i));
+            checksum ^= ptr.as_ptr().read() as usize;
+            checksum ^= ptr.as_ptr().add(size - 1).read() as usize;
+        }
+        *slot = ptr;
+    }
     black_box(checksum)
 }
 

@@ -524,8 +524,9 @@ fn allocator_publishes_retained_remote_batch_after_owner_exits() {
 
 #[test]
 fn unbound_remote_freer_publishes_without_binding() {
-    // Never-bound freer must not strand RemotePending across exit: each claim publishes
-    // immediately (no TLS batch retain without a directory retain).
+    // Never-bound freer must not strand a Claimed block across exit: each claim enqueues
+    // immediately (coalesced by owner; no TLS batch), so retiring the owner heap can accept
+    // and reclaim.
     let allocator = Allocator::new();
     let layout = Layout::from_size_align(64, 8).unwrap();
 
@@ -569,10 +570,9 @@ fn unbound_remote_freer_publishes_without_binding() {
 
 #[test]
 fn draining_entry_publishes_retained_bound_batch() {
-    // Bound freer coalesces below capacity while the owner is Active. After the owner
-    // thread exits (heap Draining), the next remote free enters the draining path,
-    // publishes the retained TLS batch, and late-frees the new pointer without stranding
-    // RemotePending.
+    // Bound freer enqueues while the owner is Active. After the owner thread exits
+    // (heap Draining), the next remote free takes the exclusive late-free path without
+    // stranding a Claimed block.
     let allocator = Allocator::new();
     let layout = Layout::from_size_align(64, 8).unwrap();
     let (ptrs_tx, ptrs_rx) = mpsc::channel();

@@ -51,7 +51,7 @@ impl ExtentHeap {
         }
     }
 
-    /// Any occupied extent that is still Allocated or `RemotePending`.
+    /// Any occupied extent that is still Allocated or `Claimed`.
     ///
     /// Cached Free extents stay in the arena while published but are not live.
     pub(crate) fn has_live_extents(&self) -> bool {

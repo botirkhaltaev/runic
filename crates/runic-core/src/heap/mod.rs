@@ -94,7 +94,7 @@ impl Heap {
         Some(ptr)
     }
 
-    pub(crate) fn allocate_extent(
+    pub(crate) fn alloc_extent(
         &mut self,
         spec: LayoutSpec,
         pages: &PageMap,

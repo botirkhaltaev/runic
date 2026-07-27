@@ -370,13 +370,22 @@ impl PersistentRemoteFanIn {
                 while let Ok(cmd) = cmd_rx.recv() {
                     match cmd {
                         WorkerCmd::Shutdown => break,
-                        WorkerCmd::Run { ops, live: _ } => {
+                        WorkerCmd::Run { ops, live } => {
+                            assert!(live >= 1);
+                            let mut pending = Vec::with_capacity(live);
                             let mut local = 0_usize;
                             for _ in 0..ops {
                                 let received = rx.recv().unwrap().0;
                                 local ^= received as usize;
                                 let ptr = std::ptr::NonNull::new(received).unwrap();
-                                target.dealloc(ptr, layout);
+                                pending.push(ptr);
+                                if pending.len() == live {
+                                    let old = pending.remove(0);
+                                    target.dealloc(old, layout);
+                                }
+                            }
+                            for old in pending {
+                                target.dealloc(old, layout);
                             }
                             checksum.fetch_xor(local, Ordering::Relaxed);
                             done.wait();
@@ -421,20 +430,20 @@ impl PersistentRemoteFanIn {
         }
     }
 
-    /// Each freer performs `ops` frees; producer allocates `ops * freers` blocks.
+    /// Each freer receives `ops` blocks and keeps up to `live` outstanding before freeing.
+    /// Producer allocates `ops * freers` blocks.
     ///
     /// # Panics
     ///
-    /// Panics if a worker channel is closed.
+    /// Panics if `live` is zero or a worker channel is closed.
     #[must_use]
-    pub fn run_round(&self, ops: usize) -> usize {
+    pub fn run_round(&self, ops: usize, live: usize) -> usize {
+        assert!(live >= 1, "live depth must be non-zero");
         self.checksum.store(0, Ordering::Relaxed);
         for tx in &self.free_cmds {
-            tx.send(WorkerCmd::Run { ops, live: 1 }).unwrap();
+            tx.send(WorkerCmd::Run { ops, live }).unwrap();
         }
-        self.alloc_cmd
-            .send(WorkerCmd::Run { ops, live: 1 })
-            .unwrap();
+        self.alloc_cmd.send(WorkerCmd::Run { ops, live }).unwrap();
         self.done.wait();
         self.checksum.load(Ordering::Relaxed)
     }
@@ -452,28 +461,147 @@ impl Drop for PersistentRemoteFanIn {
     }
 }
 
-/// Owner allocates locally while freers concurrently remote-free the owner's blocks.
+/// Owner performs local alloc/free churn while freers concurrently remote-free owner blocks.
+///
+/// Unlike [`PersistentRemoteFanIn`], the owner path stays hot: every round mixes owner-local
+/// free with remote fan-in traffic on a separate outstanding set.
 pub struct PersistentOwnerConcurrent {
-    inner: PersistentRemoteFanIn,
+    owner_cmd: mpsc::Sender<WorkerCmd>,
+    free_cmds: Vec<mpsc::Sender<WorkerCmd>>,
+    checksum: Arc<AtomicUsize>,
+    done: Arc<Barrier>,
+    joins: Vec<JoinHandle<()>>,
 }
 
 impl PersistentOwnerConcurrent {
+    /// `freers` remote freers; the owner is an extra thread.
+    ///
     /// # Panics
     ///
-    /// Panics on spawn failure.
+    /// Panics on spawn or channel failure.
     #[must_use]
     pub fn spawn(target: AllocatorTarget, freers: usize) -> Self {
+        assert!(freers >= 1);
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        let checksum = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(Barrier::new(freers + 2));
+
+        let mut free_senders = Vec::with_capacity(freers);
+        let mut free_receivers = Vec::with_capacity(freers);
+        for _ in 0..freers {
+            let (tx, rx) = mpsc::channel::<SendPtr>();
+            free_senders.push(tx);
+            free_receivers.push(Some(rx));
+        }
+
+        let mut joins = Vec::with_capacity(freers + 1);
+        let mut free_cmds = Vec::with_capacity(freers);
+
+        for rx_slot in &mut free_receivers {
+            let (cmd_tx, cmd_rx) = mpsc::channel();
+            free_cmds.push(cmd_tx);
+            let rx = rx_slot.take().unwrap();
+            let done = Arc::clone(&done);
+            let checksum = Arc::clone(&checksum);
+            joins.push(thread::spawn(move || {
+                while let Ok(cmd) = cmd_rx.recv() {
+                    match cmd {
+                        WorkerCmd::Shutdown => break,
+                        WorkerCmd::Run { ops, live } => {
+                            assert!(live >= 1);
+                            let mut pending = Vec::with_capacity(live);
+                            let mut local = 0_usize;
+                            for _ in 0..ops {
+                                let received = rx.recv().unwrap().0;
+                                local ^= received as usize;
+                                let ptr = std::ptr::NonNull::new(received).unwrap();
+                                pending.push(ptr);
+                                if pending.len() == live {
+                                    let old = pending.remove(0);
+                                    target.dealloc(old, layout);
+                                }
+                            }
+                            for old in pending {
+                                target.dealloc(old, layout);
+                            }
+                            checksum.fetch_xor(local, Ordering::Relaxed);
+                            done.wait();
+                        }
+                    }
+                }
+            }));
+        }
+
+        let (owner_cmd, owner_rx) = mpsc::channel();
+        let free_senders = Arc::new(free_senders);
+        let done_owner = Arc::clone(&done);
+        let checksum_owner = Arc::clone(&checksum);
+        joins.push(thread::spawn(move || {
+            while let Ok(cmd) = owner_rx.recv() {
+                match cmd {
+                    WorkerCmd::Shutdown => break,
+                    WorkerCmd::Run { ops, live: _ } => {
+                        let freers = free_senders.len();
+                        let mut local = 0_usize;
+                        for i in 0..ops {
+                            // Owner-local churn — the distinguishing load vs fan-in.
+                            let local_ptr = target.alloc(black_box(layout));
+                            unsafe { local_ptr.as_ptr().write(byte(i)) };
+                            local ^= local_ptr.as_ptr() as usize;
+                            target.dealloc(local_ptr, layout);
+
+                            // Separate outstanding set handed to freers.
+                            for freer in 0..freers {
+                                let remote = target.alloc(black_box(layout));
+                                unsafe { remote.as_ptr().write(byte(i ^ freer)) };
+                                local ^= remote.as_ptr() as usize;
+                                free_senders[freer].send(SendPtr(remote.as_ptr())).unwrap();
+                            }
+                        }
+                        checksum_owner.fetch_xor(local, Ordering::Relaxed);
+                        done_owner.wait();
+                    }
+                }
+            }
+        }));
+
         Self {
-            inner: PersistentRemoteFanIn::spawn(target, freers),
+            owner_cmd,
+            free_cmds,
+            checksum,
+            done,
+            joins,
         }
     }
 
+    /// Owner performs `ops` local churn steps and feeds `ops` blocks to each freer.
+    /// Freers keep up to `live` outstanding before freeing.
+    ///
     /// # Panics
     ///
-    /// Panics if a worker channel is closed.
+    /// Panics if `live` is zero or a worker channel is closed.
     #[must_use]
-    pub fn run_round(&self, ops: usize) -> usize {
-        self.inner.run_round(ops)
+    pub fn run_round(&self, ops: usize, live: usize) -> usize {
+        assert!(live >= 1, "live depth must be non-zero");
+        self.checksum.store(0, Ordering::Relaxed);
+        for tx in &self.free_cmds {
+            tx.send(WorkerCmd::Run { ops, live }).unwrap();
+        }
+        self.owner_cmd.send(WorkerCmd::Run { ops, live }).unwrap();
+        self.done.wait();
+        self.checksum.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for PersistentOwnerConcurrent {
+    fn drop(&mut self) {
+        let _ = self.owner_cmd.send(WorkerCmd::Shutdown);
+        for tx in &self.free_cmds {
+            let _ = tx.send(WorkerCmd::Shutdown);
+        }
+        for handle in self.joins.drain(..) {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -483,6 +611,8 @@ pub struct PersistentRemoteReuse {
     freer_tx: mpsc::Sender<SendPtr>,
     reuse_ns: Arc<AtomicUsize>,
     rounds: Arc<AtomicUsize>,
+    last_round_ns: Arc<AtomicUsize>,
+    last_round_ops: Arc<AtomicUsize>,
     join: Option<JoinHandle<()>>,
     target: AllocatorTarget,
     layout: Layout,
@@ -499,6 +629,8 @@ impl PersistentRemoteReuse {
         let (freer_tx, freer_rx) = mpsc::channel::<SendPtr>();
         let reuse_ns = Arc::new(AtomicUsize::new(0));
         let rounds = Arc::new(AtomicUsize::new(0));
+        let last_round_ns = Arc::new(AtomicUsize::new(0));
+        let last_round_ops = Arc::new(AtomicUsize::new(0));
 
         let stop_freer = Arc::clone(&stop);
         let join = thread::spawn(move || {
@@ -523,6 +655,8 @@ impl PersistentRemoteReuse {
             freer_tx,
             reuse_ns,
             rounds,
+            last_round_ns,
+            last_round_ops,
             join: Some(join),
             target,
             layout,
@@ -543,6 +677,7 @@ impl PersistentRemoteReuse {
         assert!(live >= 1, "live depth must be non-zero");
         let mut checksum = 0_usize;
         let mut total_ns = 0_usize;
+        let mut hits = 0_usize;
 
         for i in 0..(live - 1) {
             let ptr = self.target.alloc(black_box(self.layout));
@@ -560,25 +695,33 @@ impl PersistentRemoteReuse {
             // Spin-alloc until the freer has returned capacity via remote inbox flush.
             // Touching the new block keeps the work from being optimized away.
             let mut spun = 0_usize;
+            let spin_limit = 64.max(live.saturating_mul(4));
             loop {
                 let next = self.target.alloc(black_box(self.layout));
                 unsafe { next.as_ptr().write(byte(i ^ spun)) };
                 checksum ^= next.as_ptr() as usize;
                 spun += 1;
-                if next.as_ptr() == first.as_ptr() || spun >= 64.max(live) {
+                if next.as_ptr() == first.as_ptr() {
+                    hits += 1;
                     self.target.dealloc(next, self.layout);
                     break;
                 }
                 self.target.dealloc(next, self.layout);
+                if spun >= spin_limit {
+                    break;
+                }
             }
             total_ns += start.elapsed().as_nanos() as usize;
         }
 
+        self.last_round_ns.store(total_ns, Ordering::Relaxed);
+        self.last_round_ops.store(ops, Ordering::Relaxed);
         self.reuse_ns.fetch_add(total_ns, Ordering::Relaxed);
         self.rounds.fetch_add(ops, Ordering::Relaxed);
-        checksum ^ total_ns
+        checksum ^ total_ns ^ hits
     }
 
+    /// Mean reuse latency across all completed rounds since spawn / last reset.
     #[must_use]
     pub fn mean_reuse_ns(&self) -> Option<u64> {
         let rounds = self.rounds.load(Ordering::Relaxed);
@@ -586,6 +729,24 @@ impl PersistentRemoteReuse {
             return None;
         }
         Some((self.reuse_ns.load(Ordering::Relaxed) / rounds) as u64)
+    }
+
+    /// Total reuse nanoseconds measured in the most recent [`Self::run_round`] call.
+    #[must_use]
+    pub fn last_round_reuse_ns(&self) -> Option<u64> {
+        let ops = self.last_round_ops.load(Ordering::Relaxed);
+        if ops == 0 {
+            return None;
+        }
+        Some(self.last_round_ns.load(Ordering::Relaxed) as u64)
+    }
+
+    /// Clears cumulative reuse counters (call before a Criterion sample if desired).
+    pub fn reset_reuse_stats(&self) {
+        self.reuse_ns.store(0, Ordering::Relaxed);
+        self.rounds.store(0, Ordering::Relaxed);
+        self.last_round_ns.store(0, Ordering::Relaxed);
+        self.last_round_ops.store(0, Ordering::Relaxed);
     }
 }
 
@@ -758,6 +919,22 @@ impl PersistentChannelFreeRemote {
         }
         self.done.wait();
         self.checksum.load(Ordering::Relaxed)
+    }
+
+    /// Owner-thread alloc/free that drains published remote frees via flush/accept.
+    ///
+    /// Call after [`Self::run_free_round`] so claim→publish has already completed.
+    /// Does not touch freer channels; keep outside freer timing windows.
+    #[must_use]
+    pub fn run_accept_round(&self, ops: usize) -> usize {
+        let mut checksum = 0_usize;
+        for i in 0..ops {
+            let ptr = self.target.alloc(black_box(self.layout));
+            unsafe { ptr.as_ptr().write(byte(i)) };
+            checksum ^= ptr.as_ptr() as usize;
+            self.target.dealloc(ptr, self.layout);
+        }
+        black_box(checksum)
     }
 }
 
