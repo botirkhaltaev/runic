@@ -21,5 +21,5 @@ Run metadata owns small size-class allocations.
 - `Run::free` returns `Result<_, RunError>`; `accept` returns `bool` (needs re-push). `RunHeap` reads `is_full()` before those ops for available-list relinking. Sticky TLS free calls `Run::free` only.
 - `RunHeap` available-list pointers must refer to live `Arena<Run>` entries.
 - Sticky TLS caches hold a run checked out from `available[]`; reincarnation rebinds every occupied arena run, including sticky ones.
-- Live small ownership for reclaim is `RunHeap::has_live_blocks` over occupied arena runs (live + remote-claimed).
+- Live small ownership for reclaim is `Run::is_live` (allocated or remote-claimed), aggregated by `RunHeap::has_live` over occupied arena runs.
 - Runs stay published and arena-resident for the heap lifetime in v0.5 (no empty-run OS release).

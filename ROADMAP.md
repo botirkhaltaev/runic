@@ -122,8 +122,7 @@ GlobalAlloc
           -> AllocatorInner { refs, pages: PageMap, directory: HeapDirectory }
               -> HeapDirectory { published[], state: Mutex<Arena<HeapSlot>> }
                   -> ThreadHeap
-              -> HeapSlot { SlotState, Inbox, UnsafeCell<Heap> }
-                  -> Heap { RunHeap, ExtentHeap }
+              -> HeapSlot { SlotState, Inbox, SlotHeap{id, RunHeap, ExtentHeap} }
                   -> RunHeap { Arena<Run>, available[] }
                   -> ExtentHeap { Arena<Extent>, cache }
               -> Run
@@ -131,7 +130,7 @@ GlobalAlloc
               -> OsMemory
 ```
 
-`HeapDirectory::slot` / Active `publish` are lock-free via published pointers and
+`HeapDirectory::slot` / Active enqueue are lock-free via published pointers and
 SlotState publisher leases. Acquire, retire, Draining accept/free, and reclaim take the private
 directory lifecycle mutex. Same-thread small-run hits use TLS-owned heap metadata.
 `PageMap` stays outside that mutex so dealloc lookup is not directory-locked.
@@ -140,22 +139,22 @@ directory lifecycle mutex. Same-thread small-run hits use TLS-owned heap metadat
 
 ```text
 RunicAlloc     owns the Rust GlobalAlloc boundary.
-Allocator      owns the core public allocator API and abort boundary.
+Allocator      owns the core public allocator API, abort, and cold unbound routing.
 AllocatorInner owns the refcounted mmap instance: PageMap, HeapDirectory, and self-hosting Mapping.
-Heap           owns run and extent allocation policy for one heap identity (no mode/inbox).
 HeapDirectory  owns published slot pointers, lock-free lookup/Active enqueue, and locked acquire/retire/lock→LockedSlot/reclaim.
-HeapSlot       owns SlotState (gen+mode+retired+publishers), Inbox, and UnsafeCell<Heap> metadata.
+HeapSlot       owns SlotState (gen+mode+retired+publishers), Inbox, and run/extent metadata (RunHeap + ExtentHeap).
 Arena          owns fixed-capacity freelist metadata storage.
 LayoutSpec     owns normalized layout semantics.
 SizeClasses    owns size-class selection.
 OsMemory       maps anonymous pages; Mapping owns the mmap lifecycle (Drop munmaps).
 PageMap        owns page-indexed owner-pointer lookup.
-RunHeap        owns Arena<Run>, small-allocation policy, and available run lists.
+RunHeap        owns Arena<Run>, run checkout (acquire), and available run lists.
 Run            owns fixed-block allocation metadata, freelist-primary Free/Live, bump, and embedded InboxLink.
 BlockStates    owns clear/Free per-block bytes (one AtomicU8 per block); Free bit is DF fail-closed, not Free/Live authority.
 ExtentHeap     owns Arena<Extent>, dedicated allocation policy, and mapping reuse.
 ExtentCache    owns retained extent mappings, eviction, and reuse lookup.
 Extent         owns dedicated allocation metadata, embedded InboxLink, and Claimed byte state.
+ThreadHeap     owns TLS bind, sticky runs, and page→run cache.
 ```
 
 Prefer direct methods on the entity that owns the state. Do not add passive
@@ -199,7 +198,7 @@ subprocess abort cases
 Box, Vec, String, HashMap, Arc smoke tests
 deterministic randomized allocation traces
 Active publisher-lease remote free and Draining late free
-thread-exit / never-bound freer TLS batch publish
+thread-exit / never-bound freer claim→enqueue (no TLS batch)
 ```
 
 Abort tests must run in subprocesses, not inside the test harness process.

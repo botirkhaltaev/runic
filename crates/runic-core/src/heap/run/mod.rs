@@ -19,7 +19,7 @@ use super::{
     table::inbox::{InboxLink, InboxNode},
 };
 
-pub(crate) use heap::{RunHeap, RunHeapError};
+pub(crate) use heap::RunHeap;
 
 pub(crate) const RUN_SIZE: usize = 64 * 1024;
 /// Bits per claim-bitmap word (`AtomicU64`).
@@ -361,7 +361,7 @@ impl Run {
     }
 
     /// Outstanding blocks on this run (allocated or remote-claimed).
-    pub(crate) fn has_live_blocks(&self) -> bool {
+    pub(crate) fn is_live(&self) -> bool {
         // SAFETY: read under owner-local access or table-locked reclaim.
         unsafe { &*self.state.get() }.live != 0
     }
@@ -1184,6 +1184,6 @@ mod tests {
             }
         });
 
-        assert!(!run.has_live_blocks());
+        assert!(!run.is_live());
     }
 }

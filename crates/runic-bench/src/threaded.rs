@@ -766,8 +766,8 @@ enum ChannelFreeCmd {
 
 /// Channel-free remote free: owner fills a shared pointer array; freers drain slices.
 ///
-/// Bound mode binds each freer TLS once at spawn (`claim → TLS batch → publish`).
-/// Unbound mode never binds freers (singleton publish path).
+/// Bound mode binds each freer TLS once at spawn (`claim → enqueue`).
+/// Unbound mode never binds freers (singleton enqueue path).
 pub struct PersistentChannelFreeRemote {
     target: AllocatorTarget,
     layout: Layout,
@@ -780,10 +780,10 @@ pub struct PersistentChannelFreeRemote {
     joins: Vec<JoinHandle<()>>,
 }
 
-/// Bound freers: channel-free `claim → TLS batch → publish`.
+/// Bound freers: channel-free `claim → enqueue`.
 pub type PersistentBoundRemoteBatch = PersistentChannelFreeRemote;
 
-/// Never-bound freers: channel-free singleton publish path.
+/// Never-bound freers: channel-free singleton enqueue path.
 pub type PersistentUnboundRemoteSingleton = PersistentChannelFreeRemote;
 
 impl PersistentChannelFreeRemote {

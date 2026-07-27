@@ -125,7 +125,7 @@ impl Extent {
     }
 
     /// Allocated or claimed — cached Free extents are not live.
-    pub(crate) fn has_live_allocation(&self) -> bool {
+    pub(crate) fn is_live(&self) -> bool {
         matches!(
             self.load_state(),
             Ok(ExtentState::Allocated | ExtentState::Claimed)

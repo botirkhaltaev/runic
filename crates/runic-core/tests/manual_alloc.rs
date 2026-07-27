@@ -484,9 +484,9 @@ fn allocator_drains_remote_free_when_owner_thread_exits() {
 }
 
 #[test]
-fn allocator_publishes_retained_remote_batch_after_owner_exits() {
-    // Freer claims while owner is Active (TLS batch retains below capacity), owner then
-    // exits to Draining, and freer TLS teardown must publish the batch without abort.
+fn allocator_draining_accepts_active_remote_claim_after_owner_exits() {
+    // Freer claims+enqueues while owner is Active; owner then exits to Draining; freer
+    // exit must not abort (inbox already holds the claim for Draining accept).
     let allocator = Allocator::new();
     let layout = Layout::from_size_align(64, 8).unwrap();
     let (ptr_tx, ptr_rx) = mpsc::channel();
@@ -513,8 +513,8 @@ fn allocator_publishes_retained_remote_batch_after_owner_exits() {
         });
     });
 
-    // After freer TLS teardown published the batch and Draining accept ran, the original
-    // block is usable again (pattern write must not fault).
+    // After freer exit and Draining accept, the original block is usable again
+    // (pattern write must not fault).
     let ptr = unsafe { allocator.alloc(layout) };
     assert!(!ptr.is_null());
     unsafe { ptr.write(0xa5) };
@@ -669,9 +669,9 @@ fn concurrent_active_remote_frees_through_public_dealloc() {
 }
 
 #[test]
-fn remote_batch_capacity_flush_via_public_dealloc() {
-    // Exactly one over the TLS remote batch capacity forces a publish while the owner
-    // stays Active and makes no progress.
+fn remote_fan_in_enqueues_while_owner_stays_active() {
+    // Many remote frees against one Active owner coalesce by run inbox (claim→enqueue),
+    // without the owner making progress.
     const COUNT: usize = 33;
     let allocator = Allocator::new();
     let layout = Layout::from_size_align(64, 8).unwrap();
