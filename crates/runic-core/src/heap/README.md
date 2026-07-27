@@ -14,7 +14,7 @@ Owner-local heap frontend: runs for small size classes, extents for dedicated la
 
 - Every `Run` and `Extent` stores a `HeapId`; there is no root/central ownership heap.
 - Small allocations are owned by a heap's runs; large allocations by that heap's extents.
-- Cross-thread frees: Active `claim` → TLS batch → publish only on flush (capacity, target change, Draining observation, unbind, or never-bound singleton) via `HeapDirectory::publish` (Active lease or locked Draining accept). Bound coalesce-only frees do not take a publisher lease. Draining late frees use locked `free_draining`. Owner `flush` → `accept`.
+- Cross-thread frees: Active `claim` → TLS batch → publish only on flush (capacity, target change, Draining observation, unbind, or never-bound singleton) via `HeapDirectory::publish` / `publish_on` (Active lease or locked Draining accept). Bound coalesce-only frees do not take a publisher lease. Draining late frees use locked `free_draining`. Owner `flush` → `accept`.
 - `Inbox::push_batch` is a Treiber CAS loop: store `last.next = old_head` before CASing `head: old → first`, so drain never observes a published head without the prior chain. `drain` is a single-pass null-terminated walk.
 - Draining reclaim observes live ownership via `RunHeap::has_live_blocks` and `ExtentHeap::has_live_extents` (composed by `Heap::has_live_allocations`). Claimed / remote-pending blocks keep the heap live.
 - Partial TLS remote batches flush on capacity, target change, a later Draining observation, or bound unbind. Never-bound freers publish each claim in `Allocator::free_remote` (no Drop-stranded `RemotePending`). An idle long-lived **bound** producer may delay reclaim (bounded one-batch-per-TLS backpressure).

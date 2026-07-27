@@ -11,8 +11,8 @@ use crate::{
     heap::table::inbox::RemoteList,
     heap::table::{THREAD_HEAP, ThreadFreeError, ThreadHeap},
     heap::{
-        ExtentHeap, ExtentHeapError, ExtentInit, HeapDirectory, HeapError, HeapId, RunError,
-        RunHeap, RunHeapError,
+        ExtentHeap, ExtentHeapError, ExtentInit, HeapDirectory, HeapError, HeapId, HeapSlot,
+        RunError, RunHeap, RunHeapError,
     },
     layout::LayoutSpec,
     memory::{Mapping, OsMemory, PageMap, PageOwner},
@@ -356,7 +356,7 @@ impl Allocator {
     /// Cross-heap free: Active claim→batch→publish-on-flush, or Draining late free.
     ///
     /// Bound coalesce-only frees do not acquire a `PublisherLease`. Admission is only for
-    /// actual inbox publication (`HeapDirectory::publish` / unbound singleton). In-flight
+    /// actual inbox publication (`HeapDirectory::publish` / `publish_on`). In-flight
     /// unpublished TLS batches stay live via `RemotePending` (not the publisher count).
     #[cold]
     #[inline(never)]
@@ -378,8 +378,8 @@ impl Allocator {
             }
         };
         let pages = inner_ref.pages();
-        let slot = inner_ref
-            .directory
+        let directory = &inner_ref.directory;
+        let slot = directory
             .slot(heap_id)
             .ok_or(AllocatorError::InvalidMetadata)?;
 
@@ -411,44 +411,44 @@ impl Allocator {
                 tls.batch(heap_id, ptr)
             }
         });
-        // After a same-target flush the TLS batch is empty. Target-change leaves the new
-        // claim coalesced; coalesce-only (`None`) always retains a partial batch.
-        let mut may_hold_partial = pending.is_none();
-        if let Some((id, list)) = pending {
-            if id == heap_id {
-                // Same-target flush: admit on the already-resolved slot (unbound singleton /
-                // capacity). Avoid a second directory lookup on the publish hot path.
-                match slot.publisher(heap_id) {
-                    Ok(lease) => lease.publish(&list),
-                    Err(HeapError::InvalidHeap) => {
-                        inner_ref
-                            .directory
-                            .publish(id, &list, pages)
-                            .map_err(AllocatorError::from)?;
-                    }
-                    Err(error) => return Err(AllocatorError::from(error)),
-                }
-            } else {
-                may_hold_partial = true;
-                inner_ref
-                    .directory
+
+        match pending {
+            // Same-target flush: TLS batch is empty afterward.
+            Some((id, list)) if id == heap_id => {
+                directory
+                    .publish_on(slot, id, &list, pages)
+                    .map_err(AllocatorError::from)?;
+            }
+            // Target change: published the previous target; current claim remains coalesced.
+            Some((id, list)) => {
+                directory
                     .publish(id, &list, pages)
                     .map_err(AllocatorError::from)?;
+                Self::publish_partial_if_closed(directory, slot, pages)?;
+            }
+            // Coalesce-only: partial batch retained for heap_id.
+            None => {
+                Self::publish_partial_if_closed(directory, slot, pages)?;
             }
         }
 
-        // Capacity / target-change flushes already published above. A later Active→Draining
-        // close under a coalesce-only free must push the partial TLS batch immediately.
-        if may_hold_partial
-            && !slot.state().is_active()
+        Ok(())
+    }
+
+    /// If `slot` closed under a retained TLS partial, publish that batch immediately.
+    #[inline]
+    fn publish_partial_if_closed(
+        directory: &HeapDirectory,
+        slot: &HeapSlot,
+        pages: &PageMap,
+    ) -> Result<(), AllocatorError> {
+        if !slot.state().is_active()
             && let Some((id, list)) = THREAD_HEAP.with(ThreadHeap::take_batch)
         {
-            inner_ref
-                .directory
+            directory
                 .publish(id, &list, pages)
                 .map_err(AllocatorError::from)?;
         }
-
         Ok(())
     }
 
@@ -461,13 +461,11 @@ impl Allocator {
         ptr: NonNull<u8>,
         pages: &PageMap,
     ) -> Result<(), AllocatorError> {
-        let mut pending = THREAD_HEAP.with(ThreadHeap::take_batch);
-        while let Some((id, list)) = pending {
+        if let Some((id, list)) = THREAD_HEAP.with(ThreadHeap::take_batch) {
             inner
                 .directory
                 .publish(id, &list, pages)
                 .map_err(AllocatorError::from)?;
-            pending = THREAD_HEAP.with(ThreadHeap::take_batch);
         }
         inner
             .directory

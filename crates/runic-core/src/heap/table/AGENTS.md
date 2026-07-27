@@ -2,7 +2,7 @@
 
 Scope: `crates/runic-core/src/heap/table/`.
 
-- `HeapDirectory`: lock-free `slot` via published pointers; internal mutex for `acquire` / `retire` / Draining accept / reclaim. `publish` admits Active or cold-falls to Draining.
+- `HeapDirectory`: lock-free `slot` via published pointers; internal mutex for `acquire` / `retire` / Draining accept / reclaim. `publish` / `publish_on` admit Active or cold-fall to Draining.
 - `HeapSlot`: sole lifecycle authority (`SlotState` gen+mode+retired+publishers), `Inbox`, `UnsafeCell<Heap>` (Active TLS owner or directory-locked Draining).
 - `SlotState` publishers: in-flight Active publish admits (not unpublished TLS batch size — that stays live via `RemotePending`); close Active→Draining preserves count; Release decrement (fail-closed underflow); retire waits Acquire for zero off the mutex.
 - `ThreadHeap`: `bind` / `unbind`, owner-local alloc/free, `lookup_owner`, `batch` / `take_batch`. Bound coalesce-only frees skip publisher leases; publish on capacity / target change / Draining observation / unbind. Never-bound freers publish each claim in `Allocator::free_remote` (not `batch`) so Drop cannot strand `RemotePending`. Sticky miss prefers local/OS run acquire before inbox flush.
