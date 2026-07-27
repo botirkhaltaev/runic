@@ -11,8 +11,8 @@ use crate::{
     heap::table::inbox::RemoteList,
     heap::table::{THREAD_HEAP, ThreadFreeError, ThreadHeap},
     heap::{
-        ExtentHeap, ExtentHeapError, ExtentInit, HeapDirectory, HeapError, HeapId, HeapSlot,
-        RunError, RunHeap, RunHeapError,
+        ExtentHeap, ExtentHeapError, ExtentInit, HeapDirectory, HeapError, RunError, RunHeap,
+        RunHeapError,
     },
     layout::LayoutSpec,
     memory::{Mapping, OsMemory, PageMap, PageOwner},
@@ -384,7 +384,14 @@ impl Allocator {
             .ok_or(AllocatorError::InvalidMetadata)?;
 
         if !slot.state().is_active() {
-            return Self::free_remote_draining(inner_ref, heap_id, owner, ptr, pages);
+            if let Some((id, list)) = THREAD_HEAP.with(ThreadHeap::take_batch) {
+                directory
+                    .publish(id, &list, pages)
+                    .map_err(AllocatorError::from)?;
+            }
+            return directory
+                .free_draining(heap_id, owner, ptr, pages)
+                .map_err(AllocatorError::from);
         }
 
         match owner {
@@ -424,53 +431,27 @@ impl Allocator {
                 directory
                     .publish(id, &list, pages)
                     .map_err(AllocatorError::from)?;
-                Self::publish_partial_if_closed(directory, slot, pages)?;
+                if !slot.state().is_active()
+                    && let Some((id, list)) = THREAD_HEAP.with(ThreadHeap::take_batch)
+                {
+                    directory
+                        .publish(id, &list, pages)
+                        .map_err(AllocatorError::from)?;
+                }
             }
             // Coalesce-only: partial batch retained for heap_id.
             None => {
-                Self::publish_partial_if_closed(directory, slot, pages)?;
+                if !slot.state().is_active()
+                    && let Some((id, list)) = THREAD_HEAP.with(ThreadHeap::take_batch)
+                {
+                    directory
+                        .publish(id, &list, pages)
+                        .map_err(AllocatorError::from)?;
+                }
             }
         }
 
         Ok(())
-    }
-
-    /// If `slot` closed under a retained TLS partial, publish that batch immediately.
-    #[inline]
-    fn publish_partial_if_closed(
-        directory: &HeapDirectory,
-        slot: &HeapSlot,
-        pages: &PageMap,
-    ) -> Result<(), AllocatorError> {
-        if !slot.state().is_active()
-            && let Some((id, list)) = THREAD_HEAP.with(ThreadHeap::take_batch)
-        {
-            directory
-                .publish(id, &list, pages)
-                .map_err(AllocatorError::from)?;
-        }
-        Ok(())
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn free_remote_draining(
-        inner: &AllocatorInner,
-        heap_id: HeapId,
-        owner: PageOwner,
-        ptr: NonNull<u8>,
-        pages: &PageMap,
-    ) -> Result<(), AllocatorError> {
-        if let Some((id, list)) = THREAD_HEAP.with(ThreadHeap::take_batch) {
-            inner
-                .directory
-                .publish(id, &list, pages)
-                .map_err(AllocatorError::from)?;
-        }
-        inner
-            .directory
-            .free_draining(heap_id, owner, ptr, pages)
-            .map_err(AllocatorError::from)
     }
 }
 
