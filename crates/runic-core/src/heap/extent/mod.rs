@@ -12,7 +12,10 @@ use crate::{
     memory::{AddressRange, Mapping},
 };
 
-use super::HeapId;
+use super::{
+    HeapId,
+    table::inbox::{Notified, Notify},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ExtentId {
@@ -68,6 +71,16 @@ pub(crate) struct Extent {
     mapping: Mapping,
     range: AddressRange,
     state: AtomicU8,
+    /// Coalesced remote-notify link (see `heap::table::inbox`). Only ever armed while
+    /// exactly one claim can be outstanding (`RemotePending`), so no bulk scan is needed —
+    /// unlike `Run`, `accept` is a single exact-pointer transition.
+    notify: Notify<Extent>,
+}
+
+impl Notified for Extent {
+    fn notify(&self) -> &Notify<Self> {
+        &self.notify
+    }
 }
 
 impl Extent {
@@ -88,10 +101,26 @@ impl Extent {
                 mapping,
                 range,
                 state: AtomicU8::new(ExtentState::Allocated.raw()),
+                notify: Notify::new(),
             })
         } else {
             None
         }
+    }
+
+    /// Idle → Queued for this extent's remote-notify slot.
+    ///
+    /// `true` means the caller must publish this extent on the owning heap's extent inbox.
+    #[inline]
+    pub(crate) fn try_arm(&self) -> bool {
+        self.notify.try_arm()
+    }
+
+    /// Owner: pairs with a completed `accept` — clears the remote-notify slot so a future
+    /// claim (after this extent is reused) can arm it again.
+    #[inline]
+    pub(crate) fn disarm(&self) {
+        self.notify.disarm();
     }
 
     pub(crate) const fn id(&self) -> ExtentId {

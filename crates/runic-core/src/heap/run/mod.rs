@@ -14,7 +14,10 @@ use crate::{
     size_class::SizeClass,
 };
 
-use super::HeapId;
+use super::{
+    HeapId,
+    table::inbox::{Notified, Notify},
+};
 
 pub(crate) use heap::{RunHeap, RunHeapError};
 
@@ -200,12 +203,16 @@ impl ClaimBits {
             .fetch_and(!mask, Ordering::Release);
     }
 
-    /// Clears the bit; returns whether it was set.
+    /// Atomically take every bit in `word`, returning the bits that were set beforehand.
     #[inline]
-    fn test_and_clear(&self, index: BlockIndex) -> bool {
-        let (word, mask) = index.claim_word_bit();
-        let prev = self.word_unchecked(word).fetch_and(!mask, Ordering::AcqRel);
-        prev & mask != 0
+    fn drain_word(&self, word: usize) -> u64 {
+        self.word_unchecked(word).swap(0, Ordering::AcqRel)
+    }
+
+    /// Cheap post-scan check for a straggling claim a bulk drain may have missed.
+    #[inline]
+    fn any_set(&self) -> bool {
+        (0..self.word_count).any(|word| self.word_unchecked(word).load(Ordering::Acquire) != 0)
     }
 
     fn word_unchecked(&self, word: usize) -> &AtomicU64 {
@@ -234,11 +241,20 @@ pub(crate) struct Run {
     mapping: Mapping,
     /// Mirror of `RunState.bump` for remote `claim`. Cold.
     issued: AtomicUsize,
+    /// Coalesced-by-run remote-notify link (see `heap::table::inbox`). Cold.
+    notify: Notify<Run>,
 }
 
 // SAFETY: owner-local methods are called only by the owning heap. Remote methods only touch
-// `BlockStates` / `ClaimBits`, load `issued`, and never mutate `RunState`.
+// `BlockStates` / `ClaimBits` / `Notify`, load `issued`, and never mutate `RunState` (except
+// `accept_remote`, itself an owner-local method called only through the owning heap's flush).
 unsafe impl Sync for Run {}
+
+impl Notified for Run {
+    fn notify(&self) -> &Notify<Self> {
+        &self.notify
+    }
+}
 
 /// Empty freelist head / end-of-list link. Index `0` is a valid block, so this
 /// is a deliberate sentinel (same pattern as `Arena`'s freelist).
@@ -315,6 +331,7 @@ impl Run {
             heap,
             mapping,
             issued: AtomicUsize::new(0),
+            notify: Notify::new(),
         })
     }
 
@@ -444,22 +461,49 @@ impl Run {
         Ok(())
     }
 
-    /// Owner: consume a successful remote claim and publish to freelist.
-    pub(crate) fn accept(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
-        let block = self.locate(ptr).ok_or(RunError::InvalidPointer)?;
+    /// Idle → Queued for this run's remote-notify slot.
+    ///
+    /// `true` means the caller must publish this run on the owning heap's run inbox — see
+    /// [`Self::accept_remote`] for the paired disarm and wakeup proof.
+    #[inline]
+    pub(crate) fn try_arm(&self) -> bool {
+        self.notify.try_arm()
+    }
+
+    /// Owner: drain every claimed bit on this run and publish the freed blocks.
+    ///
+    /// Wakeup proof (idle-first + recheck): disarms this run's notify *before* scanning, so
+    /// a racing `claim` + `try_arm` is free to re-queue the run the moment it is dequeued
+    /// from the inbox (its `next` link is only safe to reuse once Idle). A straggling claim
+    /// that lands in an already-scanned word is never dropped: either that racer's own
+    /// `try_arm` wins (Idle at the time) and republishes on its own, or it loses (Queued
+    /// already, e.g. from a concurrent flush) and this call's own re-arm below wins instead —
+    /// exactly one of the two republishes, so the run is always requeued when work remains.
+    ///
+    /// Returns `Result` (never currently `Err`) for parity with the other domain ops
+    /// (`claim` / `free`) that `RunHeap::accept_remote` propagates via `?`.
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn accept_remote(&self) -> Result<bool, RunError> {
+        self.notify.disarm();
+
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
-
-        if !self.claims.test_and_clear(block.index()) {
-            return Err(RunError::DoubleFree);
+        for word in 0..self.claims.word_count {
+            let mut bits = self.claims.drain_word(word);
+            while bits != 0 {
+                // `trailing_zeros` of a nonzero `u64` is always < 64, so this never truncates.
+                let bit = usize::try_from(bits.trailing_zeros()).unwrap();
+                bits &= bits - 1;
+                let index = BlockIndex::new(word * CLAIM_WORD_BITS + bit);
+                debug_assert!(index.get() < self.capacity);
+                self.blocks.set(index, BlockState::Free, Ordering::Relaxed);
+                debug_assert!(state.live > 0);
+                state.live -= 1;
+                Self::push_free(state, Block::new(index, self.address(index)));
+            }
         }
-        self.blocks
-            .set(block.index(), BlockState::Free, Ordering::Relaxed);
 
-        debug_assert!(state.live > 0);
-        state.live -= 1;
-        Self::push_free(state, block);
-        Ok(())
+        Ok(self.claims.any_set() && self.notify.try_arm())
     }
 
     pub(crate) fn allocated(&self, ptr: NonNull<u8>) -> Result<Block, RunError> {
@@ -867,7 +911,7 @@ mod tests {
 
         assert_eq!(run.claim(ptr), Ok(()));
         assert!(matches!(run.free(ptr), Err(RunError::DoubleFree)));
-        assert!(run.accept(ptr).is_ok());
+        assert_eq!(run.accept_remote(), Ok(false));
         assert_eq!(run.allocate(), Some(ptr));
     }
 
@@ -884,7 +928,7 @@ mod tests {
         let ptr = run.allocate().unwrap();
 
         assert_eq!(run.claim(ptr), Ok(()));
-        assert!(run.accept(ptr).is_ok());
+        assert_eq!(run.accept_remote(), Ok(false));
         assert_eq!(run.allocate(), Some(ptr));
     }
 
@@ -928,7 +972,7 @@ mod tests {
             run.blocks.state(index, Ordering::Relaxed),
             BlockState::Clear
         );
-        assert!(run.accept(ptr).is_ok());
+        assert_eq!(run.accept_remote(), Ok(false));
         assert_eq!(run.allocate(), Some(ptr));
     }
 
@@ -976,7 +1020,7 @@ mod tests {
     }
 
     #[test]
-    fn accept_without_claim_reports_double_free() {
+    fn accept_remote_without_any_claim_is_a_noop() {
         let class = class_id(64, 8);
         let run = Run::new(
             RunId::from_index(16).unwrap(),
@@ -986,11 +1030,13 @@ mod tests {
         )
         .expect("test run");
         let ptr = run.allocate().unwrap();
-        assert_eq!(run.accept(ptr), Err(RunError::DoubleFree));
+        assert_eq!(run.accept_remote(), Ok(false));
+        // `ptr`'s block is still live (never claimed), so the next allocate is fresh.
+        assert_ne!(run.allocate().unwrap(), ptr);
     }
 
     #[test]
-    fn claim_accept_works_for_all_size_classes() {
+    fn claim_accept_remote_works_for_all_size_classes() {
         for (run_index, &size) in SizeClasses::SIZES.iter().enumerate() {
             let class = class_id(size, 8);
             let run = Run::new(
@@ -1002,7 +1048,7 @@ mod tests {
             .expect("test run");
             let ptr = run.allocate().unwrap();
             assert_eq!(run.claim(ptr), Ok(()), "size={size}");
-            assert!(run.accept(ptr).is_ok(), "size={size}");
+            assert_eq!(run.accept_remote(), Ok(false), "size={size}");
             assert_eq!(run.allocate(), Some(ptr), "size={size}");
         }
     }
@@ -1058,5 +1104,99 @@ mod tests {
         assert_eq!(run.range().base(), base);
         assert_eq!(run.range().len(), RUN_SIZE);
         assert!(run.mapping().len().get() >= Run::mapping_len(class).unwrap());
+    }
+
+    #[test]
+    fn try_arm_wins_once_until_disarmed() {
+        let class = class_id(64, 8);
+        let run = Run::new(
+            RunId::from_index(17).unwrap(),
+            test_heap_id(),
+            map_for_class(class),
+            class,
+        )
+        .expect("test run");
+        let a = run.allocate().unwrap();
+        let b = run.allocate().unwrap();
+
+        assert_eq!(run.claim(a), Ok(()));
+        // First claim on an idle run wins the arm race and must publish.
+        assert!(run.try_arm());
+
+        assert_eq!(run.claim(b), Ok(()));
+        // A second claim while still queued must not publish again.
+        assert!(!run.try_arm());
+
+        // accept_remote coalesces both claims from the single queued entry.
+        assert_eq!(run.accept_remote(), Ok(false));
+        assert_eq!(run.allocate(), Some(b));
+        assert_eq!(run.allocate(), Some(a));
+
+        // Disarmed by accept_remote: a fresh claim can arm again.
+        assert_eq!(run.claim(a), Ok(()));
+        assert!(run.try_arm());
+    }
+
+    /// Faithful simulation of the real `HeapSlot::flush` loop: a freer claims and
+    /// arms/notifies concurrently with an "owner" that drains the inbox and republishes
+    /// on `Ok(true)`. No claim may ever be stranded (wakeup proof).
+    #[test]
+    fn accept_remote_wakeup_proof_no_claim_is_ever_stranded() {
+        use core::sync::atomic::AtomicBool;
+
+        use super::super::table::inbox::Inbox;
+
+        let class = class_id(64, 8);
+        let run = Run::new(
+            RunId::from_index(20).unwrap(),
+            test_heap_id(),
+            map_for_class(class),
+            class,
+        )
+        .expect("test run");
+        let capacity = RUN_SIZE / class.size();
+        // Addresses, not `NonNull<u8>`: a raw-pointer `Vec` is not `Sync`, and this slice
+        // only ever crosses the thread boundary by shared reference below.
+        let addrs: Vec<usize> = (0..capacity)
+            .map(|_| run.allocate().unwrap().as_ptr() as usize)
+            .collect();
+        let inbox: Inbox<Run> = Inbox::new();
+        let done = AtomicBool::new(false);
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let run_ptr = NonNull::from(&run);
+                for &addr in &addrs {
+                    // SAFETY: addr is one of this run's own blocks, allocated above.
+                    let ptr = NonNull::new(addr as *mut u8).unwrap();
+                    run.claim(ptr).unwrap();
+                    if run.try_arm() {
+                        inbox.republish(run_ptr);
+                    }
+                }
+                done.store(true, Ordering::Release);
+            });
+
+            let mut spins = 0u32;
+            loop {
+                let finished = done.load(Ordering::Acquire);
+                while let Some(chain) = inbox.drain() {
+                    for r in chain {
+                        // SAFETY: `r` is `run_ptr`, live for the scope of this test.
+                        if unsafe { r.as_ref() }.accept_remote().unwrap() {
+                            inbox.republish(r);
+                        }
+                    }
+                }
+                if finished && inbox.is_empty() && !run.claims.any_set() {
+                    break;
+                }
+                spins += 1;
+                assert!(spins < 100_000_000, "owner loop never observed quiescence");
+                core::hint::spin_loop();
+            }
+        });
+
+        assert!(!run.has_live_blocks());
     }
 }

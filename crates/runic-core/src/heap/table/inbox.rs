@@ -1,109 +1,93 @@
-//! Intrusive multi-producer, single-consumer queue for remote frees.
+//! Intrusive multi-producer, single-consumer Treiber stack, coalesced by owner.
 //!
-//! Treiber-style stack of intrusive chains (`RemoteList` batches). Empty state is
-//! a null head pointer — no self-reference, so [`Inbox`] is movable after [`Inbox::new`].
+//! Unlike a per-pointer remote-free queue, [`Inbox`] carries at most one entry per run or
+//! extent at a time: a claim only pushes its owner once per idle→queued transition
+//! ([`Notify::try_arm`]), so many remote frees against the same run collapse into a single
+//! inbox entry instead of one entry per freed block. The owner drains the run/extent
+//! pointer and scans/accepts everything claimed on it in one pass (see `Run::accept_remote`).
 //!
-//! Publication linearizes on a successful CAS of `head`: the batch tail link to the
+//! Publication linearizes on a successful CAS of `head`: the node's next link to the
 //! previous head is stored before that CAS, so a concurrent [`Inbox::drain`] that
 //! observes the new head always walks the full prior chain.
 
 use core::{
     ptr::{self, NonNull},
-    sync::atomic::{AtomicPtr, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, Ordering},
 };
 
-/// Intrusive chain of remote-pending user blocks (FIFO within a publish).
+/// Idle/Queued arm state plus the intrusive Treiber-stack link for one entity.
 ///
-/// `first` and `last` are always valid, non-null ends: a `RemoteList` is only ever
-/// constructed from a batch that already contains at least one pointer.
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct RemoteList {
-    pub(crate) first: NonNull<u8>,
-    pub(crate) last: NonNull<u8>,
-    cursor: Option<NonNull<u8>>,
+/// Embedded by value on the owning `Run` / `Extent`. Idle means the entity is off every
+/// inbox and safe to re-link; Queued means it is linked into exactly one inbox (in transit
+/// or awaiting drain) and `next` must not be touched by anything but that inbox.
+pub(crate) struct Notify<T> {
+    next: AtomicPtr<T>,
+    queued: AtomicBool,
 }
 
-impl RemoteList {
-    pub(crate) fn from_ends(first: NonNull<u8>, last: NonNull<u8>) -> Self {
+impl<T> Notify<T> {
+    pub(crate) const fn new() -> Self {
         Self {
-            first,
-            last,
-            cursor: Some(first),
+            next: AtomicPtr::new(ptr::null_mut()),
+            queued: AtomicBool::new(false),
         }
     }
-}
 
-impl Iterator for RemoteList {
-    type Item = NonNull<u8>;
+    /// Idle → Queued. Returns `true` when this call won the transition and must publish
+    /// the owning entity on its inbox (or, from `accept_remote`, republish it directly).
+    #[inline]
+    pub(crate) fn try_arm(&self) -> bool {
+        !self.queued.swap(true, Ordering::AcqRel)
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
-        let ptr = self.cursor?;
-        if ptr == self.last {
-            self.cursor = None;
-        } else {
-            // SAFETY: nodes between first and last were linked by the producer.
-            let next = unsafe { &*ptr.as_ptr().cast::<AtomicPtr<u8>>() }.load(Ordering::Acquire);
-            self.cursor = NonNull::new(next);
-        }
-        Some(ptr)
+    /// Queued → Idle. Only the single consumer holding a just-dequeued node may call this;
+    /// it must run before that node's claims are scanned (see `Run::accept_remote`).
+    #[inline]
+    pub(crate) fn disarm(&self) {
+        self.queued.store(false, Ordering::Release);
     }
 }
 
-/// Null-terminated intrusive chain detached by [`Inbox::drain`] (single walk for accept).
-pub(crate) struct RemoteChain {
-    cursor: Option<NonNull<u8>>,
+/// Entities with an intrusive [`Notify`] link, coalesced through one [`Inbox`].
+pub(crate) trait Notified: Sized {
+    fn notify(&self) -> &Notify<Self>;
 }
 
-impl Iterator for RemoteChain {
-    type Item = NonNull<u8>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let ptr = self.cursor?;
-        // SAFETY: drained nodes keep producer-linked next words until the owner accepts them.
-        let next = unsafe { &*ptr.as_ptr().cast::<AtomicPtr<u8>>() }.load(Ordering::Acquire);
-        self.cursor = NonNull::new(next);
-        Some(ptr)
-    }
-}
-
-/// Lock-free MPSC inbox. Producers may only use shared references.
-pub(crate) struct Inbox {
+/// Lock-free MPSC inbox of distinct notified entities (run or extent pointers).
+///
+/// Producers may only use shared references. Single-consumer `drain`.
+pub(crate) struct Inbox<T: Notified> {
     /// Head of the pending intrusive chain (newer publishes link in front).
-    head: AtomicPtr<u8>,
+    head: AtomicPtr<T>,
 }
 
-// SAFETY: producers and the single consumer only coordinate through `head` and
-// in-block next words.
-unsafe impl Sync for Inbox {}
+// SAFETY: producers and the single consumer only coordinate through `head` and each node's
+// intrusive `Notify::next`.
+unsafe impl<T: Notified> Sync for Inbox<T> {}
 
-impl Inbox {
+impl<T: Notified> Inbox<T> {
     pub(crate) const fn new() -> Self {
         Self {
             head: AtomicPtr::new(ptr::null_mut()),
         }
     }
 
-    fn next_of(node: *mut u8) -> &'static AtomicPtr<u8> {
-        // SAFETY: remote-pending user blocks store the intrusive next at the base address.
-        // The reference is only used while the block remains remote-pending.
-        unsafe { &*node.cast::<AtomicPtr<u8>>() }
-    }
-
-    /// Publish `list` in front of the current head.
-    ///
-    /// Links `list.last → old_head` before a CAS of `head: old_head → list.first`.
-    /// On CAS failure the tail link is rewritten and the attempt retries.
-    pub(crate) fn push_batch(&self, list: &RemoteList) {
-        let first = list.first.as_ptr();
-        let last_next = Self::next_of(list.last.as_ptr());
+    /// Push `node`, assuming the caller already won the idle→queued transition
+    /// (`Notify::try_arm`, or `accept_remote`'s own re-arm after a straggling claim).
+    /// Does not check or touch `Notify::queued` — a second push of an already-Queued
+    /// node would corrupt the chain, so every caller must own a fresh `try_arm` win.
+    pub(crate) fn republish(&self, node: NonNull<T>) {
+        let raw = node.as_ptr();
+        // SAFETY: `node` is a stable heap-owned entity for as long as it may be claimed.
+        let next = &unsafe { node.as_ref() }.notify().next;
         let mut old = self.head.load(Ordering::Acquire);
         loop {
-            // Store the tail link before publishing the new head so a concurrent
-            // drain that observes `first` always continues into `old`.
-            last_next.store(old, Ordering::Release);
+            // Store the tail link before publishing the new head so a concurrent drain
+            // that observes `raw` always continues into the prior chain.
+            next.store(old, Ordering::Release);
             match self
                 .head
-                .compare_exchange_weak(old, first, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange_weak(old, raw, Ordering::AcqRel, Ordering::Acquire)
             {
                 Ok(_) => return,
                 Err(current) => old = current,
@@ -117,119 +101,158 @@ impl Inbox {
 
     /// Detach the entire pending chain. Single-consumer only.
     ///
-    /// Returns a null-terminated walk (one pass). Across publishes the order is LIFO;
-    /// within a batch it stays FIFO. Empty → `None`.
-    pub(crate) fn drain(&self) -> Option<RemoteChain> {
-        let first_ptr = self.head.swap(ptr::null_mut(), Ordering::AcqRel);
-        let first = NonNull::new(first_ptr)?;
-        Some(RemoteChain {
+    /// Returns a null-terminated walk (one pass). Empty → `None`.
+    pub(crate) fn drain(&self) -> Option<InboxChain<T>> {
+        let head = self.head.swap(ptr::null_mut(), Ordering::AcqRel);
+        NonNull::new(head).map(|first| InboxChain {
             cursor: Some(first),
         })
     }
 }
 
+/// Null-terminated intrusive chain detached by [`Inbox::drain`] (single walk for accept).
+pub(crate) struct InboxChain<T: Notified> {
+    cursor: Option<NonNull<T>>,
+}
+
+impl<T: Notified> Iterator for InboxChain<T> {
+    type Item = NonNull<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let node = self.cursor?;
+        // SAFETY: dequeued nodes keep their producer-linked next pointer valid until the
+        // owner disarms them (`Notify::disarm`).
+        let next = unsafe { node.as_ref() }
+            .notify()
+            .next
+            .load(Ordering::Acquire);
+        self.cursor = NonNull::new(next);
+        Some(node)
+    }
+}
+
+/// Coalesced inbox of remotely-freed runs.
+pub(crate) type RunInbox = Inbox<crate::heap::Run>;
+/// Coalesced inbox of remotely-freed extents.
+pub(crate) type ExtentInbox = Inbox<crate::heap::Extent>;
+
 #[cfg(test)]
 mod tests {
-    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     use super::*;
 
     #[repr(C)]
     struct TestNode {
-        next: AtomicPtr<u8>,
-        /// Set when the single consumer accepts the node; producers must not
-        /// write `next` after this becomes true.
+        notify: Notify<TestNode>,
         accepted: AtomicBool,
     }
 
     impl TestNode {
-        const fn new() -> Self {
+        fn new() -> Self {
             Self {
-                next: AtomicPtr::new(ptr::null_mut()),
+                notify: Notify::new(),
                 accepted: AtomicBool::new(false),
             }
         }
     }
 
-    fn node_ptr(node: &TestNode) -> NonNull<u8> {
-        NonNull::new(core::ptr::from_ref(node).cast::<u8>().cast_mut()).unwrap()
-    }
-
-    fn collect_list(list: impl Iterator<Item = NonNull<u8>>) -> [Option<NonNull<u8>>; 4] {
-        let mut out = [None; 4];
-        for (i, ptr) in list.enumerate() {
-            out[i] = Some(ptr);
+    impl Notified for TestNode {
+        fn notify(&self) -> &Notify<Self> {
+            &self.notify
         }
-        out
     }
 
-    fn accept_all(list: impl Iterator<Item = NonNull<u8>>, pool: &[TestNode]) {
-        for ptr in list {
-            let node = pool
-                .iter()
-                .find(|node| node_ptr(node) == ptr)
-                .expect("drained pointer not in pool");
-            assert!(
-                !node.accepted.swap(true, Ordering::AcqRel),
-                "node accepted twice"
-            );
+    fn node_ptr(node: &TestNode) -> NonNull<TestNode> {
+        NonNull::from(node)
+    }
+
+    fn collect_chain(chain: InboxChain<TestNode>) -> Vec<NonNull<TestNode>> {
+        chain.collect()
+    }
+
+    /// Test helper mirroring production: `try_arm` then `republish`.
+    fn push_node(inbox: &Inbox<TestNode>, ptr: NonNull<TestNode>) {
+        // SAFETY: test nodes live for the whole test.
+        if unsafe { ptr.as_ref() }.notify().try_arm() {
+            inbox.republish(ptr);
         }
     }
 
     #[test]
-    fn inbox_push_drain_single() {
+    fn inbox_notify_drain_single() {
         let inbox = Inbox::new();
         let node = TestNode::new();
         let ptr = node_ptr(&node);
-        inbox.push_batch(&RemoteList::from_ends(ptr, ptr));
-        let list = inbox.drain().unwrap();
-        assert_eq!(collect_list(list), [Some(ptr), None, None, None]);
+        push_node(&inbox, ptr);
+        let chain = inbox.drain().unwrap();
+        assert_eq!(collect_chain(chain), [ptr]);
         assert!(inbox.is_empty());
     }
 
     #[test]
-    fn inbox_push_drain_lifo_across_batches() {
+    fn inbox_repeated_notify_before_drain_pushes_once() {
+        let inbox = Inbox::new();
+        let node = TestNode::new();
+        let ptr = node_ptr(&node);
+        push_node(&inbox, ptr);
+        push_node(&inbox, ptr);
+        push_node(&inbox, ptr);
+        let chain = inbox.drain().unwrap();
+        assert_eq!(collect_chain(chain), [ptr]);
+        assert!(inbox.is_empty());
+    }
+
+    #[test]
+    fn inbox_notify_after_disarm_requeues() {
+        let inbox = Inbox::new();
+        let node = TestNode::new();
+        let ptr = node_ptr(&node);
+        push_node(&inbox, ptr);
+        assert!(inbox.drain().is_some());
+
+        node.notify.disarm();
+        push_node(&inbox, ptr);
+        let chain = inbox.drain().unwrap();
+        assert_eq!(collect_chain(chain), [ptr]);
+    }
+
+    #[test]
+    fn inbox_notify_drain_lifo_across_pushes() {
         let inbox = Inbox::new();
         let first_node = TestNode::new();
         let second_node = TestNode::new();
         let first = node_ptr(&first_node);
         let second = node_ptr(&second_node);
-        inbox.push_batch(&RemoteList::from_ends(first, first));
-        inbox.push_batch(&RemoteList::from_ends(second, second));
+        push_node(&inbox, first);
+        push_node(&inbox, second);
         // Newer publish is drained first.
-        let list = inbox.drain().unwrap();
-        assert_eq!(collect_list(list), [Some(second), Some(first), None, None]);
+        let chain = inbox.drain().unwrap();
+        assert_eq!(collect_chain(chain), [second, first]);
         assert!(inbox.is_empty());
     }
 
     #[test]
-    fn inbox_push_batch_preserves_chain_order() {
-        let inbox = Inbox::new();
-        let first_node = TestNode::new();
-        let second_node = TestNode::new();
-        let first = node_ptr(&first_node);
-        let second = node_ptr(&second_node);
-        first_node.next.store(second.as_ptr(), Ordering::Relaxed);
-        inbox.push_batch(&RemoteList::from_ends(first, second));
-        let list = inbox.drain().unwrap();
-        assert_eq!(collect_list(list), [Some(first), Some(second), None, None]);
+    fn inbox_drain_empty_is_none() {
+        let inbox: Inbox<TestNode> = Inbox::new();
+        assert!(inbox.drain().is_none());
         assert!(inbox.is_empty());
     }
 
     #[test]
-    fn inbox_is_movable_after_new() {
+    fn republish_bypasses_arm_check() {
         let inbox = Inbox::new();
-        let moved = inbox;
         let node = TestNode::new();
         let ptr = node_ptr(&node);
-        moved.push_batch(&RemoteList::from_ends(ptr, ptr));
-        let list = moved.drain().unwrap();
-        assert_eq!(collect_list(list), [Some(ptr), None, None, None]);
-        assert!(moved.is_empty());
+        // Simulate accept_remote's own re-arm winning before asking the inbox to publish.
+        assert!(node.notify.try_arm());
+        inbox.republish(ptr);
+        let chain = inbox.drain().unwrap();
+        assert_eq!(collect_chain(chain), [ptr]);
     }
 
     /// Deterministic interleaving: drain observes the new head only after the
-    /// producer has linked the previous head through the batch tail.
+    /// producer has linked the previous head through the node's next pointer.
     #[test]
     fn push_vs_drain_preserves_prior_chain() {
         let inbox = Inbox::new();
@@ -238,28 +261,27 @@ mod tests {
         let older_ptr = node_ptr(&older);
         let newer_ptr = node_ptr(&newer);
 
-        inbox.push_batch(&RemoteList::from_ends(older_ptr, older_ptr));
+        push_node(&inbox, older_ptr);
 
         let published = AtomicBool::new(false);
         let drained = AtomicUsize::new(0);
 
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                while !published.load(Ordering::Acquire) {
+                while !published.load(AtomicOrdering::Acquire) {
                     core::hint::spin_loop();
                 }
-                // Yield once so the producer's CAS and drain race more often.
                 std::thread::yield_now();
-                if let Some(list) = inbox.drain() {
-                    drained.store(list.count(), Ordering::Release);
+                if let Some(chain) = inbox.drain() {
+                    drained.store(chain.count(), AtomicOrdering::Release);
                 }
             });
 
-            published.store(true, Ordering::Release);
-            inbox.push_batch(&RemoteList::from_ends(newer_ptr, newer_ptr));
+            published.store(true, AtomicOrdering::Release);
+            push_node(&inbox, newer_ptr);
         });
 
-        let seen = drained.load(Ordering::Acquire);
+        let seen = drained.load(AtomicOrdering::Acquire);
         let remaining = inbox.drain().map_or(0, Iterator::count);
         assert_eq!(
             seen + remaining,
@@ -268,7 +290,7 @@ mod tests {
         );
     }
 
-    /// Two producers racing publish; every node must appear exactly once across drains.
+    /// Two producers racing distinct nodes; every node must appear exactly once across drains.
     #[test]
     fn two_producers_preserve_all_nodes() {
         const PER_PRODUCER: usize = 256;
@@ -279,21 +301,19 @@ mod tests {
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 for node in &left {
-                    let ptr = node_ptr(node);
-                    inbox.push_batch(&RemoteList::from_ends(ptr, ptr));
+                    push_node(&inbox, node_ptr(node));
                 }
             });
             scope.spawn(|| {
                 for node in &right {
-                    let ptr = node_ptr(node);
-                    inbox.push_batch(&RemoteList::from_ends(ptr, ptr));
+                    push_node(&inbox, node_ptr(node));
                 }
             });
         });
 
         let mut count = 0usize;
-        while let Some(list) = inbox.drain() {
-            for ptr in list {
+        while let Some(chain) = inbox.drain() {
+            for ptr in chain {
                 count += 1;
                 let known = left.iter().chain(right.iter()).any(|n| node_ptr(n) == ptr);
                 assert!(known, "unknown pointer drained");
@@ -302,57 +322,15 @@ mod tests {
         assert_eq!(count, PER_PRODUCER * 2);
     }
 
-    /// CAS-retry path: concurrent publishers force head rewrites; chain still intact.
-    #[test]
-    fn cas_retry_preserves_multi_node_batches() {
-        const BATCHES: usize = 64;
-        let inbox = Inbox::new();
-        let nodes: Vec<_> = (0..BATCHES * 2).map(|_| TestNode::new()).collect();
-
-        std::thread::scope(|scope| {
-            for chunk in nodes.chunks(2) {
-                let inbox = &inbox;
-                scope.spawn(move || {
-                    let first = node_ptr(&chunk[0]);
-                    let second = node_ptr(&chunk[1]);
-                    chunk[0].next.store(second.as_ptr(), Ordering::Relaxed);
-                    inbox.push_batch(&RemoteList::from_ends(first, second));
-                });
-            }
-        });
-
-        let mut count = 0usize;
-        while let Some(list) = inbox.drain() {
-            let collected: Vec<_> = list.collect();
-            assert!(
-                collected.len() % 2 == 0,
-                "intra-batch FIFO chain must stay intact"
-            );
-            for window in collected.chunks(2) {
-                // Each producer published a 2-node FIFO batch; LIFO across batches
-                // may interleave batches but each pair remains consecutive.
-                let a = window[0];
-                let b = window[1];
-                let pair = nodes
-                    .chunks(2)
-                    .any(|chunk| node_ptr(&chunk[0]) == a && node_ptr(&chunk[1]) == b);
-                assert!(pair, "drained pair is not a published batch");
-            }
-            count += collected.len();
-        }
-        assert_eq!(count, BATCHES * 2);
-    }
-
     /// 10_000-iteration multi-producer / drain stress: no lost nodes, and producers
-    /// never write `next` after the consumer accepts a node.
+    /// never observe a node accepted twice.
     #[test]
     fn multi_producer_drain_stress_no_lost_nodes() {
         const ITERATIONS: usize = 10_000;
         const PRODUCERS: usize = 4;
         const PER_ITER: usize = PRODUCERS;
 
-        let inbox = Inbox::new();
-        // Reuse a fixed pool: each iteration publishes fresh unaccepted nodes.
+        let inbox: Inbox<TestNode> = Inbox::new();
         let pool: Vec<_> = (0..ITERATIONS * PER_ITER)
             .map(|_| TestNode::new())
             .collect();
@@ -363,77 +341,69 @@ mod tests {
         std::thread::scope(|scope| {
             let consumer = scope.spawn(|| {
                 let mut local = 0usize;
-                while !stop.load(Ordering::Acquire) || !inbox.is_empty() {
-                    if let Some(list) = inbox.drain() {
-                        for ptr in list {
-                            for node in &pool {
-                                if node_ptr(node) == ptr {
-                                    assert!(
-                                        !node.accepted.swap(true, Ordering::AcqRel),
-                                        "double accept"
-                                    );
-                                    // Poison next after accept: a late producer write
-                                    // would be visible as a non-null/non-sentinel value
-                                    // if we ever re-linked an accepted node.
-                                    node.next.store(ptr::null_mut(), Ordering::Release);
-                                    local += 1;
-                                    break;
-                                }
-                            }
+                while !stop.load(AtomicOrdering::Acquire) || !inbox.is_empty() {
+                    if let Some(chain) = inbox.drain() {
+                        for ptr in chain {
+                            // SAFETY: pointers drained here come from the fixed `pool` below.
+                            let node = unsafe { ptr.as_ref() };
+                            assert!(
+                                !node.accepted.swap(true, AtomicOrdering::AcqRel),
+                                "double accept"
+                            );
+                            local += 1;
                         }
                     } else {
                         std::thread::yield_now();
                     }
                 }
-                accepted_total.store(local, Ordering::Release);
+                accepted_total.store(local, AtomicOrdering::Release);
             });
 
-            for producer in 0..PRODUCERS {
+            for _ in 0..PRODUCERS {
                 let inbox = &inbox;
                 let pool = &pool;
                 let next_index = &next_index;
                 scope.spawn(move || {
-                    let _ = producer;
                     loop {
-                        let i = next_index.fetch_add(1, Ordering::Relaxed);
+                        let i = next_index.fetch_add(1, AtomicOrdering::Relaxed);
                         if i >= ITERATIONS * PER_ITER {
                             break;
                         }
                         let node = &pool[i];
                         assert!(
-                            !node.accepted.load(Ordering::Acquire),
+                            !node.accepted.load(AtomicOrdering::Acquire),
                             "producer must not publish an already-accepted node"
                         );
-                        let ptr = node_ptr(node);
-                        // Clear next before publish; only push_batch may write it
-                        // while the node is remote-pending.
-                        node.next.store(ptr::null_mut(), Ordering::Relaxed);
-                        inbox.push_batch(&RemoteList::from_ends(ptr, ptr));
+                        push_node(inbox, node_ptr(node));
                     }
                 });
             }
 
-            // Wait for all publish slots to be claimed, then stop the consumer.
-            while next_index.load(Ordering::Acquire) < ITERATIONS * PER_ITER {
+            while next_index.load(AtomicOrdering::Acquire) < ITERATIONS * PER_ITER {
                 std::thread::yield_now();
             }
-            // Allow in-flight pushes to finish.
             std::thread::yield_now();
-            stop.store(true, Ordering::Release);
+            stop.store(true, AtomicOrdering::Release);
             let _ = consumer.join();
         });
 
-        // Sweep any straggler the consumer might have raced past on stop.
-        while let Some(list) = inbox.drain() {
-            accept_all(list, &pool);
+        while let Some(chain) = inbox.drain() {
+            for ptr in chain {
+                // SAFETY: pointers drained here come from the fixed `pool` above.
+                let node = unsafe { ptr.as_ref() };
+                assert!(
+                    !node.accepted.swap(true, AtomicOrdering::AcqRel),
+                    "node accepted twice on final sweep"
+                );
+            }
         }
 
         let accepted = pool
             .iter()
-            .filter(|n| n.accepted.load(Ordering::Acquire))
+            .filter(|n| n.accepted.load(AtomicOrdering::Acquire))
             .count();
         assert_eq!(accepted, ITERATIONS * PER_ITER, "lost or duplicate nodes");
-        assert!(accepted_total.load(Ordering::Acquire) <= accepted);
+        assert!(accepted_total.load(AtomicOrdering::Acquire) <= accepted);
         assert!(inbox.is_empty());
     }
 }

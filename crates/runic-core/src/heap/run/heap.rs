@@ -87,20 +87,22 @@ impl RunHeap {
         })
     }
 
-    pub(crate) fn accept(
-        &mut self,
-        run: NonNull<Run>,
-        ptr: NonNull<u8>,
-    ) -> Result<(), RunHeapError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
+    /// Owner: drain every claimed bit on `run` and publish the freed blocks.
+    ///
+    /// Returns whether the caller must republish `run` on the inbox because a straggling
+    /// claim raced the scan (see `Run::accept_remote`). Unlike single-block `free`/the old
+    /// per-pointer `accept`, a bulk drain may free zero, one, or many blocks in one call, so
+    /// the available-list relink only fires on an observed full → not-full transition.
+    pub(crate) fn accept_remote(&mut self, run: NonNull<Run>) -> Result<bool, RunHeapError> {
+        // SAFETY: the run inbox only ever carries pointers published from this allocator's
+        // live arena.
         let run_ref = unsafe { run.as_ref() };
         let was_full = run_ref.is_full();
-        run_ref.accept(ptr).map_err(RunHeapError::from)?;
-        self.finish_free(FreedRun {
-            class: run_ref.class(),
-            run,
-            was_full,
-        })
+        let needs_republish = run_ref.accept_remote().map_err(RunHeapError::from)?;
+        if was_full && !run_ref.is_full() {
+            self.push_available(run_ref.class().index(), run)?;
+        }
+        Ok(needs_republish)
     }
 
     pub(crate) fn rebind_heap_id(&mut self, heap_id: HeapId) {

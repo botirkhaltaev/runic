@@ -16,7 +16,7 @@ use crate::{
     memory::{PageMap, PageOwner},
 };
 
-use super::inbox::{Inbox, RemoteList};
+use super::inbox::{ExtentInbox, RunInbox};
 
 const MAX_HEAPS: usize = 64;
 const MAX_HEAPS_U32: u32 = 64;
@@ -213,8 +213,8 @@ pub(crate) struct PublisherLease<'a> {
 }
 
 impl PublisherLease<'_> {
-    pub(crate) fn publish(self, list: &RemoteList) {
-        self.slot.inbox.push_batch(list);
+    pub(crate) fn publish(self, target: PageOwner) {
+        self.slot.publish_target(target);
     }
 }
 
@@ -224,10 +224,11 @@ impl Drop for PublisherLease<'_> {
     }
 }
 
-/// Stable heap entity: lifecycle state, inbox, and owner-local metadata.
+/// Stable heap entity: lifecycle state, coalesced run/extent inboxes, and owner-local metadata.
 pub(crate) struct HeapSlot {
     state: SlotState,
-    inbox: Inbox,
+    run_inbox: RunInbox,
+    extent_inbox: ExtentInbox,
     heap: UnsafeCell<Heap>,
 }
 
@@ -240,9 +241,27 @@ impl HeapSlot {
     fn new(id: HeapId, config: AllocatorConfig) -> Self {
         Self {
             state: SlotState::new(id.generation(), HeapMode::Active),
-            inbox: Inbox::new(),
+            run_inbox: RunInbox::new(),
+            extent_inbox: ExtentInbox::new(),
             heap: UnsafeCell::new(Heap::new(id, HEAP_METADATA_CAPACITY, config)),
         }
+    }
+
+    /// Push `target` on its inbox.
+    ///
+    /// Callers of `publish` / `publish_on` (`Allocator::free_remote`) have already won the
+    /// idle→queued race via `try_arm` before reaching here, so this pushes unconditionally
+    /// (`Inbox::republish`) rather than re-arming — a second `try_arm` on an already-Queued
+    /// entity would return `false` and silently drop the publish.
+    fn publish_target(&self, target: PageOwner) {
+        match target {
+            PageOwner::Run(run) => self.run_inbox.republish(run),
+            PageOwner::Extent(extent) => self.extent_inbox.republish(extent),
+        }
+    }
+
+    fn inboxes_empty(&self) -> bool {
+        self.run_inbox.is_empty() && self.extent_inbox.is_empty()
     }
 
     pub(crate) fn state(&self) -> &SlotState {
@@ -279,7 +298,7 @@ impl HeapSlot {
             return false;
         }
         // SAFETY: directory lifecycle lock serializes Draining reclaim against heap mutation.
-        if unsafe { (*self.heap.get()).has_live_allocations() } || !self.inbox.is_empty() {
+        if unsafe { (*self.heap.get()).has_live_allocations() } || !self.inboxes_empty() {
             return false;
         }
         // Re-check route after live/inbox observation so a late publisher cannot be missed.
@@ -294,29 +313,36 @@ impl HeapSlot {
         true
     }
 
-    /// Drain inbox into this slot's heap (accept).
+    /// Drain both inboxes into this slot's heap (accept), republishing any run that still
+    /// has a straggling claim after its scan (see `Run::accept_remote`).
     ///
     /// SAFETY: caller is the Active TLS owner or holds the directory lifecycle lock.
     pub(crate) unsafe fn flush(&self, pages: &PageMap) -> Result<(), HeapError> {
         // SAFETY: same ownership contract as the method.
         let heap = unsafe { self.heap_mut() };
-        while let Some(list) = self.inbox.drain() {
-            for ptr in list {
-                match pages.get(ptr) {
-                    Some(PageOwner::Run(run)) => {
-                        heap.runs.accept(run, ptr)?;
-                    }
-                    Some(PageOwner::Extent(extent)) => {
-                        heap.extents.accept(extent, ptr, pages)?;
-                    }
-                    None => return Err(HeapError::InvalidPointer),
+        while let Some(chain) = self.run_inbox.drain() {
+            for run in chain {
+                // SAFETY: dequeued from this slot's run inbox; the pointer is a live run
+                // published from this heap's arena for as long as it may be claimed.
+                if heap.runs.accept_remote(run)? {
+                    self.run_inbox.republish(run);
                 }
+            }
+        }
+        while let Some(chain) = self.extent_inbox.drain() {
+            for extent in chain {
+                // SAFETY: dequeued from this slot's extent inbox; the pointer is a live
+                // extent published from this heap's arena for as long as it may be claimed.
+                let ptr = unsafe { extent.as_ref() }.ptr();
+                heap.extents.accept(extent, ptr, pages)?;
+                // SAFETY: same contract as above.
+                unsafe { extent.as_ref() }.disarm();
             }
         }
         Ok(())
     }
 
-    /// Flush inbox if needed, then owner-local free.
+    /// Flush inboxes if needed, then owner-local free.
     ///
     /// SAFETY: caller is the Active TLS owner or holds the directory lifecycle lock.
     pub(crate) unsafe fn free(
@@ -325,7 +351,7 @@ impl HeapSlot {
         ptr: NonNull<u8>,
         pages: &PageMap,
     ) -> Result<(), HeapError> {
-        if !self.inbox.is_empty() {
+        if !self.inboxes_empty() {
             // SAFETY: same ownership contract as the method.
             unsafe { self.flush(pages)? };
         }
@@ -333,7 +359,7 @@ impl HeapSlot {
         unsafe { self.heap_mut() }.free(owner, ptr, pages)
     }
 
-    /// Flush inbox if needed, then allocate a small block.
+    /// Flush inboxes if needed, then allocate a small block.
     ///
     /// SAFETY: caller is the Active TLS owner for this slot.
     pub(crate) unsafe fn alloc_run(
@@ -341,7 +367,7 @@ impl HeapSlot {
         class: crate::size_class::SizeClass,
         pages: &PageMap,
     ) -> Option<NonNull<u8>> {
-        if !self.inbox.is_empty() {
+        if !self.inboxes_empty() {
             // SAFETY: Active TLS owner.
             unsafe { self.flush(pages) }.ok()?;
         }
@@ -356,7 +382,7 @@ impl HeapSlot {
         pages: &PageMap,
         init: crate::heap::ExtentInit,
     ) -> Option<NonNull<u8>> {
-        if !self.inbox.is_empty() {
+        if !self.inboxes_empty() {
             // SAFETY: Active TLS owner.
             unsafe { self.flush(pages) }.ok()?;
         }
@@ -470,36 +496,23 @@ impl HeapDirectory {
         slot.state.matches(id).then_some(slot)
     }
 
-    /// Publish a claimed remote-free batch to `id` (Active lease or Draining accept).
-    pub(crate) fn publish(
-        &self,
-        id: HeapId,
-        list: &RemoteList,
-        pages: &PageMap,
-    ) -> Result<(), HeapError> {
-        let Some(slot) = self.slot(id) else {
-            return Err(HeapError::InvalidHeap);
-        };
-        self.publish_on(slot, id, list, pages)
-    }
-
-    /// Publish on an already-resolved slot (Active lease or Draining accept).
-    ///
-    /// Same admit path as [`Self::publish`]; callers that already hold `slot` for `id`
-    /// avoid a second directory lookup (unbound singleton / same-target capacity flush).
+    /// Publish a claimed remote-freed run/extent on an already-resolved slot for `id`
+    /// (Active lease or Draining accept). Callers resolve `slot` via [`Self::slot`]
+    /// themselves — `Allocator::free_remote` already needs it for the active/draining
+    /// check, so there is no separate id-only publish path to keep in sync.
     pub(crate) fn publish_on(
         &self,
         slot: &HeapSlot,
         id: HeapId,
-        list: &RemoteList,
+        target: PageOwner,
         pages: &PageMap,
     ) -> Result<(), HeapError> {
         match slot.publisher(id) {
             Ok(lease) => {
-                lease.publish(list);
+                lease.publish(target);
                 Ok(())
             }
-            Err(HeapError::InvalidHeap) => self.publish_draining(id, list, pages),
+            Err(HeapError::InvalidHeap) => self.publish_draining(id, target, pages),
             Err(error) => Err(error),
         }
     }
@@ -509,7 +522,7 @@ impl HeapDirectory {
     fn publish_draining(
         &self,
         id: HeapId,
-        list: &RemoteList,
+        target: PageOwner,
         pages: &PageMap,
     ) -> Result<(), HeapError> {
         let state = self.state.lock();
@@ -517,7 +530,7 @@ impl HeapDirectory {
         if slot.state.mode() != HeapMode::Draining {
             return Err(HeapError::InvalidHeap);
         }
-        slot.inbox.push_batch(list);
+        slot.publish_target(target);
         // SAFETY: directory lifecycle lock held for Draining accept.
         unsafe { slot.flush(pages)? };
         let _ = slot.try_reclaim();
@@ -630,10 +643,17 @@ impl From<ExtentHeapError> for HeapError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::config::AllocatorConfig;
+    use core::alloc::Layout;
     use std::sync::{Barrier, mpsc};
     use std::thread;
+
+    use super::*;
+    use crate::{
+        config::AllocatorConfig,
+        heap::{ExtentInit, Run},
+        layout::LayoutSpec,
+        size_class::SizeClasses,
+    };
 
     #[test]
     fn acquire_retire_reactivate_bumps_generation() {
@@ -740,50 +760,65 @@ mod tests {
         assert_eq!(directory.retire(id, &PageMap::new()), Ok(()));
     }
 
+    /// Many threads race `claim` + `try_arm` + `publish` against blocks on one shared run.
+    /// `Notify` coalesces concurrent arms into at most one live inbox entry at a time, but
+    /// every publisher lease must still be acquired and released exactly once, and every
+    /// claimed block must end up accepted after a flush (no lost wakeup, no leaked lease).
     #[test]
     fn concurrent_active_publishers_exact_once() {
         const THREADS: usize = 4;
         const PER_THREAD: usize = 64;
-        #[repr(C)]
-        struct Node {
-            next: AtomicPtr<u8>,
-        }
 
         let directory = HeapDirectory::new(AllocatorConfig::new());
-        let (id, _) = directory.acquire().unwrap();
-        let mut nodes = Vec::with_capacity(THREADS * PER_THREAD);
-        for _ in 0..(THREADS * PER_THREAD) {
-            nodes.push(Node {
-                next: AtomicPtr::new(ptr::null_mut()),
-            });
-        }
-        let nodes = &nodes[..];
+        let (id, slot_ptr) = directory.acquire().unwrap();
+        // SAFETY: test-owned slot pointer from acquire.
+        let slot = unsafe { slot_ptr.as_ref() };
+        let pages = PageMap::new();
+        let class = SizeClasses::class_for(LayoutSpec::from_layout(
+            Layout::from_size_align(64, 8).unwrap(),
+        ))
+        .unwrap();
+        // SAFETY: test drives Active slot exclusively.
+        let run = unsafe { slot.acquire_run(class, &pages) }.unwrap();
+        // Addresses, not `NonNull`: raw pointers are not `Send`/`Sync`, and `run`/`ptrs`
+        // only ever cross the thread boundary below as plain integers.
+        let run_addr = run.as_ptr() as usize;
+        let addrs: Vec<usize> = (0..THREADS * PER_THREAD)
+            // SAFETY: run is a live arena run for this slot.
+            .map(|_| unsafe { run.as_ref() }.allocate().unwrap().as_ptr() as usize)
+            .collect();
+        let addrs = &addrs[..];
         let directory = &directory;
+        let pages = &pages;
 
         thread::scope(|scope| {
             for t in 0..THREADS {
                 scope.spawn(move || {
+                    // SAFETY: run_addr is `run`, a live arena run for this slot.
+                    let run = NonNull::new(run_addr as *mut Run).unwrap();
                     let start = t * PER_THREAD;
-                    let end = start + PER_THREAD;
-                    for node in &nodes[start..end] {
-                        let ptr = NonNull::from(node).cast::<u8>();
-                        let list = RemoteList::from_ends(ptr, ptr);
-                        assert_eq!(directory.publish(id, &list, &PageMap::new()), Ok(()));
+                    for &addr in &addrs[start..start + PER_THREAD] {
+                        // SAFETY: addr is a block owned by `run`, allocated above.
+                        let ptr = NonNull::new(addr as *mut u8).unwrap();
+                        unsafe { run.as_ref() }.claim(ptr).unwrap();
+                        // SAFETY: same contract.
+                        if unsafe { run.as_ref() }.try_arm() {
+                            assert_eq!(
+                                directory.publish_on(slot, id, PageOwner::Run(run), pages),
+                                Ok(())
+                            );
+                        }
                     }
                 });
             }
         });
 
-        let slot = directory.slot(id).unwrap();
-        assert_eq!(slot.state.publishers(), 0);
-        let mut seen = 0usize;
-        while let Some(list) = slot.inbox.drain() {
-            for _ in list {
-                seen += 1;
-            }
-        }
-        assert_eq!(seen, THREADS * PER_THREAD);
-        assert_eq!(directory.retire(id, &PageMap::new()), Ok(()));
+        assert_eq!(slot.state().publishers(), 0);
+        // SAFETY: test drives Active slot exclusively; producers have joined.
+        unsafe { slot.flush(pages) }.unwrap();
+        // SAFETY: same run pointer from this slot's live arena.
+        assert!(!unsafe { run.as_ref() }.has_live_blocks());
+        assert_eq!(directory.retire(id, pages), Ok(()));
     }
 
     #[test]
@@ -804,24 +839,52 @@ mod tests {
     }
 
     #[test]
-    fn try_reclaim_rejects_nonempty_inbox() {
-        #[repr(C)]
-        struct Node {
-            next: AtomicPtr<u8>,
-        }
-
+    fn try_reclaim_rejects_nonempty_run_inbox() {
         let directory = HeapDirectory::new(AllocatorConfig::new());
         let (id, slot_ptr) = directory.acquire().unwrap();
         // SAFETY: test-owned slot pointer from acquire.
         let slot = unsafe { slot_ptr.as_ref() };
+        let pages = PageMap::new();
+        let class = SizeClasses::class_for(LayoutSpec::from_layout(
+            Layout::from_size_align(64, 8).unwrap(),
+        ))
+        .unwrap();
+        // SAFETY: test drives Active slot exclusively.
+        let run = unsafe { slot.acquire_run(class, &pages) }.unwrap();
         assert_eq!(slot.state.close_active(id), Ok(()));
-        let node = Node {
-            next: AtomicPtr::new(ptr::null_mut()),
-        };
-        let ptr = NonNull::from(&node).cast::<u8>();
-        slot.inbox.push_batch(&RemoteList::from_ends(ptr, ptr));
+
+        // SAFETY: run is a live arena run for this slot.
+        assert!(unsafe { run.as_ref() }.try_arm());
+        slot.run_inbox.republish(run);
         assert!(!slot.try_reclaim());
-        assert!(slot.inbox.drain().is_some());
+        // SAFETY: test drives Draining slot exclusively.
+        unsafe { slot.flush(&pages) }.unwrap();
+        assert!(slot.try_reclaim());
+    }
+
+    #[test]
+    fn try_reclaim_rejects_nonempty_extent_inbox() {
+        let directory = HeapDirectory::new(AllocatorConfig::new());
+        let (id, slot_ptr) = directory.acquire().unwrap();
+        // SAFETY: test-owned slot pointer from acquire.
+        let slot = unsafe { slot_ptr.as_ref() };
+        let pages = PageMap::new();
+        let spec = LayoutSpec::from_layout(Layout::from_size_align(128 * 1024, 4096).unwrap());
+        // SAFETY: test drives Active slot exclusively.
+        let ptr = unsafe { slot.allocate_extent(spec, &pages, ExtentInit::Uninit) }.unwrap();
+        let Some(PageOwner::Extent(extent)) = pages.get(ptr) else {
+            panic!("expected extent owner");
+        };
+        // SAFETY: extent is live and Allocated.
+        unsafe { extent.as_ref() }.claim(ptr).unwrap();
+        assert_eq!(slot.state.close_active(id), Ok(()));
+
+        // SAFETY: extent is live and Allocated.
+        assert!(unsafe { extent.as_ref() }.try_arm());
+        slot.extent_inbox.republish(extent);
+        assert!(!slot.try_reclaim());
+        // SAFETY: test drives Draining slot exclusively.
+        unsafe { slot.flush(&pages) }.unwrap();
         assert!(slot.try_reclaim());
     }
 }

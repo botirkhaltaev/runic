@@ -11,7 +11,7 @@
 
 - Put behavior on the owning entity; prefer `NonZero*` / `NonNull` / named fields; avoid free one-line helpers and pass-throughs.
 - Owner-local TLS vs remote table: `ThreadHeap::{alloc,alloc_extent,free,free_extent}` / `Allocator::{alloc_remote,alloc_extent_remote,free_remote}`; domain ops `free` / `claim` / `accept`.
-- One remote-free protocol: claim → batch → `HeapDirectory::publish` on flush (Active lease / Draining locked accept) → flush/`accept`. Bound coalesce-only skips the lease; never-bound freers publish each claim in `free_remote` so Drop cannot strand an unpublished claim.
+- One remote-free protocol: claim → (if `try_arm`) `HeapDirectory::publish`/`publish_on` immediately (Active lease / Draining locked accept) → owner `flush` drains the run/extent inbox via `accept_remote`/`accept`. Coalescing is by owner (`Notify`), not a per-thread batch, so no protocol state can strand an unpublished claim.
 - `Layout` only at the public boundary; convert once to `LayoutSpec` and pass it inward (`SizeClasses::class_for`, extents, resize).
 - No shared/root ownership heap; every run/extent is stamped with `HeapId`.
 - Exactly one abort sink: `Allocator::abort`. Never hold the directory lifecycle mutex across a user-memory copy.
