@@ -353,11 +353,11 @@ impl Allocator {
             .map_or(null_mut(), NonNull::as_ptr)
     }
 
-    /// Cross-heap free: Active claim→batch→publish, or Draining late free.
+    /// Cross-heap free: Active claim→batch→publish-on-flush, or Draining late free.
     ///
-    /// Active admission is a packed CAS on `SlotState` publishers for this attempt's publish
-    /// admit (in-flight lease counting — not serialization of concurrent freer bodies, and not
-    /// unpublished TLS batch size; those stay live via `RemotePending`).
+    /// Bound coalesce-only frees do not acquire a `PublisherLease`. Admission is only for
+    /// actual inbox publication (`HeapDirectory::publish` / `publish_on`). In-flight
+    /// unpublished TLS batches stay live via `RemotePending` (not the publisher count).
     #[cold]
     #[inline(never)]
     fn free_remote(
@@ -378,65 +378,80 @@ impl Allocator {
             }
         };
         let pages = inner_ref.pages();
-        let slot = inner_ref
-            .directory
+        let directory = &inner_ref.directory;
+        let slot = directory
             .slot(heap_id)
             .ok_or(AllocatorError::InvalidMetadata)?;
 
-        match slot.publisher(heap_id) {
-            Ok(lease) => {
-                match owner {
-                    PageOwner::Run(run) => {
-                        // SAFETY: PageMap stores only pointers published from this allocator's live arenas.
-                        unsafe { run.as_ref() }
-                            .claim(ptr)
-                            .map_err(AllocatorError::from)?;
-                    }
-                    PageOwner::Extent(extent) => {
-                        // SAFETY: PageMap stores only pointers published from this allocator's live arenas.
-                        unsafe { extent.as_ref() }
-                            .claim(ptr)
-                            .map_err(AllocatorError::from)?;
-                    }
-                }
-                // Bound freers coalesce via TLS batch. Never-bound freers publish a singleton
-                // here (cold path) so `ThreadHeap::batch` stays unbound-free for local codegen.
-                let pending = THREAD_HEAP.with(|tls| {
-                    if tls.is_empty() {
-                        Some((heap_id, RemoteList::from_ends(ptr, ptr)))
-                    } else {
-                        tls.batch(heap_id, ptr)
-                    }
-                });
-                match pending {
-                    Some((id, list)) if id == heap_id => lease.publish(&list),
-                    Some((id, list)) => {
-                        drop(lease);
-                        inner_ref
-                            .directory
-                            .publish(id, &list, pages)
-                            .map_err(AllocatorError::from)?;
-                    }
-                    None => drop(lease),
-                }
-                Ok(())
+        if !slot.state().is_active() {
+            if let Some((id, list)) = THREAD_HEAP.with(ThreadHeap::take_batch) {
+                directory
+                    .publish(id, &list, pages)
+                    .map_err(AllocatorError::from)?;
             }
-            Err(HeapError::InvalidHeap) => {
-                let mut pending = THREAD_HEAP.with(ThreadHeap::take_batch);
-                while let Some((id, list)) = pending {
-                    inner_ref
-                        .directory
+            return directory
+                .free_draining(heap_id, owner, ptr, pages)
+                .map_err(AllocatorError::from);
+        }
+
+        match owner {
+            PageOwner::Run(run) => {
+                // SAFETY: PageMap stores only pointers published from this allocator's live arenas.
+                unsafe { run.as_ref() }
+                    .claim(ptr)
+                    .map_err(AllocatorError::from)?;
+            }
+            PageOwner::Extent(extent) => {
+                // SAFETY: PageMap stores only pointers published from this allocator's live arenas.
+                unsafe { extent.as_ref() }
+                    .claim(ptr)
+                    .map_err(AllocatorError::from)?;
+            }
+        }
+
+        // Bound freers coalesce via TLS batch. Never-bound freers publish a singleton
+        // here (cold path) so `ThreadHeap::batch` stays unbound-free for local codegen.
+        let pending = THREAD_HEAP.with(|tls| {
+            if tls.is_empty() {
+                Some((heap_id, RemoteList::from_ends(ptr, ptr)))
+            } else {
+                tls.batch(heap_id, ptr)
+            }
+        });
+
+        match pending {
+            // Same-target flush: TLS batch is empty afterward.
+            Some((id, list)) if id == heap_id => {
+                directory
+                    .publish_on(slot, id, &list, pages)
+                    .map_err(AllocatorError::from)?;
+            }
+            // Target change: published the previous target; current claim remains coalesced.
+            Some((id, list)) => {
+                directory
+                    .publish(id, &list, pages)
+                    .map_err(AllocatorError::from)?;
+                if !slot.state().is_active()
+                    && let Some((id, list)) = THREAD_HEAP.with(ThreadHeap::take_batch)
+                {
+                    directory
                         .publish(id, &list, pages)
                         .map_err(AllocatorError::from)?;
-                    pending = THREAD_HEAP.with(ThreadHeap::take_batch);
                 }
-                inner_ref
-                    .directory
-                    .free_draining(heap_id, owner, ptr, pages)
-                    .map_err(AllocatorError::from)
             }
-            Err(error) => Err(AllocatorError::from(error)),
+            // Coalesce-only: partial batch retained for heap_id.
+            None => {
+                if !slot.state().is_active()
+                    && let Some((id, list)) = THREAD_HEAP.with(ThreadHeap::take_batch)
+                {
+                    directory
+                        .publish(id, &list, pages)
+                        .map_err(AllocatorError::from)?;
+                }
+            }
         }
+
+        Ok(())
     }
 }
 

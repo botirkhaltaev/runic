@@ -128,9 +128,9 @@ impl SlotState {
 
     /// Admit one Active publisher lease for `id`, or fail if closed / overflow.
     ///
-    /// Counts in-flight Active publish admits for this `free_remote` attempt — not unpublished
-    /// TLS batch contents (those stay live via `RemotePending` / `has_live_allocations`).
-    /// Does not serialize concurrent freer bodies.
+    /// Counts in-flight Active **publish** admits only — not unpublished TLS batch contents
+    /// (those stay live via `RemotePending` / `has_live_allocations`). Does not serialize
+    /// concurrent freer bodies.
     #[inline]
     fn try_acquire_publisher(&self, id: HeapId) -> Result<(), HeapError> {
         loop {
@@ -480,6 +480,20 @@ impl HeapDirectory {
         let Some(slot) = self.slot(id) else {
             return Err(HeapError::InvalidHeap);
         };
+        self.publish_on(slot, id, list, pages)
+    }
+
+    /// Publish on an already-resolved slot (Active lease or Draining accept).
+    ///
+    /// Same admit path as [`Self::publish`]; callers that already hold `slot` for `id`
+    /// avoid a second directory lookup (unbound singleton / same-target capacity flush).
+    pub(crate) fn publish_on(
+        &self,
+        slot: &HeapSlot,
+        id: HeapId,
+        list: &RemoteList,
+        pages: &PageMap,
+    ) -> Result<(), HeapError> {
         match slot.publisher(id) {
             Ok(lease) => {
                 lease.publish(list);
