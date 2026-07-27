@@ -173,6 +173,8 @@ pub(crate) struct Run {
     /// Cached `mapping.base()` — payload span start (`RUN_SIZE` bytes).
     payload_base: NonNull<u8>,
     blocks: BlockStates,
+    /// `trailing_zeros(block_size)` when power-of-two; `None` means multiply.
+    block_shift: Option<NonZeroU32>,
     class: SizeClassId,
     capacity: usize,
     block_size: usize,
@@ -209,6 +211,15 @@ impl Run {
         RUN_SIZE.checked_add(capacity)
     }
 
+    const fn block_size_shift(block_size: usize) -> Option<NonZeroU32> {
+        if block_size.is_power_of_two() {
+            // Min size class is 8 (`trailing_zeros` ≥ 3); never zero for our table.
+            NonZeroU32::new(block_size.trailing_zeros())
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn new(
         id: RunId,
         heap: HeapId,
@@ -236,6 +247,7 @@ impl Run {
             state: UnsafeCell::new(RunState::new(block_size)),
             payload_base: mapping.base(),
             blocks,
+            block_shift: Self::block_size_shift(block_size),
             class,
             capacity,
             block_size,
@@ -405,7 +417,15 @@ impl Run {
             return None;
         }
 
-        let index = self.class.block_index_from_offset(offset)?;
+        let index = if let Some(shift) = self.block_shift {
+            if offset & (self.block_size - 1) != 0 {
+                return None;
+            }
+            offset >> shift.get()
+        } else {
+            self.class
+                .non_power_of_two_block_index_from_offset(offset)?
+        };
         if index >= self.capacity {
             return None;
         }
@@ -417,7 +437,10 @@ impl Run {
     #[inline]
     fn block_ptr(&self, index: BlockIndex) -> NonNull<u8> {
         debug_assert!(index.get() < self.capacity);
-        let byte_offset = self.class.block_offset(index.get());
+        let byte_offset = match self.block_shift {
+            Some(shift) => index.get() << shift.get(),
+            None => index.get() * self.block_size,
+        };
         // SAFETY: freelist / `allocate_fresh` only yield `index < capacity`, so
         // `byte_offset < RUN_SIZE` inside the payload span.
         unsafe { NonNull::new_unchecked(self.payload_base.as_ptr().add(byte_offset)) }
@@ -642,6 +665,46 @@ mod tests {
 
         assert!(run.block_at(ptr).is_some());
         assert!(run.block_at(interior).is_none());
+    }
+
+    #[test]
+    fn reusable_run_round_trips_hotspot_non_power_of_two_classes() {
+        for (run_index, size) in [80, 96].into_iter().enumerate() {
+            let class = class_id(size, 8);
+            let run = Run::new(
+                RunId::from_index(u32::try_from(run_index).unwrap()).unwrap(),
+                test_heap_id(),
+                map_for_class(class),
+                class,
+            )
+            .expect("test run");
+            let ptr = run.allocate().unwrap();
+
+            assert!(run.block_at(ptr).is_some(), "size={size}");
+            assert!(run.free(ptr).is_ok(), "size={size}");
+            assert_eq!(run.allocate(), Some(ptr), "size={size}");
+        }
+    }
+
+    #[test]
+    fn reusable_run_rejects_aligned_tail_slack() {
+        for (run_index, size) in [80, 96].into_iter().enumerate() {
+            let class = class_id(size, 8);
+            let run = Run::new(
+                RunId::from_index(u32::try_from(run_index).unwrap()).unwrap(),
+                test_heap_id(),
+                map_for_class(class),
+                class,
+            )
+            .expect("test run");
+            let capacity = RUN_SIZE / SizeClasses::block_size(class);
+            let slack_offset = capacity * SizeClasses::block_size(class);
+            assert!(slack_offset < RUN_SIZE, "size={size}");
+            let slack =
+                unsafe { NonNull::new_unchecked(run.range().base().as_ptr().add(slack_offset)) };
+
+            assert!(run.block_at(slack).is_none(), "size={size}");
+        }
     }
 
     #[test]

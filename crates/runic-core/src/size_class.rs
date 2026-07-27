@@ -29,79 +29,67 @@ impl SizeClassId {
         debug_assert!(index < SizeClasses::COUNT);
         Self { index }
     }
-
-    /// Byte offset of block `index` within a run payload for this class.
-    #[inline]
-    pub(crate) fn block_offset(self, index: usize) -> usize {
-        match self.index() {
-            0 => index << 3,
-            1 => index << 4,
-            2 => index * 24,
-            3 => index << 5,
-            4 => index * 48,
-            5 => index << 6,
-            6 => index * 80,
-            7 => index * 96,
-            8 => index << 7,
-            9 => index * 160,
-            10 => index * 192,
-            11 => index << 8,
-            12 => index * 320,
-            13 => index * 384,
-            14 => index << 9,
-            15 => index * 768,
-            16 => index << 10,
-            17 => index * 1536,
-            18 => index << 11,
-            19 => index * 3072,
-            20 => index << 12,
-            21 => index * 6144,
-            22 => index << 13,
-            23 => index * 12288,
-            24 => index << 14,
-            25 => index * 24576,
-            26 => index << 15,
-            _ => unreachable!(),
-        }
-    }
-
-    /// Block index from a payload offset; rejects interior and misaligned offsets.
-    #[inline]
-    pub(crate) fn block_index_from_offset(self, offset: usize) -> Option<usize> {
-        match self.index() {
-            0 => (offset.trailing_zeros() >= 3).then_some(offset >> 3),
-            1 => (offset.trailing_zeros() >= 4).then_some(offset >> 4),
-            2 => offset.is_multiple_of(24).then_some(offset / 24),
-            3 => (offset.trailing_zeros() >= 5).then_some(offset >> 5),
-            4 => offset.is_multiple_of(48).then_some(offset / 48),
-            5 => (offset.trailing_zeros() >= 6).then_some(offset >> 6),
-            6 => offset.is_multiple_of(80).then_some(offset / 80),
-            7 => offset.is_multiple_of(96).then_some(offset / 96),
-            8 => (offset.trailing_zeros() >= 7).then_some(offset >> 7),
-            9 => offset.is_multiple_of(160).then_some(offset / 160),
-            10 => offset.is_multiple_of(192).then_some(offset / 192),
-            11 => (offset.trailing_zeros() >= 8).then_some(offset >> 8),
-            12 => offset.is_multiple_of(320).then_some(offset / 320),
-            13 => offset.is_multiple_of(384).then_some(offset / 384),
-            14 => (offset.trailing_zeros() >= 9).then_some(offset >> 9),
-            15 => offset.is_multiple_of(768).then_some(offset / 768),
-            16 => (offset.trailing_zeros() >= 10).then_some(offset >> 10),
-            17 => offset.is_multiple_of(1536).then_some(offset / 1536),
-            18 => (offset.trailing_zeros() >= 11).then_some(offset >> 11),
-            19 => offset.is_multiple_of(3072).then_some(offset / 3072),
-            20 => (offset.trailing_zeros() >= 12).then_some(offset >> 12),
-            21 => offset.is_multiple_of(6144).then_some(offset / 6144),
-            22 => (offset.trailing_zeros() >= 13).then_some(offset >> 13),
-            23 => offset.is_multiple_of(12288).then_some(offset / 12288),
-            24 => (offset.trailing_zeros() >= 14).then_some(offset >> 14),
-            25 => offset.is_multiple_of(24576).then_some(offset / 24576),
-            26 => (offset.trailing_zeros() >= 15).then_some(offset >> 15),
-            _ => None,
-        }
-    }
 }
 
 pub(crate) struct SizeClasses;
+
+macro_rules! define_size_classes {
+    ($( $index:literal => $size:literal ),+ $(,)?) => {
+        impl SizeClassId {
+            /// Block index from a non-power-of-two class payload offset.
+            ///
+            /// Returns `None` for power-of-two classes and non-boundary offsets.
+            #[inline(always)]
+            pub(crate) fn non_power_of_two_block_index_from_offset(
+                self,
+                offset: usize,
+            ) -> Option<usize> {
+                $(
+                    if !usize::is_power_of_two($size) && self.index() == $index {
+                        return offset.is_multiple_of($size).then_some(offset / $size);
+                    }
+                )+
+                None
+            }
+        }
+
+        impl SizeClasses {
+            /// The one hand-authored size-class declaration. Constant-divisor
+            /// indexing and derived lookup tables are generated from this list.
+            const SIZES: [usize; Self::COUNT] = [$($size),+];
+        }
+    };
+}
+
+define_size_classes! {
+    0 => 8,
+    1 => 16,
+    2 => 24,
+    3 => 32,
+    4 => 48,
+    5 => 64,
+    6 => 80,
+    7 => 96,
+    8 => 128,
+    9 => 160,
+    10 => 192,
+    11 => 256,
+    12 => 320,
+    13 => 384,
+    14 => 512,
+    15 => 768,
+    16 => 1024,
+    17 => 1536,
+    18 => 2048,
+    19 => 3072,
+    20 => 4096,
+    21 => 6144,
+    22 => 8192,
+    23 => 12288,
+    24 => 16384,
+    25 => 24576,
+    26 => 32768,
+}
 
 impl SizeClasses {
     pub(crate) const COUNT: usize = 27;
@@ -110,12 +98,6 @@ impl SizeClasses {
     /// One entry per representable alignment power, from `2^0` up to and
     /// including `PAGE_SIZE`.
     const ALIGN_POWER_COUNT: usize = Self::align_power_count();
-    /// The one hand-authored size-class table. The alignment remap is
-    /// const-generated from this list.
-    const SIZES: [usize; Self::COUNT] = [
-        8, 16, 24, 32, 48, 64, 80, 96, 128, 160, 192, 256, 320, 384, 512, 768, 1024, 1536, 2048,
-        3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768,
-    ];
     /// `ALIGNED_CLASS_BY_START[power][start]` is the smallest class index at
     /// or after `start` whose block size is a multiple of `2^power`. `SIZES`
     /// ends at `SMALL_MAX`, a multiple of every representable alignment, so
@@ -399,27 +381,19 @@ mod tests {
     }
 
     #[test]
-    fn block_index_offset_oracle_all_classes() {
-        const RUN_SIZE: usize = 64 * 1024;
-
+    fn non_power_of_two_block_index_matches_linear_oracle_for_all_classes() {
         for class_index in 0..SizeClasses::COUNT {
             let id = SizeClassId::new(class_index).unwrap();
             let size = SizeClasses::block_size(id);
-            let capacity = RUN_SIZE / size;
 
-            for block in 0..capacity {
-                let offset = block * size;
-                assert_eq!(id.block_index_from_offset(offset), Some(block));
-                assert_eq!(id.block_offset(block), offset);
-            }
-
-            if size > 1 {
-                for block in 0..capacity {
-                    let base = block * size;
-                    for interior in 1..size {
-                        assert_eq!(id.block_index_from_offset(base + interior), None);
-                    }
-                }
+            for offset in 0..=size * 2 {
+                let reference = (!size.is_power_of_two() && offset.is_multiple_of(size))
+                    .then_some(offset.checked_div(size).unwrap());
+                assert_eq!(
+                    id.non_power_of_two_block_index_from_offset(offset),
+                    reference,
+                    "class={class_index} size={size} offset={offset}"
+                );
             }
         }
     }
