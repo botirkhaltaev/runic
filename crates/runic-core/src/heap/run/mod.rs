@@ -173,8 +173,6 @@ pub(crate) struct Run {
     /// Cached `mapping.base()` — payload span start (`RUN_SIZE` bytes).
     payload_base: NonNull<u8>,
     blocks: BlockStates,
-    /// `trailing_zeros(block_size)` when power-of-two; `None` ⇒ multiply path.
-    block_shift: Option<NonZeroU32>,
     class: SizeClassId,
     capacity: usize,
     block_size: usize,
@@ -211,15 +209,6 @@ impl Run {
         RUN_SIZE.checked_add(capacity)
     }
 
-    const fn block_size_shift(block_size: usize) -> Option<NonZeroU32> {
-        if block_size.is_power_of_two() {
-            // Min size class is 8 (`trailing_zeros` ≥ 3); never zero for our table.
-            NonZeroU32::new(block_size.trailing_zeros())
-        } else {
-            None
-        }
-    }
-
     pub(crate) fn new(
         id: RunId,
         heap: HeapId,
@@ -247,7 +236,6 @@ impl Run {
             state: UnsafeCell::new(RunState::new(block_size)),
             payload_base: mapping.base(),
             blocks,
-            block_shift: Self::block_size_shift(block_size),
             class,
             capacity,
             block_size,
@@ -417,7 +405,7 @@ impl Run {
             return None;
         }
 
-        let index = self.block_index(offset)?;
+        let index = self.class.block_index_from_offset(offset)?;
         if index >= self.capacity {
             return None;
         }
@@ -429,10 +417,7 @@ impl Run {
     #[inline]
     fn block_ptr(&self, index: BlockIndex) -> NonNull<u8> {
         debug_assert!(index.get() < self.capacity);
-        let byte_offset = match self.block_shift {
-            Some(shift) => index.get() << shift.get(),
-            None => index.get() * self.block_size,
-        };
+        let byte_offset = self.class.block_offset(index.get());
         // SAFETY: freelist / `allocate_fresh` only yield `index < capacity`, so
         // `byte_offset < RUN_SIZE` inside the payload span.
         unsafe { NonNull::new_unchecked(self.payload_base.as_ptr().add(byte_offset)) }
@@ -482,23 +467,6 @@ impl Run {
         unsafe {
             ptr.cast::<usize>().as_ptr().write(word);
         }
-    }
-
-    #[inline]
-    fn block_index(&self, offset: usize) -> Option<usize> {
-        if let Some(shift) = self.block_shift {
-            if offset & (self.block_size - 1) != 0 {
-                return None;
-            }
-
-            return Some(offset >> shift.get());
-        }
-
-        if !offset.is_multiple_of(self.block_size) {
-            return None;
-        }
-
-        offset.checked_div(self.block_size)
     }
 }
 
