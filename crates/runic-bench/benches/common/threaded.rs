@@ -29,6 +29,8 @@ pub fn register(c: &mut Criterion, suite: &str, targets: &[AllocatorTarget]) {
     register_persistent_remote_fan_in(c, suite, targets);
     register_persistent_owner_concurrent(c, suite, targets);
     register_persistent_remote_reuse_latency(c, suite, targets);
+    register_persistent_bound_remote_batch(c, suite, targets);
+    register_persistent_unbound_remote_singleton(c, suite, targets);
 }
 
 fn register_setup_lifecycle_thread_local_churn(
@@ -273,19 +275,91 @@ fn register_persistent_remote_reuse_latency(
 
     for &target in targets {
         for &live in LIVE_DEPTHS {
-            let _ = live;
             group.throughput(Throughput::Elements(PERSISTENT_OPS as u64));
             group.bench_with_input(
                 BenchmarkId::new(target.name(), format!("live:{live}")),
                 &(target, live),
-                |bench, &(target, _live)| {
+                |bench, &(target, live)| {
                     bench.iter_custom(|iters| {
                         let workers = threaded::PersistentRemoteReuse::spawn(target);
                         let start = Instant::now();
                         for _ in 0..iters {
-                            black_box(workers.run_round(PERSISTENT_OPS));
+                            black_box(workers.run_round(PERSISTENT_OPS, live));
                         }
                         let elapsed = start.elapsed();
+                        drop(workers);
+                        elapsed
+                    });
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
+fn register_persistent_bound_remote_batch(
+    c: &mut Criterion,
+    suite: &str,
+    targets: &[AllocatorTarget],
+) {
+    let mut group = c.benchmark_group(format!("{suite}/persistent_bound_remote_batch"));
+    configure_group(&mut group);
+
+    for &target in targets {
+        for &threads in THREAD_COUNTS {
+            group.throughput(Throughput::Elements((threads * PERSISTENT_OPS) as u64));
+            group.bench_with_input(
+                BenchmarkId::new(target.name(), threads),
+                &(target, threads),
+                |bench, &(target, threads)| {
+                    bench.iter_custom(|iters| {
+                        let workers =
+                            threaded::PersistentBoundRemoteBatch::spawn_bound(target, threads);
+                        let mut elapsed = Duration::ZERO;
+                        for _ in 0..iters {
+                            black_box(workers.prepare_round(PERSISTENT_OPS));
+                            let start = Instant::now();
+                            black_box(workers.run_free_round());
+                            elapsed += start.elapsed();
+                        }
+                        drop(workers);
+                        elapsed
+                    });
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
+fn register_persistent_unbound_remote_singleton(
+    c: &mut Criterion,
+    suite: &str,
+    targets: &[AllocatorTarget],
+) {
+    let mut group = c.benchmark_group(format!("{suite}/persistent_unbound_remote_singleton"));
+    configure_group(&mut group);
+
+    for &target in targets {
+        for &threads in THREAD_COUNTS {
+            group.throughput(Throughput::Elements((threads * PERSISTENT_OPS) as u64));
+            group.bench_with_input(
+                BenchmarkId::new(target.name(), threads),
+                &(target, threads),
+                |bench, &(target, threads)| {
+                    bench.iter_custom(|iters| {
+                        let workers = threaded::PersistentUnboundRemoteSingleton::spawn_unbound(
+                            target, threads,
+                        );
+                        let mut elapsed = Duration::ZERO;
+                        for _ in 0..iters {
+                            black_box(workers.prepare_round(PERSISTENT_OPS));
+                            let start = Instant::now();
+                            black_box(workers.run_free_round());
+                            elapsed += start.elapsed();
+                        }
                         drop(workers);
                         elapsed
                     });

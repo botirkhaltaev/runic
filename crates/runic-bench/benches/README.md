@@ -34,7 +34,14 @@ Persistent workers (preferred for allocator profiles):
 - `threaded/persistent_cross_thread_ring/runic/4/live:256`
 - `threaded/persistent_remote_fan_in/runic/4/live:256`
 - `threaded/persistent_owner_concurrent/runic/4/live:256`
-- `threaded/persistent_remote_reuse_latency/runic/live:1`
+- `threaded/persistent_remote_reuse_latency/runic/live:1` (also `live:32`, `live:256`)
+- `threaded/persistent_bound_remote_batch/runic/4` — channel-free bound batch frees
+- `threaded/persistent_unbound_remote_singleton/runic/4` — channel-free unbound singletons
+
+Local size-class matrix (full + focused hotspot subset):
+
+- `explicit/recycled_live_churn/runic/{size}/live:{depth}` — all 27 classes
+- `explicit/recycled_live_hotspot/runic/{64|72|80|88}/live:{depth}` — PoT vs non-PoT index gate
 
 ## Run
 
@@ -60,6 +67,19 @@ scripts/profile.sh -t 20 -a 'runic_core::heap::run::Run::free' \
 Recycled live-set matrix (all 27 size classes × depths 1 / 32 / 256):
 
 - `explicit/recycled_live_churn/runic/{size}/live:{depth}`
+
+Hotspot subset (64 / 72 / 80 / 88 × same depths):
+
+- `explicit/recycled_live_hotspot/runic/{size}/live:{depth}`
+
+Channel-free remote free baselines (allocate outside timed free phase):
+
+```sh
+scripts/profile.sh -l post-pr5-pr1 -t 20 \
+  threaded 'threaded/persistent_bound_remote_batch/runic/4'
+scripts/profile.sh -l post-pr5-pr1 -t 20 \
+  threaded 'threaded/persistent_unbound_remote_singleton/runic/4'
+```
 
 Artifacts land under `target/runic-profiles/` (override with `RUNIC_PROFILE_DIR` or `-o`).
 Each run writes `manifest.txt`, `metrics.txt`, and `summary.txt`.

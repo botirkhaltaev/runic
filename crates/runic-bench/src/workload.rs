@@ -10,6 +10,10 @@ pub const SIZE_CLASSES: &[usize] = &[
 pub const SINGLE_SIZE_CHURN: &[usize] = &[8, 16, 32, 64, 128, 256, 512, 1024, 4096];
 /// Live-set depths for freelist-heavy recycled churn (gate matrix).
 pub const RECYCLED_LIVE_DEPTHS: &[usize] = &[1, 32, 256];
+/// Focused local free/index hotspot sizes for profile gates (power-of-two and non-power-of-two requests).
+///
+/// `72` / `88` round into classes `80` / `96` and exercise non-power-of-two `block_at`.
+pub const LOCAL_HOTSPOT_SIZES: &[usize] = &[64, 72, 80, 88];
 pub const LARGE_SIZES: &[usize] = &[32769, 64 * 1024, 256 * 1024, 1024 * 1024];
 pub const ALIGNMENT_CASES: &[(usize, usize)] =
     &[(1, 8), (1, 64), (1, 4096), (64, 64), (4096, 4096)];
