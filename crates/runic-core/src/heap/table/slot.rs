@@ -128,8 +128,8 @@ impl SlotState {
 
     /// Admit one Active publisher lease for `id`, or fail if closed / overflow.
     ///
-    /// Counts in-flight Active **publish** admits only — not unpublished TLS batch contents
-    /// (those stay live via `RemotePending` / `has_live_allocations`). Does not serialize
+    /// Counts in-flight Active **publish** admits only — not inbox depth
+    /// (that stays live via claim bits / `has_live_allocations`). Does not serialize
     /// concurrent freer bodies.
     #[inline]
     fn try_acquire_publisher(&self, id: HeapId) -> Result<(), HeapError> {

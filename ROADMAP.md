@@ -35,14 +35,22 @@ real lifecycle, invariant, or policy.
 Latest published release: `0.5.0`.
 
 Current `master` ships the v0.5 owner-local heap frontend: TLS heaps own runs and
-extents stamped with `HeapId`, lock-free remote-free inboxes, and Draining
-lifecycle after thread exit, with explicit page-map ownership.
+extents stamped with `HeapId`, run-owned `ClaimBits` remote admission, run/extent
+`Notify` coalesced inboxes, and Draining lifecycle after thread exit, with explicit
+page-map ownership.
+
+Branch `perf/close-local-churn-gap` (PR1–PR3) removes owner-local `lock cmpxchg`
+on run free, coalesces remote publication by run, and adds phase-isolated benches.
+Measured on Linux x86_64 (paired Runic cycles/op): 64-byte owner_free −23%,
+churn −12%, fan-in −35%, remote-reuse latency −15% vs pre-change baseline.
+Small local churn remains ~2.7× snmalloc on the same host (TLS + metadata residue;
+not parity).
 
 The next milestone is:
 
 ```text
-Optimize remote-free reuse latency after ownership and Draining are stable,
-while keeping owner-side validation mandatory on every remote free.
+Reduce TLS entry and page-map lookup overhead on owner-local alloc/dealloc without
+weakening fail-closed ownership or multi-allocator thread safety.
 ```
 
 ## Supported Scope
@@ -59,8 +67,9 @@ mmap-backed extents for dedicated allocations (heap-local)
 out-of-line metadata
 page-indexed pointer lookup
 per-size-class available run lists
-per-block AtomicU8 clear/Free/RemotePending (Free bit DF fail-closed; freelist+bump own Free/Live)
-lock-free remote-free Treiber inboxes per heap
+per-block AtomicU8 clear/Free on runs (Free bit DF fail-closed; freelist+bump own Free/Live)
+run-owned ClaimBits bitmap for remote admission (no byte RemotePending on runs)
+run/extent Notify inboxes coalesced by owner (Treiber stack of runs/extents, not per-block nodes)
 configurable extent mapping retention and reuse
 runs retained for the heap lifetime (no empty-run OS release in v0.5)
 run block-boundary checks
@@ -142,11 +151,12 @@ SizeClasses    owns size-class selection.
 OsMemory       maps anonymous pages; Mapping owns the mmap lifecycle (Drop munmaps).
 PageMap        owns page-indexed owner-pointer lookup.
 RunHeap        owns Arena<Run>, small-allocation policy, and available run lists.
-Run            owns fixed-block allocation metadata, freelist-primary Free/Live, and bump.
-BlockStates    owns clear/Free/RemotePending per-block bits (one AtomicU8 per block); Free bit is DF fail-closed, not Free/Live authority (freelist + bump owns that).
+Run            owns fixed-block allocation metadata, freelist-primary Free/Live, bump, and embedded run Notify.
+ClaimBits      owns remote-admission bitmap in the run mapping tail (handshake with owner free / accept_remote).
+BlockStates    owns clear/Free per-block bytes (one AtomicU8 per block); Free bit is DF fail-closed, not Free/Live authority.
 ExtentHeap     owns Arena<Extent>, dedicated allocation policy, and mapping reuse.
 ExtentCache    owns retained extent mappings, eviction, and reuse lookup.
-Extent         owns dedicated allocation metadata.
+Extent         owns dedicated allocation metadata and embedded extent Notify (extent byte state still uses RemotePending).
 ```
 
 Prefer direct methods on the entity that owns the state. Do not add passive
@@ -214,9 +224,12 @@ allocation paths.
 Current benchmark interpretation:
 
 ```text
-Small allocation work is structurally limited by the global heap lock and shared
-metadata. Do not add a global-lock block cache unless it improves hot paths and
-preserves stale-free detection.
+Owner-local run free no longer uses lock cmpxchg (ClaimBits handshake). Remaining
+small-churn cost is mostly TLS entry (`LocalKey::with`) and page-map lookup, not
+per-block byte CAS.
+
+Remote fan-in improved via run-coalesced Notify publication; cross-allocator ratios
+are informational (library/host drift) — use paired Runic cycles/op for PR gates.
 
 Dedicated extent churn is primarily controlled by mapping retention policy.
 Keep extent retention deterministic, bounded, and allocation-free.
@@ -288,9 +301,9 @@ Delivered:
 HeapId ownership on Run and Extent (no Owner/root heap)
 ThreadHeap frontend for small and large allocations
 per-thread heap ownership through HeapDirectory / HeapSlot
-explicit block states for reusable, allocated, and remote-pending blocks
-lock-free remote-free Treiber inbox on each HeapSlot
-claim → batch → publish → flush/accept remote-free protocol
+explicit block states for reusable and allocated run blocks; extent RemotePending
+run/extent Notify inboxes coalesced by owner (claim → try_arm → publish → accept_remote)
+run ClaimBits remote admission (owner free store/recheck; no owner lock cmpxchg)
 alloc-miss prefers local/OS run acquire, then flush+retry before mmap
 thread-exit Draining mode with orphan flush and generation bump
 heap-local extents
@@ -307,22 +320,23 @@ tag: 0.5.0
 crates: runic-core 0.5.0, runic-alloc 0.5.0
 ```
 
-### v0.6 Next: Remote Free Queue Optimization
+### v0.6 Next: Owner-local TLS and lookup overhead
 
 Goal:
 
 ```text
-Optimize remote-free reuse latency after ownership and Draining are stable
-(e.g. concurrent per-run remote freelists or freer-side batch buffers).
+Reduce TLS entry and page-map lookup cost on owner-local alloc/dealloc while
+preserving fail-closed ownership, multi-allocator thread safety, and the
+claim → try_arm → publish → accept_remote protocol.
 ```
 
 Acceptance gate:
 
 ```text
+≥5% improvement on phase-isolated owner_free and single_size_churn vs paired baseline
+≤3% regression on unaffected matrix rows
 owner-side validation of every remote free remains mandatory
-enqueue never drops frees and never blocks the freer on the owner
-randomized cross-thread traces
-abort cases remain intact
+randomized cross-thread traces and abort cases remain intact
 ```
 
 ### v0.7 Later: Hardening
