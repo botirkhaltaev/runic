@@ -9,7 +9,7 @@ use crate::{
     heap::{Extent, ExtentInit, HeapDirectory, HeapId, HeapSlot, Run, RunError},
     layout::LayoutSpec,
     memory::{PageMap, PageOwner},
-    size_class::{SizeClassId, SizeClasses},
+    size_class::{SizeClass, SizeClasses},
 };
 
 use super::{inbox::RemoteList, slot::HeapError};
@@ -172,7 +172,7 @@ impl ThreadHeap {
     pub(crate) fn alloc(
         &self,
         inner: NonNull<AllocatorInner>,
-        class: SizeClassId,
+        class: SizeClass,
         pages: &PageMap,
     ) -> Option<NonNull<u8>> {
         if !self.matches(inner) {
@@ -336,7 +336,7 @@ impl ThreadHeap {
     #[cold]
     fn acquire_alloc(
         &self,
-        class: SizeClassId,
+        class: SizeClass,
         pages: &PageMap,
         slot: NonNull<HeapSlot>,
     ) -> Option<NonNull<u8>> {
@@ -378,9 +378,9 @@ impl ThreadHeap {
         None
     }
 
-    fn run_cell(&self, class: SizeClassId) -> &Cell<*mut Run> {
+    fn run_cell(&self, class: SizeClass) -> &Cell<*mut Run> {
         debug_assert!(class.index() < self.runs.len());
-        // SAFETY: SizeClassId values are created only by SizeClasses for indexes in this array.
+        // SAFETY: SizeClass values are created only by SizeClasses for indexes in this array.
         unsafe { self.runs.get_unchecked(class.index()) }
     }
 

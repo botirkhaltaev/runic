@@ -10,7 +10,7 @@ Allocator core organized around entities and invariants.
 - `heap`: owner-local heaps, run/extent heaps, `HeapDirectory`, and thread binding.
 - `layout`: normalized layout semantics and mapping sizing (`align` as `NonZeroUsize`; `mapping_len` uses `size + align - 1`).
 - `memory`: address ranges, mmap ownership, and page-indexed owner lookup.
-- `size_class`: one size-class declaration generates constant-divisor block indexing and lookup tables. `SizeClassId` is a bounded index minted only by `SizeClasses`.
+- `size_class`: one size-class declaration generates `SizeClass::index_of` and lookup tables. `SizeClass` is minted only by `SizeClasses::class_for`.
 
 ## Invariant
 

@@ -7,7 +7,7 @@ pub(crate) mod heap;
 use crate::{
     layout::LayoutSpec,
     memory::{AddressRange, Mapping},
-    size_class::{SizeClassId, SizeClasses},
+    size_class::SizeClass,
 };
 
 use super::HeapId;
@@ -48,18 +48,18 @@ impl BlockIndex {
     /// State-tail byte for an index already proven in `0..bytes.len()` (capacity).
     fn byte_unchecked(self, bytes: AddressRange) -> NonNull<u8> {
         debug_assert!(self.get() < bytes.len());
-        // SAFETY: caller proved `get() < bytes.len()` via `block_at` / freelist / bump.
+        // SAFETY: caller proved `get() < bytes.len()` via `locate` / freelist / bump.
         unsafe { NonNull::new_unchecked(bytes.base().as_ptr().add(self.get())) }
     }
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct RunBlock {
+pub(crate) struct Block {
     index: BlockIndex,
     ptr: NonNull<u8>,
 }
 
-impl RunBlock {
+impl Block {
     const fn new(index: BlockIndex, ptr: NonNull<u8>) -> Self {
         Self { index, ptr }
     }
@@ -171,13 +171,13 @@ pub(crate) struct Run {
     /// `repr(Rust)` (not a layout guarantee; do not treat as ABI).
     state: UnsafeCell<RunState>,
     /// Cached `mapping.base()` — payload span start (`RUN_SIZE` bytes).
-    payload_base: NonNull<u8>,
+    base: NonNull<u8>,
     blocks: BlockStates,
-    /// `trailing_zeros(block_size)` when power-of-two; `None` means multiply.
-    block_shift: Option<NonZeroU32>,
-    class: SizeClassId,
+    /// `trailing_zeros(stride)` when power-of-two; `None` means multiply.
+    stride_shift: Option<NonZeroU32>,
+    class: SizeClass,
     capacity: usize,
-    block_size: usize,
+    stride: usize,
     id: RunId,
     heap: HeapId,
     mapping: Mapping,
@@ -203,33 +203,15 @@ struct RunState {
 
 impl Run {
     /// Bytes for one run mapping: `RUN_SIZE` payload plus one `AtomicU8` per block.
-    pub(crate) fn mapping_len(class: SizeClassId) -> Option<usize> {
-        let block_size = SizeClasses::block_size(class);
-        let capacity = RUN_SIZE
-            .checked_div(block_size)
-            .filter(|&count| count > 0)?;
+    pub(crate) fn mapping_len(class: SizeClass) -> Option<usize> {
+        let stride = class.size();
+        let capacity = RUN_SIZE.checked_div(stride).filter(|&count| count > 0)?;
         RUN_SIZE.checked_add(capacity)
     }
 
-    const fn block_size_shift(block_size: usize) -> Option<NonZeroU32> {
-        if block_size.is_power_of_two() {
-            // Min size class is 8 (`trailing_zeros` ≥ 3); never zero for our table.
-            NonZeroU32::new(block_size.trailing_zeros())
-        } else {
-            None
-        }
-    }
-
-    pub(crate) fn new(
-        id: RunId,
-        heap: HeapId,
-        mapping: Mapping,
-        class: SizeClassId,
-    ) -> Option<Self> {
-        let block_size = SizeClasses::block_size(class);
-        let capacity = RUN_SIZE
-            .checked_div(block_size)
-            .filter(|&count| count > 0)?;
+    pub(crate) fn new(id: RunId, heap: HeapId, mapping: Mapping, class: SizeClass) -> Option<Self> {
+        let stride = class.size();
+        let capacity = RUN_SIZE.checked_div(stride).filter(|&count| count > 0)?;
         let need = RUN_SIZE.checked_add(capacity)?;
         if mapping.len().get() < need {
             return None;
@@ -243,14 +225,19 @@ impl Run {
         let blocks = BlockStates {
             bytes: AddressRange::new(state_base, capacity),
         };
+        // Min size class is 8 (`trailing_zeros` ≥ 3); never zero for our table.
+        let stride_shift = stride
+            .is_power_of_two()
+            .then(|| NonZeroU32::new(stride.trailing_zeros()))
+            .flatten();
         Some(Self {
-            state: UnsafeCell::new(RunState::new(block_size)),
-            payload_base: mapping.base(),
+            state: UnsafeCell::new(RunState::new(stride)),
+            base: mapping.base(),
             blocks,
-            block_shift: Self::block_size_shift(block_size),
+            stride_shift,
             class,
             capacity,
-            block_size,
+            stride,
             id,
             heap,
             mapping,
@@ -271,13 +258,8 @@ impl Run {
         self.heap
     }
 
-    pub(crate) const fn class(&self) -> SizeClassId {
+    pub(crate) const fn class(&self) -> SizeClass {
         self.class
-    }
-
-    pub(crate) fn has_available_blocks(&self) -> bool {
-        // SAFETY: owner-local methods are called only by the owning heap.
-        unsafe { &*self.state.get() }.live < self.capacity
     }
 
     /// True when every block is outstanding (allocated or remote-pending).
@@ -309,7 +291,7 @@ impl Run {
     }
 
     pub(crate) fn range(&self) -> AddressRange {
-        AddressRange::new(self.payload_base, RUN_SIZE)
+        AddressRange::new(self.base, RUN_SIZE)
     }
 
     #[inline]
@@ -329,7 +311,7 @@ impl Run {
             }
             None => self.allocate_fresh(state)?,
         };
-        let ptr = self.block_ptr(index);
+        let ptr = self.address(index);
 
         debug_assert!(state.live < self.capacity);
         state.live += 1;
@@ -340,7 +322,7 @@ impl Run {
     /// Free bit keeps delayed double-free fail-closed without bump-path stores.
     #[inline]
     pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
-        let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
+        let block = self.locate(ptr).ok_or(RunError::InvalidPointer)?;
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
         if block.index().get() >= state.bump {
@@ -358,7 +340,7 @@ impl Run {
 
     /// Freer: live → `RemotePending` (before batch/publish).
     pub(crate) fn claim(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
-        let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
+        let block = self.locate(ptr).ok_or(RunError::InvalidPointer)?;
         if block.index().get() >= self.issued.load(Ordering::Relaxed) {
             return Err(RunError::DoubleFree);
         }
@@ -370,7 +352,7 @@ impl Run {
 
     /// Owner: `RemotePending` → freelist (inbox flush / publish Draining complete).
     pub(crate) fn accept(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
-        let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
+        let block = self.locate(ptr).ok_or(RunError::InvalidPointer)?;
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
 
@@ -383,8 +365,8 @@ impl Run {
         Ok(())
     }
 
-    pub(crate) fn allocated_block_at(&self, ptr: NonNull<u8>) -> Result<RunBlock, RunError> {
-        let block = self.block_at(ptr).ok_or(RunError::InvalidPointer)?;
+    pub(crate) fn allocated(&self, ptr: NonNull<u8>) -> Result<Block, RunError> {
+        let block = self.locate(ptr).ok_or(RunError::InvalidPointer)?;
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &*self.state.get() };
         if block.index().get() >= state.bump {
@@ -401,49 +383,38 @@ impl Run {
         ptr: NonNull<u8>,
         spec: LayoutSpec,
     ) -> Result<bool, RunError> {
-        self.allocated_block_at(ptr)?;
+        self.allocated(ptr)?;
 
-        Ok(self.block_size >= spec.size() && spec.is_addr_aligned(ptr.as_ptr().addr()))
+        Ok(self.stride >= spec.size() && spec.is_addr_aligned(ptr.as_ptr().addr()))
     }
 
     #[inline]
-    pub(crate) fn block_at(&self, ptr: NonNull<u8>) -> Option<RunBlock> {
+    pub(crate) fn locate(&self, ptr: NonNull<u8>) -> Option<Block> {
         // Out-of-span (incl. below base) wraps to a large offset ≥ `RUN_SIZE`.
-        let offset = ptr
-            .as_ptr()
-            .addr()
-            .wrapping_sub(self.payload_base.as_ptr().addr());
+        let offset = ptr.as_ptr().addr().wrapping_sub(self.base.as_ptr().addr());
         if offset >= RUN_SIZE {
             return None;
         }
 
-        let index = if let Some(shift) = self.block_shift {
-            if offset & (self.block_size - 1) != 0 {
-                return None;
-            }
-            offset >> shift.get()
-        } else {
-            self.class
-                .non_power_of_two_block_index_from_offset(offset)?
-        };
+        let index = self.class.index_of(offset)?;
         if index >= self.capacity {
             return None;
         }
 
-        Some(RunBlock::new(BlockIndex::new(index), ptr))
+        Some(Block::new(BlockIndex::new(index), ptr))
     }
 
     /// Payload pointer for a freelist or bump index in `0..capacity`.
     #[inline]
-    fn block_ptr(&self, index: BlockIndex) -> NonNull<u8> {
+    fn address(&self, index: BlockIndex) -> NonNull<u8> {
         debug_assert!(index.get() < self.capacity);
-        let byte_offset = match self.block_shift {
+        let byte_offset = match self.stride_shift {
             Some(shift) => index.get() << shift.get(),
-            None => index.get() * self.block_size,
+            None => index.get() * self.stride,
         };
         // SAFETY: freelist / `allocate_fresh` only yield `index < capacity`, so
         // `byte_offset < RUN_SIZE` inside the payload span.
-        unsafe { NonNull::new_unchecked(self.payload_base.as_ptr().add(byte_offset)) }
+        unsafe { NonNull::new_unchecked(self.base.as_ptr().add(byte_offset)) }
     }
 
     #[cold]
@@ -466,14 +437,14 @@ impl Run {
         }
 
         let index = BlockIndex::new(raw);
-        let ptr = self.block_ptr(index);
+        let ptr = self.address(index);
         state.free = Self::read_link(ptr);
         Some(index)
     }
 
-    /// Push using the payload pointer already proven by `block_at` / `RunBlock`.
+    /// Push using the payload pointer already proven by `locate` / `Block`.
     #[inline]
-    fn push_free(state: &mut RunState, block: RunBlock) {
+    fn push_free(state: &mut RunState, block: Block) {
         Self::write_link(block.ptr(), state.free);
         state.free = block.index().get();
     }
@@ -524,15 +495,15 @@ mod tests {
         LayoutSpec::from_layout(Layout::from_size_align(size, align).unwrap())
     }
 
-    fn class_id(size: usize, align: usize) -> SizeClassId {
-        SizeClasses::id_for(layout_spec(size, align)).unwrap()
+    fn class_id(size: usize, align: usize) -> SizeClass {
+        SizeClasses::class_for(layout_spec(size, align)).unwrap()
     }
 
     fn test_heap_id() -> HeapId {
         HeapId::new(0, NonZeroU32::MIN).unwrap()
     }
 
-    fn map_for_class(class: SizeClassId) -> Mapping {
+    fn map_for_class(class: SizeClass) -> Mapping {
         OsMemory::map(Run::mapping_len(class).unwrap()).unwrap()
     }
 
@@ -546,12 +517,12 @@ mod tests {
             class,
         )
         .expect("test run");
-        let capacity = RUN_SIZE / SizeClasses::block_size(class);
+        let capacity = RUN_SIZE / class.size();
         let mut seen = vec![false; capacity];
 
         for _ in 0..capacity {
             let ptr = run.allocate().unwrap();
-            let block = run.block_at(ptr).unwrap();
+            let block = run.locate(ptr).unwrap();
             let index = block.index().get();
 
             assert!(!seen[index]);
@@ -596,7 +567,7 @@ mod tests {
 
         let ptr = run.allocate().unwrap();
         assert!(run.free(ptr).is_ok());
-        let index = run.block_at(ptr).unwrap().index();
+        let index = run.locate(ptr).unwrap().index();
         // Corrupt DF bit while the block remains on the freelist.
         run.blocks.set(index, BlockState::Clear);
         assert!(run.allocate().is_none());
@@ -647,7 +618,38 @@ mod tests {
         let ptr = run.allocate().unwrap();
         let interior = unsafe { NonNull::new_unchecked(ptr.as_ptr().add(1)) };
 
-        assert!(run.block_at(interior).is_none());
+        assert!(run.locate(interior).is_none());
+    }
+
+    #[test]
+    fn reusable_run_locate_covers_all_classes_boundaries_and_tail_slack() {
+        for (run_index, &size) in SizeClasses::SIZES.iter().enumerate() {
+            let class = class_id(size, 8);
+            let run = Run::new(
+                RunId::from_index(u32::try_from(run_index).unwrap()).unwrap(),
+                test_heap_id(),
+                map_for_class(class),
+                class,
+            )
+            .expect("test run");
+            let capacity = RUN_SIZE / size;
+
+            let first = run.allocate().unwrap();
+            assert!(run.locate(first).is_some(), "size={size}");
+            assert!(
+                run.locate(unsafe { NonNull::new_unchecked(first.as_ptr().add(1)) })
+                    .is_none(),
+                "size={size}"
+            );
+
+            let slack_offset = capacity * size;
+            if slack_offset < RUN_SIZE {
+                let slack = unsafe {
+                    NonNull::new_unchecked(run.range().base().as_ptr().add(slack_offset))
+                };
+                assert!(run.locate(slack).is_none(), "size={size} slack");
+            }
+        }
     }
 
     #[test]
@@ -663,8 +665,8 @@ mod tests {
         let ptr = run.allocate().unwrap();
         let interior = unsafe { NonNull::new_unchecked(ptr.as_ptr().add(1)) };
 
-        assert!(run.block_at(ptr).is_some());
-        assert!(run.block_at(interior).is_none());
+        assert!(run.locate(ptr).is_some());
+        assert!(run.locate(interior).is_none());
     }
 
     #[test]
@@ -680,7 +682,7 @@ mod tests {
             .expect("test run");
             let ptr = run.allocate().unwrap();
 
-            assert!(run.block_at(ptr).is_some(), "size={size}");
+            assert!(run.locate(ptr).is_some(), "size={size}");
             assert!(run.free(ptr).is_ok(), "size={size}");
             assert_eq!(run.allocate(), Some(ptr), "size={size}");
         }
@@ -697,13 +699,13 @@ mod tests {
                 class,
             )
             .expect("test run");
-            let capacity = RUN_SIZE / SizeClasses::block_size(class);
-            let slack_offset = capacity * SizeClasses::block_size(class);
+            let capacity = RUN_SIZE / class.size();
+            let slack_offset = capacity * class.size();
             assert!(slack_offset < RUN_SIZE, "size={size}");
             let slack =
                 unsafe { NonNull::new_unchecked(run.range().base().as_ptr().add(slack_offset)) };
 
-            assert!(run.block_at(slack).is_none(), "size={size}");
+            assert!(run.locate(slack).is_none(), "size={size}");
         }
     }
 
@@ -817,7 +819,7 @@ mod tests {
             class,
         )
         .expect("test run");
-        let capacity = RUN_SIZE / SizeClasses::block_size(class);
+        let capacity = RUN_SIZE / class.size();
 
         for _ in 0..capacity {
             let ptr = run.allocate().unwrap();

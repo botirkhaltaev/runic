@@ -5,7 +5,7 @@ use crate::{
     heap::{HeapId, Run, RunError, RunId},
     layout::LayoutSpec,
     memory::{OsMemory, PageMap},
-    size_class::{SizeClassId, SizeClasses},
+    size_class::{SizeClass, SizeClasses},
 };
 
 pub(crate) struct RunHeap {
@@ -15,7 +15,7 @@ pub(crate) struct RunHeap {
 
 #[derive(Clone, Copy)]
 struct FreedRun {
-    class: SizeClassId,
+    class: SizeClass,
     run: NonNull<Run>,
     was_full: bool,
 }
@@ -42,7 +42,7 @@ impl RunHeap {
 
     pub(crate) fn allocate(
         &mut self,
-        class: SizeClassId,
+        class: SizeClass,
         heap_id: HeapId,
         pages: &PageMap,
     ) -> Option<NonNull<Run>> {
@@ -50,14 +50,14 @@ impl RunHeap {
             .or_else(|| self.allocate_run(class, heap_id, pages))
     }
 
-    pub(crate) fn take_available(&mut self, class: SizeClassId) -> Option<NonNull<Run>> {
+    pub(crate) fn take_available(&mut self, class: SizeClass) -> Option<NonNull<Run>> {
         self.take_available_from(class.index())
     }
 
     #[cold]
     pub(crate) fn allocate_run(
         &mut self,
-        class: SizeClassId,
+        class: SizeClass,
         heap_id: HeapId,
         pages: &PageMap,
     ) -> Option<NonNull<Run>> {
@@ -166,7 +166,7 @@ impl RunHeap {
             *available = next;
 
             // SAFETY: available-list pointers are created only from live arena entries.
-            if unsafe { run_ptr.as_ref() }.has_available_blocks() {
+            if !unsafe { run_ptr.as_ref() }.is_full() {
                 return Some(run_ptr);
             }
         }
@@ -184,7 +184,7 @@ impl RunHeap {
         // SAFETY: caller supplies a pointer derived from this allocator's live arena.
         let run = unsafe { run_ptr.as_mut() };
 
-        if !run.has_available_blocks() {
+        if run.is_full() {
             return Err(RunHeapError::InvalidMetadata);
         }
 
@@ -246,8 +246,8 @@ mod tests {
     use super::super::RUN_SIZE;
     use super::*;
 
-    fn class_id(size: usize, align: usize) -> SizeClassId {
-        SizeClasses::id_for(LayoutSpec::from_layout(
+    fn class_id(size: usize, align: usize) -> SizeClass {
+        SizeClasses::class_for(LayoutSpec::from_layout(
             Layout::from_size_align(size, align).unwrap(),
         ))
         .unwrap()
@@ -270,7 +270,7 @@ mod tests {
 
     fn allocate_block(
         allocator: &mut RunHeap,
-        class: SizeClassId,
+        class: SizeClass,
         pages: &PageMap,
     ) -> Option<(NonNull<Run>, NonNull<u8>)> {
         let heap = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
@@ -278,7 +278,7 @@ mod tests {
         // SAFETY: RunHeap returns pointers to live runs from its arena.
         let ptr = unsafe { run.as_mut() }.allocate()?;
         // SAFETY: RunHeap returns pointers to live runs from its arena.
-        if unsafe { run.as_ref() }.has_available_blocks() {
+        if !unsafe { run.as_ref() }.is_full() {
             allocator.return_available(run).ok()?;
         }
         Some((run, ptr))
@@ -290,7 +290,7 @@ mod tests {
         let pages = PageMap::new();
         let class = class_id(64, 8);
         let class_index = class.index();
-        let capacity = RUN_SIZE / SizeClasses::block_size(class);
+        let capacity = RUN_SIZE / class.size();
         let (_run, first) = allocate_block(&mut allocator, class, &pages).unwrap();
         let PageOwner::Run(run_ptr) = pages.get(first).unwrap() else {
             panic!("small allocation should publish a run entry");

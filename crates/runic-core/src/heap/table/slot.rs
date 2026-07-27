@@ -338,7 +338,7 @@ impl HeapSlot {
     /// SAFETY: caller is the Active TLS owner for this slot.
     pub(crate) unsafe fn alloc_run(
         &self,
-        class: crate::size_class::SizeClassId,
+        class: crate::size_class::SizeClass,
         pages: &PageMap,
     ) -> Option<NonNull<u8>> {
         if !self.inbox.is_empty() {
@@ -369,7 +369,7 @@ impl HeapSlot {
     /// SAFETY: caller is the Active TLS owner for this slot.
     pub(crate) unsafe fn acquire_run(
         &self,
-        class: crate::size_class::SizeClassId,
+        class: crate::size_class::SizeClass,
         pages: &PageMap,
     ) -> Option<NonNull<crate::heap::Run>> {
         // SAFETY: Active TLS owner.

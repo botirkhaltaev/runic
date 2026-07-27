@@ -16,7 +16,7 @@ use crate::{
     },
     layout::LayoutSpec,
     memory::{Mapping, OsMemory, PageMap, PageOwner},
-    size_class::{SizeClassId, SizeClasses},
+    size_class::{SizeClass, SizeClasses},
 };
 
 pub struct Allocator {
@@ -81,7 +81,7 @@ impl Allocator {
     pub unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // `Layout` stays at the GlobalAlloc boundary; internals use `LayoutSpec`.
         let spec = LayoutSpec::from_layout(layout);
-        if let Some(class) = SizeClasses::id_for(spec) {
+        if let Some(class) = SizeClasses::class_for(spec) {
             let Some(inner) = self.inner().or_else(|| self.init()) else {
                 return null_mut();
             };
@@ -243,7 +243,7 @@ impl Allocator {
     pub unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         // One classify: small → allocate then zero; large → extent path owns zeroing.
         let spec = LayoutSpec::from_layout(layout);
-        let Some(class) = SizeClasses::id_for(spec) else {
+        let Some(class) = SizeClasses::class_for(spec) else {
             let Some(inner) = self.inner().or_else(|| self.init()) else {
                 return null_mut();
             };
@@ -312,7 +312,7 @@ impl Allocator {
     fn alloc_remote(
         inner: NonNull<AllocatorInner>,
         inner_ref: &AllocatorInner,
-        class: SizeClassId,
+        class: SizeClass,
     ) -> *mut u8 {
         let heap_id = THREAD_HEAP.with(|tls| tls.bind(inner, &inner_ref.directory));
         let pages = inner_ref.pages();
@@ -614,7 +614,7 @@ mod tests {
         // SAFETY: test drives Active slot exclusively.
         unsafe {
             slot.alloc_run(
-                SizeClasses::id_for(LayoutSpec::from_layout(layout)).unwrap(),
+                SizeClasses::class_for(LayoutSpec::from_layout(layout)).unwrap(),
                 inner_ref.pages(),
             )
         }

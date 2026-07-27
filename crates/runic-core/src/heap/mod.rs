@@ -4,7 +4,7 @@ use crate::{
     config::AllocatorConfig,
     layout::LayoutSpec,
     memory::{PageMap, PageOwner},
-    size_class::SizeClassId,
+    size_class::SizeClass,
 };
 
 pub(crate) mod extent;
@@ -76,19 +76,19 @@ impl Heap {
     /// Obtain a run for `class`: available list or cold mmap.
     pub(crate) fn acquire_run(
         &mut self,
-        class: SizeClassId,
+        class: SizeClass,
         pages: &PageMap,
     ) -> Option<NonNull<Run>> {
         self.runs.allocate(class, self.id, pages)
     }
 
     /// One-shot small alloc without sticky: acquire, take one block, return run.
-    pub(crate) fn alloc_run(&mut self, class: SizeClassId, pages: &PageMap) -> Option<NonNull<u8>> {
+    pub(crate) fn alloc_run(&mut self, class: SizeClass, pages: &PageMap) -> Option<NonNull<u8>> {
         let run = self.acquire_run(class, pages)?;
         // SAFETY: run was just returned by this heap's live arena.
         let ptr = unsafe { run.as_ref() }.allocate()?;
         // SAFETY: same run pointer from this heap's live arena.
-        if unsafe { run.as_ref() }.has_available_blocks() {
+        if !unsafe { run.as_ref() }.is_full() {
             let _ = self.runs.return_available(run);
         }
         Some(ptr)
