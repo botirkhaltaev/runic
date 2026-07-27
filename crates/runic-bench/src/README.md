@@ -20,3 +20,5 @@ belongs in the Criterion benchmark targets.
 
 - `setup_lifecycle_*` Criterion groups call spawn/join inside each iteration — use for lifecycle noise, not allocator hot-path profiles.
 - `persistent_*` groups spawn workers once per Criterion sample via `iter_custom` and time only `run_round` — use with `scripts/profile.sh`.
+- `persistent_bound_remote_batch` / `persistent_unbound_remote_singleton` allocate outside the timed region (`prepare_round`) and time only channel-free freer drains (`run_free_round`).
+- `persistent_remote_reuse_latency` varies freer backlog via `live:{1,32,256}`.

@@ -19,6 +19,7 @@ fn configure_group(group: &mut criterion::BenchmarkGroup<'_, criterion::measurem
 pub fn register(c: &mut Criterion, suite: &str, targets: &[AllocatorTarget]) {
     register_single_size_churn(c, suite, targets);
     register_recycled_live_churn(c, suite, targets);
+    register_recycled_live_hotspot(c, suite, targets);
     register_size_boundary_sweep(c, suite, targets);
     register_small_biased_random(c, suite, targets);
     register_alignment_stress(c, suite, targets);
@@ -54,6 +55,30 @@ fn register_recycled_live_churn(c: &mut Criterion, suite: &str, targets: &[Alloc
 
     for &target in targets {
         for &size in workload::SIZE_CLASSES {
+            for &live in workload::RECYCLED_LIVE_DEPTHS {
+                group.bench_with_input(
+                    BenchmarkId::new(target.name(), format!("{size}/live:{live}")),
+                    &(target, size, live),
+                    |bench, &(target, size, live)| {
+                        bench.iter(|| {
+                            workload::single_size_recycled_churn(target, size, SMALL_OPS, live)
+                        });
+                    },
+                );
+            }
+        }
+    }
+
+    group.finish();
+}
+
+fn register_recycled_live_hotspot(c: &mut Criterion, suite: &str, targets: &[AllocatorTarget]) {
+    let mut group = c.benchmark_group(format!("{suite}/recycled_live_hotspot"));
+    configure_group(&mut group);
+    group.throughput(Throughput::Elements(SMALL_OPS as u64));
+
+    for &target in targets {
+        for &size in workload::LOCAL_HOTSPOT_SIZES {
             for &live in workload::RECYCLED_LIVE_DEPTHS {
                 group.bench_with_input(
                     BenchmarkId::new(target.name(), format!("{size}/live:{live}")),

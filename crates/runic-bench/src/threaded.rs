@@ -1,9 +1,10 @@
 use std::{
     alloc::Layout,
     hint::black_box,
+    ptr,
     sync::{
         Arc, Barrier, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
         mpsc,
     },
     thread::{self, JoinHandle},
@@ -530,16 +531,29 @@ impl PersistentRemoteReuse {
 
     /// Runs `ops` allocate→remote-free→allocate reuse probes on the calling thread.
     ///
+    /// `live` is the freer backlog depth: `live - 1` unmeasured remote frees are primed
+    /// once, then each sample measures send→reuse with that backlog in flight (`1`
+    /// matches the previous single-outstanding path).
+    ///
     /// # Panics
     ///
-    /// Panics if the freer channel is closed.
+    /// Panics if `live` is zero or the freer channel is closed.
     #[must_use]
-    pub fn run_round(&self, ops: usize) -> usize {
+    pub fn run_round(&self, ops: usize, live: usize) -> usize {
+        assert!(live >= 1, "live depth must be non-zero");
         let mut checksum = 0_usize;
         let mut total_ns = 0_usize;
+
+        for i in 0..(live - 1) {
+            let ptr = self.target.alloc(black_box(self.layout));
+            unsafe { ptr.as_ptr().write(byte(i)) };
+            checksum ^= ptr.as_ptr() as usize;
+            self.freer_tx.send(SendPtr(ptr.as_ptr())).unwrap();
+        }
+
         for i in 0..ops {
             let first = self.target.alloc(black_box(self.layout));
-            unsafe { first.as_ptr().write(byte(i)) };
+            unsafe { first.as_ptr().write(byte(i.wrapping_add(live))) };
             checksum ^= first.as_ptr() as usize;
             let start = Instant::now();
             self.freer_tx.send(SendPtr(first.as_ptr())).unwrap();
@@ -551,7 +565,7 @@ impl PersistentRemoteReuse {
                 unsafe { next.as_ptr().write(byte(i ^ spun)) };
                 checksum ^= next.as_ptr() as usize;
                 spun += 1;
-                if next.as_ptr() == first.as_ptr() || spun >= 64 {
+                if next.as_ptr() == first.as_ptr() || spun >= 64.max(live) {
                     self.target.dealloc(next, self.layout);
                     break;
                 }
@@ -559,6 +573,7 @@ impl PersistentRemoteReuse {
             }
             total_ns += start.elapsed().as_nanos() as usize;
         }
+
         self.reuse_ns.fetch_add(total_ns, Ordering::Relaxed);
         self.rounds.fetch_add(ops, Ordering::Relaxed);
         checksum ^ total_ns
@@ -578,6 +593,180 @@ impl Drop for PersistentRemoteReuse {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(handle) = self.join.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+enum ChannelFreeCmd {
+    FreeRound,
+    Shutdown,
+}
+
+/// Channel-free remote free: owner fills a shared pointer array; freers drain slices.
+///
+/// Bound mode binds each freer TLS once at spawn (`claim → TLS batch → publish`).
+/// Unbound mode never binds freers (singleton publish path).
+pub struct PersistentChannelFreeRemote {
+    target: AllocatorTarget,
+    layout: Layout,
+    capacity_per_freer: usize,
+    slots: Arc<[AtomicPtr<u8>]>,
+    ops_per_freer: Arc<AtomicUsize>,
+    checksum: Arc<AtomicUsize>,
+    done: Arc<Barrier>,
+    cmds: Vec<mpsc::Sender<ChannelFreeCmd>>,
+    joins: Vec<JoinHandle<()>>,
+}
+
+/// Bound freers: channel-free `claim → TLS batch → publish`.
+pub type PersistentBoundRemoteBatch = PersistentChannelFreeRemote;
+
+/// Never-bound freers: channel-free singleton publish path.
+pub type PersistentUnboundRemoteSingleton = PersistentChannelFreeRemote;
+
+impl PersistentChannelFreeRemote {
+    /// Already-bound freers draining owner-filled slices without per-element `mpsc`.
+    #[must_use]
+    pub fn spawn_bound(target: AllocatorTarget, freers: usize) -> Self {
+        Self::spawn(target, freers, true)
+    }
+
+    /// Never-bound freers draining owner-filled slices without per-element `mpsc`.
+    #[must_use]
+    pub fn spawn_unbound(target: AllocatorTarget, freers: usize) -> Self {
+        Self::spawn(target, freers, false)
+    }
+
+    /// Spawns `freers` workers. When `bind_freers` is true, each freer allocates once
+    /// on its own thread before accepting free rounds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `freers` is zero, layout construction fails, or spawn fails.
+    #[must_use]
+    fn spawn(target: AllocatorTarget, freers: usize, bind_freers: bool) -> Self {
+        assert!(freers >= 1);
+        let capacity_per_freer = 2_048;
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        let total = freers
+            .checked_mul(capacity_per_freer)
+            .expect("remote free slot capacity overflow");
+        let slots: Arc<[AtomicPtr<u8>]> = (0..total)
+            .map(|_| AtomicPtr::new(ptr::null_mut()))
+            .collect::<Vec<_>>()
+            .into();
+        let ops_per_freer = Arc::new(AtomicUsize::new(0));
+        let checksum = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(Barrier::new(freers + 1));
+        let ready = Arc::new(Barrier::new(freers + 1));
+
+        let mut cmds = Vec::with_capacity(freers);
+        let mut joins = Vec::with_capacity(freers);
+
+        for freer_index in 0..freers {
+            let (tx, rx) = mpsc::channel();
+            cmds.push(tx);
+            let slots = Arc::clone(&slots);
+            let ops_per_freer = Arc::clone(&ops_per_freer);
+            let checksum = Arc::clone(&checksum);
+            let done = Arc::clone(&done);
+            let ready = Arc::clone(&ready);
+            joins.push(thread::spawn(move || {
+                if bind_freers {
+                    let binder = target.alloc(layout);
+                    unsafe { binder.as_ptr().write(0xbd) };
+                    target.dealloc(binder, layout);
+                }
+                // Freers park until the controller finishes spawn setup.
+                ready.wait();
+                while let Ok(cmd) = rx.recv() {
+                    match cmd {
+                        ChannelFreeCmd::Shutdown => break,
+                        ChannelFreeCmd::FreeRound => {
+                            let ops = ops_per_freer.load(Ordering::Acquire);
+                            let base = freer_index * capacity_per_freer;
+                            let mut local = 0_usize;
+                            for offset in 0..ops {
+                                let ptr =
+                                    slots[base + offset].swap(ptr::null_mut(), Ordering::Acquire);
+                                debug_assert!(!ptr.is_null());
+                                local ^= ptr as usize;
+                                let ptr = std::ptr::NonNull::new(ptr).unwrap();
+                                target.dealloc(ptr, layout);
+                            }
+                            checksum.fetch_xor(local, Ordering::Relaxed);
+                            done.wait();
+                        }
+                    }
+                }
+            }));
+        }
+
+        ready.wait();
+
+        Self {
+            target,
+            layout,
+            capacity_per_freer,
+            slots,
+            ops_per_freer,
+            checksum,
+            done,
+            cmds,
+            joins,
+        }
+    }
+
+    /// Owner-thread allocate into the shared array. Not part of the timed free phase.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ops` exceeds the per-freer capacity or allocation fails.
+    #[must_use]
+    pub fn prepare_round(&self, ops: usize) -> usize {
+        assert!(
+            ops <= self.capacity_per_freer,
+            "ops {ops} exceeds capacity {}",
+            self.capacity_per_freer
+        );
+        let mut checksum = 0_usize;
+        let freers = self.cmds.len();
+        for freer_index in 0..freers {
+            let base = freer_index * self.capacity_per_freer;
+            for offset in 0..ops {
+                let ptr = self.target.alloc(black_box(self.layout));
+                unsafe { ptr.as_ptr().write(byte(freer_index ^ offset)) };
+                checksum ^= ptr.as_ptr() as usize;
+                self.slots[base + offset].store(ptr.as_ptr(), Ordering::Release);
+            }
+        }
+        self.ops_per_freer.store(ops, Ordering::Release);
+        checksum
+    }
+
+    /// Freers drain their disjoint slices. Call only after [`Self::prepare_round`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if a freer command channel is closed.
+    #[must_use]
+    pub fn run_free_round(&self) -> usize {
+        self.checksum.store(0, Ordering::Relaxed);
+        for tx in &self.cmds {
+            tx.send(ChannelFreeCmd::FreeRound).unwrap();
+        }
+        self.done.wait();
+        self.checksum.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for PersistentChannelFreeRemote {
+    fn drop(&mut self) {
+        for tx in &self.cmds {
+            let _ = tx.send(ChannelFreeCmd::Shutdown);
+        }
+        for handle in self.joins.drain(..) {
             let _ = handle.join();
         }
     }
