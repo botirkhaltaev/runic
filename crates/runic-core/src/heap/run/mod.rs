@@ -173,7 +173,7 @@ pub(crate) struct Run {
     /// Cached `mapping.base()` — payload span start (`RUN_SIZE` bytes).
     payload_base: NonNull<u8>,
     blocks: BlockStates,
-    /// `trailing_zeros(block_size)` when power-of-two; `None` ⇒ multiply path.
+    /// `trailing_zeros(block_size)` when power-of-two; `None` means multiply.
     block_shift: Option<NonZeroU32>,
     class: SizeClassId,
     capacity: usize,
@@ -417,7 +417,15 @@ impl Run {
             return None;
         }
 
-        let index = self.block_index(offset)?;
+        let index = if let Some(shift) = self.block_shift {
+            if offset & (self.block_size - 1) != 0 {
+                return None;
+            }
+            offset >> shift.get()
+        } else {
+            self.class
+                .non_power_of_two_block_index_from_offset(offset)?
+        };
         if index >= self.capacity {
             return None;
         }
@@ -482,23 +490,6 @@ impl Run {
         unsafe {
             ptr.cast::<usize>().as_ptr().write(word);
         }
-    }
-
-    #[inline]
-    fn block_index(&self, offset: usize) -> Option<usize> {
-        if let Some(shift) = self.block_shift {
-            if offset & (self.block_size - 1) != 0 {
-                return None;
-            }
-
-            return Some(offset >> shift.get());
-        }
-
-        if !offset.is_multiple_of(self.block_size) {
-            return None;
-        }
-
-        offset.checked_div(self.block_size)
     }
 }
 
@@ -674,6 +665,46 @@ mod tests {
 
         assert!(run.block_at(ptr).is_some());
         assert!(run.block_at(interior).is_none());
+    }
+
+    #[test]
+    fn reusable_run_round_trips_hotspot_non_power_of_two_classes() {
+        for (run_index, size) in [80, 96].into_iter().enumerate() {
+            let class = class_id(size, 8);
+            let run = Run::new(
+                RunId::from_index(u32::try_from(run_index).unwrap()).unwrap(),
+                test_heap_id(),
+                map_for_class(class),
+                class,
+            )
+            .expect("test run");
+            let ptr = run.allocate().unwrap();
+
+            assert!(run.block_at(ptr).is_some(), "size={size}");
+            assert!(run.free(ptr).is_ok(), "size={size}");
+            assert_eq!(run.allocate(), Some(ptr), "size={size}");
+        }
+    }
+
+    #[test]
+    fn reusable_run_rejects_aligned_tail_slack() {
+        for (run_index, size) in [80, 96].into_iter().enumerate() {
+            let class = class_id(size, 8);
+            let run = Run::new(
+                RunId::from_index(u32::try_from(run_index).unwrap()).unwrap(),
+                test_heap_id(),
+                map_for_class(class),
+                class,
+            )
+            .expect("test run");
+            let capacity = RUN_SIZE / SizeClasses::block_size(class);
+            let slack_offset = capacity * SizeClasses::block_size(class);
+            assert!(slack_offset < RUN_SIZE, "size={size}");
+            let slack =
+                unsafe { NonNull::new_unchecked(run.range().base().as_ptr().add(slack_offset)) };
+
+            assert!(run.block_at(slack).is_none(), "size={size}");
+        }
     }
 
     #[test]

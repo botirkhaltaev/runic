@@ -33,6 +33,64 @@ impl SizeClassId {
 
 pub(crate) struct SizeClasses;
 
+macro_rules! define_size_classes {
+    ($( $index:literal => $size:literal ),+ $(,)?) => {
+        impl SizeClassId {
+            /// Block index from a non-power-of-two class payload offset.
+            ///
+            /// Returns `None` for power-of-two classes and non-boundary offsets.
+            #[inline(always)]
+            pub(crate) fn non_power_of_two_block_index_from_offset(
+                self,
+                offset: usize,
+            ) -> Option<usize> {
+                $(
+                    if !usize::is_power_of_two($size) && self.index() == $index {
+                        return offset.is_multiple_of($size).then_some(offset / $size);
+                    }
+                )+
+                None
+            }
+        }
+
+        impl SizeClasses {
+            /// The one hand-authored size-class declaration. Constant-divisor
+            /// indexing and derived lookup tables are generated from this list.
+            const SIZES: [usize; Self::COUNT] = [$($size),+];
+        }
+    };
+}
+
+define_size_classes! {
+    0 => 8,
+    1 => 16,
+    2 => 24,
+    3 => 32,
+    4 => 48,
+    5 => 64,
+    6 => 80,
+    7 => 96,
+    8 => 128,
+    9 => 160,
+    10 => 192,
+    11 => 256,
+    12 => 320,
+    13 => 384,
+    14 => 512,
+    15 => 768,
+    16 => 1024,
+    17 => 1536,
+    18 => 2048,
+    19 => 3072,
+    20 => 4096,
+    21 => 6144,
+    22 => 8192,
+    23 => 12288,
+    24 => 16384,
+    25 => 24576,
+    26 => 32768,
+}
+
 impl SizeClasses {
     pub(crate) const COUNT: usize = 27;
     pub(crate) const SMALL_MAX: usize = 32 * 1024;
@@ -40,12 +98,6 @@ impl SizeClasses {
     /// One entry per representable alignment power, from `2^0` up to and
     /// including `PAGE_SIZE`.
     const ALIGN_POWER_COUNT: usize = Self::align_power_count();
-    /// The one hand-authored size-class table. The alignment remap is
-    /// const-generated from this list.
-    const SIZES: [usize; Self::COUNT] = [
-        8, 16, 24, 32, 48, 64, 80, 96, 128, 160, 192, 256, 320, 384, 512, 768, 1024, 1536, 2048,
-        3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768,
-    ];
     /// `ALIGNED_CLASS_BY_START[power][start]` is the smallest class index at
     /// or after `start` whose block size is a multiple of `2^power`. `SIZES`
     /// ends at `SMALL_MAX`, a multiple of every representable alignment, so
@@ -326,5 +378,23 @@ mod tests {
         assert!(SizeClassId::new(SizeClasses::COUNT).is_none());
         assert!(SizeClassId::new(0).is_some());
         assert!(SizeClassId::new(SizeClasses::COUNT - 1).is_some());
+    }
+
+    #[test]
+    fn non_power_of_two_block_index_matches_linear_oracle_for_all_classes() {
+        for class_index in 0..SizeClasses::COUNT {
+            let id = SizeClassId::new(class_index).unwrap();
+            let size = SizeClasses::block_size(id);
+
+            for offset in 0..=size * 2 {
+                let reference = (!size.is_power_of_two() && offset.is_multiple_of(size))
+                    .then_some(offset.checked_div(size).unwrap());
+                assert_eq!(
+                    id.non_power_of_two_block_index_from_offset(offset),
+                    reference,
+                    "class={class_index} size={size} offset={offset}"
+                );
+            }
+        }
     }
 }
