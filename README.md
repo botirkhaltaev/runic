@@ -37,8 +37,8 @@ Runic v0.5 implements:
 - `GlobalAlloc`
 - owner-local heaps via `HeapDirectory` / `ThreadHeap`
 - `HeapId` ownership on runs and extents
-- lock-free remote-free run/extent Notify inboxes with claim → try_arm → publish → flush/`accept_remote`
-- run-owned `ClaimBits` remote admission (owner free uses store/recheck, not byte CAS)
+- lock-free remote-free run/extent inboxes with claim → enqueue → flush/`accept`
+- private run claim-bitmap remote admission (owner free uses store/recheck, not byte CAS)
 - Free | Active | Draining heap-slot lifecycle after thread exit
 - mmap-backed runs for small size classes
 - mmap-backed extents for dedicated allocations (heap-local)

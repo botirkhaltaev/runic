@@ -348,15 +348,15 @@ impl Allocator {
             return null_mut();
         }
         // SAFETY: just bound as Active TLS owner for this slot.
-        unsafe { slot.allocate_extent(spec, inner_ref.pages(), init) }
+        unsafe { slot.alloc_extent(spec, inner_ref.pages(), init) }
             .map_or(null_mut(), NonNull::as_ptr)
     }
 
-    /// Cross-heap free: Active claim → (if `try_arm`) immediate publish, or Draining late free.
+    /// Cross-heap free: Active claim → enqueue (push-or-coalesce), or exclusive late free.
     ///
-    /// Coalescing happens by owner, not by producer batch: many remote frees against the
-    /// same run/extent collapse into at most one live inbox entry (`Notify`), so a
-    /// successful claim publishes right away instead of retaining a TLS batch.
+    /// Coalescing is by owner: many remote frees against the same run/extent collapse into
+    /// at most one live inbox entry, so a successful claim enqueues immediately instead of
+    /// retaining a per-thread batch.
     #[cold]
     #[inline(never)]
     fn free_remote(
@@ -383,33 +383,35 @@ impl Allocator {
             .ok_or(AllocatorError::InvalidMetadata)?;
 
         if !slot.state().is_active() {
-            return directory
-                .free_draining(heap_id, owner, ptr, pages)
-                .map_err(AllocatorError::from);
+            let mut locked = directory.lock(heap_id).map_err(AllocatorError::from)?;
+            return locked.free(owner, ptr, pages).map_err(AllocatorError::from);
         }
 
-        let armed = match owner {
+        match owner {
             PageOwner::Run(run) => {
                 // SAFETY: PageMap stores only pointers published from this allocator's live arenas.
-                let run = unsafe { run.as_ref() };
-                run.claim(ptr).map_err(AllocatorError::from)?;
-                run.try_arm()
+                unsafe { run.as_ref() }
+                    .claim(ptr)
+                    .map_err(AllocatorError::from)?;
             }
             PageOwner::Extent(extent) => {
                 // SAFETY: PageMap stores only pointers published from this allocator's live arenas.
-                let extent = unsafe { extent.as_ref() };
-                extent.claim(ptr).map_err(AllocatorError::from)?;
-                extent.try_arm()
+                unsafe { extent.as_ref() }
+                    .claim(ptr)
+                    .map_err(AllocatorError::from)?;
             }
-        };
-
-        if armed {
-            directory
-                .publish_on(slot, heap_id, owner, pages)
-                .map_err(AllocatorError::from)?;
         }
 
-        Ok(())
+        match slot.enqueue(heap_id, owner) {
+            Ok(()) => Ok(()),
+            Err(HeapError::InvalidHeap) => {
+                // Won the queue race but Active admission closed — link under exclusive lock.
+                let mut locked = directory.lock(heap_id).map_err(AllocatorError::from)?;
+                locked.enqueue(owner);
+                locked.flush(pages).map_err(AllocatorError::from)
+            }
+            Err(error) => Err(AllocatorError::from(error)),
+        }
     }
 }
 
@@ -588,7 +590,7 @@ mod tests {
         let slot = inner_ref.directory.slot(id).unwrap();
         assert!(slot.state().is_active());
         // SAFETY: test drives Active slot exclusively.
-        unsafe { slot.allocate_extent(spec, inner_ref.pages(), init) }.unwrap()
+        unsafe { slot.alloc_extent(spec, inner_ref.pages(), init) }.unwrap()
     }
 
     fn run_of(inner_ref: &AllocatorInner, ptr: NonNull<u8>) -> NonNull<Run> {
@@ -713,6 +715,8 @@ mod tests {
 
     #[test]
     fn retained_remote_claim_completes_under_draining() {
+        use crate::heap::table::inbox::InboxNode;
+
         let allocator = Allocator::new();
         let inner_ref = allocator_inner(&allocator);
         let id = acquire_id(inner_ref);
@@ -720,7 +724,7 @@ mod tests {
         let ptr = allocate_small(inner_ref, id, layout);
         let run = run_of(inner_ref, ptr);
 
-        // Claim without publishing: the outstanding claim keeps the heap live so retire
+        // Claim without enqueueing: the outstanding claim keeps the heap live so retire
         // cannot reclaim until the run is accepted.
         assert_eq!(unsafe { run.as_ref() }.claim(ptr), Ok(()));
         assert_eq!(inner_ref.directory.retire(id, inner_ref.pages()), Ok(()));
@@ -728,14 +732,12 @@ mod tests {
             inner_ref.directory.slot(id).map(|s| s.state().mode()),
             Some(HeapMode::Draining)
         );
-        assert!(unsafe { run.as_ref() }.try_arm());
-        let slot = inner_ref.directory.slot(id).unwrap();
-        assert_eq!(
-            inner_ref
-                .directory
-                .publish_on(slot, id, PageOwner::Run(run), inner_ref.pages()),
-            Ok(())
-        );
+        // SAFETY: run is a live arena run for this slot.
+        assert!(unsafe { run.as_ref() }.link().try_queue());
+        let mut locked = inner_ref.directory.lock(id).unwrap();
+        locked.enqueue(PageOwner::Run(run));
+        assert_eq!(locked.flush(inner_ref.pages()), Ok(()));
+        drop(locked);
         assert!(inner_ref.directory.slot(id).is_none());
     }
 
@@ -754,7 +756,7 @@ mod tests {
         let ptr_b = allocate_small(inner_ref, second, layout);
         let run_b = run_of(inner_ref, ptr_b);
 
-        // Each remote free claims and publishes its own target immediately — no per-thread
+        // Each remote free claims and enqueues its own target immediately — no per-thread
         // batch retains one heap's claim while a different heap's free is in flight.
         assert_eq!(
             Allocator::free_remote(inner, PageOwner::Run(run_a), ptr_a),
@@ -765,7 +767,7 @@ mod tests {
             Ok(())
         );
 
-        // SAFETY: test drives Active slot exclusively; the claim above already published.
+        // SAFETY: test drives Active slot exclusively; the claim above already enqueued.
         unsafe {
             inner_ref
                 .directory
@@ -799,25 +801,21 @@ mod tests {
         let second_run = run_of(inner_ref, second);
 
         assert_eq!(inner_ref.directory.retire(id, inner_ref.pages()), Ok(()));
-        assert_eq!(
-            inner_ref.directory.free_draining(
-                id,
-                PageOwner::Run(first_run),
-                first,
-                inner_ref.pages()
-            ),
-            Ok(())
-        );
+        {
+            let mut locked = inner_ref.directory.lock(id).unwrap();
+            assert_eq!(
+                locked.free(PageOwner::Run(first_run), first, inner_ref.pages()),
+                Ok(())
+            );
+        }
         assert!(inner_ref.directory.slot(id).is_some());
-        assert_eq!(
-            inner_ref.directory.free_draining(
-                id,
-                PageOwner::Run(second_run),
-                second,
-                inner_ref.pages()
-            ),
-            Ok(())
-        );
+        {
+            let mut locked = inner_ref.directory.lock(id).unwrap();
+            assert_eq!(
+                locked.free(PageOwner::Run(second_run), second, inner_ref.pages()),
+                Ok(())
+            );
+        }
         assert!(inner_ref.directory.slot(id).is_none());
     }
 
@@ -831,12 +829,13 @@ mod tests {
         let run = run_of(inner_ref, ptr);
 
         assert_eq!(inner_ref.directory.retire(heap, inner_ref.pages()), Ok(()));
-        assert_eq!(
-            inner_ref
-                .directory
-                .free_draining(heap, PageOwner::Run(run), ptr, inner_ref.pages()),
-            Ok(())
-        );
+        {
+            let mut locked = inner_ref.directory.lock(heap).unwrap();
+            assert_eq!(
+                locked.free(PageOwner::Run(run), ptr, inner_ref.pages()),
+                Ok(())
+            );
+        }
         assert!(inner_ref.pages().get(ptr).is_some());
         let reused = acquire_id(inner_ref);
         assert_eq!(reused.index(), heap.index());

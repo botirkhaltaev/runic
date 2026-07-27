@@ -16,7 +16,7 @@ use crate::{
     memory::{PageMap, PageOwner},
 };
 
-use super::inbox::{ExtentInbox, RunInbox};
+use super::inbox::{ExtentInbox, InboxNode, RunInbox};
 
 const MAX_HEAPS: usize = 64;
 const MAX_HEAPS_U32: u32 = 64;
@@ -43,7 +43,7 @@ struct SlotStateSnapshot {
 ///
 /// Linearization / ordering:
 /// - Active publish admit: successful `try_acquire_publisher` `AcqRel` CAS
-/// - Inbox publish: head CAS in [`Inbox::push_batch`] (after lease admit)
+/// - Inbox publish: head CAS in [`Inbox::link`] (after lease admit)
 /// - Active→Draining close: `close_active` `AcqRel` CAS (preserves publisher count)
 /// - Publisher release: `Release` `fetch_sub`; retire observes zero with `Acquire` loads
 /// - Free reactivation: `Release` store of Active after metadata rebind under the lifecycle lock
@@ -207,15 +207,11 @@ impl SlotState {
 }
 
 /// RAII Active publisher admission. Drop releases the packed count.
+///
+/// Internal to [`HeapSlot::enqueue`] only — taken only when a freer newly queues a run/extent.
 #[must_use]
-pub(crate) struct PublisherLease<'a> {
+struct PublisherLease<'a> {
     slot: &'a HeapSlot,
-}
-
-impl PublisherLease<'_> {
-    pub(crate) fn publish(self, target: PageOwner) {
-        self.slot.publish_target(target);
-    }
 }
 
 impl Drop for PublisherLease<'_> {
@@ -247,16 +243,35 @@ impl HeapSlot {
         }
     }
 
-    /// Push `target` on its inbox.
+    /// Push-or-coalesce `owner` onto its inbox. Active freers only.
     ///
-    /// Callers of `publish` / `publish_on` (`Allocator::free_remote`) have already won the
-    /// idle→queued race via `try_arm` before reaching here, so this pushes unconditionally
-    /// (`Inbox::republish`) rather than re-arming — a second `try_arm` on an already-Queued
-    /// entity would return `false` and silently drop the publish.
-    fn publish_target(&self, target: PageOwner) {
-        match target {
-            PageOwner::Run(run) => self.run_inbox.republish(run),
-            PageOwner::Extent(extent) => self.extent_inbox.republish(extent),
+    /// Coalesced claims (already queued) return `Ok` without taking a publisher lease.
+    /// Newly queued claims take a lease, then [`Inbox::link`]. `Err(InvalidHeap)` means the
+    /// freer won the queue race but Active admission closed — caller must
+    /// [`LockedSlot::enqueue`] (link the already-queued node) under [`HeapDirectory::lock`].
+    pub(crate) fn enqueue(&self, id: HeapId, owner: PageOwner) -> Result<(), HeapError> {
+        let queued = match owner {
+            PageOwner::Run(run) => {
+                // SAFETY: PageMap / claim paths only pass live arena owners for this heap.
+                unsafe { run.as_ref() }.link().try_queue()
+            }
+            PageOwner::Extent(extent) => {
+                // SAFETY: PageMap / claim paths only pass live arena owners for this heap.
+                unsafe { extent.as_ref() }.link().try_queue()
+            }
+        };
+        if !queued {
+            return Ok(());
+        }
+        let _lease = self.publisher(id)?;
+        self.link_owner(owner);
+        Ok(())
+    }
+
+    fn link_owner(&self, owner: PageOwner) {
+        match owner {
+            PageOwner::Run(run) => self.run_inbox.link(run),
+            PageOwner::Extent(extent) => self.extent_inbox.link(extent),
         }
     }
 
@@ -283,15 +298,15 @@ impl HeapSlot {
             .store(id.generation(), HeapMode::Active, false, 0);
     }
 
-    pub(crate) fn publisher(&self, id: HeapId) -> Result<PublisherLease<'_>, HeapError> {
+    fn publisher(&self, id: HeapId) -> Result<PublisherLease<'_>, HeapError> {
         self.state.try_acquire_publisher(id)?;
         Ok(PublisherLease { slot: self })
     }
 
     /// Mark Free and bump generation when Draining, empty, and publishers == 0.
     ///
-    /// Publisher count tracks in-flight leases only; claimed-but-unpublished TLS batches keep
-    /// the heap live via `has_live_allocations` until published and accepted.
+    /// Publisher count tracks in-flight leases only; claimed-but-unpublished work keeps
+    /// the heap live via `has_live_allocations` until enqueued and accepted.
     fn try_reclaim(&self) -> bool {
         let snap = self.state.load();
         if snap.retired || snap.mode != HeapMode::Draining || snap.publishers != 0 {
@@ -313,8 +328,8 @@ impl HeapSlot {
         true
     }
 
-    /// Drain both inboxes into this slot's heap (accept), republishing any run that still
-    /// has a straggling claim after its scan (see `Run::accept_remote`).
+    /// Drain both inboxes into this slot's heap (accept), re-pushing any run that still
+    /// has a straggling claim after its scan (see `Run::accept`).
     ///
     /// SAFETY: caller is the Active TLS owner or holds the directory lifecycle lock.
     pub(crate) unsafe fn flush(&self, pages: &PageMap) -> Result<(), HeapError> {
@@ -324,8 +339,8 @@ impl HeapSlot {
             for run in chain {
                 // SAFETY: dequeued from this slot's run inbox; the pointer is a live run
                 // published from this heap's arena for as long as it may be claimed.
-                if heap.runs.accept_remote(run)? {
-                    self.run_inbox.republish(run);
+                if heap.runs.accept(run)? {
+                    let _ = self.run_inbox.push(run);
                 }
             }
         }
@@ -335,8 +350,6 @@ impl HeapSlot {
                 // extent published from this heap's arena for as long as it may be claimed.
                 let ptr = unsafe { extent.as_ref() }.ptr();
                 heap.extents.accept(extent, ptr, pages)?;
-                // SAFETY: same contract as above.
-                unsafe { extent.as_ref() }.disarm();
             }
         }
         Ok(())
@@ -376,7 +389,7 @@ impl HeapSlot {
     }
 
     /// SAFETY: caller is the Active TLS owner for this slot.
-    pub(crate) unsafe fn allocate_extent(
+    pub(crate) unsafe fn alloc_extent(
         &self,
         spec: crate::layout::LayoutSpec,
         pages: &PageMap,
@@ -387,7 +400,7 @@ impl HeapSlot {
             unsafe { self.flush(pages) }.ok()?;
         }
         // SAFETY: Active TLS owner.
-        unsafe { self.heap_mut() }.allocate_extent(spec, pages, init)
+        unsafe { self.heap_mut() }.alloc_extent(spec, pages, init)
     }
 
     /// Acquire a run without flushing the inbox (caller owns flush policy).
@@ -412,6 +425,51 @@ impl HeapSlot {
             .runs
             .return_available(run)
             .map_err(HeapError::from)
+    }
+}
+
+/// Exclusive directory-locked access to a Draining slot (lifecycle mutex held).
+///
+/// Drop attempts [`HeapSlot::try_reclaim`] under the same lock.
+pub(crate) struct LockedSlot<'a> {
+    slot: NonNull<HeapSlot>,
+    _guard: spin::MutexGuard<'a, HeapDirectoryState>,
+}
+
+impl LockedSlot<'_> {
+    fn slot(&self) -> &HeapSlot {
+        // SAFETY: `_guard` keeps the directory arena alive and serializes mutation; `slot`
+        // was resolved under that lock for a matching Draining generation.
+        unsafe { self.slot.as_ref() }
+    }
+
+    /// Link an already-queued owner (no Active publisher lease). Caller won
+    /// [`super::inbox::InboxLink::try_queue`] on the Active path that then observed closed
+    /// admission.
+    pub(crate) fn enqueue(&mut self, owner: PageOwner) {
+        self.slot().link_owner(owner);
+    }
+
+    /// Direct late free while exclusive (heap winding down; freer did not claim).
+    pub(crate) fn free(
+        &mut self,
+        owner: PageOwner,
+        ptr: NonNull<u8>,
+        pages: &PageMap,
+    ) -> Result<(), HeapError> {
+        // SAFETY: directory lifecycle lock held for Draining free.
+        unsafe { self.slot().free(owner, ptr, pages) }
+    }
+
+    pub(crate) fn flush(&mut self, pages: &PageMap) -> Result<(), HeapError> {
+        // SAFETY: directory lifecycle lock held for Draining accept.
+        unsafe { self.slot().flush(pages) }
+    }
+}
+
+impl Drop for LockedSlot<'_> {
+    fn drop(&mut self) {
+        let _ = self.slot().try_reclaim();
     }
 }
 
@@ -496,64 +554,17 @@ impl HeapDirectory {
         slot.state.matches(id).then_some(slot)
     }
 
-    /// Publish a claimed remote-freed run/extent on an already-resolved slot for `id`
-    /// (Active lease or Draining accept). Callers resolve `slot` via [`Self::slot`]
-    /// themselves — `Allocator::free_remote` already needs it for the active/draining
-    /// check, so there is no separate id-only publish path to keep in sync.
-    pub(crate) fn publish_on(
-        &self,
-        slot: &HeapSlot,
-        id: HeapId,
-        target: PageOwner,
-        pages: &PageMap,
-    ) -> Result<(), HeapError> {
-        match slot.publisher(id) {
-            Ok(lease) => {
-                lease.publish(target);
-                Ok(())
-            }
-            Err(HeapError::InvalidHeap) => self.publish_draining(id, target, pages),
-            Err(error) => Err(error),
-        }
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn publish_draining(
-        &self,
-        id: HeapId,
-        target: PageOwner,
-        pages: &PageMap,
-    ) -> Result<(), HeapError> {
-        let state = self.state.lock();
-        let slot = Self::slot_locked(&state, id).ok_or(HeapError::InvalidHeap)?;
+    /// Lifecycle mutex + generation check; only while mode is Draining.
+    pub(crate) fn lock(&self, id: HeapId) -> Result<LockedSlot<'_>, HeapError> {
+        let guard = self.state.lock();
+        let slot = Self::slot_locked(&guard, id).ok_or(HeapError::InvalidHeap)?;
         if slot.state.mode() != HeapMode::Draining {
             return Err(HeapError::InvalidHeap);
         }
-        slot.publish_target(target);
-        // SAFETY: directory lifecycle lock held for Draining accept.
-        unsafe { slot.flush(pages)? };
-        let _ = slot.try_reclaim();
-        Ok(())
-    }
-
-    /// Locked direct late free for a pointer not previously claimed into a remote batch.
-    pub(crate) fn free_draining(
-        &self,
-        id: HeapId,
-        owner: PageOwner,
-        ptr: NonNull<u8>,
-        pages: &PageMap,
-    ) -> Result<(), HeapError> {
-        let state = self.state.lock();
-        let slot = Self::slot_locked(&state, id).ok_or(HeapError::InvalidHeap)?;
-        if slot.state.mode() != HeapMode::Draining {
-            return Err(HeapError::InvalidHeap);
-        }
-        // SAFETY: directory lifecycle lock held for Draining free.
-        unsafe { slot.free(owner, ptr, pages)? };
-        let _ = slot.try_reclaim();
-        Ok(())
+        Ok(LockedSlot {
+            slot: NonNull::from(slot),
+            _guard: guard,
+        })
     }
 
     /// Owner thread gives up the slot: close Active, wait publishers, flush, reclaim.
@@ -566,17 +577,13 @@ impl HeapDirectory {
 
         self.wait_publishers(id);
 
-        let state = self.state.lock();
-        let Some(slot) = Self::slot_locked(&state, id) else {
+        let mut locked = match self.lock(id) {
+            Ok(locked) => locked,
             // A concurrent Draining accept already reclaimed this generation.
-            return Ok(());
+            Err(HeapError::InvalidHeap) => return Ok(()),
+            Err(error) => return Err(error),
         };
-        if slot.state.mode() != HeapMode::Draining {
-            return Ok(());
-        }
-        // SAFETY: directory lifecycle lock held after publishers drained.
-        unsafe { slot.flush(pages)? };
-        let _ = slot.try_reclaim();
+        locked.flush(pages)?;
         Ok(())
     }
 
@@ -760,10 +767,11 @@ mod tests {
         assert_eq!(directory.retire(id, &PageMap::new()), Ok(()));
     }
 
-    /// Many threads race `claim` + `try_arm` + `publish` against blocks on one shared run.
-    /// `Notify` coalesces concurrent arms into at most one live inbox entry at a time, but
-    /// every publisher lease must still be acquired and released exactly once, and every
-    /// claimed block must end up accepted after a flush (no lost wakeup, no leaked lease).
+    /// Many threads race `claim` + `enqueue` against blocks on one shared run.
+    /// Inbox coalescing collapses concurrent queue wins into at most one live inbox entry
+    /// at a time, but every publisher lease must still be acquired and released exactly
+    /// once, and every claimed block must end up accepted after a flush (no lost wakeup,
+    /// no leaked lease).
     #[test]
     fn concurrent_active_publishers_exact_once() {
         const THREADS: usize = 4;
@@ -788,7 +796,6 @@ mod tests {
             .map(|_| unsafe { run.as_ref() }.allocate().unwrap().as_ptr() as usize)
             .collect();
         let addrs = &addrs[..];
-        let directory = &directory;
         let pages = &pages;
 
         thread::scope(|scope| {
@@ -801,13 +808,7 @@ mod tests {
                         // SAFETY: addr is a block owned by `run`, allocated above.
                         let ptr = NonNull::new(addr as *mut u8).unwrap();
                         unsafe { run.as_ref() }.claim(ptr).unwrap();
-                        // SAFETY: same contract.
-                        if unsafe { run.as_ref() }.try_arm() {
-                            assert_eq!(
-                                directory.publish_on(slot, id, PageOwner::Run(run), pages),
-                                Ok(())
-                            );
-                        }
+                        assert_eq!(slot.enqueue(id, PageOwner::Run(run)), Ok(()));
                     }
                 });
             }
@@ -853,9 +854,7 @@ mod tests {
         let run = unsafe { slot.acquire_run(class, &pages) }.unwrap();
         assert_eq!(slot.state.close_active(id), Ok(()));
 
-        // SAFETY: run is a live arena run for this slot.
-        assert!(unsafe { run.as_ref() }.try_arm());
-        slot.run_inbox.republish(run);
+        assert!(slot.run_inbox.push(run));
         assert!(!slot.try_reclaim());
         // SAFETY: test drives Draining slot exclusively.
         unsafe { slot.flush(&pages) }.unwrap();
@@ -871,7 +870,7 @@ mod tests {
         let pages = PageMap::new();
         let spec = LayoutSpec::from_layout(Layout::from_size_align(128 * 1024, 4096).unwrap());
         // SAFETY: test drives Active slot exclusively.
-        let ptr = unsafe { slot.allocate_extent(spec, &pages, ExtentInit::Uninit) }.unwrap();
+        let ptr = unsafe { slot.alloc_extent(spec, &pages, ExtentInit::Uninit) }.unwrap();
         let Some(PageOwner::Extent(extent)) = pages.get(ptr) else {
             panic!("expected extent owner");
         };
@@ -879,9 +878,7 @@ mod tests {
         unsafe { extent.as_ref() }.claim(ptr).unwrap();
         assert_eq!(slot.state.close_active(id), Ok(()));
 
-        // SAFETY: extent is live and Allocated.
-        assert!(unsafe { extent.as_ref() }.try_arm());
-        slot.extent_inbox.republish(extent);
+        assert!(slot.extent_inbox.push(extent));
         assert!(!slot.try_reclaim());
         // SAFETY: test drives Draining slot exclusively.
         unsafe { slot.flush(&pages) }.unwrap();

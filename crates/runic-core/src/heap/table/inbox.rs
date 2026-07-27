@@ -1,31 +1,29 @@
 //! Intrusive multi-producer, single-consumer Treiber stack, coalesced by owner.
 //!
-//! Unlike a per-pointer remote-free queue, [`Inbox`] carries at most one entry per run or
-//! extent at a time: a claim only pushes its owner once per idle→queued transition
-//! ([`Notify::try_arm`]), so many remote frees against the same run collapse into a single
-//! inbox entry instead of one entry per freed block. The owner drains the run/extent
-//! pointer and scans/accepts everything claimed on it in one pass (see `Run::accept_remote`).
+//! [`Inbox`] carries at most one entry per run or extent at a time: [`Inbox::push`]
+//! queues a node only on the idle→queued transition, so many remote frees against the
+//! same run collapse into a single inbox entry. The owner [`Inbox::drain`]s and
+//! [`crate::heap::Run::accept`]s (or extent accept) claimed work in one pass.
 //!
 //! Publication linearizes on a successful CAS of `head`: the node's next link to the
-//! previous head is stored before that CAS, so a concurrent [`Inbox::drain`] that
-//! observes the new head always walks the full prior chain.
+//! previous head is stored before that CAS, so a concurrent drain that observes the new
+//! head always walks the full prior chain.
 
 use core::{
     ptr::{self, NonNull},
     sync::atomic::{AtomicBool, AtomicPtr, Ordering},
 };
 
-/// Idle/Queued arm state plus the intrusive Treiber-stack link for one entity.
+/// Intrusive inbox membership: Treiber `next` link plus queued flag.
 ///
-/// Embedded by value on the owning `Run` / `Extent`. Idle means the entity is off every
-/// inbox and safe to re-link; Queued means it is linked into exactly one inbox (in transit
-/// or awaiting drain) and `next` must not be touched by anything but that inbox.
-pub(crate) struct Notify<T> {
+/// Embedded on the owning `Run` / `Extent`. Idle (`queued == false`) means the entity is
+/// off every inbox and safe to re-link; Queued means it is linked into exactly one inbox.
+pub(crate) struct InboxLink<T> {
     next: AtomicPtr<T>,
     queued: AtomicBool,
 }
 
-impl<T> Notify<T> {
+impl<T> InboxLink<T> {
     pub(crate) const fn new() -> Self {
         Self {
             next: AtomicPtr::new(ptr::null_mut()),
@@ -33,58 +31,72 @@ impl<T> Notify<T> {
         }
     }
 
-    /// Idle → Queued. Returns `true` when this call won the transition and must publish
-    /// the owning entity on its inbox (or, from `accept_remote`, republish it directly).
+    /// Idle → Queued. `true` when this call won the transition.
+    ///
+    /// Active freers call this *before* taking a publisher lease so coalesced claims skip
+    /// the lease; [`Inbox::link`] then runs only for the winner under that lease.
     #[inline]
-    pub(crate) fn try_arm(&self) -> bool {
+    pub(crate) fn try_queue(&self) -> bool {
         !self.queued.swap(true, Ordering::AcqRel)
     }
 
-    /// Queued → Idle. Only the single consumer holding a just-dequeued node may call this;
-    /// it must run before that node's claims are scanned (see `Run::accept_remote`).
+    /// Queued → Idle. Owner-only, before scanning claims on a just-dequeued node.
     #[inline]
-    pub(crate) fn disarm(&self) {
+    pub(crate) fn clear_queued(&self) {
         self.queued.store(false, Ordering::Release);
     }
 }
 
-/// Entities with an intrusive [`Notify`] link, coalesced through one [`Inbox`].
-pub(crate) trait Notified: Sized {
-    fn notify(&self) -> &Notify<Self>;
+/// Types that embed an [`InboxLink`] for coalesced inbox membership.
+pub(crate) trait InboxNode: Sized {
+    fn link(&self) -> &InboxLink<Self>;
 }
 
-/// Lock-free MPSC inbox of distinct notified entities (run or extent pointers).
+/// Lock-free MPSC inbox of distinct owner entities (run or extent pointers).
 ///
 /// Producers may only use shared references. Single-consumer `drain`.
-pub(crate) struct Inbox<T: Notified> {
+pub(crate) struct Inbox<T: InboxNode> {
     /// Head of the pending intrusive chain (newer publishes link in front).
     head: AtomicPtr<T>,
 }
 
 // SAFETY: producers and the single consumer only coordinate through `head` and each node's
-// intrusive `Notify::next`.
-unsafe impl<T: Notified> Sync for Inbox<T> {}
+// intrusive `InboxLink::next`.
+unsafe impl<T: InboxNode> Sync for Inbox<T> {}
 
-impl<T: Notified> Inbox<T> {
+impl<T: InboxNode> Inbox<T> {
     pub(crate) const fn new() -> Self {
         Self {
             head: AtomicPtr::new(ptr::null_mut()),
         }
     }
 
-    /// Push `node`, assuming the caller already won the idle→queued transition
-    /// (`Notify::try_arm`, or `accept_remote`'s own re-arm after a straggling claim).
-    /// Does not check or touch `Notify::queued` — a second push of an already-Queued
-    /// node would corrupt the chain, so every caller must own a fresh `try_arm` win.
-    pub(crate) fn republish(&self, node: NonNull<T>) {
-        let raw = node.as_ptr();
+    /// Queue `node` if not already queued. Returns `true` when newly queued and linked.
+    ///
+    /// Already-queued → `false` (coalesce). Active freers that need a publisher lease must
+    /// use [`InboxLink::try_queue`] then [`Self::link`] under the lease instead, so coalesced
+    /// claims skip the lease entirely.
+    pub(crate) fn push(&self, node: NonNull<T>) -> bool {
         // SAFETY: `node` is a stable heap-owned entity for as long as it may be claimed.
-        let next = &unsafe { node.as_ref() }.notify().next;
+        let link = unsafe { node.as_ref() }.link();
+        if !link.try_queue() {
+            return false;
+        }
+        self.link(node);
+        true
+    }
+
+    /// Treiber-link an already-queued `node`. Caller won [`InboxLink::try_queue`] (or holds
+    /// the directory lifecycle lock for an exclusive drain-path link).
+    pub(crate) fn link(&self, node: NonNull<T>) {
+        // SAFETY: `node` is a stable heap-owned entity for as long as it may be claimed.
+        let link = unsafe { node.as_ref() }.link();
+        let raw = node.as_ptr();
         let mut old = self.head.load(Ordering::Acquire);
         loop {
             // Store the tail link before publishing the new head so a concurrent drain
             // that observes `raw` always continues into the prior chain.
-            next.store(old, Ordering::Release);
+            link.next.store(old, Ordering::Release);
             match self
                 .head
                 .compare_exchange_weak(old, raw, Ordering::AcqRel, Ordering::Acquire)
@@ -111,21 +123,18 @@ impl<T: Notified> Inbox<T> {
 }
 
 /// Null-terminated intrusive chain detached by [`Inbox::drain`] (single walk for accept).
-pub(crate) struct InboxChain<T: Notified> {
+pub(crate) struct InboxChain<T: InboxNode> {
     cursor: Option<NonNull<T>>,
 }
 
-impl<T: Notified> Iterator for InboxChain<T> {
+impl<T: InboxNode> Iterator for InboxChain<T> {
     type Item = NonNull<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let node = self.cursor?;
         // SAFETY: dequeued nodes keep their producer-linked next pointer valid until the
-        // owner disarms them (`Notify::disarm`).
-        let next = unsafe { node.as_ref() }
-            .notify()
-            .next
-            .load(Ordering::Acquire);
+        // owner clears queued (`InboxLink::clear_queued`).
+        let next = unsafe { node.as_ref() }.link().next.load(Ordering::Acquire);
         self.cursor = NonNull::new(next);
         Some(node)
     }
@@ -144,22 +153,22 @@ mod tests {
 
     #[repr(C)]
     struct TestNode {
-        notify: Notify<TestNode>,
+        link: InboxLink<TestNode>,
         accepted: AtomicBool,
     }
 
     impl TestNode {
         fn new() -> Self {
             Self {
-                notify: Notify::new(),
+                link: InboxLink::new(),
                 accepted: AtomicBool::new(false),
             }
         }
     }
 
-    impl Notified for TestNode {
-        fn notify(&self) -> &Notify<Self> {
-            &self.notify
+    impl InboxNode for TestNode {
+        fn link(&self) -> &InboxLink<Self> {
+            &self.link
         }
     }
 
@@ -171,62 +180,53 @@ mod tests {
         chain.collect()
     }
 
-    /// Test helper mirroring production: `try_arm` then `republish`.
-    fn push_node(inbox: &Inbox<TestNode>, ptr: NonNull<TestNode>) {
-        // SAFETY: test nodes live for the whole test.
-        if unsafe { ptr.as_ref() }.notify().try_arm() {
-            inbox.republish(ptr);
-        }
-    }
-
     #[test]
-    fn inbox_notify_drain_single() {
+    fn inbox_push_drain_single() {
         let inbox = Inbox::new();
         let node = TestNode::new();
         let ptr = node_ptr(&node);
-        push_node(&inbox, ptr);
+        assert!(inbox.push(ptr));
         let chain = inbox.drain().unwrap();
         assert_eq!(collect_chain(chain), [ptr]);
         assert!(inbox.is_empty());
     }
 
     #[test]
-    fn inbox_repeated_notify_before_drain_pushes_once() {
+    fn inbox_repeated_push_before_drain_queues_once() {
         let inbox = Inbox::new();
         let node = TestNode::new();
         let ptr = node_ptr(&node);
-        push_node(&inbox, ptr);
-        push_node(&inbox, ptr);
-        push_node(&inbox, ptr);
+        assert!(inbox.push(ptr));
+        assert!(!inbox.push(ptr));
+        assert!(!inbox.push(ptr));
         let chain = inbox.drain().unwrap();
         assert_eq!(collect_chain(chain), [ptr]);
         assert!(inbox.is_empty());
     }
 
     #[test]
-    fn inbox_notify_after_disarm_requeues() {
+    fn inbox_push_after_clear_queued_requeues() {
         let inbox = Inbox::new();
         let node = TestNode::new();
         let ptr = node_ptr(&node);
-        push_node(&inbox, ptr);
+        assert!(inbox.push(ptr));
         assert!(inbox.drain().is_some());
 
-        node.notify.disarm();
-        push_node(&inbox, ptr);
+        node.link.clear_queued();
+        assert!(inbox.push(ptr));
         let chain = inbox.drain().unwrap();
         assert_eq!(collect_chain(chain), [ptr]);
     }
 
     #[test]
-    fn inbox_notify_drain_lifo_across_pushes() {
+    fn inbox_drain_lifo_across_pushes() {
         let inbox = Inbox::new();
         let first_node = TestNode::new();
         let second_node = TestNode::new();
         let first = node_ptr(&first_node);
         let second = node_ptr(&second_node);
-        push_node(&inbox, first);
-        push_node(&inbox, second);
-        // Newer publish is drained first.
+        assert!(inbox.push(first));
+        assert!(inbox.push(second));
         let chain = inbox.drain().unwrap();
         assert_eq!(collect_chain(chain), [second, first]);
         assert!(inbox.is_empty());
@@ -239,18 +239,6 @@ mod tests {
         assert!(inbox.is_empty());
     }
 
-    #[test]
-    fn republish_bypasses_arm_check() {
-        let inbox = Inbox::new();
-        let node = TestNode::new();
-        let ptr = node_ptr(&node);
-        // Simulate accept_remote's own re-arm winning before asking the inbox to publish.
-        assert!(node.notify.try_arm());
-        inbox.republish(ptr);
-        let chain = inbox.drain().unwrap();
-        assert_eq!(collect_chain(chain), [ptr]);
-    }
-
     /// Deterministic interleaving: drain observes the new head only after the
     /// producer has linked the previous head through the node's next pointer.
     #[test]
@@ -261,7 +249,7 @@ mod tests {
         let older_ptr = node_ptr(&older);
         let newer_ptr = node_ptr(&newer);
 
-        push_node(&inbox, older_ptr);
+        assert!(inbox.push(older_ptr));
 
         let published = AtomicBool::new(false);
         let drained = AtomicUsize::new(0);
@@ -278,7 +266,7 @@ mod tests {
             });
 
             published.store(true, AtomicOrdering::Release);
-            push_node(&inbox, newer_ptr);
+            assert!(inbox.push(newer_ptr));
         });
 
         let seen = drained.load(AtomicOrdering::Acquire);
@@ -301,12 +289,12 @@ mod tests {
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 for node in &left {
-                    push_node(&inbox, node_ptr(node));
+                    assert!(inbox.push(node_ptr(node)));
                 }
             });
             scope.spawn(|| {
                 for node in &right {
-                    push_node(&inbox, node_ptr(node));
+                    assert!(inbox.push(node_ptr(node)));
                 }
             });
         });
@@ -322,8 +310,8 @@ mod tests {
         assert_eq!(count, PER_PRODUCER * 2);
     }
 
-    /// 10_000-iteration multi-producer / drain stress: no lost nodes, and producers
-    /// never observe a node accepted twice.
+    /// Multi-producer / drain stress: no lost nodes, and producers never observe a node
+    /// accepted twice.
     #[test]
     fn multi_producer_drain_stress_no_lost_nodes() {
         const ITERATIONS: usize = 10_000;
@@ -374,7 +362,7 @@ mod tests {
                             !node.accepted.load(AtomicOrdering::Acquire),
                             "producer must not publish an already-accepted node"
                         );
-                        push_node(inbox, node_ptr(node));
+                        assert!(inbox.push(node_ptr(node)));
                     }
                 });
             }

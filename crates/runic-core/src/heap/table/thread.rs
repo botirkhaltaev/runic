@@ -26,9 +26,9 @@ impl From<RunError> for ThreadFreeError {
 
 /// Thread-local frontend: bound slot and cached runs.
 ///
-/// Remote frees no longer retain a TLS batch: `Allocator::free_remote` claims and, on
-/// `try_arm`, publishes the affected run/extent immediately — coalescing now happens by
-/// owner (`Notify`) rather than by producer batch, so no per-thread flush is needed here.
+/// Remote frees no longer retain a TLS batch: `Allocator::free_remote` claims and
+/// `HeapSlot::enqueue`s the affected run/extent immediately — coalescing is by owner
+/// (`Inbox`), not by producer batch, so no per-thread flush is needed here.
 pub(crate) struct ThreadHeap {
     inner: Cell<*mut AllocatorInner>,
     heap_id: Cell<Option<HeapId>>,
@@ -126,7 +126,7 @@ impl ThreadHeap {
 
         let slot = self.bound_slot();
         // SAFETY: Active TLS owner for this bound slot.
-        unsafe { slot.as_ref().allocate_extent(spec, pages, init) }
+        unsafe { slot.as_ref().alloc_extent(spec, pages, init) }
     }
 
     /// Owner-local free for a run owned by the bound heap.

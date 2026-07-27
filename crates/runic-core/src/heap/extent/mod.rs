@@ -14,7 +14,7 @@ use crate::{
 
 use super::{
     HeapId,
-    table::inbox::{Notified, Notify},
+    table::inbox::{InboxLink, InboxNode},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,7 +43,7 @@ pub(crate) enum ExtentError {
 enum ExtentState {
     Free = 0,
     Allocated = 1,
-    RemotePending = 2,
+    Claimed = 2,
 }
 
 impl ExtentState {
@@ -51,7 +51,7 @@ impl ExtentState {
         match self {
             Self::Free => 0,
             Self::Allocated => 1,
-            Self::RemotePending => 2,
+            Self::Claimed => 2,
         }
     }
 
@@ -59,7 +59,7 @@ impl ExtentState {
         match raw {
             value if value == Self::Free.raw() => Some(Self::Free),
             value if value == Self::Allocated.raw() => Some(Self::Allocated),
-            value if value == Self::RemotePending.raw() => Some(Self::RemotePending),
+            value if value == Self::Claimed.raw() => Some(Self::Claimed),
             _ => None,
         }
     }
@@ -71,15 +71,15 @@ pub(crate) struct Extent {
     mapping: Mapping,
     range: AddressRange,
     state: AtomicU8,
-    /// Coalesced remote-notify link (see `heap::table::inbox`). Only ever armed while
-    /// exactly one claim can be outstanding (`RemotePending`), so no bulk scan is needed —
+    /// Coalesced inbox membership (see `heap::table::inbox`). Only ever queued while
+    /// exactly one claim can be outstanding (`Claimed`), so no bulk scan is needed —
     /// unlike `Run`, `accept` is a single exact-pointer transition.
-    notify: Notify<Extent>,
+    link: InboxLink<Extent>,
 }
 
-impl Notified for Extent {
-    fn notify(&self) -> &Notify<Self> {
-        &self.notify
+impl InboxNode for Extent {
+    fn link(&self) -> &InboxLink<Self> {
+        &self.link
     }
 }
 
@@ -101,26 +101,11 @@ impl Extent {
                 mapping,
                 range,
                 state: AtomicU8::new(ExtentState::Allocated.raw()),
-                notify: Notify::new(),
+                link: InboxLink::new(),
             })
         } else {
             None
         }
-    }
-
-    /// Idle → Queued for this extent's remote-notify slot.
-    ///
-    /// `true` means the caller must publish this extent on the owning heap's extent inbox.
-    #[inline]
-    pub(crate) fn try_arm(&self) -> bool {
-        self.notify.try_arm()
-    }
-
-    /// Owner: pairs with a completed `accept` — clears the remote-notify slot so a future
-    /// claim (after this extent is reused) can arm it again.
-    #[inline]
-    pub(crate) fn disarm(&self) {
-        self.notify.disarm();
     }
 
     pub(crate) const fn id(&self) -> ExtentId {
@@ -139,11 +124,11 @@ impl Extent {
         self.range.base()
     }
 
-    /// Allocated or remote-pending — cached Free extents are not live.
+    /// Allocated or claimed — cached Free extents are not live.
     pub(crate) fn has_live_allocation(&self) -> bool {
         matches!(
             self.load_state(),
-            Ok(ExtentState::Allocated | ExtentState::RemotePending)
+            Ok(ExtentState::Allocated | ExtentState::Claimed)
         )
     }
 
@@ -188,39 +173,42 @@ impl Extent {
             Ordering::Relaxed,
         ) {
             Ok(_) => Ok(()),
-            Err(value) if value == ExtentState::RemotePending.raw() => Err(ExtentError::DoubleFree),
+            Err(value) if value == ExtentState::Claimed.raw() => Err(ExtentError::DoubleFree),
             Err(value) if value == ExtentState::Free.raw() => Err(ExtentError::DoubleFree),
             Err(_) => Err(ExtentError::InvalidPointer),
         }
     }
 
-    /// Freer: exact pointer, then `Allocated → RemotePending`.
+    /// Freer: exact pointer, then `Allocated → Claimed`.
     pub(crate) fn claim(&self, ptr: NonNull<u8>) -> Result<(), ExtentError> {
         self.validate_exact(ptr)?;
         match self.state.compare_exchange(
             ExtentState::Allocated.raw(),
-            ExtentState::RemotePending.raw(),
+            ExtentState::Claimed.raw(),
             Ordering::Relaxed,
             Ordering::Relaxed,
         ) {
             Ok(_) => Ok(()),
-            Err(value) if value == ExtentState::RemotePending.raw() => Err(ExtentError::DoubleFree),
+            Err(value) if value == ExtentState::Claimed.raw() => Err(ExtentError::DoubleFree),
             Err(value) if value == ExtentState::Free.raw() => Err(ExtentError::DoubleFree),
             Err(_) => Err(ExtentError::InvalidPointer),
         }
     }
 
-    /// Owner: exact pointer, then `RemotePending → Free`.
+    /// Owner: exact pointer `Claimed → Free`, then clear inbox queued.
     pub(crate) fn accept(&self, ptr: NonNull<u8>) -> Result<(), ExtentError> {
         self.validate_exact(ptr)?;
         match self.state.compare_exchange(
-            ExtentState::RemotePending.raw(),
+            ExtentState::Claimed.raw(),
             ExtentState::Free.raw(),
             Ordering::Relaxed,
             Ordering::Relaxed,
         ) {
-            Ok(_) => Ok(()),
-            Err(value) if value == ExtentState::RemotePending.raw() => Err(ExtentError::DoubleFree),
+            Ok(_) => {
+                self.link.clear_queued();
+                Ok(())
+            }
+            Err(value) if value == ExtentState::Claimed.raw() => Err(ExtentError::DoubleFree),
             Err(value) if value == ExtentState::Free.raw() => Err(ExtentError::DoubleFree),
             Err(_) => Err(ExtentError::InvalidPointer),
         }

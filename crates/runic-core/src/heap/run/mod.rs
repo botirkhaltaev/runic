@@ -16,7 +16,7 @@ use crate::{
 
 use super::{
     HeapId,
-    table::inbox::{Notified, Notify},
+    table::inbox::{InboxLink, InboxNode},
 };
 
 pub(crate) use heap::{RunHeap, RunHeapError};
@@ -241,18 +241,18 @@ pub(crate) struct Run {
     mapping: Mapping,
     /// Mirror of `RunState.bump` for remote `claim`. Cold.
     issued: AtomicUsize,
-    /// Coalesced-by-run remote-notify link (see `heap::table::inbox`). Cold.
-    notify: Notify<Run>,
+    /// Coalesced-by-run inbox membership (see `heap::table::inbox`). Cold.
+    link: InboxLink<Run>,
 }
 
 // SAFETY: owner-local methods are called only by the owning heap. Remote methods only touch
-// `BlockStates` / `ClaimBits` / `Notify`, load `issued`, and never mutate `RunState` (except
-// `accept_remote`, itself an owner-local method called only through the owning heap's flush).
+// `BlockStates` / claim bitmap / `InboxLink`, load `issued`, and never mutate `RunState`
+// (except `accept`, itself an owner-local method called only through the owning heap's flush).
 unsafe impl Sync for Run {}
 
-impl Notified for Run {
-    fn notify(&self) -> &Notify<Self> {
-        &self.notify
+impl InboxNode for Run {
+    fn link(&self) -> &InboxLink<Self> {
+        &self.link
     }
 }
 
@@ -331,7 +331,7 @@ impl Run {
             heap,
             mapping,
             issued: AtomicUsize::new(0),
-            notify: Notify::new(),
+            link: InboxLink::new(),
         })
     }
 
@@ -461,30 +461,14 @@ impl Run {
         Ok(())
     }
 
-    /// Idle → Queued for this run's remote-notify slot.
+    /// Owner: clear inbox queued, drain every claimed bit, publish blocks to the freelist.
     ///
-    /// `true` means the caller must publish this run on the owning heap's run inbox — see
-    /// [`Self::accept_remote`] for the paired disarm and wakeup proof.
-    #[inline]
-    pub(crate) fn try_arm(&self) -> bool {
-        self.notify.try_arm()
-    }
-
-    /// Owner: drain every claimed bit on this run and publish the freed blocks.
-    ///
-    /// Wakeup proof (idle-first + recheck): disarms this run's notify *before* scanning, so
-    /// a racing `claim` + `try_arm` is free to re-queue the run the moment it is dequeued
-    /// from the inbox (its `next` link is only safe to reuse once Idle). A straggling claim
-    /// that lands in an already-scanned word is never dropped: either that racer's own
-    /// `try_arm` wins (Idle at the time) and republishes on its own, or it loses (Queued
-    /// already, e.g. from a concurrent flush) and this call's own re-arm below wins instead —
-    /// exactly one of the two republishes, so the run is always requeued when work remains.
-    ///
-    /// Returns `Result` (never currently `Err`) for parity with the other domain ops
-    /// (`claim` / `free`) that `RunHeap::accept_remote` propagates via `?`.
-    #[allow(clippy::unnecessary_wraps)]
-    pub(crate) fn accept_remote(&self) -> Result<bool, RunError> {
-        self.notify.disarm();
+    /// Wakeup proof (idle-first + recheck): clears queued *before* scanning, so a racing
+    /// `claim` + `Inbox::push` may re-queue the run once it is dequeued. Returns `true` when
+    /// claim bits remain after the scan — the caller must `Inbox::push` again (or a racer
+    /// already did). Exactly one of those pushes keeps the run queued when work remains.
+    pub(crate) fn accept(&self) -> bool {
+        self.link.clear_queued();
 
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
@@ -503,7 +487,7 @@ impl Run {
             }
         }
 
-        Ok(self.claims.any_set() && self.notify.try_arm())
+        self.claims.any_set()
     }
 
     pub(crate) fn allocated(&self, ptr: NonNull<u8>) -> Result<Block, RunError> {
@@ -911,7 +895,7 @@ mod tests {
 
         assert_eq!(run.claim(ptr), Ok(()));
         assert!(matches!(run.free(ptr), Err(RunError::DoubleFree)));
-        assert_eq!(run.accept_remote(), Ok(false));
+        assert!(!run.accept());
         assert_eq!(run.allocate(), Some(ptr));
     }
 
@@ -928,7 +912,7 @@ mod tests {
         let ptr = run.allocate().unwrap();
 
         assert_eq!(run.claim(ptr), Ok(()));
-        assert_eq!(run.accept_remote(), Ok(false));
+        assert!(!run.accept());
         assert_eq!(run.allocate(), Some(ptr));
     }
 
@@ -972,7 +956,7 @@ mod tests {
             run.blocks.state(index, Ordering::Relaxed),
             BlockState::Clear
         );
-        assert_eq!(run.accept_remote(), Ok(false));
+        assert!(!run.accept());
         assert_eq!(run.allocate(), Some(ptr));
     }
 
@@ -1020,7 +1004,7 @@ mod tests {
     }
 
     #[test]
-    fn accept_remote_without_any_claim_is_a_noop() {
+    fn accept_without_any_claim_is_a_noop() {
         let class = class_id(64, 8);
         let run = Run::new(
             RunId::from_index(16).unwrap(),
@@ -1030,13 +1014,13 @@ mod tests {
         )
         .expect("test run");
         let ptr = run.allocate().unwrap();
-        assert_eq!(run.accept_remote(), Ok(false));
+        assert!(!run.accept());
         // `ptr`'s block is still live (never claimed), so the next allocate is fresh.
         assert_ne!(run.allocate().unwrap(), ptr);
     }
 
     #[test]
-    fn claim_accept_remote_works_for_all_size_classes() {
+    fn claim_accept_works_for_all_size_classes() {
         for (run_index, &size) in SizeClasses::SIZES.iter().enumerate() {
             let class = class_id(size, 8);
             let run = Run::new(
@@ -1048,7 +1032,7 @@ mod tests {
             .expect("test run");
             let ptr = run.allocate().unwrap();
             assert_eq!(run.claim(ptr), Ok(()), "size={size}");
-            assert_eq!(run.accept_remote(), Ok(false), "size={size}");
+            assert!(!run.accept(), "size={size}");
             assert_eq!(run.allocate(), Some(ptr), "size={size}");
         }
     }
@@ -1107,7 +1091,9 @@ mod tests {
     }
 
     #[test]
-    fn try_arm_wins_once_until_disarmed() {
+    fn try_queue_wins_once_until_cleared() {
+        use super::super::table::inbox::Inbox;
+
         let class = class_id(64, 8);
         let run = Run::new(
             RunId::from_index(17).unwrap(),
@@ -1118,30 +1104,33 @@ mod tests {
         .expect("test run");
         let a = run.allocate().unwrap();
         let b = run.allocate().unwrap();
+        let inbox: Inbox<Run> = Inbox::new();
+        let run_ptr = NonNull::from(&run);
 
         assert_eq!(run.claim(a), Ok(()));
-        // First claim on an idle run wins the arm race and must publish.
-        assert!(run.try_arm());
+        // First claim on an idle run wins the queue race and must push.
+        assert!(inbox.push(run_ptr));
 
         assert_eq!(run.claim(b), Ok(()));
-        // A second claim while still queued must not publish again.
-        assert!(!run.try_arm());
+        // A second claim while still queued must not push again.
+        assert!(!inbox.push(run_ptr));
 
-        // accept_remote coalesces both claims from the single queued entry.
-        assert_eq!(run.accept_remote(), Ok(false));
+        // accept coalesces both claims from the single queued entry.
+        let _ = inbox.drain();
+        assert!(!run.accept());
         assert_eq!(run.allocate(), Some(b));
         assert_eq!(run.allocate(), Some(a));
 
-        // Disarmed by accept_remote: a fresh claim can arm again.
+        // Cleared by accept: a fresh claim can queue again.
         assert_eq!(run.claim(a), Ok(()));
-        assert!(run.try_arm());
+        assert!(inbox.push(run_ptr));
     }
 
     /// Faithful simulation of the real `HeapSlot::flush` loop: a freer claims and
-    /// arms/notifies concurrently with an "owner" that drains the inbox and republishes
-    /// on `Ok(true)`. No claim may ever be stranded (wakeup proof).
+    /// pushes concurrently with an "owner" that drains the inbox and re-pushes
+    /// when `accept` returns true. No claim may ever be stranded (wakeup proof).
     #[test]
-    fn accept_remote_wakeup_proof_no_claim_is_ever_stranded() {
+    fn accept_wakeup_proof_no_claim_is_ever_stranded() {
         use core::sync::atomic::AtomicBool;
 
         use super::super::table::inbox::Inbox;
@@ -1170,9 +1159,7 @@ mod tests {
                     // SAFETY: addr is one of this run's own blocks, allocated above.
                     let ptr = NonNull::new(addr as *mut u8).unwrap();
                     run.claim(ptr).unwrap();
-                    if run.try_arm() {
-                        inbox.republish(run_ptr);
-                    }
+                    let _ = inbox.push(run_ptr);
                 }
                 done.store(true, Ordering::Release);
             });
@@ -1183,8 +1170,8 @@ mod tests {
                 while let Some(chain) = inbox.drain() {
                     for r in chain {
                         // SAFETY: `r` is `run_ptr`, live for the scope of this test.
-                        if unsafe { r.as_ref() }.accept_remote().unwrap() {
-                            inbox.republish(r);
+                        if unsafe { r.as_ref() }.accept() {
+                            let _ = inbox.push(r);
                         }
                     }
                 }

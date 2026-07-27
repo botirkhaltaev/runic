@@ -35,8 +35,8 @@ real lifecycle, invariant, or policy.
 Latest published release: `0.5.0`.
 
 Current `master` ships the v0.5 owner-local heap frontend: TLS heaps own runs and
-extents stamped with `HeapId`, run-owned `ClaimBits` remote admission, run/extent
-`Notify` coalesced inboxes, and Draining lifecycle after thread exit, with explicit
+extents stamped with `HeapId`, private run claim-bitmap remote admission, run/extent
+`Inbox` coalesced by owner, and Draining lifecycle after thread exit, with explicit
 page-map ownership.
 
 Branch `perf/close-local-churn-gap` (PR1–PR3) removes owner-local `lock cmpxchg`
@@ -68,8 +68,8 @@ out-of-line metadata
 page-indexed pointer lookup
 per-size-class available run lists
 per-block AtomicU8 clear/Free on runs (Free bit DF fail-closed; freelist+bump own Free/Live)
-run-owned ClaimBits bitmap for remote admission (no byte RemotePending on runs)
-run/extent Notify inboxes coalesced by owner (Treiber stack of runs/extents, not per-block nodes)
+private run claim-bitmap for remote admission (no byte Claimed on runs)
+run/extent Inbox coalesced by owner (Treiber stack of runs/extents, not per-block nodes)
 configurable extent mapping retention and reuse
 runs retained for the heap lifetime (no empty-run OS release in v0.5)
 run block-boundary checks
@@ -143,7 +143,7 @@ RunicAlloc     owns the Rust GlobalAlloc boundary.
 Allocator      owns the core public allocator API and abort boundary.
 AllocatorInner owns the refcounted mmap instance: PageMap, HeapDirectory, and self-hosting Mapping.
 Heap           owns run and extent allocation policy for one heap identity (no mode/inbox).
-HeapDirectory  owns published slot pointers, lock-free lookup/Active publish, and locked acquire/retire/Draining/reclaim.
+HeapDirectory  owns published slot pointers, lock-free lookup/Active enqueue, and locked acquire/retire/lock→LockedSlot/reclaim.
 HeapSlot       owns SlotState (gen+mode+retired+publishers), Inbox, and UnsafeCell<Heap> metadata.
 Arena          owns fixed-capacity freelist metadata storage.
 LayoutSpec     owns normalized layout semantics.
@@ -151,12 +151,11 @@ SizeClasses    owns size-class selection.
 OsMemory       maps anonymous pages; Mapping owns the mmap lifecycle (Drop munmaps).
 PageMap        owns page-indexed owner-pointer lookup.
 RunHeap        owns Arena<Run>, small-allocation policy, and available run lists.
-Run            owns fixed-block allocation metadata, freelist-primary Free/Live, bump, and embedded run Notify.
-ClaimBits      owns remote-admission bitmap in the run mapping tail (handshake with owner free / accept_remote).
+Run            owns fixed-block allocation metadata, freelist-primary Free/Live, bump, and embedded InboxLink.
 BlockStates    owns clear/Free per-block bytes (one AtomicU8 per block); Free bit is DF fail-closed, not Free/Live authority.
 ExtentHeap     owns Arena<Extent>, dedicated allocation policy, and mapping reuse.
 ExtentCache    owns retained extent mappings, eviction, and reuse lookup.
-Extent         owns dedicated allocation metadata and embedded extent Notify (extent byte state still uses RemotePending).
+Extent         owns dedicated allocation metadata, embedded InboxLink, and Claimed byte state.
 ```
 
 Prefer direct methods on the entity that owns the state. Do not add passive
@@ -224,11 +223,11 @@ allocation paths.
 Current benchmark interpretation:
 
 ```text
-Owner-local run free no longer uses lock cmpxchg (ClaimBits handshake). Remaining
+Owner-local run free no longer uses lock cmpxchg (claim-bitmap handshake). Remaining
 small-churn cost is mostly TLS entry (`LocalKey::with`) and page-map lookup, not
 per-block byte CAS.
 
-Remote fan-in improved via run-coalesced Notify publication; cross-allocator ratios
+Remote fan-in improved via run-coalesced Inbox publication; cross-allocator ratios
 are informational (library/host drift) — use paired Runic cycles/op for PR gates.
 
 Dedicated extent churn is primarily controlled by mapping retention policy.
@@ -301,9 +300,9 @@ Delivered:
 HeapId ownership on Run and Extent (no Owner/root heap)
 ThreadHeap frontend for small and large allocations
 per-thread heap ownership through HeapDirectory / HeapSlot
-explicit block states for reusable and allocated run blocks; extent RemotePending
-run/extent Notify inboxes coalesced by owner (claim → try_arm → publish → accept_remote)
-run ClaimBits remote admission (owner free store/recheck; no owner lock cmpxchg)
+explicit block states for reusable and allocated run blocks; extent Claimed
+run/extent Inbox coalesced by owner (claim → enqueue → accept)
+private run claim-bitmap remote admission (owner free store/recheck; no owner lock cmpxchg)
 alloc-miss prefers local/OS run acquire, then flush+retry before mmap
 thread-exit Draining mode with orphan flush and generation bump
 heap-local extents
@@ -327,7 +326,7 @@ Goal:
 ```text
 Reduce TLS entry and page-map lookup cost on owner-local alloc/dealloc while
 preserving fail-closed ownership, multi-allocator thread safety, and the
-claim → try_arm → publish → accept_remote protocol.
+claim → enqueue → accept protocol.
 ```
 
 Acceptance gate:
