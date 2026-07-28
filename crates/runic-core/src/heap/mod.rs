@@ -5,7 +5,7 @@ pub(crate) mod id;
 pub(crate) mod inbox;
 pub(crate) mod run;
 mod state;
-mod thread;
+pub(crate) mod thread;
 
 use core::{
     cell::UnsafeCell,
@@ -38,11 +38,13 @@ const HEAP_CAPACITY: u32 = 16_384;
 
 /// Indexed heap entry: lifecycle, remote-free inboxes, and owner-local run/extent metadata.
 ///
-/// Shared (`get`): atomics only — `state`, `enqueue`.
-/// Active mutation: [`ThreadHeap`](thread::ThreadHeap) (TLS exclusivity).
-/// Draining mutation: [`LockedHeap`].
+/// Shared (`get`): atomics only — `enqueue`, mode queries.
+/// Active body mutation: [`ThreadHeap`](thread::ThreadHeap) only.
+/// Draining body mutation + reclaim: [`LockedHeap`] only.
 pub(crate) struct Heap {
-    state: HeapState,
+    /// Lifecycle word — `pub(super)` so `Heaps` can close / wait / reactivate without a
+    /// public `&HeapState` projection.
+    pub(super) state: HeapState,
     run_inbox: RunInbox,
     extent_inbox: ExtentInbox,
     body: UnsafeCell<Body>,
@@ -95,27 +97,37 @@ impl Heap {
 
     /// Push-or-coalesce `owner` onto its inbox. Active freers only.
     ///
-    /// Coalesced claims (already queued) return `Ok` without taking an enqueue lease.
-    /// Newly queued claims take a lease, then [`Inbox::link`]. `Err(InvalidHeap)` means the
-    /// freer won the queue race but Active admission closed — caller must
-    /// [`LockedHeap::enqueue`] under [`Heaps::lock`](Heaps::lock).
+    /// Already-queued claims coalesce with no lease. A new queue win takes a lease
+    /// **before** `try_queue` so close cannot observe Queued without a link.
     pub(crate) fn enqueue(&self, id: HeapId, owner: PageOwner) -> Result<(), HeapError> {
-        let queued = match owner {
+        match owner {
             PageOwner::Run(run) => {
                 // SAFETY: PageMap / claim paths only pass live arena owners for this heap.
-                unsafe { run.as_ref() }.link().try_queue()
+                let link = unsafe { run.as_ref() }.link();
+                if link.is_queued() {
+                    return Ok(());
+                }
+                let _lease = self.state.acquire_lease(id)?;
+                if !link.try_queue() {
+                    return Ok(());
+                }
+                self.link_owner(owner);
+                Ok(())
             }
             PageOwner::Extent(extent) => {
                 // SAFETY: PageMap / claim paths only pass live arena owners for this heap.
-                unsafe { extent.as_ref() }.link().try_queue()
+                let link = unsafe { extent.as_ref() }.link();
+                if link.is_queued() {
+                    return Ok(());
+                }
+                let _lease = self.state.acquire_lease(id)?;
+                if !link.try_queue() {
+                    return Ok(());
+                }
+                self.link_owner(owner);
+                Ok(())
             }
-        };
-        if !queued {
-            return Ok(());
         }
-        let _lease = self.state.acquire_lease(id)?;
-        self.link_owner(owner);
-        Ok(())
     }
 
     fn link_owner(&self, owner: PageOwner) {
@@ -129,8 +141,20 @@ impl Heap {
         self.run_inbox.is_empty() && self.extent_inbox.is_empty()
     }
 
-    pub(crate) fn state(&self) -> &HeapState {
-        &self.state
+    pub(crate) fn is_active(&self) -> bool {
+        self.state.is_active()
+    }
+
+    pub(crate) fn mode(&self) -> HeapMode {
+        self.state.mode()
+    }
+
+    pub(crate) fn leases(&self) -> u32 {
+        self.state.leases()
+    }
+
+    pub(crate) fn close(&self, id: HeapId) -> Result<(), HeapError> {
+        self.state.close(id)
     }
 
     /// SAFETY: caller is the Active TLS owner (`ThreadHeap`) or holds [`LockedHeap`].
@@ -140,7 +164,7 @@ impl Heap {
         unsafe { &mut *self.body.get() }
     }
 
-    pub(crate) fn reactivate(&self, id: HeapId) {
+    pub(super) fn reactivate(&self, id: HeapId) {
         // Rebind retained metadata first, then publish Active with Release.
         // SAFETY: Free reactivation runs under the heaps arena lock with leases == 0.
         unsafe { self.body_mut() }.rebind(id);
@@ -149,12 +173,14 @@ impl Heap {
     }
 
     /// Mark Free and bump generation when Draining, empty, and leases == 0.
-    pub(crate) fn reclaim(&self) -> bool {
+    ///
+    /// Only [`LockedHeap`] Drop may call this (holds `exclusive`).
+    fn reclaim(&self) -> bool {
         let snap = self.state.load();
         if snap.retired || snap.mode != HeapMode::Draining || snap.leases != 0 {
             return false;
         }
-        // SAFETY: `LockedHeap` (or test) serializes Draining reclaim against body mutation.
+        // SAFETY: `LockedHeap` serializes Draining reclaim against body mutation.
         if unsafe { self.body_mut() }.has_live() || !self.inboxes_empty() {
             return false;
         }
@@ -172,7 +198,7 @@ impl Heap {
     /// Drain both inboxes into run/extent metadata (accept).
     ///
     /// SAFETY: caller is the Active TLS owner or holds [`LockedHeap`].
-    pub(crate) unsafe fn flush(&self, pages: &PageMap) -> Result<(), HeapError> {
+    pub(super) unsafe fn flush(&self, pages: &PageMap) -> Result<(), HeapError> {
         // SAFETY: same ownership contract as the method.
         let body = unsafe { self.body_mut() };
         while let Some(chain) = self.run_inbox.drain() {
@@ -196,7 +222,7 @@ impl Heap {
     /// Flush inboxes if needed, then owner-local free.
     ///
     /// SAFETY: caller is the Active TLS owner or holds [`LockedHeap`].
-    pub(crate) unsafe fn free(
+    pub(super) unsafe fn free(
         &self,
         owner: PageOwner,
         ptr: NonNull<u8>,
@@ -214,32 +240,10 @@ impl Heap {
         }
     }
 
-    /// Flush inboxes if needed, then allocate one small block.
+    /// Flush inboxes if needed, then allocate one large block.
     ///
     /// SAFETY: caller is the Active TLS owner for this heap.
-    pub(crate) unsafe fn alloc_run(
-        &self,
-        class: SizeClass,
-        pages: &PageMap,
-    ) -> Option<NonNull<u8>> {
-        if !self.inboxes_empty() {
-            // SAFETY: Active TLS owner.
-            unsafe { self.flush(pages) }.ok()?;
-        }
-        // SAFETY: Active TLS owner.
-        let run = unsafe { self.acquire_run(class, pages) }?;
-        // SAFETY: run was just returned by this heap's live arena.
-        let ptr = unsafe { run.as_ref() }.allocate()?;
-        // SAFETY: same run pointer from this heap's live arena.
-        if !unsafe { run.as_ref() }.is_full() {
-            // SAFETY: Active TLS owner.
-            let _ = unsafe { self.push_available(run) };
-        }
-        Some(ptr)
-    }
-
-    /// SAFETY: caller is the Active TLS owner for this heap.
-    pub(crate) unsafe fn alloc_extent(
+    pub(super) unsafe fn alloc_extent(
         &self,
         spec: LayoutSpec,
         pages: &PageMap,
@@ -257,7 +261,7 @@ impl Heap {
     /// Acquire a run without flushing the inbox (caller owns flush policy).
     ///
     /// SAFETY: caller is the Active TLS owner for this heap.
-    pub(crate) unsafe fn acquire_run(
+    pub(super) unsafe fn acquire_run(
         &self,
         class: SizeClass,
         pages: &PageMap,
@@ -268,13 +272,13 @@ impl Heap {
     }
 
     /// SAFETY: caller is the Active TLS owner for this heap.
-    pub(crate) unsafe fn push_available(&self, run: NonNull<Run>) -> Result<(), HeapError> {
+    pub(super) unsafe fn push_available(&self, run: NonNull<Run>) -> Result<(), HeapError> {
         // SAFETY: Active TLS owner.
         unsafe { self.body_mut() }.runs.push_available(run)
     }
 
     /// Take the Draining exclusive token. Caller must have observed Draining for `id`.
-    pub(crate) fn lock_exclusive(&self, id: HeapId) -> Result<LockedHeap<'_>, HeapError> {
+    pub(super) fn lock_exclusive(&self, id: HeapId) -> Result<LockedHeap<'_>, HeapError> {
         while self
             .exclusive
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -290,15 +294,22 @@ impl Heap {
     }
 }
 
-/// Exclusive Draining access to one [`Heap`]. Drop attempts [`Heap::reclaim`].
+/// Exclusive Draining access to one [`Heap`]. Drop attempts reclaim.
 pub(crate) struct LockedHeap<'a> {
     heap: &'a Heap,
 }
 
 impl LockedHeap<'_> {
-    /// Link an already-queued owner (no Active enqueue lease).
+    /// Queue+link `owner` onto its inbox (Draining; no Active enqueue lease).
     pub(crate) fn enqueue(&mut self, owner: PageOwner) {
-        self.heap.link_owner(owner);
+        match owner {
+            PageOwner::Run(run) => {
+                let _ = self.heap.run_inbox.push(run);
+            }
+            PageOwner::Extent(extent) => {
+                let _ = self.heap.extent_inbox.push(extent);
+            }
+        }
     }
 
     /// Direct late free while exclusive.
@@ -326,153 +337,4 @@ impl Drop for LockedHeap<'_> {
 }
 
 #[cfg(test)]
-mod tests {
-    use core::alloc::Layout;
-    use std::thread;
-
-    use super::*;
-    use crate::{
-        config::AllocatorConfig, layout::LayoutSpec, memory::PageMap, size_class::SizeClasses,
-    };
-
-    use state::MAX_LEASES;
-
-    #[test]
-    fn lease_rejected_after_close() {
-        let heaps = Heaps::new(AllocatorConfig::new());
-        let (id, heap) = heaps.acquire().unwrap();
-        // SAFETY: test-owned heap pointer from acquire.
-        let heap = unsafe { heap.as_ref() };
-        assert_eq!(heap.state.close(id), Ok(()));
-        assert!(heap.state.acquire_lease(id).is_err());
-        assert_eq!(heaps.retire(id, &PageMap::new()), Ok(()));
-    }
-
-    #[test]
-    fn lease_count_overflow_fails_closed() {
-        let heaps = Heaps::new(AllocatorConfig::new());
-        let (id, heap_ptr) = heaps.acquire().unwrap();
-        // SAFETY: test-owned heap pointer from acquire.
-        let heap = unsafe { heap_ptr.as_ref() };
-        heap.state
-            .store(id.generation(), HeapMode::Active, false, MAX_LEASES);
-        assert!(matches!(
-            heap.state.acquire_lease(id),
-            Err(HeapError::InvalidMetadata)
-        ));
-        heap.state
-            .store(id.generation(), HeapMode::Active, false, 0);
-        assert_eq!(heaps.retire(id, &PageMap::new()), Ok(()));
-    }
-
-    /// Many threads race `claim` + `enqueue` against blocks on one shared run.
-    #[test]
-    fn concurrent_active_leases_exact_once() {
-        const THREADS: usize = 4;
-        const PER_THREAD: usize = 64;
-
-        let heaps = Heaps::new(AllocatorConfig::new());
-        let (id, heap_ptr) = heaps.acquire().unwrap();
-        // SAFETY: test-owned heap pointer from acquire.
-        let heap = unsafe { heap_ptr.as_ref() };
-        let pages = PageMap::new();
-        let class = SizeClasses::class_for(LayoutSpec::from_layout(
-            Layout::from_size_align(64, 8).unwrap(),
-        ))
-        .unwrap();
-        // SAFETY: test drives Active heap exclusively.
-        let run = unsafe { heap.acquire_run(class, &pages) }.unwrap();
-        let run_addr = run.as_ptr() as usize;
-        let addrs: Vec<usize> = (0..THREADS * PER_THREAD)
-            // SAFETY: run is a live arena run for this heap.
-            .map(|_| unsafe { run.as_ref() }.allocate().unwrap().as_ptr() as usize)
-            .collect();
-        let addrs = &addrs[..];
-        let pages = &pages;
-
-        thread::scope(|scope| {
-            for t in 0..THREADS {
-                scope.spawn(move || {
-                    // SAFETY: run_addr is `run`, a live arena run for this heap.
-                    let run = NonNull::new(run_addr as *mut Run).unwrap();
-                    let start = t * PER_THREAD;
-                    for &addr in &addrs[start..start + PER_THREAD] {
-                        // SAFETY: addr is a block owned by `run`, allocated above.
-                        let ptr = NonNull::new(addr as *mut u8).unwrap();
-                        unsafe { run.as_ref() }.claim(ptr).unwrap();
-                        assert_eq!(heap.enqueue(id, PageOwner::Run(run)), Ok(()));
-                    }
-                });
-            }
-        });
-
-        assert_eq!(heap.state().leases(), 0);
-        // SAFETY: test drives Active heap exclusively; producers have joined.
-        unsafe { heap.flush(pages) }.unwrap();
-        // SAFETY: same run pointer from this heap's live arena.
-        assert!(!unsafe { run.as_ref() }.is_live());
-        assert_eq!(heaps.retire(id, pages), Ok(()));
-    }
-
-    #[test]
-    fn reclaim_rejects_nonzero_leases() {
-        let heaps = Heaps::new(AllocatorConfig::new());
-        let (id, heap_ptr) = heaps.acquire().unwrap();
-        // SAFETY: test-owned heap pointer from acquire.
-        let heap = unsafe { heap_ptr.as_ref() };
-        assert_eq!(heap.state.close(id), Ok(()));
-        assert!(heap.state.acquire_lease(id).is_err());
-        heap.state
-            .store(id.generation(), HeapMode::Draining, false, 1);
-        assert!(!heap.reclaim());
-        heap.state
-            .store(id.generation(), HeapMode::Draining, false, 0);
-        assert!(heap.reclaim());
-    }
-
-    #[test]
-    fn reclaim_rejects_nonempty_run_inbox() {
-        let heaps = Heaps::new(AllocatorConfig::new());
-        let (id, heap_ptr) = heaps.acquire().unwrap();
-        // SAFETY: test-owned heap pointer from acquire.
-        let heap = unsafe { heap_ptr.as_ref() };
-        let pages = PageMap::new();
-        let class = SizeClasses::class_for(LayoutSpec::from_layout(
-            Layout::from_size_align(64, 8).unwrap(),
-        ))
-        .unwrap();
-        // SAFETY: test drives Active heap exclusively.
-        let run = unsafe { heap.acquire_run(class, &pages) }.unwrap();
-        assert_eq!(heap.state.close(id), Ok(()));
-
-        assert!(heap.run_inbox.push(run));
-        assert!(!heap.reclaim());
-        // SAFETY: test drives Draining heap exclusively.
-        unsafe { heap.flush(&pages) }.unwrap();
-        assert!(heap.reclaim());
-    }
-
-    #[test]
-    fn reclaim_rejects_nonempty_extent_inbox() {
-        let heaps = Heaps::new(AllocatorConfig::new());
-        let (id, heap_ptr) = heaps.acquire().unwrap();
-        // SAFETY: test-owned heap pointer from acquire.
-        let heap = unsafe { heap_ptr.as_ref() };
-        let pages = PageMap::new();
-        let spec = LayoutSpec::from_layout(Layout::from_size_align(128 * 1024, 4096).unwrap());
-        // SAFETY: test drives Active heap exclusively.
-        let ptr = unsafe { heap.alloc_extent(spec, &pages, ExtentInit::Uninit) }.unwrap();
-        let Some(PageOwner::Extent(extent)) = pages.get(ptr) else {
-            panic!("expected extent owner");
-        };
-        // SAFETY: extent is live and Allocated.
-        unsafe { extent.as_ref() }.claim(ptr).unwrap();
-        assert_eq!(heap.state.close(id), Ok(()));
-
-        assert!(heap.extent_inbox.push(extent));
-        assert!(!heap.reclaim());
-        // SAFETY: test drives Draining heap exclusively.
-        unsafe { heap.flush(&pages) }.unwrap();
-        assert!(heap.reclaim());
-    }
-}
+mod tests;

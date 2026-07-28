@@ -129,37 +129,43 @@ impl ThreadHeap {
         unsafe { heap.as_ref().alloc_extent(spec, pages, init) }
     }
 
-    /// Unbound cold path after `bind`: flush-then-alloc (run or extent).
+    /// Unbound cold path after `bind`: flush inboxes, then owner-local run alloc.
     #[cold]
-    pub(crate) fn alloc_fresh(
+    pub(crate) fn alloc_after_bind(
         &self,
         inner: NonNull<AllocatorInner>,
         class: SizeClass,
         pages: &PageMap,
     ) -> Option<NonNull<u8>> {
-        if !self.matches(inner) {
-            return None;
-        }
-        let heap = self.bound_heap();
-        // SAFETY: Active TLS owner for this bound heap.
-        unsafe { heap.as_ref().alloc_run(class, pages) }
+        self.flush(inner, pages).ok()?;
+        self.alloc(inner, class, pages)
     }
 
-    /// Unbound cold path after `bind`: flush-then-alloc for an extent.
+    /// Unbound cold path after `bind`: flush inboxes, then owner-local extent alloc.
     #[cold]
-    pub(crate) fn alloc_extent_fresh(
+    pub(crate) fn alloc_extent_after_bind(
         &self,
         inner: NonNull<AllocatorInner>,
         spec: LayoutSpec,
         pages: &PageMap,
         init: ExtentInit,
     ) -> Option<NonNull<u8>> {
+        self.flush(inner, pages).ok()?;
+        self.alloc_extent(inner, spec, pages, init)
+    }
+
+    /// Owner drain of remote-free inboxes (Active TLS).
+    pub(crate) fn flush(
+        &self,
+        inner: NonNull<AllocatorInner>,
+        pages: &PageMap,
+    ) -> Result<(), HeapError> {
         if !self.matches(inner) {
-            return None;
+            return Err(HeapError::InvalidHeap);
         }
         let heap = self.bound_heap();
         // SAFETY: Active TLS owner for this bound heap.
-        unsafe { heap.as_ref().alloc_extent(spec, pages, init) }
+        unsafe { heap.as_ref().flush(pages) }
     }
 
     /// Owner-local free for a run owned by the bound heap.

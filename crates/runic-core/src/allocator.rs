@@ -293,9 +293,11 @@ impl Allocator {
         // SAFETY: caller retains `inner` for this cold unbound alloc.
         let pages = unsafe { inner.as_ref() }.pages();
         let ptr = match request {
-            AllocKind::Run(class) => THREAD_HEAP.with(|tls| tls.alloc_fresh(inner, class, pages)),
+            AllocKind::Run(class) => {
+                THREAD_HEAP.with(|tls| tls.alloc_after_bind(inner, class, pages))
+            }
             AllocKind::Extent(spec, init) => {
-                THREAD_HEAP.with(|tls| tls.alloc_extent_fresh(inner, spec, pages, init))
+                THREAD_HEAP.with(|tls| tls.alloc_extent_after_bind(inner, spec, pages, init))
             }
         };
         ptr.map_or(null_mut(), NonNull::as_ptr)
@@ -328,7 +330,7 @@ impl Allocator {
         let heaps = &inner.heaps;
         let heap = heaps.get(heap_id).ok_or(AllocatorError::InvalidMetadata)?;
 
-        if !heap.state().is_active() {
+        if !heap.is_active() {
             let mut locked = heaps.lock(heap_id).map_err(AllocatorError::from)?;
             return locked.free(owner, ptr, pages).map_err(AllocatorError::from);
         }
@@ -350,6 +352,7 @@ impl Allocator {
 
         match heap.enqueue(heap_id, owner) {
             Ok(()) => Ok(()),
+            // Close won: claim held, not queued — Draining push+flush (no stranded Queued).
             Err(HeapError::InvalidHeap) => {
                 let mut locked = heaps.lock(heap_id).map_err(AllocatorError::from)?;
                 locked.enqueue(owner);
@@ -490,7 +493,10 @@ impl From<HeapError> for AllocatorError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::heap::{Extent, HeapId, HeapMode, Run};
+    use crate::heap::thread::ThreadHeap;
+    use crate::heap::{Extent, Heap, HeapMode, Run};
+    use std::sync::mpsc;
+    use std::thread;
 
     /// Lazily-initialized inner for an `Allocator` created in this test.
     fn allocator_inner_ptr(allocator: &Allocator) -> NonNull<AllocatorInner> {
@@ -502,89 +508,76 @@ mod tests {
         unsafe { allocator_inner_ptr(allocator).as_ref() }
     }
 
-    fn acquire_id(inner: &AllocatorInner) -> HeapId {
-        inner.heaps.acquire().unwrap().0
+    fn bind_alloc_small(
+        tls: &ThreadHeap,
+        inner: NonNull<AllocatorInner>,
+        pages: &PageMap,
+        layout: Layout,
+    ) -> NonNull<u8> {
+        let class = SizeClasses::class_for(LayoutSpec::from_layout(layout)).unwrap();
+        tls.alloc(inner, class, pages).unwrap()
     }
 
-    fn alloc_small(inner: &AllocatorInner, id: HeapId, layout: Layout) -> NonNull<u8> {
-        let heap = inner.heaps.get(id).unwrap();
-        assert!(heap.state().is_active());
-        // SAFETY: test drives Active heap exclusively.
-        unsafe {
-            heap.alloc_run(
-                SizeClasses::class_for(LayoutSpec::from_layout(layout)).unwrap(),
-                inner.pages(),
-            )
-        }
-        .unwrap()
-    }
-
-    fn alloc_extent(
-        inner: &AllocatorInner,
-        id: HeapId,
+    fn bind_alloc_extent(
+        tls: &ThreadHeap,
+        inner: NonNull<AllocatorInner>,
+        pages: &PageMap,
         layout: Layout,
         init: ExtentInit,
     ) -> NonNull<u8> {
         let spec = LayoutSpec::from_layout(layout);
-        let heap = inner.heaps.get(id).unwrap();
-        assert!(heap.state().is_active());
-        // SAFETY: test drives Active heap exclusively.
-        unsafe { heap.alloc_extent(spec, inner.pages(), init) }.unwrap()
+        tls.alloc_extent(inner, spec, pages, init).unwrap()
     }
 
-    fn run_of(inner: &AllocatorInner, ptr: NonNull<u8>) -> NonNull<Run> {
-        let PageOwner::Run(run) = inner.pages().get(ptr).unwrap() else {
+    fn run_of(pages: &PageMap, ptr: NonNull<u8>) -> NonNull<Run> {
+        let PageOwner::Run(run) = pages.get(ptr).unwrap() else {
             panic!("expected a run-owned pointer");
         };
         run
     }
 
-    fn extent_of(inner: &AllocatorInner, ptr: NonNull<u8>) -> NonNull<Extent> {
-        let PageOwner::Extent(extent) = inner.pages().get(ptr).unwrap() else {
+    fn extent_of(pages: &PageMap, ptr: NonNull<u8>) -> NonNull<Extent> {
+        let PageOwner::Extent(extent) = pages.get(ptr).unwrap() else {
             panic!("expected an extent-owned pointer");
         };
         extent
     }
 
-    fn free_owner(inner: &AllocatorInner, id: HeapId, owner: PageOwner, ptr: NonNull<u8>) {
-        let heap = inner.heaps.get(id).unwrap();
-        // SAFETY: test drives Active/Draining heap exclusively.
-        assert_eq!(unsafe { heap.free(owner, ptr, inner.pages()) }, Ok(()));
-    }
-
     #[test]
     fn allocator_reports_small_double_free() {
         let allocator = Allocator::new();
-        let inner = allocator_inner(&allocator);
-        let id = acquire_id(inner);
+        let inner = allocator_inner_ptr(&allocator);
         let layout = Layout::from_size_align(64, 8).unwrap();
-        let ptr = alloc_small(inner, id, layout);
-        let run = run_of(inner, ptr);
-        let pages = inner.pages();
-        let heap = inner.heaps.get(id).unwrap();
-
-        // SAFETY: test drives Active heap exclusively.
-        assert_eq!(
-            unsafe { heap.free(PageOwner::Run(run), ptr, pages) },
-            Ok(())
-        );
-        assert_eq!(
-            unsafe { heap.free(PageOwner::Run(run), ptr, pages) },
-            Err(HeapError::DoubleFree)
-        );
+        THREAD_HEAP.with(|tls| {
+            let _id = tls.bind(inner).unwrap();
+            // SAFETY: inner retained by allocator.
+            let pages = unsafe { inner.as_ref() }.pages();
+            let ptr = bind_alloc_small(tls, inner, pages, layout);
+            let run = run_of(pages, ptr);
+            assert_eq!(tls.free_run(inner, run, ptr, pages), Ok(()));
+            assert_eq!(
+                tls.free_run(inner, run, ptr, pages),
+                Err(ThreadFreeError::Heap(HeapError::DoubleFree))
+            );
+            tls.unbind();
+        });
     }
 
     #[test]
     fn allocator_extent_free_keeps_page_entry_while_cached() {
         let allocator = Allocator::new();
-        let inner = allocator_inner(&allocator);
-        let id = acquire_id(inner);
+        let inner = allocator_inner_ptr(&allocator);
         let layout = Layout::from_size_align(128 * 1024, 4096).unwrap();
-        let ptr = alloc_extent(inner, id, layout, ExtentInit::Uninit);
-        let extent = extent_of(inner, ptr);
-
-        free_owner(inner, id, PageOwner::Extent(extent), ptr);
-        assert_eq!(inner.pages().get(ptr), Some(PageOwner::Extent(extent)));
+        THREAD_HEAP.with(|tls| {
+            let _id = tls.bind(inner).unwrap();
+            // SAFETY: inner retained by allocator.
+            let pages = unsafe { inner.as_ref() }.pages();
+            let ptr = bind_alloc_extent(tls, inner, pages, layout, ExtentInit::Uninit);
+            let extent = extent_of(pages, ptr);
+            assert_eq!(tls.free_extent(inner, extent, ptr, pages), Ok(()));
+            assert_eq!(pages.get(ptr), Some(PageOwner::Extent(extent)));
+            tls.unbind();
+        });
     }
 
     #[test]
@@ -592,232 +585,437 @@ mod tests {
         let allocator = Allocator::with_config(
             AllocatorConfig::new().with_extent_policy(crate::config::ExtentPolicy::Drop),
         );
-        let inner = allocator_inner(&allocator);
-        let id = acquire_id(inner);
+        let inner = allocator_inner_ptr(&allocator);
         let layout = Layout::from_size_align(128 * 1024, 4096).unwrap();
-        let ptr = alloc_extent(inner, id, layout, ExtentInit::Uninit);
-        let extent = extent_of(inner, ptr);
-
-        free_owner(inner, id, PageOwner::Extent(extent), ptr);
-        assert!(inner.pages().get(ptr).is_none());
+        THREAD_HEAP.with(|tls| {
+            let _id = tls.bind(inner).unwrap();
+            // SAFETY: inner retained by allocator.
+            let pages = unsafe { inner.as_ref() }.pages();
+            let ptr = bind_alloc_extent(tls, inner, pages, layout, ExtentInit::Uninit);
+            let extent = extent_of(pages, ptr);
+            assert_eq!(tls.free_extent(inner, extent, ptr, pages), Ok(()));
+            assert!(pages.get(ptr).is_none());
+            tls.unbind();
+        });
     }
 
     #[test]
     fn allocator_allocates_small_from_current_heap() {
         let allocator = Allocator::new();
-        let inner = allocator_inner(&allocator);
-        let id = acquire_id(inner);
+        let inner = allocator_inner_ptr(&allocator);
         let layout = Layout::from_size_align(64, 8).unwrap();
-        let ptr = alloc_small(inner, id, layout);
-        let run = run_of(inner, ptr);
-
-        // SAFETY: PageMap stores only live run pointers.
-        assert_eq!(unsafe { run.as_ref() }.heap_id(), id);
-        free_owner(inner, id, PageOwner::Run(run), ptr);
+        THREAD_HEAP.with(|tls| {
+            let id = tls.bind(inner).unwrap();
+            // SAFETY: inner retained by allocator.
+            let pages = unsafe { inner.as_ref() }.pages();
+            let ptr = bind_alloc_small(tls, inner, pages, layout);
+            let run = run_of(pages, ptr);
+            // SAFETY: PageMap stores only live run pointers.
+            assert_eq!(unsafe { run.as_ref() }.heap_id(), id);
+            assert_eq!(tls.free_run(inner, run, ptr, pages), Ok(()));
+            tls.unbind();
+        });
     }
 
     #[test]
     fn allocator_allocates_extent_from_current_heap() {
         let allocator = Allocator::new();
-        let inner = allocator_inner(&allocator);
-        let id = acquire_id(inner);
+        let inner = allocator_inner_ptr(&allocator);
         let layout = Layout::from_size_align(128 * 1024, 4096).unwrap();
-        let ptr = alloc_extent(inner, id, layout, ExtentInit::Uninit);
-        let extent = extent_of(inner, ptr);
-
-        // SAFETY: PageMap stores only live extent pointers.
-        assert_eq!(unsafe { extent.as_ref() }.heap_id(), id);
-        free_owner(inner, id, PageOwner::Extent(extent), ptr);
+        THREAD_HEAP.with(|tls| {
+            let id = tls.bind(inner).unwrap();
+            // SAFETY: inner retained by allocator.
+            let pages = unsafe { inner.as_ref() }.pages();
+            let ptr = bind_alloc_extent(tls, inner, pages, layout, ExtentInit::Uninit);
+            let extent = extent_of(pages, ptr);
+            // SAFETY: PageMap stores only live extent pointers.
+            assert_eq!(unsafe { extent.as_ref() }.heap_id(), id);
+            assert_eq!(tls.free_extent(inner, extent, ptr, pages), Ok(()));
+            tls.unbind();
+        });
     }
 
     #[test]
     fn allocator_rejects_duplicate_remote_free() {
         let allocator = Allocator::new();
         let layout = Layout::from_size_align(64, 8).unwrap();
-        let (run, ptr) = {
-            let inner = allocator_inner(&allocator);
-            let id = acquire_id(inner);
-            let ptr = alloc_small(inner, id, layout);
-            (run_of(inner, ptr), ptr)
-        };
-
         let inner = allocator_inner_ptr(&allocator);
-        // Unbound TLS simulates a free from a thread that does not own this heap.
-        assert_eq!(
-            Allocator::free_remote(inner, PageOwner::Run(run), ptr),
-            Ok(())
-        );
-        assert_eq!(
-            Allocator::free_remote(inner, PageOwner::Run(run), ptr),
-            Err(AllocatorError::DoubleFree)
-        );
+        THREAD_HEAP.with(|tls| {
+            let _id = tls.bind(inner).unwrap();
+            // SAFETY: inner retained by allocator.
+            let pages = unsafe { inner.as_ref() }.pages();
+            let ptr = bind_alloc_small(tls, inner, pages, layout);
+            let run = run_of(pages, ptr);
+            // Heap stays Active (still bound). free_remote is the cross-thread path —
+            // claim+enqueue twice must report DoubleFree on the second claim.
+            assert_eq!(
+                Allocator::free_remote(inner, PageOwner::Run(run), ptr),
+                Ok(())
+            );
+            assert_eq!(
+                Allocator::free_remote(inner, PageOwner::Run(run), ptr),
+                Err(AllocatorError::DoubleFree)
+            );
+            tls.unbind();
+        });
     }
 
     #[test]
     fn retained_remote_claim_completes_under_draining() {
-        use crate::heap::inbox::InboxNode;
-
         let allocator = Allocator::new();
-        let inner = allocator_inner(&allocator);
-        let id = acquire_id(inner);
+        let inner = allocator_inner_ptr(&allocator);
         let layout = Layout::from_size_align(64, 8).unwrap();
-        let ptr = alloc_small(inner, id, layout);
-        let run = run_of(inner, ptr);
+        let (id, run, ptr) = THREAD_HEAP.with(|tls| {
+            let id = tls.bind(inner).unwrap();
+            // SAFETY: inner retained by allocator.
+            let pages = unsafe { inner.as_ref() }.pages();
+            let ptr = bind_alloc_small(tls, inner, pages, layout);
+            let run = run_of(pages, ptr);
+            // SAFETY: block was just allocated from this run.
+            assert_eq!(unsafe { run.as_ref() }.claim(ptr), Ok(()));
+            tls.unbind();
+            (id, run, ptr)
+        });
 
-        // Claim without enqueueing: the outstanding claim keeps the heap live so retire
-        // cannot reclaim until the run is accepted.
-        assert_eq!(unsafe { run.as_ref() }.claim(ptr), Ok(()));
-        assert_eq!(inner.heaps.retire(id, inner.pages()), Ok(()));
+        let inner_ref = allocator_inner(&allocator);
+        assert_eq!(inner_ref.heaps.retire(id, inner_ref.pages()), Ok(()));
         assert_eq!(
-            inner.heaps.get(id).map(|s| s.state().mode()),
+            inner_ref.heaps.get(id).map(Heap::mode),
             Some(HeapMode::Draining)
         );
-        // SAFETY: run is a live arena run for this heap.
-        assert!(unsafe { run.as_ref() }.link().try_queue());
-        let mut locked = inner.heaps.lock(id).unwrap();
+        let mut locked = inner_ref.heaps.lock(id).unwrap();
         locked.enqueue(PageOwner::Run(run));
-        assert_eq!(locked.flush(inner.pages()), Ok(()));
+        assert_eq!(locked.flush(inner_ref.pages()), Ok(()));
         drop(locked);
-        assert!(inner.heaps.get(id).is_none());
+        assert!(inner_ref.heaps.get(id).is_none());
+        let _ = ptr;
     }
 
     #[test]
     fn remote_frees_to_distinct_heaps_publish_independently_without_batching() {
         let allocator = Allocator::new();
         let layout = Layout::from_size_align(64, 8).unwrap();
-        let (first, second, run_a, ptr_a, run_b, ptr_b) = {
-            let inner = allocator_inner(&allocator);
-            let first = acquire_id(inner);
-            let second = acquire_id(inner);
-            let ptr_a = alloc_small(inner, first, layout);
-            let run_a = run_of(inner, ptr_a);
-            let ptr_b = alloc_small(inner, second, layout);
-            let run_b = run_of(inner, ptr_b);
-            (first, second, run_a, ptr_a, run_b, ptr_b)
-        };
-
         let inner = allocator_inner_ptr(&allocator);
-        // Each remote free claims and enqueues its own target immediately — no per-thread
-        // batch retains one heap's claim while a different heap's free is in flight.
-        assert_eq!(
-            Allocator::free_remote(inner, PageOwner::Run(run_a), ptr_a),
-            Ok(())
-        );
-        assert_eq!(
-            Allocator::free_remote(inner, PageOwner::Run(run_b), ptr_b),
-            Ok(())
-        );
+        let inner_addr = inner.as_ptr() as usize;
+        let (ready_a, wait_a) = mpsc::channel::<usize>();
+        let (ready_b, wait_b) = mpsc::channel::<usize>();
+        let (go_a, start_a) = mpsc::channel::<()>();
+        let (go_b, start_b) = mpsc::channel::<()>();
+        let (done_a, finished_a) = mpsc::channel::<bool>();
+        let (done_b, finished_b) = mpsc::channel::<bool>();
 
-        let inner = allocator_inner(&allocator);
-        // SAFETY: test drives Active heap exclusively; the claim above already enqueued.
-        unsafe {
-            inner
-                .heaps
-                .get(first)
-                .unwrap()
-                .flush(inner.pages())
-                .unwrap();
-            inner
-                .heaps
-                .get(second)
-                .unwrap()
-                .flush(inner.pages())
-                .unwrap();
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                // SAFETY: `inner_addr` is the test allocator's live inner for this scope.
+                let inner = NonNull::new(inner_addr as *mut AllocatorInner).unwrap();
+                let start_a = start_a;
+                let ready_a = ready_a;
+                let done_a = done_a;
+                THREAD_HEAP.with(|tls| {
+                    let _id = tls.bind(inner).unwrap();
+                    // SAFETY: inner retained by allocator.
+                    let pages = unsafe { inner.as_ref() }.pages();
+                    let ptr = bind_alloc_small(tls, inner, pages, layout);
+                    let run = run_of(pages, ptr);
+                    ready_a.send(ptr.as_ptr() as usize).unwrap();
+                    start_a.recv().unwrap();
+                    assert_eq!(tls.flush(inner, pages), Ok(()));
+                    // SAFETY: run from this heap's arena.
+                    done_a.send(unsafe { run.as_ref() }.is_live()).unwrap();
+                    tls.unbind();
+                });
+            });
+            scope.spawn(move || {
+                // SAFETY: `inner_addr` is the test allocator's live inner for this scope.
+                let inner = NonNull::new(inner_addr as *mut AllocatorInner).unwrap();
+                let start_b = start_b;
+                let ready_b = ready_b;
+                let done_b = done_b;
+                THREAD_HEAP.with(|tls| {
+                    let _id = tls.bind(inner).unwrap();
+                    // SAFETY: inner retained by allocator.
+                    let pages = unsafe { inner.as_ref() }.pages();
+                    let ptr = bind_alloc_small(tls, inner, pages, layout);
+                    let run = run_of(pages, ptr);
+                    ready_b.send(ptr.as_ptr() as usize).unwrap();
+                    start_b.recv().unwrap();
+                    assert_eq!(tls.flush(inner, pages), Ok(()));
+                    // SAFETY: run from this heap's arena.
+                    done_b.send(unsafe { run.as_ref() }.is_live()).unwrap();
+                    tls.unbind();
+                });
+            });
+
+            let ptr_a = NonNull::new(wait_a.recv().unwrap() as *mut u8).unwrap();
+            let ptr_b = NonNull::new(wait_b.recv().unwrap() as *mut u8).unwrap();
+            // SAFETY: owners still bound; PageMap entries live.
+            let pages = unsafe { inner.as_ref() }.pages();
+            let run_a = run_of(pages, ptr_a);
+            let run_b = run_of(pages, ptr_b);
+            assert_eq!(
+                Allocator::free_remote(inner, PageOwner::Run(run_a), ptr_a),
+                Ok(())
+            );
+            assert_eq!(
+                Allocator::free_remote(inner, PageOwner::Run(run_b), ptr_b),
+                Ok(())
+            );
+            go_a.send(()).unwrap();
+            go_b.send(()).unwrap();
+            assert!(!finished_a.recv().unwrap());
+            assert!(!finished_b.recv().unwrap());
+        });
+    }
+
+    #[test]
+    fn concurrent_active_leases_exact_once() {
+        const THREADS: usize = 4;
+        const PER_THREAD: usize = 64;
+
+        let allocator = Allocator::new();
+        let inner = allocator_inner_ptr(&allocator);
+        // SAFETY: inner retained by allocator.
+        let inner_ref = unsafe { inner.as_ref() };
+        let pages = inner_ref.pages();
+        let class = SizeClasses::class_for(LayoutSpec::from_layout(
+            Layout::from_size_align(64, 8).unwrap(),
+        ))
+        .unwrap();
+
+        let (id, run_addr, addrs) = THREAD_HEAP.with(|tls| {
+            let id = tls.bind(inner).unwrap();
+            let mut addrs = Vec::with_capacity(THREADS * PER_THREAD);
+            for _ in 0..THREADS * PER_THREAD {
+                addrs.push(tls.alloc(inner, class, pages).unwrap().as_ptr() as usize);
+            }
+            let run = run_of(pages, NonNull::new(addrs[0] as *mut u8).unwrap());
+            (id, run.as_ptr() as usize, addrs)
+        });
+
+        let heap = inner_ref.heaps.get(id).unwrap();
+        let addrs = &addrs[..];
+        let heap_addr = core::ptr::from_ref(heap) as usize;
+
+        thread::scope(|scope| {
+            for t in 0..THREADS {
+                scope.spawn(move || {
+                    // SAFETY: heap stays Active and published for this test scope.
+                    let heap = unsafe { &*(heap_addr as *const Heap) };
+                    let run = NonNull::new(run_addr as *mut Run).unwrap();
+                    let start = t * PER_THREAD;
+                    for &addr in &addrs[start..start + PER_THREAD] {
+                        let ptr = NonNull::new(addr as *mut u8).unwrap();
+                        // SAFETY: addr is a block owned by `run`, allocated above.
+                        unsafe { run.as_ref() }.claim(ptr).unwrap();
+                        assert_eq!(heap.enqueue(id, PageOwner::Run(run)), Ok(()));
+                    }
+                });
+            }
+        });
+
+        assert_eq!(heap.leases(), 0);
+        THREAD_HEAP.with(|tls| {
+            assert_eq!(tls.flush(inner, pages), Ok(()));
+            let run = NonNull::new(run_addr as *mut Run).unwrap();
+            // SAFETY: same run pointer from this heap's live arena.
+            assert!(!unsafe { run.as_ref() }.is_live());
+            tls.unbind();
+        });
+    }
+
+    #[test]
+    fn reclaim_rejects_nonempty_run_inbox() {
+        let allocator = Allocator::new();
+        let inner = allocator_inner_ptr(&allocator);
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        let id = THREAD_HEAP.with(|tls| {
+            let id = tls.bind(inner).unwrap();
+            // SAFETY: inner retained by allocator.
+            let pages = unsafe { inner.as_ref() }.pages();
+            let ptr = bind_alloc_small(tls, inner, pages, layout);
+            let run = run_of(pages, ptr);
+            // SAFETY: block was just allocated from this run.
+            unsafe { run.as_ref() }.claim(ptr).unwrap();
+            let heap = unsafe { inner.as_ref() }.heaps.get(id).unwrap();
+            assert_eq!(heap.enqueue(id, PageOwner::Run(run)), Ok(()));
+            assert_eq!(heap.close(id), Ok(()));
+            id
+        });
+
+        let inner_ref = allocator_inner(&allocator);
+        {
+            let locked = inner_ref.heaps.lock(id).unwrap();
+            drop(locked);
         }
-        assert!(!unsafe { run_a.as_ref() }.is_live());
-        assert!(!unsafe { run_b.as_ref() }.is_live());
+        assert!(inner_ref.heaps.get(id).is_some());
+        {
+            let mut locked = inner_ref.heaps.lock(id).unwrap();
+            locked.flush(inner_ref.pages()).unwrap();
+        }
+        assert!(inner_ref.heaps.get(id).is_none());
+        THREAD_HEAP.with(ThreadHeap::unbind);
+    }
+
+    #[test]
+    fn reclaim_rejects_nonempty_extent_inbox() {
+        let allocator = Allocator::new();
+        let inner = allocator_inner_ptr(&allocator);
+        let layout = Layout::from_size_align(128 * 1024, 4096).unwrap();
+        let id = THREAD_HEAP.with(|tls| {
+            let id = tls.bind(inner).unwrap();
+            // SAFETY: inner retained by allocator.
+            let pages = unsafe { inner.as_ref() }.pages();
+            let ptr = bind_alloc_extent(tls, inner, pages, layout, ExtentInit::Uninit);
+            let extent = extent_of(pages, ptr);
+            // SAFETY: extent is live and Allocated.
+            unsafe { extent.as_ref() }.claim(ptr).unwrap();
+            let heap = unsafe { inner.as_ref() }.heaps.get(id).unwrap();
+            assert_eq!(heap.enqueue(id, PageOwner::Extent(extent)), Ok(()));
+            assert_eq!(heap.close(id), Ok(()));
+            id
+        });
+
+        let inner_ref = allocator_inner(&allocator);
+        {
+            let locked = inner_ref.heaps.lock(id).unwrap();
+            drop(locked);
+        }
+        assert!(inner_ref.heaps.get(id).is_some());
+        {
+            let mut locked = inner_ref.heaps.lock(id).unwrap();
+            locked.flush(inner_ref.pages()).unwrap();
+        }
+        assert!(inner_ref.heaps.get(id).is_none());
+        THREAD_HEAP.with(ThreadHeap::unbind);
     }
 
     #[test]
     fn allocator_tracks_live_run_allocations_through_draining_reclaim() {
         let allocator = Allocator::new();
-        let inner = allocator_inner(&allocator);
-        let id = acquire_id(inner);
+        let inner = allocator_inner_ptr(&allocator);
         let layout = Layout::from_size_align(64, 8).unwrap();
-        let first = alloc_small(inner, id, layout);
-        let second = alloc_small(inner, id, layout);
-        let first_run = run_of(inner, first);
-        let second_run = run_of(inner, second);
+        let (id, first, first_run, second, second_run) = THREAD_HEAP.with(|tls| {
+            let id = tls.bind(inner).unwrap();
+            // SAFETY: inner retained by allocator.
+            let pages = unsafe { inner.as_ref() }.pages();
+            let first = bind_alloc_small(tls, inner, pages, layout);
+            let second = bind_alloc_small(tls, inner, pages, layout);
+            let first_run = run_of(pages, first);
+            let second_run = run_of(pages, second);
+            tls.unbind();
+            (id, first, first_run, second, second_run)
+        });
 
-        assert_eq!(inner.heaps.retire(id, inner.pages()), Ok(()));
+        let inner_ref = allocator_inner(&allocator);
+        // unbind already retired; heap should be Draining with live blocks.
+        assert_eq!(
+            inner_ref.heaps.get(id).map(Heap::mode),
+            Some(HeapMode::Draining)
+        );
         {
-            let mut locked = inner.heaps.lock(id).unwrap();
+            let mut locked = inner_ref.heaps.lock(id).unwrap();
             assert_eq!(
-                locked.free(PageOwner::Run(first_run), first, inner.pages()),
+                locked.free(PageOwner::Run(first_run), first, inner_ref.pages()),
                 Ok(())
             );
         }
-        assert!(inner.heaps.get(id).is_some());
+        assert!(inner_ref.heaps.get(id).is_some());
         {
-            let mut locked = inner.heaps.lock(id).unwrap();
+            let mut locked = inner_ref.heaps.lock(id).unwrap();
             assert_eq!(
-                locked.free(PageOwner::Run(second_run), second, inner.pages()),
+                locked.free(PageOwner::Run(second_run), second, inner_ref.pages()),
                 Ok(())
             );
         }
-        assert!(inner.heaps.get(id).is_none());
+        assert!(inner_ref.heaps.get(id).is_none());
     }
 
     #[test]
     fn allocator_reuses_released_heap_after_draining_free() {
         let allocator = Allocator::new();
-        let inner = allocator_inner(&allocator);
-        let heap = acquire_id(inner);
+        let inner = allocator_inner_ptr(&allocator);
         let layout = Layout::from_size_align(64, 8).unwrap();
-        let ptr = alloc_small(inner, heap, layout);
-        let run = run_of(inner, ptr);
+        let (heap, ptr, run) = THREAD_HEAP.with(|tls| {
+            let heap = tls.bind(inner).unwrap();
+            // SAFETY: inner retained by allocator.
+            let pages = unsafe { inner.as_ref() }.pages();
+            let ptr = bind_alloc_small(tls, inner, pages, layout);
+            let run = run_of(pages, ptr);
+            tls.unbind();
+            (heap, ptr, run)
+        });
 
-        assert_eq!(inner.heaps.retire(heap, inner.pages()), Ok(()));
+        let inner_ref = allocator_inner(&allocator);
         {
-            let mut locked = inner.heaps.lock(heap).unwrap();
-            assert_eq!(locked.free(PageOwner::Run(run), ptr, inner.pages()), Ok(()));
+            let mut locked = inner_ref.heaps.lock(heap).unwrap();
+            assert_eq!(
+                locked.free(PageOwner::Run(run), ptr, inner_ref.pages()),
+                Ok(())
+            );
         }
-        assert!(inner.pages().get(ptr).is_some());
-        let reused = acquire_id(inner);
-        assert_eq!(reused.index(), heap.index());
+        assert!(inner_ref.pages().get(ptr).is_some());
+        THREAD_HEAP.with(|tls| {
+            let reused = tls.bind(inner).unwrap();
+            assert_eq!(reused.index(), heap.index());
+            tls.unbind();
+        });
     }
 
     #[test]
     fn allocator_release_retains_empty_heap_run_page_entry_for_reuse() {
         let allocator = Allocator::new();
-        let inner = allocator_inner(&allocator);
-        let heap = acquire_id(inner);
+        let inner = allocator_inner_ptr(&allocator);
         let layout = Layout::from_size_align(64, 8).unwrap();
-        let ptr = alloc_small(inner, heap, layout);
-        let run = run_of(inner, ptr);
+        let (heap, ptr) = THREAD_HEAP.with(|tls| {
+            let heap = tls.bind(inner).unwrap();
+            // SAFETY: inner retained by allocator.
+            let pages = unsafe { inner.as_ref() }.pages();
+            let ptr = bind_alloc_small(tls, inner, pages, layout);
+            let run = run_of(pages, ptr);
+            assert_eq!(tls.free_run(inner, run, ptr, pages), Ok(()));
+            assert!(pages.get(ptr).is_some());
+            tls.unbind();
+            (heap, ptr)
+        });
 
-        free_owner(inner, heap, PageOwner::Run(run), ptr);
-        assert!(inner.pages().get(ptr).is_some());
-        assert_eq!(inner.heaps.retire(heap, inner.pages()), Ok(()));
-        assert!(inner.pages().get(ptr).is_some());
+        let pages = allocator_inner(&allocator).pages();
+        assert!(pages.get(ptr).is_some());
 
-        let reused = acquire_id(inner);
-        assert_eq!(reused.index(), heap.index());
-        assert_ne!(reused.generation(), heap.generation());
-        let reused_ptr = alloc_small(inner, reused, layout);
-        assert_eq!(reused_ptr, ptr);
-        let reused_run = run_of(inner, reused_ptr);
-        free_owner(inner, reused, PageOwner::Run(reused_run), reused_ptr);
+        THREAD_HEAP.with(|tls| {
+            let reused = tls.bind(inner).unwrap();
+            assert_eq!(reused.index(), heap.index());
+            assert_ne!(reused.generation(), heap.generation());
+            let pages = unsafe { inner.as_ref() }.pages();
+            let reused_ptr = bind_alloc_small(tls, inner, pages, layout);
+            assert_eq!(reused_ptr, ptr);
+            let reused_run = run_of(pages, reused_ptr);
+            assert_eq!(tls.free_run(inner, reused_run, reused_ptr, pages), Ok(()));
+            tls.unbind();
+        });
     }
 
     #[test]
     fn allocator_zeroed_large_allocation_uses_current_heap() {
         let allocator = Allocator::new();
-        let inner = allocator_inner(&allocator);
-        let id = acquire_id(inner);
+        let inner = allocator_inner_ptr(&allocator);
         let layout = Layout::from_size_align(128 * 1024, 4096).unwrap();
-        let ptr = alloc_extent(inner, id, layout, ExtentInit::Zeroed);
-        // SAFETY: ptr was just allocated zeroed for layout and is valid for layout.size() bytes.
-        assert!(
-            unsafe { core::slice::from_raw_parts(ptr.as_ptr(), layout.size()) }
-                .iter()
-                .all(|&byte| byte == 0)
-        );
-        let extent = extent_of(inner, ptr);
-
-        // SAFETY: PageMap stores only live extent pointers.
-        assert_eq!(unsafe { extent.as_ref() }.heap_id(), id);
-        free_owner(inner, id, PageOwner::Extent(extent), ptr);
+        THREAD_HEAP.with(|tls| {
+            let id = tls.bind(inner).unwrap();
+            // SAFETY: inner retained by allocator.
+            let pages = unsafe { inner.as_ref() }.pages();
+            let ptr = bind_alloc_extent(tls, inner, pages, layout, ExtentInit::Zeroed);
+            // SAFETY: ptr was just allocated zeroed for layout.
+            assert!(
+                unsafe { core::slice::from_raw_parts(ptr.as_ptr(), layout.size()) }
+                    .iter()
+                    .all(|&byte| byte == 0)
+            );
+            let extent = extent_of(pages, ptr);
+            // SAFETY: PageMap stores only live extent pointers.
+            assert_eq!(unsafe { extent.as_ref() }.heap_id(), id);
+            assert_eq!(tls.free_extent(inner, extent, ptr, pages), Ok(()));
+            tls.unbind();
+        });
     }
 
     #[test]
@@ -833,12 +1031,16 @@ mod tests {
         unsafe { write_bytes(ptr, 0xab, small.size()) };
 
         let inner = allocator_inner(&allocator);
-        let id = unsafe { run_of(inner, NonNull::new(ptr).unwrap()).as_ref() }.heap_id();
+        let id = unsafe {
+            run_of(inner.pages(), NonNull::new(ptr).unwrap())
+                .as_ref()
+                .heap_id()
+        };
 
         // SAFETY: ptr was returned by alloc(small) above and is not yet freed.
         let grown = unsafe { allocator.realloc(ptr, small, large.size()) };
         assert!(!grown.is_null());
-        let extent = extent_of(inner, NonNull::new(grown).unwrap());
+        let extent = extent_of(inner.pages(), NonNull::new(grown).unwrap());
 
         // SAFETY: PageMap stores only live extent pointers.
         assert_eq!(unsafe { extent.as_ref() }.heap_id(), id);

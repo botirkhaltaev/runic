@@ -15,10 +15,10 @@
 - TLS hot paths: `ThreadHeap::{alloc,alloc_extent,free_run,free_extent,lookup}` take `NonNull<AllocatorInner>` (identity) + `&PageMap` projected once at `Allocator`. Cold unbound: `Allocator::{bind_alloc,free_remote}`.
 - Naming: short, clear, domain words only — same term means the same thing everywhere. No long compound jargon, invented synonyms, or parallel names for one concept. Frontend `alloc`, domain block/extent `allocate`, checkout `acquire`. Free protocol: `free` / `claim` / `accept`. Prefer existing vocabulary (`run`, `extent`, `heap`, `inbox`, `flush`, `bind`) over new coinages.
 - Indices: `Arena` / `HeapId` / `RunId` / `ExtentId` use `u32`; convert to `usize` only when indexing Rust arrays or doing pointer/byte math — no free cast-wrapper helpers.
-- Remote free: claim → `Heap::enqueue` (Active; lease only if newly queued) or `Heaps::lock` → `LockedHeap` → owner `flush` → `accept`. Coalesce by owner (`Inbox`), never a freer TLS batch.
-- Flush policy: sticky empty = local/OS acquire then flush (`refill`); unbound = flush then alloc; sticky free hit = `Run::free` only (no available relink).
+- Remote free: claim → `Heap::enqueue` (Active; lease before new `try_queue`) or `Heaps::lock` → `LockedHeap` → owner `flush` → `accept`. Coalesce by owner (`Inbox`), never a freer TLS batch.
+- Flush policy: sticky empty = local/OS acquire then flush (`refill`); unbound = `alloc_after_bind` / `alloc_extent_after_bind` (flush then alloc); sticky free hit = `Run::free` only (no available relink).
 - `Layout` only at the public boundary → `LayoutSpec` inward once.
-- No root/shared ownership heap; every run/extent has `HeapId`. `Heap` owns lifecycle, inboxes, and `RunHeap`/`ExtentHeap`. Active via `ThreadHeap`; Draining via `LockedHeap`.
+- No root/shared ownership heap; every run/extent has `HeapId`. Capabilities: shared `&Heap` = atomics only (`enqueue` / mode); Active body = `ThreadHeap` only; Draining body + reclaim = `LockedHeap` only (`Heaps::lock`). No `Heap::state()` projection; no `*_fresh` dual alloc APIs.
 - One abort sink: `Allocator::abort`. Preserve abort kinds through `HeapError` (`InvalidRunPointer` / `InvalidExtentPointer` / `MissingExtent`). Never hold the heaps arena mutex across flush / accept / user-memory copies.
 - No allocator-internal `Vec` / `Box` / `HashMap` / `String` / formatting / panic unless recursion risk is addressed.
 - `#![deny(unsafe_op_in_unsafe_fn)]`. No test-only methods on production `impl` blocks.

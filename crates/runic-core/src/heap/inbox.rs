@@ -31,10 +31,17 @@ impl<T> InboxLink<T> {
         }
     }
 
+    /// Whether this entity is currently queued on an inbox.
+    #[inline]
+    pub(crate) fn is_queued(&self) -> bool {
+        self.queued.load(Ordering::Acquire)
+    }
+
     /// Idle → Queued. `true` when this call won the transition.
     ///
-    /// Active freers call this *before* taking an enqueue lease so coalesced claims skip
-    /// the lease; [`Inbox::link`] then runs only for the winner under that lease.
+    /// Active freers take an enqueue lease before calling this for a new queue win so
+    /// close cannot observe Queued without a subsequent [`Inbox::link`]. Coalesced
+    /// freers use [`Self::is_queued`] and skip the lease.
     #[inline]
     pub(crate) fn try_queue(&self) -> bool {
         !self.queued.swap(true, Ordering::AcqRel)

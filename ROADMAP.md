@@ -131,8 +131,10 @@ GlobalAlloc
 ```
 
 `Heaps::get` / Active enqueue are lock-free via published pointers and
-`HeapState` enqueue leases. Arena mutex covers acquire / Free reactivation only.
-Draining exclusivity is `LockedHeap` (not the heaps arena mutex across flush).
+`HeapState` enqueue leases (lease before new `try_queue`). Arena mutex covers
+acquire / Free reactivation only. Draining exclusivity is `LockedHeap` (not the
+heaps arena mutex across flush). Shared `&Heap` is atomics-only; Active body
+mutation is `ThreadHeap` only; reclaim is `LockedHeap` Drop only.
 Same-thread small-run hits use TLS-owned heap metadata with no locks or atomics.
 `PageMap` stays outside heaps arena locks so dealloc lookup is not heaps-locked.
 
@@ -142,9 +144,9 @@ Same-thread small-run hits use TLS-owned heap metadata with no locks or atomics.
 RunicAlloc     owns the Rust GlobalAlloc boundary.
 Allocator      owns the core public allocator API, abort, and cold unbound routing.
 AllocatorInner owns the refcounted mmap instance: PageMap, Heaps, and self-hosting Mapping.
-Heaps  owns published heap pointers, lock-free get/Active enqueue lookup, and arena acquire/reuse.
-Heap           owns HeapState (gen+mode+retired+leases), Inbox, and run/extent metadata (RunHeap + ExtentHeap).
-LockedHeap     owns exclusive Draining access to one Heap (flush / late free / reclaim).
+Heaps           owns published heap pointers, lock-free get, arena acquire/reuse, and LockedHeap construction (`lock`).
+Heap           owns HeapState, Inbox, and run/extent metadata; shared surface is atomics only (`enqueue` / mode).
+LockedHeap     owns exclusive Draining body access to one Heap (flush / late free / reclaim on Drop).
 Arena          owns fixed-capacity freelist metadata storage.
 LayoutSpec     owns normalized layout semantics.
 SizeClasses    owns size-class selection.
@@ -156,7 +158,7 @@ BlockStates    owns clear/Free per-block bytes (one AtomicU8 per block); Free bi
 ExtentHeap     owns Arena<Extent>, dedicated allocation policy, and mapping reuse.
 ExtentCache    owns retained extent mappings, eviction, and reuse lookup.
 Extent         owns dedicated allocation metadata, embedded InboxLink, and Claimed byte state.
-ThreadHeap     owns TLS bind, sticky runs, and page→run cache (Active capability).
+ThreadHeap     owns TLS bind, sticky runs, page→run cache, and the sole Active body path.
 ```
 
 Prefer direct methods on the entity that owns the state. Do not add passive

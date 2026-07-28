@@ -70,11 +70,11 @@ impl Heaps {
             let Some(heap) = arena.get(index) else {
                 continue;
             };
-            if heap.state().is_retired() || !heap.state().is_free() {
+            if heap.state.is_retired() || !heap.state.is_free() {
                 continue;
             }
 
-            let generation = heap.state().generation();
+            let generation = heap.state.generation();
             let id = HeapId::new(index, generation)?;
             heap.reactivate(id);
             return Some((id, NonNull::from(heap)));
@@ -92,13 +92,13 @@ impl Heaps {
         let heap = NonNull::new(ptr)?;
         // SAFETY: published pointers are set once on claim and never cleared; arena keeps storage.
         let heap = unsafe { heap.as_ref() };
-        heap.state().matches(id).then_some(heap)
+        heap.state.matches(id).then_some(heap)
     }
 
     /// Exclusive Draining access to one heap (per-heap token; not the heaps arena mutex).
     pub(crate) fn lock(&self, id: HeapId) -> Result<LockedHeap<'_>, HeapError> {
         let heap = self.get(id).ok_or(HeapError::InvalidHeap)?;
-        if heap.state().mode() != HeapMode::Draining {
+        if heap.mode() != HeapMode::Draining {
             return Err(HeapError::InvalidHeap);
         }
         heap.lock_exclusive(id)
@@ -107,8 +107,11 @@ impl Heaps {
     /// Owner thread gives up the heap: close Active, wait leases, flush, reclaim.
     pub(crate) fn retire(&self, id: HeapId, pages: &PageMap) -> Result<(), HeapError> {
         {
-            let heap = self.get(id).ok_or(HeapError::InvalidHeap)?;
-            heap.state().close(id)?;
+            let Some(heap) = self.get(id) else {
+                // Already reclaimed / stale id — unbind races with LockedHeap Drop.
+                return Ok(());
+            };
+            heap.close(id)?;
         }
 
         self.wait_leases(id);
@@ -129,7 +132,7 @@ impl Heaps {
             let Some(heap) = self.get(id) else {
                 return;
             };
-            if heap.state().leases() == 0 {
+            if heap.leases() == 0 {
                 return;
             }
             hint::spin_loop();
@@ -177,20 +180,24 @@ mod tests {
         let heaps = Heaps::new(AllocatorConfig::new());
         let (id, _) = heaps.acquire().unwrap();
         let index = id.index();
+        let max_gen = NonZeroU32::new(u32::MAX).unwrap();
         {
             let arena = heaps.arena.lock();
             let heap = arena.get(index).unwrap();
-            // Drive route to terminal generation under Draining, then reclaim → retired.
-            heap.state().store(
-                NonZeroU32::new(u32::MAX).unwrap(),
-                HeapMode::Draining,
-                false,
-                0,
-            );
-            assert!(heap.reclaim());
-            assert!(heap.state().is_retired());
+            // Drive route to terminal generation under Draining; LockedHeap Drop reclaims.
+            heap.state.store(max_gen, HeapMode::Draining, false, 0);
+        }
+        let id_max = HeapId::new(index, max_gen).unwrap();
+        {
+            let locked = heaps.lock(id_max).unwrap();
+            drop(locked);
         }
         assert!(heaps.get(id).is_none());
+        assert!(heaps.get(id_max).is_none());
+        {
+            let arena = heaps.arena.lock();
+            assert!(arena.get(index).unwrap().state.is_retired());
+        }
         let (other, _) = heaps.acquire().unwrap();
         assert_ne!(other.index(), id.index());
     }
@@ -198,10 +205,9 @@ mod tests {
     #[test]
     fn retire_waits_for_in_flight_lease() {
         let heaps = Heaps::new(AllocatorConfig::new());
-        let (id, heap_ptr) = heaps.acquire().unwrap();
-        // SAFETY: test-owned heap pointer from acquire.
-        let heap = unsafe { heap_ptr.as_ref() };
-        let lease = heap.state().acquire_lease(id).unwrap();
+        let (id, _) = heaps.acquire().unwrap();
+        let heap = heaps.get(id).unwrap();
+        let lease = heap.state.acquire_lease(id).unwrap();
         let start = Barrier::new(2);
         let (done_tx, done_rx) = mpsc::channel();
 
@@ -214,10 +220,10 @@ mod tests {
 
             start.wait();
             // Observe Draining with the lease still held — no wall-clock probe.
-            while heap.state().mode() != HeapMode::Draining {
+            while heap.state.mode() != HeapMode::Draining {
                 hint::spin_loop();
             }
-            assert_eq!(heap.state().leases(), 1);
+            assert_eq!(heap.state.leases(), 1);
             assert!(done_rx.try_recv().is_err());
             drop(lease);
             done_rx.recv().unwrap();
