@@ -2,14 +2,15 @@
 
 ## Goals
 
-- Hot-path performance first: simple, direct, minimal work.
-- Safe idiomatic Rust; `unsafe` only for OS/ownership contracts or measured hot paths (narrow + SAFETY).
+- Performance is the top priority on hot paths — but **data-driven only**: profile before and after (`scripts/profile.sh`); never infer micro-opts, inlining, or layout “wins” without measurements.
+- Clean, idiomatic, readable Rust. No hacks at code or architecture level (no clever dual paths, kludges, or “temporary” shims that become permanent).
+- Safe Rust first; `unsafe` only for OS/ownership contracts or **measured** hot paths (narrow + SAFETY).
 - Explicit ownership entities, fail-closed frees, auditable invariants — not line-for-line ports.
 - Composable APIs: behavior on the owning entity; no one-caller shims, pass-throughs, dual APIs, or `*_v2` / `*_slow` / `*_miss` / `*_nonlocal` names (`#[cold]` only).
 
 ## Conventions
 
-- Prefer `NonZero*` / `NonNull` / named fields; no free one-line helpers.
+- Prefer `NonZero*` / `NonNull` / named fields. Helper fns only when justified (real reuse, clearer ownership boundary, or a **profiled** cold-path factor) — not for one-call extract-method noise.
 - **One handle** — never the same object as both `NonNull<T>` and `&T`. Project fields once at the boundary; do not thread `&AllocatorInner` with `&PageMap` / `&HeapDirectory`.
 - TLS hot paths: `ThreadHeap::{alloc,alloc_extent,free_run,free_extent,lookup_owner}` take `NonNull<AllocatorInner>` (identity) + `&PageMap` projected once at `Allocator`. Cold unbound: `Allocator::{alloc_unbound,free_cross_heap}`.
 - Naming: frontend `alloc`, domain block/extent `allocate`, checkout `acquire`. Domain free protocol: `free` / `claim` / `accept`.
