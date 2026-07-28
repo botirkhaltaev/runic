@@ -59,46 +59,57 @@ cargo bench -p runic-bench --bench compare_explicit
 
 ## Perf
 
-Preferred: `scripts/profile.sh` (builds once, runs the resolved bench binary under perf):
+Benches are ordinary Criterion targets. `scripts/profile.sh` only orchestrates tools on the
+resolved ELF (build hygiene, CPU pin, `perf` / flamegraph / samply / callgrind).
+
+Optimize only with four facts, in order:
+
+1. **Cost** — `metrics.txt` (cycles/insn/branches per elem, IPC) vs self and competitors;
+   `--compare` before/after. Use phase filters for free/alloc/remote.
+2. **Where** — open `perf.data` with `perf report` / `perf annotate`, or samply / flamegraph.
+   Inlining hides work inside symbols; annotate answers that, not name guessing.
+3. **Why** — counter groups in `perf-stat.txt` (IPC, branches, cache/TLB); threaded phases for contention.
+4. **Causal** — temporary A/B after Where points at a hypothesis; accept only if Cost improves
+   enough (e.g. ≥5% cyc/elem) and remote gates do not regress.
 
 ```sh
+scripts/profile.sh --preflight
 scripts/profile.sh -l baseline explicit 'explicit/single_size_churn/runic/64'
 scripts/profile.sh -l baseline explicit 'explicit/owner_free_only/runic/64'
 scripts/profile.sh -l baseline explicit 'explicit/freelist_allocate_only/runic/64'
 scripts/profile.sh -l baseline explicit 'explicit/recycled_live_churn/runic/64/live:1'
 scripts/profile.sh -l baseline -t 20 \
   threaded 'threaded/persistent_remote_fan_in/runic/4/live:256'
-scripts/profile.sh -t 20 -a 'runic_core::heap::run::Run::free' \
-  explicit 'explicit/alloc_zeroed/runic/64'
-```
-
-Recycled live-set matrix (all 27 size classes × depths 1 / 32 / 256):
-
-- `explicit/recycled_live_churn/runic/{size}/live:{depth}`
-
-Hotspot subset (64 / 72 / 80 / 88 × same depths):
-
-- `explicit/recycled_live_hotspot/runic/{size}/live:{depth}`
-
-Channel-free remote free baselines (allocate outside timed free phase):
-
-```sh
-scripts/profile.sh -l post-pr5-pr1 -t 20 \
-  threaded 'threaded/persistent_bound_remote/runic/4'
-scripts/profile.sh -l post-pr5-pr1 -t 20 \
-  threaded 'threaded/persistent_unbound_remote/runic/4'
 scripts/profile.sh -l baseline -t 20 \
   threaded 'threaded/persistent_owner_accept/runic/4'
 ```
 
-Artifacts land under `target/runic-profiles/` (override with `RUNIC_PROFILE_DIR` or `-o`).
-Each run writes `manifest.txt`, `metrics.txt`, and `summary.txt`.
+After a run:
 
-Compare two labeled runs (ratios + % delta from `metrics.txt`):
+```sh
+OUT=target/runic-profiles/<run-dir>
+perf report -i "$OUT/perf.data"
+perf annotate -i "$OUT/perf.data" --symbol '<symbol from report>'
+# optional:
+scripts/profile.sh --with flamegraph,samply ...
+samply load "$OUT/samply.json"
+```
+
+Optional Callgrind (owner-local only):
+
+```sh
+scripts/profile.sh --with callgrind explicit 'explicit/owner_free_only/runic/64'
+```
+
+Artifacts under `target/runic-profiles/` (`RUNIC_PROFILE_DIR` or `-o`):
+`manifest.txt`, `metrics.txt`, `perf-stat.txt`, `perf.data`, `perf-report-*.txt`,
+`summary.txt`, plus optional flamegraph/samply/callgrind.
+
+Compare Cost:
 
 ```sh
 scripts/profile.sh --compare \
   target/runic-profiles/run-before target/runic-profiles/run-after
 ```
 
-Compare base and head on the same machine, preferably from separate git worktrees built from exact commits.
+Prefer separate git worktrees built from exact commits for before/after on the same machine.

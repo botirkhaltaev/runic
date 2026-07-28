@@ -80,12 +80,14 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo bench -p runic-bench --no-run
 ```
 
-Use `perf stat` for same-machine benchmark comparisons. For example:
+Use `scripts/profile.sh` for same-machine allocator profiles (ordinary Criterion
+benches; script wraps the resolved ELF under perf). Cost is `metrics.txt` /
+`--compare`; Where is `perf report` / annotate / samply on `perf.data`:
 
 ```sh
-cargo bench -p runic-bench --bench explicit --no-run
-perf stat -r 3 -e task-clock,cycles,instructions,branches,branch-misses,cache-misses \
-  ./target/release/deps/explicit-* explicit/alloc_zeroed/runic/4096 --bench
+scripts/profile.sh --preflight
+scripts/profile.sh -l baseline explicit 'explicit/single_size_churn/runic/64'
+scripts/profile.sh --compare target/runic-profiles/run-before target/runic-profiles/run-after
 ```
 
 ## Release

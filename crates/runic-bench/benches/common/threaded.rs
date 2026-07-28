@@ -6,17 +6,14 @@ use std::{
 use criterion::{BenchmarkId, Criterion, Throughput};
 use runic_bench::{allocator_target::AllocatorTarget, threaded};
 
+#[path = "configure.rs"]
+mod configure;
+use configure::configure_group;
+
 const THREAD_COUNTS: &[usize] = &[2, 4];
 const OPS_PER_THREAD: usize = 512;
 const PERSISTENT_OPS: usize = 2_048;
 const LIVE_DEPTHS: &[usize] = &[1, 32, 256];
-
-fn configure_group(group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>) {
-    group
-        .sample_size(10)
-        .warm_up_time(Duration::from_millis(250))
-        .measurement_time(Duration::from_secs(1));
-}
 
 pub fn register(c: &mut Criterion, suite: &str, targets: &[AllocatorTarget]) {
     register_setup_lifecycle_thread_local_churn(c, suite, targets);

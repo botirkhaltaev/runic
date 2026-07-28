@@ -6,18 +6,15 @@ use std::{
 use criterion::{BenchmarkId, Criterion, Throughput};
 use runic_bench::{allocator_target::AllocatorTarget, workload};
 
+#[path = "configure.rs"]
+mod configure;
+use configure::configure_group;
+
 const SMALL_OPS: usize = 512;
 const RANDOM_OPS: usize = 2_000;
 const RANDOM_LIVE: usize = 256;
 const LARGE_OPS: usize = 64;
 const REALLOC_ROUNDS: usize = 16;
-
-fn configure_group(group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>) {
-    group
-        .sample_size(10)
-        .warm_up_time(Duration::from_millis(250))
-        .measurement_time(Duration::from_secs(1));
-}
 
 pub fn register(c: &mut Criterion, suite: &str, targets: &[AllocatorTarget]) {
     register_single_size_churn(c, suite, targets);
