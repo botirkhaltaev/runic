@@ -37,12 +37,12 @@ Latest published release: `0.5.0`.
 Current `master` ships the v0.5 owner-local heap frontend: TLS heaps own runs and
 extents stamped with `HeapId`, private run claim-bitmap remote admission, run/extent
 `Inbox` coalesced by owner, and Draining lifecycle after thread exit, with explicit
-page-map ownership.
+page-map ownership. Heap lifecycle lives on `HeapDirectory` / `HeapSlot` (no thin
+public `Heap` shell); run/extent metadata is private `SlotHeap` inside each slot.
 
-Branch `perf/close-local-churn-gap` (PR1–PR3) removes owner-local `lock cmpxchg`
-on run free, coalesces remote publication by run, and adds phase-isolated benches.
-Measured on Linux x86_64 (paired Runic cycles/op): 64-byte owner_free −23%,
-churn −12%, fan-in −35%, remote-reuse latency −15% vs pre-change baseline.
+Local free/churn hot paths use claim-bitmap run free (no owner `lock cmpxchg`) and
+owner-coalesced remote publication. Measured on Linux x86_64 (paired Runic cycles/op
+vs pre-claim-bitmap baseline): 64-byte owner_free −23%, churn −12%, fan-in −35%.
 Small local churn remains ~2.7× snmalloc on the same host (TLS + metadata residue;
 not parity).
 

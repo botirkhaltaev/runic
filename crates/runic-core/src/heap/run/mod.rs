@@ -16,7 +16,7 @@ use crate::{
 
 use super::{
     HeapId,
-    table::inbox::{InboxLink, InboxNode},
+    directory::inbox::{InboxLink, InboxNode},
 };
 
 pub(crate) use heap::RunHeap;
@@ -241,7 +241,7 @@ pub(crate) struct Run {
     mapping: Mapping,
     /// Mirror of `RunState.bump` for remote `claim`. Cold.
     issued: AtomicUsize,
-    /// Coalesced-by-run inbox membership (see `heap::table::inbox`). Cold.
+    /// Coalesced-by-run inbox membership (see `heap::directory::inbox`). Cold.
     link: InboxLink<Run>,
 }
 
@@ -335,7 +335,6 @@ impl Run {
         })
     }
 
-    #[cfg(test)]
     pub(crate) const fn id(&self) -> RunId {
         self.id
     }
@@ -1092,7 +1091,7 @@ mod tests {
 
     #[test]
     fn try_queue_wins_once_until_cleared() {
-        use super::super::table::inbox::Inbox;
+        use super::super::directory::inbox::Inbox;
 
         let class = class_id(64, 8);
         let run = Run::new(
@@ -1133,7 +1132,7 @@ mod tests {
     fn accept_wakeup_proof_no_claim_is_ever_stranded() {
         use core::sync::atomic::AtomicBool;
 
-        use super::super::table::inbox::Inbox;
+        use super::super::directory::inbox::Inbox;
 
         let class = class_id(64, 8);
         let run = Run::new(

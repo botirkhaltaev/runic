@@ -14,7 +14,7 @@ use crate::{
 
 use super::{
     HeapId,
-    table::inbox::{InboxLink, InboxNode},
+    directory::inbox::{InboxLink, InboxNode},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,7 +71,7 @@ pub(crate) struct Extent {
     mapping: Mapping,
     range: AddressRange,
     state: AtomicU8,
-    /// Coalesced inbox membership (see `heap::table::inbox`). Only ever queued while
+    /// Coalesced inbox membership (see `heap::directory::inbox`). Only ever queued while
     /// exactly one claim can be outstanding (`Claimed`), so no bulk scan is needed —
     /// unlike `Run`, `accept` is a single exact-pointer transition.
     link: InboxLink<Extent>,

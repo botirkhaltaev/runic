@@ -11,7 +11,7 @@ use crate::{
 };
 
 use super::{
-    directory::HeapDirectoryState,
+    HeapDirectoryState,
     inbox::{ExtentInbox, InboxNode, RunInbox},
     state::{HeapMode, SlotState},
 };
@@ -77,7 +77,7 @@ impl HeapSlot {
     /// Coalesced claims (already queued) return `Ok` without taking a publisher lease.
     /// Newly queued claims take a lease, then [`Inbox::link`]. `Err(InvalidHeap)` means the
     /// freer won the queue race but Active admission closed — caller must
-    /// [`LockedSlot::enqueue`] (link the already-queued node) under [`super::directory::HeapDirectory::lock`].
+    /// [`LockedSlot::enqueue`] (link the already-queued node) under [`HeapDirectory::lock`](super::HeapDirectory::lock).
     pub(crate) fn enqueue(&self, id: HeapId, owner: PageOwner) -> Result<(), HeapError> {
         let queued = match owner {
             PageOwner::Run(run) => {

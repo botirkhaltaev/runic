@@ -173,7 +173,7 @@ impl RunHeap {
             let _removed = self.runs.remove(usize::try_from(id.index()).ok()?);
             return None;
         };
-        debug_assert_eq!(inserted_run.id, id);
+        debug_assert_eq!(inserted_run.id(), id);
         let run_ptr = NonNull::from(&mut *inserted_run);
 
         debug_assert_eq!(inserted_run.range().base(), inserted_run.mapping().base());

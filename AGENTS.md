@@ -10,11 +10,10 @@
 ## Conventions
 
 - Put behavior on the owning entity; prefer `NonZero*` / `NonNull` / named fields; avoid free one-line helpers and pass-throughs.
-- **One handle** — never pass the same object as `NonNull<T>` and `&T`, and never pass a parent plus a field only reachable from that parent (`inner` + `pages`/`directory`). Project locally once.
-- Owner-local TLS: `ThreadHeap::{alloc,alloc_extent,free_run,free_extent}`; cold unbound: `Allocator::{alloc_unbound,free_cross_heap}`. Domain: `free` / `claim` / `accept`. Naming: frontend `alloc`, domain block `allocate`, checkout `acquire`.
-- Hot TLS takes `&AllocatorInner` (caller converts `NonNull` once). `bind` keeps `NonNull` for retain.
+- **One handle** — never pass the same object as both `NonNull<T>` and `&T`. Project fields once at the boundary; do not thread `&AllocatorInner` alongside `&PageMap` / `&HeapDirectory`.
+- Owner-local TLS: `ThreadHeap::{alloc,alloc_extent,free_run,free_extent}` take `NonNull<AllocatorInner>` (identity) plus `&PageMap` projected once at `Allocator`. Cold unbound: `Allocator::{alloc_unbound,free_cross_heap}`. Domain: `free` / `claim` / `accept`. Naming: frontend `alloc`, domain block `allocate`, checkout `acquire`.
 - One remote-free protocol: claim → `HeapSlot::enqueue` (Active push-or-coalesce; lease only if newly queued) or `HeapDirectory::lock` → `LockedSlot` (exclusive) → owner `flush` drains via `accept`. Coalescing is by owner (`Inbox`), not a per-thread batch.
-- Flush policy: sticky miss = local/OS acquire then flush; unbound cold alloc = flush then alloc; sticky free hit = `Run::free` only (no available relink).
+- Flush policy: sticky empty = local/OS acquire then flush; unbound cold alloc = flush then alloc; sticky free hit = `Run::free` only (no available relink).
 - `Layout` only at the public boundary; convert once to `LayoutSpec` and pass it inward (`SizeClasses::class_for`, extents, resize).
 - No shared/root ownership heap; every run/extent is stamped with `HeapId`. `HeapSlot` owns run/extent metadata (no thin `Heap` shell).
 - Exactly one abort sink: `Allocator::abort`. Never hold the directory lifecycle mutex across a user-memory copy.

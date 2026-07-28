@@ -2,9 +2,9 @@ use core::{cell::Cell, ptr::NonNull};
 
 use crate::{
     allocator::{Allocator, AllocatorInner},
-    heap::{ExtentInit, HeapError, HeapId, HeapSlot, Run, RunError},
+    heap::{Extent, ExtentInit, HeapError, HeapId, HeapSlot, Run, RunError},
     layout::LayoutSpec,
-    memory::PageOwner,
+    memory::{PageMap, PageOwner},
     size_class::{SizeClass, SizeClasses},
 };
 
@@ -24,8 +24,8 @@ impl From<RunError> for ThreadFreeError {
 
 /// Thread-local frontend: bound slot and cached runs.
 ///
-/// Hot paths take `&AllocatorInner` (one handle; caller `as_ref`s once).
-/// `bind` keeps `NonNull` for retain/release.
+/// Hot paths take `NonNull<AllocatorInner>` for identity and `&PageMap` projected once
+/// at the `Allocator` boundary (avoids parent+field dual refs inside TLS).
 pub(crate) struct ThreadHeap {
     inner: Cell<*mut AllocatorInner>,
     heap_id: Cell<Option<HeapId>>,
@@ -54,13 +54,16 @@ impl ThreadHeap {
         }
     }
 
-    /// `PageMap` lookup with a one-entry TLS page→run cache.
+    /// `PageMap` lookup with a one-entry TLS page→run cache (miss fills from `pages`).
     ///
-    /// Only **run** owners are cached: runs stay published for the heap lifetime in v0.5.
+    /// Cache hit/fill only while bound to `inner` (retained allocator). Only **run**
+    /// owners are cached: runs stay published for the heap lifetime in v0.5. Extents
+    /// may `unpublish` / reuse VA, so caching them would go stale.
     #[inline]
     pub(crate) fn lookup_owner(
         &self,
-        inner: &AllocatorInner,
+        inner: NonNull<AllocatorInner>,
+        pages: &PageMap,
         ptr: NonNull<u8>,
     ) -> Option<PageOwner> {
         let page = ptr.as_ptr().addr() / crate::memory::PAGE_SIZE;
@@ -69,7 +72,7 @@ impl ThreadHeap {
             return self.page_cache_owner.get();
         }
 
-        let owner = inner.pages().get(ptr)?;
+        let owner = pages.get(ptr)?;
         if bound && matches!(owner, PageOwner::Run(_)) {
             self.page_cache_page.set(page);
             self.page_cache_owner.set(Some(owner));
@@ -80,7 +83,13 @@ impl ThreadHeap {
     /// Owner-local small allocation via the TLS run cache.
     ///
     /// Returns `None` when this thread is not bound to `inner` (caller should `bind`).
-    pub(crate) fn alloc(&self, inner: &AllocatorInner, class: SizeClass) -> Option<NonNull<u8>> {
+    /// Sticky hit is the straight-line body; empty sticky goes through `refill_sticky`.
+    pub(crate) fn alloc(
+        &self,
+        inner: NonNull<AllocatorInner>,
+        class: SizeClass,
+        pages: &PageMap,
+    ) -> Option<NonNull<u8>> {
         if !self.matches(inner) {
             return None;
         }
@@ -95,14 +104,17 @@ impl ThreadHeap {
             }
         }
 
-        self.alloc_sticky_miss(class, inner.pages(), self.bound_slot())
+        self.refill_sticky(class, pages, self.bound_slot())
     }
 
     /// Owner-local large allocation via the bound slot (no sticky extent cache).
+    ///
+    /// Returns `None` when this thread is not bound to `inner` (caller should `bind`).
     pub(crate) fn alloc_extent(
         &self,
-        inner: &AllocatorInner,
+        inner: NonNull<AllocatorInner>,
         spec: LayoutSpec,
+        pages: &PageMap,
         init: ExtentInit,
     ) -> Option<NonNull<u8>> {
         if !self.matches(inner) {
@@ -111,16 +123,20 @@ impl ThreadHeap {
 
         let slot = self.bound_slot();
         // SAFETY: Active TLS owner for this bound slot.
-        unsafe { slot.as_ref().alloc_extent(spec, inner.pages(), init) }
+        unsafe { slot.as_ref().alloc_extent(spec, pages, init) }
     }
 
-    /// Owner-local free for a run (sticky hit is the straight-line body).
+    /// Owner-local free for a run owned by the bound heap.
+    ///
+    /// Sticky hit is the straight-line body (unbind clears sticky ⇒ sticky implies bound);
+    /// non-cached owner free goes through `HeapSlot::free` after `matches` / `HeapId`.
     #[inline]
     pub(crate) fn free_run(
         &self,
-        inner: &AllocatorInner,
+        inner: NonNull<AllocatorInner>,
         run: NonNull<Run>,
         ptr: NonNull<u8>,
+        pages: &PageMap,
     ) -> Result<(), ThreadFreeError> {
         // SAFETY: PageMap stores only pointers published from this allocator's live arena.
         let run_ref = unsafe { run.as_ref() };
@@ -137,17 +153,17 @@ impl ThreadHeap {
 
         let slot = self.bound_slot();
         // SAFETY: Active TLS owner for this bound slot.
-        unsafe { slot.as_ref().free(PageOwner::Run(run), ptr, inner.pages()) }
+        unsafe { slot.as_ref().free(PageOwner::Run(run), ptr, pages) }
             .map_err(ThreadFreeError::Heap)
     }
 
     /// Owner-local free for an extent owned by the bound heap.
-    #[inline]
     pub(crate) fn free_extent(
         &self,
-        inner: &AllocatorInner,
-        extent: NonNull<crate::heap::Extent>,
+        inner: NonNull<AllocatorInner>,
+        extent: NonNull<Extent>,
         ptr: NonNull<u8>,
+        pages: &PageMap,
     ) -> Result<(), ThreadFreeError> {
         // SAFETY: PageMap stores only pointers published from this allocator's live arena.
         let heap_id = unsafe { extent.as_ref() }.heap_id();
@@ -157,17 +173,16 @@ impl ThreadHeap {
 
         let slot = self.bound_slot();
         // SAFETY: Active TLS owner for this bound slot.
-        unsafe {
-            slot.as_ref()
-                .free(PageOwner::Extent(extent), ptr, inner.pages())
-        }
-        .map_err(ThreadFreeError::Heap)
+        unsafe { slot.as_ref().free(PageOwner::Extent(extent), ptr, pages) }
+            .map_err(ThreadFreeError::Heap)
     }
 
-    /// Bind this thread to a slot for `inner` (directory projected from `inner`).
+    /// Bind this thread to a slot in `directory`.
+    ///
+    /// Reuses the current binding when already attached to `inner`; otherwise unbinds any
+    /// foreign binding and acquires a fresh slot (directory locks internally).
     pub(crate) fn bind(&self, inner: NonNull<AllocatorInner>) -> Option<HeapId> {
-        // SAFETY: caller retains `inner` for bind.
-        if self.matches(unsafe { inner.as_ref() }) {
+        if self.matches(inner) {
             return self.heap_id.get();
         }
 
@@ -196,8 +211,8 @@ impl ThreadHeap {
         self.inner.set(inner.as_ptr());
     }
 
-    fn matches(&self, inner: &AllocatorInner) -> bool {
-        core::ptr::eq(self.inner.get(), inner)
+    fn matches(&self, inner: NonNull<AllocatorInner>) -> bool {
+        self.inner.get() == inner.as_ptr()
     }
 
     /// No allocator retain — never bound, or after `unbind`.
@@ -207,10 +222,10 @@ impl ThreadHeap {
 
     /// Sticky empty: prefer local/OS runs, then flush inbox and retry.
     #[cold]
-    fn alloc_sticky_miss(
+    fn refill_sticky(
         &self,
         class: SizeClass,
-        pages: &crate::memory::PageMap,
+        pages: &PageMap,
         slot: NonNull<HeapSlot>,
     ) -> Option<NonNull<u8>> {
         let cell = self.run_cell(class);
@@ -219,7 +234,7 @@ impl ThreadHeap {
         let slot_ref = unsafe { slot.as_ref() };
 
         // Prefer bump/available/OS before remote accept so a fast lock-free fan-in does not
-        // force the owner through flush on every sticky miss.
+        // force the owner through flush on every sticky-empty refill.
         // SAFETY: Active TLS owner. Inbox flush is deferred until local acquire fails.
         if let Some(run) = unsafe { slot_ref.acquire_run(class, pages) } {
             cell.set(run.as_ptr());
@@ -228,10 +243,13 @@ impl ThreadHeap {
                 return Some(ptr);
             }
             cell.set(core::ptr::null_mut());
+            // Do not abandon a checked-out run off the available list.
             // SAFETY: Active TLS owner returning a run acquired from this slot.
             let _ = unsafe { slot_ref.return_available(run) };
         }
 
+        // Always flush (empty drain is cheap) then retry — never early-None on a stale empty check
+        // while a concurrent Active publish may still land.
         // SAFETY: Active TLS owner.
         unsafe { slot_ref.flush(pages) }.ok()?;
 

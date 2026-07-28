@@ -4,11 +4,11 @@ Owner-local heap frontend: runs for small size classes, extents for dedicated la
 
 ## Layout
 
-- `error.rs`: `HeapError` (composed at the heap/slot edge) + `From<RunError>` / `From<ExtentError>`.
+- `error.rs`: `HeapError` at the slot edge (`InvalidRunPointer` / `InvalidExtentPointer` / `MissingExtent`, …) + `From<RunError>` / `From<ExtentError>`.
 - `id.rs`: `HeapId` (slot index + generation).
 - `run/`: size-classed fixed-block runs (`Run`, `RunHeap` with `Arena<Run>`).
 - `extent/`: dedicated mappings (`Extent`, `ExtentHeap` with `Arena<Extent>`, `ExtentCache`).
-- `table/`: `state.rs` (`HeapMode`, `SlotState`, `PublisherLease`), `slot.rs` (`HeapSlot` — folded run/extent metadata, `LockedSlot`), `directory.rs` (`HeapDirectory`), `inbox.rs` (`Inbox`/`InboxLink`), `thread.rs` (`ThreadHeap`).
+- `directory/`: `mod.rs` (`HeapDirectory`), `state.rs` (`HeapMode`, `SlotState`, `PublisherLease`), `slot.rs` (`HeapSlot`, `LockedSlot`), `inbox.rs` (`Inbox`/`InboxLink`), `thread.rs` (`ThreadHeap`).
 
 ## Invariants
 
@@ -20,7 +20,7 @@ Owner-local heap frontend: runs for small size classes, extents for dedicated la
 - Draining reclaim observes live ownership via private `SlotHeap::has_live` (`RunHeap` ∨ `ExtentHeap`). In-flight claim bits keep the heap live.
 - Never-bound freers enqueue each successful claim in `Allocator::free_cross_heap` (no TLS batch; no stranded claims). Bound producers coalesce by run/extent, not by thread batch.
 - Owner free composition stays on `HeapSlot::free` / `flush`; domain ops are `free` / `claim` / `accept` on `Run`/`Extent`. Failures after claim abort (no rollback).
-- Sticky miss prefers local/OS `acquire_run` before inbox flush so lock-free remote fan-in does not force the owner onto accept every miss.
+- Sticky-empty refill prefers local/OS `acquire_run` before inbox flush so lock-free remote fan-in does not force the owner onto accept every refill.
 - `SlotState` packs generation, mode (`Free` / `Active` / `Draining`), retired, and in-flight **publisher lease** count for Active **enqueue** admits only (not inbox depth — that stays live via claim bits / `has_live`).
 - `HeapSlot` metadata is one `UnsafeCell<SlotHeap>` (`heap_mut()`): Active TLS owner or directory-locked Draining/Free only. No whole-slot `&mut` after publication.
 - `HeapDirectory` publishes stable slot pointers per index once; lookup is lock-free. Lifecycle mutex is private inside the directory facade.

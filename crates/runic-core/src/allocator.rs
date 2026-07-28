@@ -7,8 +7,8 @@ use core::{
 
 use crate::{
     config::AllocatorConfig,
+    heap::directory::{THREAD_HEAP, ThreadFreeError},
     heap::extent::ExtentError,
-    heap::table::{THREAD_HEAP, ThreadFreeError},
     heap::{ExtentInit, HeapDirectory, HeapError, RunError},
     layout::LayoutSpec,
     memory::{Mapping, OsMemory, PageMap, PageOwner},
@@ -80,15 +80,15 @@ impl Allocator {
             return null_mut();
         };
         // SAFETY: inner is retained by this Allocator while installed from self.inner.
-        let inner_ref = unsafe { inner.as_ref() };
+        let pages = unsafe { inner.as_ref() }.pages();
         if let Some(class) = SizeClasses::class_for(spec) {
-            if let Some(ptr) = THREAD_HEAP.with(|tls| tls.alloc(inner_ref, class)) {
+            if let Some(ptr) = THREAD_HEAP.with(|tls| tls.alloc(inner, class, pages)) {
                 return ptr.as_ptr();
             }
             return Self::alloc_unbound(inner, &UnboundRequest::Run(class));
         }
         if let Some(ptr) =
-            THREAD_HEAP.with(|tls| tls.alloc_extent(inner_ref, spec, ExtentInit::Uninit))
+            THREAD_HEAP.with(|tls| tls.alloc_extent(inner, spec, pages, ExtentInit::Uninit))
         {
             return ptr.as_ptr();
         }
@@ -111,22 +111,22 @@ impl Allocator {
             Self::abort();
         };
         // SAFETY: inner is retained by this Allocator while installed from self.inner.
-        let inner_ref = unsafe { inner.as_ref() };
+        let pages = unsafe { inner.as_ref() }.pages();
         let Some(ptr) = NonNull::new(ptr) else {
             return;
         };
         // One TLS entry for lookup + owner-local free; cross-heap/abort after `with`.
         let remote = THREAD_HEAP.with(|tls| {
-            let Some(owner) = tls.lookup_owner(inner_ref, ptr) else {
+            let Some(owner) = tls.lookup_owner(inner, pages, ptr) else {
                 Self::abort();
             };
-            // Match here (not inside `free`) so the sticky run path stays as lean as master.
+            // Match here (not inside ThreadHeap) so the sticky run path stays typed and lean.
             match owner {
                 PageOwner::Run(run) => tls
-                    .free_run(inner_ref, run, ptr)
+                    .free_run(inner, run, ptr, pages)
                     .map_err(|error| (owner, error)),
                 PageOwner::Extent(extent) => tls
-                    .free_extent(inner_ref, extent, ptr)
+                    .free_extent(inner, extent, ptr, pages)
                     .map_err(|error| (owner, error)),
             }
             .err()
@@ -231,17 +231,17 @@ impl Allocator {
             return null_mut();
         };
         // SAFETY: inner is retained by this Allocator while installed from self.inner.
-        let inner_ref = unsafe { inner.as_ref() };
+        let pages = unsafe { inner.as_ref() }.pages();
         let Some(class) = SizeClasses::class_for(spec) else {
             if let Some(ptr) =
-                THREAD_HEAP.with(|tls| tls.alloc_extent(inner_ref, spec, ExtentInit::Zeroed))
+                THREAD_HEAP.with(|tls| tls.alloc_extent(inner, spec, pages, ExtentInit::Zeroed))
             {
                 return ptr.as_ptr();
             }
             return Self::alloc_unbound(inner, &UnboundRequest::Extent(spec, ExtentInit::Zeroed));
         };
 
-        let ptr = if let Some(ptr) = THREAD_HEAP.with(|tls| tls.alloc(inner_ref, class)) {
+        let ptr = if let Some(ptr) = THREAD_HEAP.with(|tls| tls.alloc(inner, class, pages)) {
             ptr.as_ptr()
         } else {
             Self::alloc_unbound(inner, &UnboundRequest::Run(class))
@@ -491,7 +491,8 @@ impl From<HeapError> for AllocatorError {
     fn from(error: HeapError) -> Self {
         match error {
             HeapError::InvalidHeap | HeapError::InvalidMetadata => Self::InvalidMetadata,
-            HeapError::InvalidPointer => Self::InvalidRunPointer,
+            HeapError::InvalidRunPointer => Self::InvalidRunPointer,
+            HeapError::InvalidExtentPointer => Self::InvalidExtentPointer,
             HeapError::DoubleFree => Self::DoubleFree,
             HeapError::MissingExtent => Self::MissingExtent,
         }
@@ -665,7 +666,7 @@ mod tests {
 
     #[test]
     fn retained_remote_claim_completes_under_draining() {
-        use crate::heap::table::inbox::InboxNode;
+        use crate::heap::directory::inbox::InboxNode;
 
         let allocator = Allocator::new();
         let inner_ref = allocator_inner(&allocator);

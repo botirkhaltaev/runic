@@ -6,11 +6,11 @@ Extent metadata owns dedicated large allocations.
 
 - `mod.rs`: `Extent`, `ExtentId`, exact-pointer checks, reuse, and resize-in-place rules.
 - `cache.rs`: bounded index of published Free extents (`ExtentPolicy::{Drop, Keep}`, exact-length reuse only).
-- `heap.rs`: dedicated allocation via `ExtentInit`, `Arena<Extent>`, page-map publication, and the shared local/remote retire path.
+- `heap.rs`: dedicated allocation via `ExtentInit`, `Arena<Extent>`, page-map publication, and `cache_or_unmap` / `unmap`.
 
 ## Same-thread fast path
 
-`ThreadHeap::alloc_extent` / `ThreadHeap::free(PageOwner::Extent)` call `HeapSlot` on the bound heap without taking the directory lifecycle mutex. Extents have no sticky TLS slot cache (unlike runs) because `ExtentCache` already owns reuse. `Allocator::alloc` / `alloc_zeroed` try the TLS path first and fall back to `alloc_unbound` when unbound; `dealloc` uses `free_cross_heap` for cross-heap pointers.
+`ThreadHeap::alloc_extent` / `ThreadHeap::free_extent` call `HeapSlot` on the bound heap without taking the directory lifecycle mutex. Extents have no sticky TLS slot cache (unlike runs) because `ExtentCache` already owns reuse. `Allocator::alloc` / `alloc_zeroed` try the TLS path first and fall back to `alloc_unbound` when unbound; `dealloc` uses `free_cross_heap` for cross-heap pointers.
 
 ## Invariants
 

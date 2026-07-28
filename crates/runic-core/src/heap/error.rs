@@ -5,7 +5,8 @@ use super::{extent::ExtentError, run::RunError};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HeapError {
     InvalidHeap,
-    InvalidPointer,
+    InvalidRunPointer,
+    InvalidExtentPointer,
     DoubleFree,
     InvalidMetadata,
     MissingExtent,
@@ -14,7 +15,7 @@ pub(crate) enum HeapError {
 impl From<RunError> for HeapError {
     fn from(error: RunError) -> Self {
         match error {
-            RunError::InvalidPointer => Self::InvalidPointer,
+            RunError::InvalidPointer => Self::InvalidRunPointer,
             RunError::DoubleFree => Self::DoubleFree,
         }
     }
@@ -23,7 +24,7 @@ impl From<RunError> for HeapError {
 impl From<ExtentError> for HeapError {
     fn from(error: ExtentError) -> Self {
         match error {
-            ExtentError::InvalidPointer => Self::InvalidPointer,
+            ExtentError::InvalidPointer => Self::InvalidExtentPointer,
             ExtentError::DoubleFree => Self::DoubleFree,
         }
     }

@@ -1,3 +1,8 @@
+pub(crate) mod inbox;
+mod slot;
+mod state;
+mod thread;
+
 use core::{
     hint,
     num::NonZeroU32,
@@ -14,15 +19,14 @@ use crate::{
     memory::PageMap,
 };
 
-use super::{
-    slot::{HeapSlot, LockedSlot},
-    state::HeapMode,
-};
+pub(crate) use slot::{HeapSlot, LockedSlot};
+pub(crate) use state::HeapMode;
+pub(crate) use thread::{THREAD_HEAP, ThreadFreeError};
 
 const MAX_HEAPS: usize = 64;
 const MAX_HEAPS_U32: u32 = 64;
 
-pub(super) struct HeapDirectoryState {
+struct HeapDirectoryState {
     slots: Arena<HeapSlot>,
     config: AllocatorConfig,
 }
