@@ -31,7 +31,7 @@ struct HeapDirectoryState {
     config: AllocatorConfig,
 }
 
-/// Directory facade: lock-free published slot lookup; lifecycle ops lock private state.
+/// Heap slot directory: lock-free published lookup; lifecycle ops lock private state.
 pub(crate) struct HeapDirectory {
     published: [AtomicPtr<HeapSlot>; MAX_HEAPS],
     state: Mutex<HeapDirectoryState>,
@@ -114,7 +114,7 @@ impl HeapDirectory {
         if slot.state().mode() != HeapMode::Draining {
             return Err(HeapError::InvalidHeap);
         }
-        Ok(LockedSlot::new(NonNull::from(slot), guard))
+        Ok(LockedSlot::new(id, guard))
     }
 
     /// Owner thread gives up the slot: close Active, wait publishers, flush, reclaim.

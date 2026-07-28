@@ -222,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_extent_page_publication_removes_table_entry() {
+    fn failed_extent_page_publication_removes_map_entry() {
         let mut heap = ExtentHeap::new(4, ExtentConfig::new());
         let pages = PageMap::new();
         let index = heap.extents.claim().unwrap();

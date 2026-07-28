@@ -767,7 +767,7 @@ enum ChannelFreeCmd {
 /// Channel-free remote free: owner fills a shared pointer array; freers drain slices.
 ///
 /// Bound mode binds each freer TLS once at spawn (`claim → enqueue`).
-/// Unbound mode never binds freers (singleton enqueue path).
+/// Unbound mode never binds freers (claim→enqueue without TLS bind).
 pub struct PersistentChannelFreeRemote {
     target: AllocatorTarget,
     layout: Layout,
@@ -781,11 +781,7 @@ pub struct PersistentChannelFreeRemote {
 }
 
 /// Bound freers: channel-free `claim → enqueue`.
-pub type PersistentBoundRemoteBatch = PersistentChannelFreeRemote;
-
-/// Never-bound freers: channel-free singleton enqueue path.
-pub type PersistentUnboundRemoteSingleton = PersistentChannelFreeRemote;
-
+/// Never-bound freers: channel-free enqueue path (`spawn_unbound`).
 impl PersistentChannelFreeRemote {
     /// Already-bound freers draining owner-filled slices without per-element `mpsc`.
     #[must_use]

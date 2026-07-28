@@ -569,14 +569,14 @@ fn unbound_remote_freer_publishes_without_binding() {
 }
 
 #[test]
-fn draining_entry_publishes_retained_bound_batch() {
+fn draining_entry_completes_retained_bound_frees() {
     // Bound freer enqueues while the owner is Active. After the owner thread exits
     // (heap Draining), the next remote free takes the exclusive late-free path without
     // stranding a Claimed block.
     let allocator = Allocator::new();
     let layout = Layout::from_size_align(64, 8).unwrap();
     let (ptrs_tx, ptrs_rx) = mpsc::channel();
-    let (batched_tx, batched_rx) = mpsc::channel();
+    let (owner_hold_tx, owner_hold_rx) = mpsc::channel();
 
     thread::scope(|scope| {
         let allocator = &allocator;
@@ -589,18 +589,18 @@ fn draining_entry_publishes_retained_bound_batch() {
                 b.write(0x42);
             }
             ptrs_tx.send((a.addr(), b.addr())).unwrap();
-            batched_rx.recv().unwrap();
+            owner_hold_rx.recv().unwrap();
         });
 
         scope.spawn(move || {
-            // Bind freer TLS so the first free coalesces instead of singleton-publishing.
+            // Bind freer TLS so the first free coalesces on the owner's inbox.
             let binder = unsafe { allocator.alloc(layout) };
             assert!(!binder.is_null());
             unsafe { allocator.dealloc(binder, layout) };
 
             let (a, b) = ptrs_rx.recv().unwrap();
             unsafe { allocator.dealloc(a as *mut u8, layout) };
-            batched_tx.send(()).unwrap();
+            owner_hold_tx.send(()).unwrap();
             // Owner exit closes Active→Draining before the second free.
             owner.join().unwrap();
             unsafe { allocator.dealloc(b as *mut u8, layout) };

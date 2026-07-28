@@ -263,24 +263,25 @@ impl HeapSlot {
 
 /// Exclusive directory-locked access to a Draining slot (lifecycle mutex held).
 ///
+/// Holds the lifecycle guard + matching `HeapId` (no parallel `NonNull` / `&` of the slot).
 /// Drop attempts [`HeapSlot::try_reclaim`] under the same lock.
 pub(crate) struct LockedSlot<'a> {
-    slot: NonNull<HeapSlot>,
-    _guard: MutexGuard<'a, HeapDirectoryState>,
+    id: HeapId,
+    guard: MutexGuard<'a, HeapDirectoryState>,
 }
 
 impl<'a> LockedSlot<'a> {
-    pub(super) fn new(slot: NonNull<HeapSlot>, guard: MutexGuard<'a, HeapDirectoryState>) -> Self {
-        Self {
-            slot,
-            _guard: guard,
-        }
+    pub(super) fn new(id: HeapId, guard: MutexGuard<'a, HeapDirectoryState>) -> Self {
+        Self { id, guard }
     }
 
     fn slot(&self) -> &HeapSlot {
-        // SAFETY: `_guard` keeps the directory arena alive and serializes mutation; `slot`
-        // was resolved under that lock for a matching Draining generation.
-        unsafe { self.slot.as_ref() }
+        // Invariant: `HeapDirectory::lock` only builds this while Draining for `id`;
+        // the held guard keeps arena storage stable for that generation.
+        match super::HeapDirectory::slot_locked(&self.guard, self.id) {
+            Some(slot) => slot,
+            None => crate::allocator::Allocator::abort(),
+        }
     }
 
     /// Link an already-queued owner (no Active publisher lease). Caller won

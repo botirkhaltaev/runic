@@ -29,8 +29,8 @@ pub fn register(c: &mut Criterion, suite: &str, targets: &[AllocatorTarget]) {
     register_persistent_remote_fan_in(c, suite, targets);
     register_persistent_owner_concurrent(c, suite, targets);
     register_persistent_remote_reuse_latency(c, suite, targets);
-    register_persistent_bound_remote_batch(c, suite, targets);
-    register_persistent_unbound_remote_singleton(c, suite, targets);
+    register_persistent_bound_remote(c, suite, targets);
+    register_persistent_unbound_remote(c, suite, targets);
     register_persistent_owner_accept(c, suite, targets);
 }
 
@@ -305,12 +305,8 @@ fn register_persistent_remote_reuse_latency(
     group.finish();
 }
 
-fn register_persistent_bound_remote_batch(
-    c: &mut Criterion,
-    suite: &str,
-    targets: &[AllocatorTarget],
-) {
-    let mut group = c.benchmark_group(format!("{suite}/persistent_bound_remote_batch"));
+fn register_persistent_bound_remote(c: &mut Criterion, suite: &str, targets: &[AllocatorTarget]) {
+    let mut group = c.benchmark_group(format!("{suite}/persistent_bound_remote"));
     configure_group(&mut group);
 
     for &target in targets {
@@ -322,7 +318,7 @@ fn register_persistent_bound_remote_batch(
                 |bench, &(target, threads)| {
                     bench.iter_custom(|iters| {
                         let workers =
-                            threaded::PersistentBoundRemoteBatch::spawn_bound(target, threads);
+                            threaded::PersistentChannelFreeRemote::spawn_bound(target, threads);
                         let mut elapsed = Duration::ZERO;
                         for _ in 0..iters {
                             black_box(workers.prepare_round(PERSISTENT_OPS));
@@ -341,12 +337,8 @@ fn register_persistent_bound_remote_batch(
     group.finish();
 }
 
-fn register_persistent_unbound_remote_singleton(
-    c: &mut Criterion,
-    suite: &str,
-    targets: &[AllocatorTarget],
-) {
-    let mut group = c.benchmark_group(format!("{suite}/persistent_unbound_remote_singleton"));
+fn register_persistent_unbound_remote(c: &mut Criterion, suite: &str, targets: &[AllocatorTarget]) {
+    let mut group = c.benchmark_group(format!("{suite}/persistent_unbound_remote"));
     configure_group(&mut group);
 
     for &target in targets {
@@ -357,9 +349,8 @@ fn register_persistent_unbound_remote_singleton(
                 &(target, threads),
                 |bench, &(target, threads)| {
                     bench.iter_custom(|iters| {
-                        let workers = threaded::PersistentUnboundRemoteSingleton::spawn_unbound(
-                            target, threads,
-                        );
+                        let workers =
+                            threaded::PersistentChannelFreeRemote::spawn_unbound(target, threads);
                         let mut elapsed = Duration::ZERO;
                         for _ in 0..iters {
                             black_box(workers.prepare_round(PERSISTENT_OPS));
@@ -391,7 +382,7 @@ fn register_persistent_owner_accept(c: &mut Criterion, suite: &str, targets: &[A
                 |bench, &(target, threads)| {
                     bench.iter_custom(|iters| {
                         let workers =
-                            threaded::PersistentBoundRemoteBatch::spawn_bound(target, threads);
+                            threaded::PersistentChannelFreeRemote::spawn_bound(target, threads);
                         let mut elapsed = Duration::ZERO;
                         for _ in 0..iters {
                             black_box(workers.prepare_round(PERSISTENT_OPS));

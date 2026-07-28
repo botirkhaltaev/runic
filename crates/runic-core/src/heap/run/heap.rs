@@ -36,10 +36,6 @@ impl RunHeap {
             .or_else(|| self.map_run(class, heap_id, pages))
     }
 
-    fn take_available(&mut self, class: SizeClass) -> Option<NonNull<Run>> {
-        self.take_available_from(class.index())
-    }
-
     #[cold]
     fn map_run(
         &mut self,
@@ -116,7 +112,8 @@ impl RunHeap {
         self.push_available(run.class().index(), run_ptr)
     }
 
-    fn take_available_from(&mut self, class_index: usize) -> Option<NonNull<Run>> {
+    fn take_available(&mut self, class: SizeClass) -> Option<NonNull<Run>> {
+        let class_index = class.index();
         loop {
             let mut run_ptr = *self.available.get(class_index)?.as_ref()?;
             let next = {
@@ -267,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_run_page_publication_removes_table_entry() {
+    fn failed_run_page_publication_removes_map_entry() {
         let mut heap = RunHeap::new(4);
         let pages = PageMap::new();
         let index = heap.runs.claim().unwrap();

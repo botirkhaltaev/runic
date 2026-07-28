@@ -35,8 +35,8 @@ Persistent workers (preferred for allocator profiles):
 - `threaded/persistent_remote_fan_in/runic/4/live:256` — freer backlog depth is real
 - `threaded/persistent_owner_concurrent/runic/4/live:256` — owner-local churn + remote frees
 - `threaded/persistent_remote_reuse_latency/runic/live:1` (also `live:32`, `live:256`) — Criterion time is measured reuse latency; emits `runic_mean_reuse_ns=`
-- `threaded/persistent_bound_remote_batch/runic/4` — channel-free bound batch frees
-- `threaded/persistent_unbound_remote_singleton/runic/4` — channel-free unbound singletons
+- `threaded/persistent_bound_remote/runic/4` — channel-free bound freer drains
+- `threaded/persistent_unbound_remote/runic/4` — channel-free unbound freer drains
 - `threaded/persistent_owner_accept/runic/4` — prepare+free outside timing; owner accept/flush only
 
 Phase-isolated local free/alloc (setup outside timed window):
@@ -84,9 +84,9 @@ Channel-free remote free baselines (allocate outside timed free phase):
 
 ```sh
 scripts/profile.sh -l post-pr5-pr1 -t 20 \
-  threaded 'threaded/persistent_bound_remote_batch/runic/4'
+  threaded 'threaded/persistent_bound_remote/runic/4'
 scripts/profile.sh -l post-pr5-pr1 -t 20 \
-  threaded 'threaded/persistent_unbound_remote_singleton/runic/4'
+  threaded 'threaded/persistent_unbound_remote/runic/4'
 scripts/profile.sh -l baseline -t 20 \
   threaded 'threaded/persistent_owner_accept/runic/4'
 ```

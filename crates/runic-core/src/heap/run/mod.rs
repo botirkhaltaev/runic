@@ -440,7 +440,7 @@ impl Run {
         Ok(())
     }
 
-    /// Freer: reserve remote admission before batch/publish payload reuse.
+    /// Freer: reserve remote admission before publish / payload reuse.
     ///
     /// Handshake vs owner `free`: set claim bit, then Acquire-load Free. If Free
     /// already, clear the bit and fail closed.

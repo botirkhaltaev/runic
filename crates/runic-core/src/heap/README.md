@@ -23,4 +23,4 @@ Owner-local heap frontend: runs for small size classes, extents for dedicated la
 - Sticky-empty refill prefers local/OS `acquire_run` before inbox flush so lock-free remote fan-in does not force the owner onto accept every refill.
 - `SlotState` packs generation, mode (`Free` / `Active` / `Draining`), retired, and in-flight **publisher lease** count for Active **enqueue** admits only (not inbox depth — that stays live via claim bits / `has_live`).
 - `HeapSlot` metadata is one `UnsafeCell<SlotHeap>` (`heap_mut()`): Active TLS owner or directory-locked Draining/Free only. No whole-slot `&mut` after publication.
-- `HeapDirectory` publishes stable slot pointers per index once; lookup is lock-free. Lifecycle mutex is private inside the directory facade.
+- `HeapDirectory` publishes stable slot pointers per index once; lookup is lock-free. Lifecycle mutex is private inside the directory.

@@ -195,8 +195,8 @@ impl ThreadHeap {
         }
 
         // SAFETY: retain succeeded; directory lives for the retained lifetime.
-        let directory = &unsafe { inner.as_ref() }.directory;
-        let Some((id, slot)) = directory.acquire() else {
+        let acquired = unsafe { inner.as_ref() }.directory.acquire();
+        let Some((id, slot)) = acquired else {
             AllocatorInner::release(inner);
             return None;
         };
@@ -235,8 +235,7 @@ impl ThreadHeap {
 
         // Prefer bump/available/OS before remote accept so a fast lock-free fan-in does not
         // force the owner through flush on every sticky-empty refill.
-        // SAFETY: Active TLS owner. Inbox flush is deferred until local acquire fails.
-        if let Some(run) = unsafe { slot_ref.acquire_run(class, pages) } {
+        let install = |run: NonNull<Run>| -> Option<NonNull<u8>> {
             cell.set(run.as_ptr());
             // SAFETY: run was just returned by this heap's live arena.
             if let Some(ptr) = unsafe { run.as_ref() }.allocate() {
@@ -246,6 +245,14 @@ impl ThreadHeap {
             // Do not abandon a checked-out run off the available list.
             // SAFETY: Active TLS owner returning a run acquired from this slot.
             let _ = unsafe { slot_ref.return_available(run) };
+            None
+        };
+
+        // SAFETY: Active TLS owner. Inbox flush is deferred until local acquire fails.
+        if let Some(run) = unsafe { slot_ref.acquire_run(class, pages) }
+            && let Some(ptr) = install(run)
+        {
+            return Some(ptr);
         }
 
         // Always flush (empty drain is cheap) then retry — never early-None on a stale empty check
@@ -255,15 +262,7 @@ impl ThreadHeap {
 
         // SAFETY: Active TLS owner.
         let run = unsafe { slot_ref.acquire_run(class, pages) }?;
-        cell.set(run.as_ptr());
-        // SAFETY: run was just returned by this heap's live arena.
-        if let Some(ptr) = unsafe { run.as_ref() }.allocate() {
-            return Some(ptr);
-        }
-        cell.set(core::ptr::null_mut());
-        // SAFETY: Active TLS owner returning a run acquired from this slot.
-        let _ = unsafe { slot_ref.return_available(run) };
-        None
+        install(run)
     }
 
     fn run_cell(&self, class: SizeClass) -> &Cell<*mut Run> {
@@ -307,16 +306,15 @@ impl ThreadHeap {
         let heap_id = self.heap_id.replace(None);
         self.slot.set(core::ptr::null_mut());
 
-        // SAFETY: this TLS entry retained inner while bound.
-        let inner_ref = unsafe { inner.as_ref() };
-
-        if let Some(heap_id) = heap_id
-            && inner_ref
-                .directory
-                .retire(heap_id, inner_ref.pages())
-                .is_err()
-        {
-            Allocator::abort();
+        if let Some(heap_id) = heap_id {
+            // SAFETY: this TLS entry retained inner while bound; project then drop before release.
+            let retired = unsafe {
+                let inner = inner.as_ref();
+                inner.directory.retire(heap_id, inner.pages())
+            };
+            if retired.is_err() {
+                Allocator::abort();
+            }
         }
 
         AllocatorInner::release(inner);

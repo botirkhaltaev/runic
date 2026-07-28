@@ -21,7 +21,7 @@
 - One abort sink: `Allocator::abort`. Preserve abort kinds through `HeapError` (`InvalidRunPointer` / `InvalidExtentPointer` / `MissingExtent`). Never hold the directory lifecycle mutex across a user-memory copy.
 - No allocator-internal `Vec` / `Box` / `HashMap` / `String` / formatting / panic unless recursion risk is addressed.
 - `#![deny(unsafe_op_in_unsafe_fn)]`. No test-only methods on production `impl` blocks.
-- No backward-compat or parallel old paths when reshaping APIs.
+- No backward compatibility for public or internal APIs — reshape in place; delete dual paths, aliases, and parallel old names. Best architecture and code always win.
 - Nested `AGENTS.md`: subtree rules only; closest wins; shorter than root; no root duplication; <60 lines (cap 100). Update the matching `README.md` when APIs change. Skill: `.agents/skills/agents-md`.
 
 ## Commands
