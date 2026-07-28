@@ -2,24 +2,26 @@
 
 ## Goals
 
-- Performance is the top design priority on hot paths (simple, direct, minimal work).
-- Prefer safe idiomatic Rust; use `unsafe` only where needed for OS/ownership contracts or measured hot-path performance (narrow blocks + SAFETY comments).
-- Best-practice allocator design: explicit ownership entities, fail-closed frees, auditable invariants — not line-for-line ports.
-- General composable clean APIs; no one-caller overfit methods, shims, or `*_slow` / `*_miss` / `*_nonlocal` names (`#[cold]` only).
+- Hot-path performance first: simple, direct, minimal work.
+- Safe idiomatic Rust; `unsafe` only for OS/ownership contracts or measured hot paths (narrow + SAFETY).
+- Explicit ownership entities, fail-closed frees, auditable invariants — not line-for-line ports.
+- Composable APIs: behavior on the owning entity; no one-caller shims, pass-throughs, dual APIs, or `*_v2` / `*_slow` / `*_miss` / `*_nonlocal` names (`#[cold]` only).
 
 ## Conventions
 
-- Put behavior on the owning entity; prefer `NonZero*` / `NonNull` / named fields; avoid free one-line helpers and pass-throughs.
-- **One handle** — never pass the same object as both `NonNull<T>` and `&T`. Project fields once at the boundary; do not thread `&AllocatorInner` alongside `&PageMap` / `&HeapDirectory`.
-- Owner-local TLS: `ThreadHeap::{alloc,alloc_extent,free_run,free_extent}` take `NonNull<AllocatorInner>` (identity) plus `&PageMap` projected once at `Allocator`. Cold unbound: `Allocator::{alloc_unbound,free_cross_heap}`. Domain: `free` / `claim` / `accept`. Naming: frontend `alloc`, domain block `allocate`, checkout `acquire`.
-- One remote-free protocol: claim → `HeapSlot::enqueue` (Active push-or-coalesce; lease only if newly queued) or `HeapDirectory::lock` → `LockedSlot` (exclusive) → owner `flush` drains via `accept`. Coalescing is by owner (`Inbox`), not a per-thread batch.
-- Flush policy: sticky empty = local/OS acquire then flush; unbound cold alloc = flush then alloc; sticky free hit = `Run::free` only (no available relink).
-- `Layout` only at the public boundary; convert once to `LayoutSpec` and pass it inward (`SizeClasses::class_for`, extents, resize).
-- No shared/root ownership heap; every run/extent is stamped with `HeapId`. `HeapSlot` owns run/extent metadata (no thin `Heap` shell).
-- Exactly one abort sink: `Allocator::abort`. Never hold the directory lifecycle mutex across a user-memory copy.
+- Prefer `NonZero*` / `NonNull` / named fields; no free one-line helpers.
+- **One handle** — never the same object as both `NonNull<T>` and `&T`. Project fields once at the boundary; do not thread `&AllocatorInner` with `&PageMap` / `&HeapDirectory`.
+- TLS hot paths: `ThreadHeap::{alloc,alloc_extent,free_run,free_extent,lookup_owner}` take `NonNull<AllocatorInner>` (identity) + `&PageMap` projected once at `Allocator`. Cold unbound: `Allocator::{alloc_unbound,free_cross_heap}`.
+- Naming: frontend `alloc`, domain block/extent `allocate`, checkout `acquire`. Domain free protocol: `free` / `claim` / `accept`.
+- Remote free: claim → `HeapSlot::enqueue` (Active; lease only if newly queued) or `HeapDirectory::lock` → `LockedSlot` → owner `flush` → `accept`. Coalesce by owner (`Inbox`), never a freer TLS batch.
+- Flush policy: sticky empty = local/OS acquire then flush (`refill_sticky`); unbound = flush then alloc; sticky free hit = `Run::free` only (no available relink).
+- `Layout` only at the public boundary → `LayoutSpec` inward once.
+- No root/shared ownership heap; every run/extent has `HeapId`. `HeapSlot` owns metadata via private `SlotHeap` (no thin public `Heap`).
+- One abort sink: `Allocator::abort`. Preserve abort kinds through `HeapError` (`InvalidRunPointer` / `InvalidExtentPointer` / `MissingExtent`). Never hold the directory lifecycle mutex across a user-memory copy.
 - No allocator-internal `Vec` / `Box` / `HashMap` / `String` / formatting / panic unless recursion risk is addressed.
 - `#![deny(unsafe_op_in_unsafe_fn)]`. No test-only methods on production `impl` blocks.
-- When editing any `AGENTS.md`, follow `.agents/skills/agents-md`: nested files only for subtree-specific rules; closest wins; shorter than root; no root duplication; target <60 lines (hard cap 100). Revamp/clean the nearest file when APIs change; update the matching `README.md`.
+- No backward-compat or parallel old paths when reshaping APIs.
+- Nested `AGENTS.md`: subtree rules only; closest wins; shorter than root; no root duplication; <60 lines (cap 100). Update the matching `README.md` when APIs change. Skill: `.agents/skills/agents-md`.
 
 ## Commands
 
@@ -31,6 +33,7 @@
 | Format | `cargo fmt --all` |
 | Lint | `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
 | Bench build | `cargo bench -p runic-bench --no-run` |
+| Profile | `scripts/profile.sh` |
 
 ## External References
 
