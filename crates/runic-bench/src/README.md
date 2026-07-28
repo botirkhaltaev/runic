@@ -20,7 +20,7 @@ belongs in the Criterion benchmark targets.
 
 - `setup_lifecycle_*` Criterion groups call spawn/join inside each iteration — use for lifecycle noise, not allocator hot-path profiles.
 - `persistent_*` groups spawn workers once per Criterion sample via `iter_custom` and time only `run_round` — use with `scripts/profile.sh`.
-- `persistent_bound_remote_batch` / `persistent_unbound_remote_singleton` allocate outside the timed region (`prepare_round`) and time only channel-free freer drains (`run_free_round`).
+- `persistent_bound_remote` / `persistent_unbound_remote` allocate outside the timed region (`prepare_round`) and time only channel-free freer drains (`run_free_round`).
 - `persistent_owner_accept` runs prepare + free outside timing and measures owner `run_accept_round` (flush/accept) only.
 - `persistent_remote_fan_in` honors freer `live` backlog depth; `persistent_owner_concurrent` mixes owner-local churn with remote frees (not a fan-in alias).
 - `persistent_remote_reuse_latency` varies freer backlog via `live:{1,32,256}`; Criterion duration is measured reuse latency and emits `runic_mean_reuse_ns=`.

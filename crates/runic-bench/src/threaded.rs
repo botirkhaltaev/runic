@@ -49,17 +49,13 @@ pub fn thread_local_churn(target: AllocatorTarget, threads: usize, ops_per_threa
 /// Sends allocations around a thread ring and frees them on another thread.
 ///
 /// Spawns and joins workers inside the call — setup/lifecycle noise included.
-/// Prefer [`PersistentCrossThreadRing`] for allocator-path profiles.
+/// Prefer [`FreeRing`] for allocator-path profiles.
 ///
 /// # Panics
 ///
 /// Panics if layout construction, allocation, channel operations, or thread joins fail.
 #[must_use]
-pub fn cross_thread_free_ring(
-    target: AllocatorTarget,
-    threads: usize,
-    ops_per_thread: usize,
-) -> usize {
+pub fn remote_free_ring(target: AllocatorTarget, threads: usize, ops_per_thread: usize) -> usize {
     let layout = Layout::from_size_align(64, 8).unwrap();
 
     thread::scope(|scope| {
@@ -143,7 +139,7 @@ pub fn mixed_thread_random(
 /// Panics on layout, channel, or join failure.
 #[must_use]
 pub fn draining_late_free(target: AllocatorTarget, threads: usize, ops_per_thread: usize) -> usize {
-    cross_thread_free_ring(target, threads, ops_per_thread)
+    remote_free_ring(target, threads, ops_per_thread)
 }
 
 enum WorkerCmd {
@@ -223,14 +219,14 @@ impl Drop for PersistentLocalChurn {
 }
 
 /// Persistent cross-thread free ring with a configurable live-set depth.
-pub struct PersistentCrossThreadRing {
+pub struct FreeRing {
     cmds: Vec<mpsc::Sender<WorkerCmd>>,
     results: Arc<Mutex<Vec<usize>>>,
     done: Arc<Barrier>,
     joins: Vec<JoinHandle<()>>,
 }
 
-impl PersistentCrossThreadRing {
+impl FreeRing {
     /// # Panics
     ///
     /// Panics on channel or spawn failure.
@@ -316,7 +312,7 @@ impl PersistentCrossThreadRing {
     }
 }
 
-impl Drop for PersistentCrossThreadRing {
+impl Drop for FreeRing {
     fn drop(&mut self) {
         for tx in &self.cmds {
             let _ = tx.send(WorkerCmd::Shutdown);
@@ -759,16 +755,16 @@ impl Drop for PersistentRemoteReuse {
     }
 }
 
-enum ChannelFreeCmd {
+enum RemoteFreeCmd {
     FreeRound,
     Shutdown,
 }
 
 /// Channel-free remote free: owner fills a shared pointer array; freers drain slices.
 ///
-/// Bound mode binds each freer TLS once at spawn (`claim → TLS batch → publish`).
-/// Unbound mode never binds freers (singleton publish path).
-pub struct PersistentChannelFreeRemote {
+/// Bound mode binds each freer TLS once at spawn (`claim → enqueue`).
+/// Unbound mode never binds freers (claim→enqueue without TLS bind).
+pub struct RemoteFree {
     target: AllocatorTarget,
     layout: Layout,
     capacity_per_freer: usize,
@@ -776,17 +772,13 @@ pub struct PersistentChannelFreeRemote {
     ops_per_freer: Arc<AtomicUsize>,
     checksum: Arc<AtomicUsize>,
     done: Arc<Barrier>,
-    cmds: Vec<mpsc::Sender<ChannelFreeCmd>>,
+    cmds: Vec<mpsc::Sender<RemoteFreeCmd>>,
     joins: Vec<JoinHandle<()>>,
 }
 
-/// Bound freers: channel-free `claim → TLS batch → publish`.
-pub type PersistentBoundRemoteBatch = PersistentChannelFreeRemote;
-
-/// Never-bound freers: channel-free singleton publish path.
-pub type PersistentUnboundRemoteSingleton = PersistentChannelFreeRemote;
-
-impl PersistentChannelFreeRemote {
+/// Bound freers: channel-free `claim → enqueue`.
+/// Never-bound freers: channel-free enqueue path (`spawn_unbound`).
+impl RemoteFree {
     /// Already-bound freers draining owner-filled slices without per-element `mpsc`.
     #[must_use]
     pub fn spawn_bound(target: AllocatorTarget, freers: usize) -> Self {
@@ -843,8 +835,8 @@ impl PersistentChannelFreeRemote {
                 ready.wait();
                 while let Ok(cmd) = rx.recv() {
                     match cmd {
-                        ChannelFreeCmd::Shutdown => break,
-                        ChannelFreeCmd::FreeRound => {
+                        RemoteFreeCmd::Shutdown => break,
+                        RemoteFreeCmd::FreeRound => {
                             let ops = ops_per_freer.load(Ordering::Acquire);
                             let base = freer_index * capacity_per_freer;
                             let mut local = 0_usize;
@@ -915,7 +907,7 @@ impl PersistentChannelFreeRemote {
     pub fn run_free_round(&self) -> usize {
         self.checksum.store(0, Ordering::Relaxed);
         for tx in &self.cmds {
-            tx.send(ChannelFreeCmd::FreeRound).unwrap();
+            tx.send(RemoteFreeCmd::FreeRound).unwrap();
         }
         self.done.wait();
         self.checksum.load(Ordering::Relaxed)
@@ -938,10 +930,10 @@ impl PersistentChannelFreeRemote {
     }
 }
 
-impl Drop for PersistentChannelFreeRemote {
+impl Drop for RemoteFree {
     fn drop(&mut self) {
         for tx in &self.cmds {
-            let _ = tx.send(ChannelFreeCmd::Shutdown);
+            let _ = tx.send(RemoteFreeCmd::Shutdown);
         }
         for handle in self.joins.drain(..) {
             let _ = handle.join();

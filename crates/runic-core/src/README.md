@@ -7,7 +7,7 @@ Allocator core organized around entities and invariants.
 - `allocator`: public core facade and abort boundary used by the global wrapper.
 - `arena`: grow-on-demand freelist object table for heap/run/extent metadata (each chunk owns a `Mapping`; hard `max`; fixed chunk directory).
 - `config`: allocator and extent retention/reuse configuration.
-- `heap`: owner-local heaps, run/extent heaps, `HeapDirectory`, and thread binding.
+- `heap`: owner-local heaps, run/extent heaps, `Heaps`, and thread binding.
 - `layout`: normalized layout semantics and mapping sizing (`align` as `NonZeroUsize`; `mapping_len` uses `size + align - 1`).
 - `memory`: address ranges, mmap ownership, and page-indexed owner lookup.
 - `size_class`: one size-class declaration generates `SizeClass::index_of` and lookup tables. `SizeClass` is minted only by `SizeClasses::class_for`.

@@ -14,7 +14,7 @@ use crate::{
 
 use super::{
     HeapId,
-    table::inbox::{InboxLink, InboxNode},
+    inbox::{InboxLink, InboxNode},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,7 +71,7 @@ pub(crate) struct Extent {
     mapping: Mapping,
     range: AddressRange,
     state: AtomicU8,
-    /// Coalesced inbox membership (see `heap::table::inbox`). Only ever queued while
+    /// Coalesced inbox membership (see `heap::inbox`). Only ever queued while
     /// exactly one claim can be outstanding (`Claimed`), so no bulk scan is needed —
     /// unlike `Run`, `accept` is a single exact-pointer transition.
     link: InboxLink<Extent>,
@@ -125,7 +125,7 @@ impl Extent {
     }
 
     /// Allocated or claimed — cached Free extents are not live.
-    pub(crate) fn has_live_allocation(&self) -> bool {
+    pub(crate) fn is_live(&self) -> bool {
         matches!(
             self.load_state(),
             Ok(ExtentState::Allocated | ExtentState::Claimed)

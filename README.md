@@ -35,7 +35,7 @@ fn main() {
 Runic v0.5 implements:
 
 - `GlobalAlloc`
-- owner-local heaps via `HeapDirectory` / `ThreadHeap`
+- owner-local heaps via `Heaps` / `ThreadHeap`
 - `HeapId` ownership on runs and extents
 - lock-free remote-free run/extent inboxes with claim → enqueue → flush/`accept`
 - private run claim-bitmap remote admission (owner free uses store/recheck, not byte CAS)

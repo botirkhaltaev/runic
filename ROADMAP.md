@@ -37,12 +37,12 @@ Latest published release: `0.5.0`.
 Current `master` ships the v0.5 owner-local heap frontend: TLS heaps own runs and
 extents stamped with `HeapId`, private run claim-bitmap remote admission, run/extent
 `Inbox` coalesced by owner, and Draining lifecycle after thread exit, with explicit
-page-map ownership.
+page-map ownership. Heap lifecycle lives on `Heaps` / `Heap`
+(Heaps indexes each Heap; each `Heap` owns inboxes and `RunHeap`/`ExtentHeap`).
 
-Branch `perf/close-local-churn-gap` (PR1–PR3) removes owner-local `lock cmpxchg`
-on run free, coalesces remote publication by run, and adds phase-isolated benches.
-Measured on Linux x86_64 (paired Runic cycles/op): 64-byte owner_free −23%,
-churn −12%, fan-in −35%, remote-reuse latency −15% vs pre-change baseline.
+Local free/churn hot paths use claim-bitmap run free (no owner `lock cmpxchg`) and
+owner-coalesced remote publication. Measured on Linux x86_64 (paired Runic cycles/op
+vs pre-claim-bitmap baseline): 64-byte owner_free −23%, churn −12%, fan-in −35%.
 Small local churn remains ~2.7× snmalloc on the same host (TLS + metadata residue;
 not parity).
 
@@ -61,7 +61,7 @@ Build only:
 Linux x86_64
 Rust stable
 GlobalAlloc
-owner-local heaps via HeapDirectory / ThreadHeap
+owner-local heaps via Heaps / ThreadHeap
 mmap-backed runs for size-classed allocations
 mmap-backed extents for dedicated allocations (heap-local)
 out-of-line metadata
@@ -119,11 +119,10 @@ Use this architecture first:
 GlobalAlloc
   -> RunicAlloc
       -> Allocator
-          -> AllocatorInner { refs, pages: PageMap, directory: HeapDirectory }
-              -> HeapDirectory { published[], state: Mutex<Arena<HeapSlot>> }
+          -> AllocatorInner { refs, pages: PageMap, heaps: Heaps }
+              -> Heaps { published[], arena: Mutex<Arena<Heap>>, config }
                   -> ThreadHeap
-              -> HeapSlot { SlotState, Inbox, UnsafeCell<Heap> }
-                  -> Heap { RunHeap, ExtentHeap }
+              -> Heap { HeapState, Inbox, id, RunHeap, ExtentHeap }
                   -> RunHeap { Arena<Run>, available[] }
                   -> ExtentHeap { Arena<Extent>, cache }
               -> Run
@@ -131,31 +130,35 @@ GlobalAlloc
               -> OsMemory
 ```
 
-`HeapDirectory::slot` / Active `publish` are lock-free via published pointers and
-SlotState publisher leases. Acquire, retire, Draining accept/free, and reclaim take the private
-directory lifecycle mutex. Same-thread small-run hits use TLS-owned heap metadata.
-`PageMap` stays outside that mutex so dealloc lookup is not directory-locked.
+`Heaps::get` / Active enqueue are lock-free via published pointers and
+`HeapState` enqueue leases (lease before new `try_queue`). Arena mutex covers
+acquire / Free reactivation only. Draining exclusivity is `LockedHeap` (not the
+heaps arena mutex across flush). Shared `&Heap` is atomics-only; Active body
+mutation is `ThreadHeap` only; reclaim is `LockedHeap` Drop only.
+Same-thread small-run hits use TLS-owned heap metadata with no locks or atomics.
+`PageMap` stays outside heaps arena locks so dealloc lookup is not heaps-locked.
 
 ## Entity Responsibilities
 
 ```text
 RunicAlloc     owns the Rust GlobalAlloc boundary.
-Allocator      owns the core public allocator API and abort boundary.
-AllocatorInner owns the refcounted mmap instance: PageMap, HeapDirectory, and self-hosting Mapping.
-Heap           owns run and extent allocation policy for one heap identity (no mode/inbox).
-HeapDirectory  owns published slot pointers, lock-free lookup/Active enqueue, and locked acquire/retire/lock→LockedSlot/reclaim.
-HeapSlot       owns SlotState (gen+mode+retired+publishers), Inbox, and UnsafeCell<Heap> metadata.
+Allocator      owns the core public allocator API, abort, and cold unbound routing.
+AllocatorInner owns the refcounted mmap instance: PageMap, Heaps, and self-hosting Mapping.
+Heaps           owns published heap pointers, lock-free get, arena acquire/reuse, and LockedHeap construction (`lock`).
+Heap           owns HeapState, Inbox, and run/extent metadata; shared surface is atomics only (`enqueue` / mode).
+LockedHeap     owns exclusive Draining body access to one Heap (flush / late free / reclaim on Drop).
 Arena          owns fixed-capacity freelist metadata storage.
 LayoutSpec     owns normalized layout semantics.
 SizeClasses    owns size-class selection.
 OsMemory       maps anonymous pages; Mapping owns the mmap lifecycle (Drop munmaps).
 PageMap        owns page-indexed owner-pointer lookup.
-RunHeap        owns Arena<Run>, small-allocation policy, and available run lists.
+RunHeap        owns Arena<Run>, run checkout (acquire), and available run lists.
 Run            owns fixed-block allocation metadata, freelist-primary Free/Live, bump, and embedded InboxLink.
 BlockStates    owns clear/Free per-block bytes (one AtomicU8 per block); Free bit is DF fail-closed, not Free/Live authority.
 ExtentHeap     owns Arena<Extent>, dedicated allocation policy, and mapping reuse.
 ExtentCache    owns retained extent mappings, eviction, and reuse lookup.
 Extent         owns dedicated allocation metadata, embedded InboxLink, and Claimed byte state.
+ThreadHeap     owns TLS bind, sticky runs, page→run cache, and the sole Active body path.
 ```
 
 Prefer direct methods on the entity that owns the state. Do not add passive
@@ -198,8 +201,8 @@ realloc prefix preservation and in-place growth
 subprocess abort cases
 Box, Vec, String, HashMap, Arc smoke tests
 deterministic randomized allocation traces
-Active publisher-lease remote free and Draining late free
-thread-exit / never-bound freer TLS batch publish
+Active lease remote free and Draining late free
+thread-exit / never-bound freer claim→enqueue (no TLS batch)
 ```
 
 Abort tests must run in subprocesses, not inside the test harness process.
@@ -299,7 +302,7 @@ Delivered:
 ```text
 HeapId ownership on Run and Extent (no Owner/root heap)
 ThreadHeap frontend for small and large allocations
-per-thread heap ownership through HeapDirectory / HeapSlot
+per-thread heap ownership through Heaps / Heap / ThreadHeap
 explicit block states for reusable and allocated run blocks; extent Claimed
 run/extent Inbox coalesced by owner (claim → enqueue → accept)
 private run claim-bitmap remote admission (owner free store/recheck; no owner lock cmpxchg)

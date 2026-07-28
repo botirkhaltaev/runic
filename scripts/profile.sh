@@ -344,9 +344,9 @@ resolve_bench_bin() {
 
   bin=$(
     python3 - "$json_log" "$target" <<'PY'
-import json, sys
+import json, os, sys
 path, name = sys.argv[1], sys.argv[2]
-exe = None
+candidates = []
 with open(path, encoding="utf-8") as f:
     for line in f:
         line = line.strip()
@@ -364,11 +364,18 @@ with open(path, encoding="utf-8") as f:
         if "bench" not in (target.get("kind") or []):
             continue
         candidate = msg.get("executable")
-        if candidate:
-            exe = candidate
-if not exe:
+        if not candidate:
+            continue
+        candidates.append((bool(msg.get("fresh")), candidate))
+if not candidates:
     sys.exit(1)
-print(exe)
+# Prefer a freshly built artifact; otherwise the newest mtime (stale fingerprints linger).
+fresh = [c for is_fresh, c in candidates if is_fresh]
+pool = fresh or [c for _, c in candidates]
+pool = [c for c in pool if os.path.isfile(c)]
+if not pool:
+    sys.exit(1)
+print(max(pool, key=lambda p: os.path.getmtime(p)))
 PY
   ) || die "failed to resolve bench executable for $target (see $json_log)"
 

@@ -16,10 +16,10 @@ use crate::{
 
 use super::{
     HeapId,
-    table::inbox::{InboxLink, InboxNode},
+    inbox::{InboxLink, InboxNode},
 };
 
-pub(crate) use heap::{RunHeap, RunHeapError};
+pub(crate) use heap::RunHeap;
 
 pub(crate) const RUN_SIZE: usize = 64 * 1024;
 /// Bits per claim-bitmap word (`AtomicU64`).
@@ -241,7 +241,7 @@ pub(crate) struct Run {
     mapping: Mapping,
     /// Mirror of `RunState.bump` for remote `claim`. Cold.
     issued: AtomicUsize,
-    /// Coalesced-by-run inbox membership (see `heap::table::inbox`). Cold.
+    /// Coalesced-by-run inbox membership (see `heap::inbox`). Cold.
     link: InboxLink<Run>,
 }
 
@@ -335,7 +335,6 @@ impl Run {
         })
     }
 
-    #[cfg(test)]
     pub(crate) const fn id(&self) -> RunId {
         self.id
     }
@@ -361,7 +360,7 @@ impl Run {
     }
 
     /// Outstanding blocks on this run (allocated or remote-claimed).
-    pub(crate) fn has_live_blocks(&self) -> bool {
+    pub(crate) fn is_live(&self) -> bool {
         // SAFETY: read under owner-local access or table-locked reclaim.
         unsafe { &*self.state.get() }.live != 0
     }
@@ -441,7 +440,7 @@ impl Run {
         Ok(())
     }
 
-    /// Freer: reserve remote admission before batch/publish payload reuse.
+    /// Freer: reserve remote admission before publish / payload reuse.
     ///
     /// Handshake vs owner `free`: set claim bit, then Acquire-load Free. If Free
     /// already, clear the bit and fail closed.
@@ -1092,7 +1091,7 @@ mod tests {
 
     #[test]
     fn try_queue_wins_once_until_cleared() {
-        use super::super::table::inbox::Inbox;
+        use super::super::inbox::Inbox;
 
         let class = class_id(64, 8);
         let run = Run::new(
@@ -1126,14 +1125,14 @@ mod tests {
         assert!(inbox.push(run_ptr));
     }
 
-    /// Faithful simulation of the real `HeapSlot::flush` loop: a freer claims and
+    /// Faithful simulation of the real `Heap::flush` loop: a freer claims and
     /// pushes concurrently with an "owner" that drains the inbox and re-pushes
     /// when `accept` returns true. No claim may ever be stranded (wakeup proof).
     #[test]
     fn accept_wakeup_proof_no_claim_is_ever_stranded() {
         use core::sync::atomic::AtomicBool;
 
-        use super::super::table::inbox::Inbox;
+        use super::super::inbox::Inbox;
 
         let class = class_id(64, 8);
         let run = Run::new(
@@ -1184,6 +1183,6 @@ mod tests {
             }
         });
 
-        assert!(!run.has_live_blocks());
+        assert!(!run.is_live());
     }
 }
