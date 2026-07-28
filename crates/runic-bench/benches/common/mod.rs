@@ -1,15 +1,14 @@
-use std::time::Duration;
-
 use criterion::{Criterion, Throughput};
 use runic_bench::global_workload;
 
+#[path = "configure.rs"]
+mod configure;
+pub use configure::configure_group;
+
 pub fn register_global_collections(c: &mut Criterion, allocator: &str) {
     let mut group = c.benchmark_group(format!("global/{allocator}/collections"));
-    group
-        .sample_size(10)
-        .warm_up_time(Duration::from_millis(250))
-        .measurement_time(Duration::from_secs(1))
-        .throughput(Throughput::Elements(1_024));
+    configure_group(&mut group);
+    group.throughput(Throughput::Elements(1_024));
 
     group.bench_function("vec_push_clear", |bench| {
         bench.iter(|| global_workload::vec_push_clear(32, 1_024));
