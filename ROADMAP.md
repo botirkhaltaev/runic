@@ -37,8 +37,8 @@ Latest published release: `0.5.0`.
 Current `master` ships the v0.5 owner-local heap frontend: TLS heaps own runs and
 extents stamped with `HeapId`, private run claim-bitmap remote admission, run/extent
 `Inbox` coalesced by owner, and Draining lifecycle after thread exit, with explicit
-page-map ownership. Heap lifecycle lives on `HeapDirectory` / `HeapSlot` (no thin
-public `Heap` shell); run/extent metadata is private `SlotHeap` inside each slot.
+page-map ownership. Heap lifecycle lives on `Heaps` / `Heap`
+(Heaps indexes each Heap; each `Heap` owns inboxes and `RunHeap`/`ExtentHeap`).
 
 Local free/churn hot paths use claim-bitmap run free (no owner `lock cmpxchg`) and
 owner-coalesced remote publication. Measured on Linux x86_64 (paired Runic cycles/op
@@ -61,7 +61,7 @@ Build only:
 Linux x86_64
 Rust stable
 GlobalAlloc
-owner-local heaps via HeapDirectory / ThreadHeap
+owner-local heaps via Heaps / ThreadHeap
 mmap-backed runs for size-classed allocations
 mmap-backed extents for dedicated allocations (heap-local)
 out-of-line metadata
@@ -119,10 +119,10 @@ Use this architecture first:
 GlobalAlloc
   -> RunicAlloc
       -> Allocator
-          -> AllocatorInner { refs, pages: PageMap, directory: HeapDirectory }
-              -> HeapDirectory { published[], state: Mutex<Arena<HeapSlot>> }
+          -> AllocatorInner { refs, pages: PageMap, heaps: Heaps }
+              -> Heaps { published[], arena: Mutex<Arena<Heap>>, config }
                   -> ThreadHeap
-              -> HeapSlot { SlotState, Inbox, SlotHeap{id, RunHeap, ExtentHeap} }
+              -> Heap { HeapState, Inbox, id, RunHeap, ExtentHeap }
                   -> RunHeap { Arena<Run>, available[] }
                   -> ExtentHeap { Arena<Extent>, cache }
               -> Run
@@ -130,19 +130,21 @@ GlobalAlloc
               -> OsMemory
 ```
 
-`HeapDirectory::slot` / Active enqueue are lock-free via published pointers and
-SlotState publisher leases. Acquire, retire, Draining accept/free, and reclaim take the private
-directory lifecycle mutex. Same-thread small-run hits use TLS-owned heap metadata.
-`PageMap` stays outside that mutex so dealloc lookup is not directory-locked.
+`Heaps::get` / Active enqueue are lock-free via published pointers and
+`HeapState` enqueue leases. Arena mutex covers acquire / Free reactivation only.
+Draining exclusivity is `LockedHeap` (not the heaps arena mutex across flush).
+Same-thread small-run hits use TLS-owned heap metadata with no locks or atomics.
+`PageMap` stays outside heaps arena locks so dealloc lookup is not heaps-locked.
 
 ## Entity Responsibilities
 
 ```text
 RunicAlloc     owns the Rust GlobalAlloc boundary.
 Allocator      owns the core public allocator API, abort, and cold unbound routing.
-AllocatorInner owns the refcounted mmap instance: PageMap, HeapDirectory, and self-hosting Mapping.
-HeapDirectory  owns published slot pointers, lock-free lookup/Active enqueue, and locked acquire/retire/lock→LockedSlot/reclaim.
-HeapSlot       owns SlotState (gen+mode+retired+publishers), Inbox, and run/extent metadata (RunHeap + ExtentHeap).
+AllocatorInner owns the refcounted mmap instance: PageMap, Heaps, and self-hosting Mapping.
+Heaps  owns published heap pointers, lock-free get/Active enqueue lookup, and arena acquire/reuse.
+Heap           owns HeapState (gen+mode+retired+leases), Inbox, and run/extent metadata (RunHeap + ExtentHeap).
+LockedHeap     owns exclusive Draining access to one Heap (flush / late free / reclaim).
 Arena          owns fixed-capacity freelist metadata storage.
 LayoutSpec     owns normalized layout semantics.
 SizeClasses    owns size-class selection.
@@ -154,7 +156,7 @@ BlockStates    owns clear/Free per-block bytes (one AtomicU8 per block); Free bi
 ExtentHeap     owns Arena<Extent>, dedicated allocation policy, and mapping reuse.
 ExtentCache    owns retained extent mappings, eviction, and reuse lookup.
 Extent         owns dedicated allocation metadata, embedded InboxLink, and Claimed byte state.
-ThreadHeap     owns TLS bind, sticky runs, and page→run cache.
+ThreadHeap     owns TLS bind, sticky runs, and page→run cache (Active capability).
 ```
 
 Prefer direct methods on the entity that owns the state. Do not add passive
@@ -197,7 +199,7 @@ realloc prefix preservation and in-place growth
 subprocess abort cases
 Box, Vec, String, HashMap, Arc smoke tests
 deterministic randomized allocation traces
-Active publisher-lease remote free and Draining late free
+Active lease remote free and Draining late free
 thread-exit / never-bound freer claim→enqueue (no TLS batch)
 ```
 
@@ -298,7 +300,7 @@ Delivered:
 ```text
 HeapId ownership on Run and Extent (no Owner/root heap)
 ThreadHeap frontend for small and large allocations
-per-thread heap ownership through HeapDirectory / HeapSlot
+per-thread heap ownership through Heaps / Heap / ThreadHeap
 explicit block states for reusable and allocated run blocks; extent Claimed
 run/extent Inbox coalesced by owner (claim → enqueue → accept)
 private run claim-bitmap remote admission (owner free store/recheck; no owner lock cmpxchg)

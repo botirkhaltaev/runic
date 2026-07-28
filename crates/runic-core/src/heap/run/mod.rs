@@ -16,7 +16,7 @@ use crate::{
 
 use super::{
     HeapId,
-    directory::inbox::{InboxLink, InboxNode},
+    inbox::{InboxLink, InboxNode},
 };
 
 pub(crate) use heap::RunHeap;
@@ -241,7 +241,7 @@ pub(crate) struct Run {
     mapping: Mapping,
     /// Mirror of `RunState.bump` for remote `claim`. Cold.
     issued: AtomicUsize,
-    /// Coalesced-by-run inbox membership (see `heap::directory::inbox`). Cold.
+    /// Coalesced-by-run inbox membership (see `heap::inbox`). Cold.
     link: InboxLink<Run>,
 }
 
@@ -1091,7 +1091,7 @@ mod tests {
 
     #[test]
     fn try_queue_wins_once_until_cleared() {
-        use super::super::directory::inbox::Inbox;
+        use super::super::inbox::Inbox;
 
         let class = class_id(64, 8);
         let run = Run::new(
@@ -1125,14 +1125,14 @@ mod tests {
         assert!(inbox.push(run_ptr));
     }
 
-    /// Faithful simulation of the real `HeapSlot::flush` loop: a freer claims and
+    /// Faithful simulation of the real `Heap::flush` loop: a freer claims and
     /// pushes concurrently with an "owner" that drains the inbox and re-pushes
     /// when `accept` returns true. No claim may ever be stranded (wakeup proof).
     #[test]
     fn accept_wakeup_proof_no_claim_is_ever_stranded() {
         use core::sync::atomic::AtomicBool;
 
-        use super::super::directory::inbox::Inbox;
+        use super::super::inbox::Inbox;
 
         let class = class_id(64, 8);
         let run = Run::new(

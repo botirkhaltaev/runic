@@ -25,13 +25,13 @@ Use these targets for same-machine `perf stat` comparisons of Runic changes with
 Setup/lifecycle (spawn/join inside the timed region — not for hot-path profiles):
 
 - `threaded/setup_lifecycle_thread_local_churn/runic/4`
-- `threaded/setup_lifecycle_cross_thread_free_ring/runic/4`
+- `threaded/setup_lifecycle_remote_free_ring/runic/4`
 - `threaded/setup_lifecycle_draining_late_free/runic/4`
 
 Persistent workers (preferred for allocator profiles):
 
 - `threaded/persistent_local_churn/runic/4`
-- `threaded/persistent_cross_thread_ring/runic/4/live:256`
+- `threaded/persistent_free_ring/runic/4/live:256`
 - `threaded/persistent_remote_fan_in/runic/4/live:256` — freer backlog depth is real
 - `threaded/persistent_owner_concurrent/runic/4/live:256` — owner-local churn + remote frees
 - `threaded/persistent_remote_reuse_latency/runic/live:1` (also `live:32`, `live:256`) — Criterion time is measured reuse latency; emits `runic_mean_reuse_ns=`

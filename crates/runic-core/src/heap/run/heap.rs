@@ -45,7 +45,7 @@ impl RunHeap {
     ) -> Option<NonNull<Run>> {
         let mapping = OsMemory::map(Run::mapping_len(class)?)?;
         let index = self.runs.claim()?;
-        let Some(id) = RunId::from_index(u32::try_from(index).ok()?) else {
+        let Some(id) = RunId::from_index(index) else {
             self.runs.release(index);
             return None;
         };
@@ -63,7 +63,7 @@ impl RunHeap {
         let was_full = run_ref.is_full();
         run_ref.free(ptr)?;
         if was_full {
-            self.push_available(run_ref.class().index(), run)?;
+            self.push_available(run)?;
         }
         Ok(())
     }
@@ -79,12 +79,12 @@ impl RunHeap {
         let was_full = run_ref.is_full();
         let needs_push = run_ref.accept();
         if was_full && !run_ref.is_full() {
-            self.push_available(run_ref.class().index(), run)?;
+            self.push_available(run)?;
         }
         Ok(needs_push)
     }
 
-    pub(crate) fn rebind_heap_id(&mut self, heap_id: HeapId) {
+    pub(crate) fn rebind(&mut self, heap_id: HeapId) {
         debug_assert!(self.runs.len() <= self.runs.capacity());
         let len = self.runs.len();
         for index in 0..len {
@@ -106,10 +106,18 @@ impl RunHeap {
         false
     }
 
-    pub(crate) fn return_available(&mut self, mut run_ptr: NonNull<Run>) -> Result<(), HeapError> {
+    pub(crate) fn push_available(&mut self, mut run_ptr: NonNull<Run>) -> Result<(), HeapError> {
         // SAFETY: caller supplies a pointer derived from this allocator's live arena.
         let run = unsafe { run_ptr.as_mut() };
-        self.push_available(run.class().index(), run_ptr)
+        if run.is_full() {
+            return Err(HeapError::InvalidMetadata);
+        }
+        let Some(available) = self.available.get_mut(run.class().index()) else {
+            return Err(HeapError::InvalidMetadata);
+        };
+        run.set_available_next(*available);
+        *available = Some(run_ptr);
+        Ok(())
     }
 
     fn take_available(&mut self, class: SizeClass) -> Option<NonNull<Run>> {
@@ -132,31 +140,9 @@ impl RunHeap {
         }
     }
 
-    fn push_available(
-        &mut self,
-        class_index: usize,
-        mut run_ptr: NonNull<Run>,
-    ) -> Result<(), HeapError> {
-        let Some(available) = self.available.get_mut(class_index) else {
-            return Err(HeapError::InvalidMetadata);
-        };
-
-        // SAFETY: caller supplies a pointer derived from this allocator's live arena.
-        let run = unsafe { run_ptr.as_mut() };
-
-        if run.is_full() {
-            return Err(HeapError::InvalidMetadata);
-        }
-
-        run.set_available_next(*available);
-        *available = Some(run_ptr);
-
-        Ok(())
-    }
-
     fn insert_run(
         &mut self,
-        index: usize,
+        index: u32,
         id: RunId,
         run: Run,
         pages: &PageMap,
@@ -167,7 +153,7 @@ impl RunHeap {
         }
 
         let Some(inserted_run) = self.runs.get_mut(index) else {
-            let _removed = self.runs.remove(usize::try_from(id.index()).ok()?);
+            let _removed = self.runs.remove(id.index());
             return None;
         };
         debug_assert_eq!(inserted_run.id(), id);
@@ -175,7 +161,7 @@ impl RunHeap {
 
         debug_assert_eq!(inserted_run.range().base(), inserted_run.mapping().base());
         if pages.publish_run(inserted_run.mapping(), run_ptr).is_err() {
-            let _removed = self.runs.remove(usize::try_from(id.index()).ok()?);
+            let _removed = self.runs.remove(id.index());
             return None;
         }
 
@@ -230,7 +216,7 @@ mod tests {
         let ptr = unsafe { run.as_mut() }.allocate()?;
         // SAFETY: RunHeap returns pointers to live runs from its arena.
         if !unsafe { run.as_ref() }.is_full() {
-            heap.return_available(run).ok()?;
+            heap.push_available(run).ok()?;
         }
         Some((run, ptr))
     }
@@ -268,8 +254,8 @@ mod tests {
         let mut heap = RunHeap::new(4);
         let pages = PageMap::new();
         let index = heap.runs.claim().unwrap();
-        let id = RunId::from_index(u32::try_from(index).unwrap()).unwrap();
-        assert_eq!(usize::try_from(id.index()).unwrap(), index);
+        let id = RunId::from_index(index).unwrap();
+        assert_eq!(id.index(), index);
         let run = reusable_run(id);
         let existing = NonNull::dangling();
         let base = run.range().base();
@@ -282,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn rebind_heap_id_rebinds_runs_off_the_available_list() {
+    fn rebind_rebinds_runs_off_the_available_list() {
         let mut heap = RunHeap::new(2);
         let pages = PageMap::new();
         let class = class_id(64, 8);
@@ -290,11 +276,11 @@ mod tests {
         let new = HeapId::new(0, core::num::NonZeroU32::new(2).unwrap()).unwrap();
 
         let run = heap.acquire(class, old, &pages).unwrap();
-        // Leave the run checked out (sticky-style): never return_available.
+        // Leave the run checked out (sticky-style): never push_available.
         // SAFETY: run came from this heap's live arena.
         assert_eq!(unsafe { run.as_ref() }.heap_id(), old);
 
-        heap.rebind_heap_id(new);
+        heap.rebind(new);
 
         // SAFETY: run remains a live arena entry after rebind.
         assert_eq!(unsafe { run.as_ref() }.heap_id(), new);

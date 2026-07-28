@@ -47,7 +47,7 @@ impl ExtentHeap {
         false
     }
 
-    pub(crate) fn rebind_heap_id(&mut self, heap_id: HeapId) {
+    pub(crate) fn rebind(&mut self, heap_id: HeapId) {
         let len = self.extents.len();
         for index in 0..len {
             let Some(extent) = self.extents.get_mut(index) else {
@@ -91,7 +91,7 @@ impl ExtentHeap {
         pages: &PageMap,
     ) -> Option<NonNull<u8>> {
         let index = self.extents.claim()?;
-        let Some(id) = ExtentId::from_index(u32::try_from(index).ok()?) else {
+        let Some(id) = ExtentId::from_index(index) else {
             self.extents.release(index);
             return None;
         };
@@ -156,7 +156,7 @@ impl ExtentHeap {
             .unpublish_extent(extent.mapping(), extent_ptr)
             .map_err(|_| HeapError::InvalidMetadata)?;
 
-        let index = usize::try_from(id.index()).map_err(|_| HeapError::InvalidMetadata)?;
+        let index = id.index();
         let Some(extent) = self.extents.remove(index) else {
             return Err(HeapError::MissingExtent);
         };
@@ -167,7 +167,7 @@ impl ExtentHeap {
 
     fn insert_extent(
         &mut self,
-        index: usize,
+        index: u32,
         id: ExtentId,
         extent: Extent,
         pages: &PageMap,
@@ -226,7 +226,7 @@ mod tests {
         let mut heap = ExtentHeap::new(4, ExtentConfig::new());
         let pages = PageMap::new();
         let index = heap.extents.claim().unwrap();
-        let id = ExtentId::from_index(u32::try_from(index).unwrap()).unwrap();
+        let id = ExtentId::from_index(index).unwrap();
         let extent = reusable_extent(id);
         let existing = NonNull::dangling();
         let base = extent.mapping().range().base();

@@ -33,7 +33,7 @@ impl<T> InboxLink<T> {
 
     /// Idle → Queued. `true` when this call won the transition.
     ///
-    /// Active freers call this *before* taking a publisher lease so coalesced claims skip
+    /// Active freers call this *before* taking an enqueue lease so coalesced claims skip
     /// the lease; [`Inbox::link`] then runs only for the winner under that lease.
     #[inline]
     pub(crate) fn try_queue(&self) -> bool {
@@ -73,7 +73,7 @@ impl<T: InboxNode> Inbox<T> {
 
     /// Queue `node` if not already queued. Returns `true` when newly queued and linked.
     ///
-    /// Already-queued → `false` (coalesce). Active freers that need a publisher lease must
+    /// Already-queued → `false` (coalesce). Active freers that need an enqueue lease must
     /// use [`InboxLink::try_queue`] then [`Self::link`] under the lease instead, so coalesced
     /// claims skip the lease entirely.
     pub(crate) fn push(&self, node: NonNull<T>) -> bool {
@@ -87,7 +87,7 @@ impl<T: InboxNode> Inbox<T> {
     }
 
     /// Treiber-link an already-queued `node`. Caller won [`InboxLink::try_queue`] (or holds
-    /// the directory lifecycle lock for an exclusive drain-path link).
+    /// the heaps exclusive path for an exclusive drain-path link).
     pub(crate) fn link(&self, node: NonNull<T>) {
         // SAFETY: `node` is a stable heap-owned entity for as long as it may be claimed.
         let link = unsafe { node.as_ref() }.link();

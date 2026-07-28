@@ -10,15 +10,16 @@
 
 ## Conventions
 
-- Prefer `NonZero*` / `NonNull` / named fields. Helper fns only when justified (real reuse, clearer ownership boundary, or a **profiled** cold-path factor) — not for one-call extract-method noise.
-- **One handle** — never the same object as both `NonNull<T>` and `&T`. Project fields once at the boundary; do not thread `&AllocatorInner` with `&PageMap` / `&HeapDirectory`.
-- TLS hot paths: `ThreadHeap::{alloc,alloc_extent,free_run,free_extent,lookup_owner}` take `NonNull<AllocatorInner>` (identity) + `&PageMap` projected once at `Allocator`. Cold unbound: `Allocator::{alloc_unbound,free_cross_heap}`.
-- Naming: frontend `alloc`, domain block/extent `allocate`, checkout `acquire`. Domain free protocol: `free` / `claim` / `accept`.
-- Remote free: claim → `HeapSlot::enqueue` (Active; lease only if newly queued) or `HeapDirectory::lock` → `LockedSlot` → owner `flush` → `accept`. Coalesce by owner (`Inbox`), never a freer TLS batch.
-- Flush policy: sticky empty = local/OS acquire then flush (`refill_sticky`); unbound = flush then alloc; sticky free hit = `Run::free` only (no available relink).
+- Prefer `NonZero*` / `NonNull` / named fields. No useless helpers — especially free (module-level) one-liners / cast wrappers / pass-throughs. Put behavior on the owning type; helpers only for real reuse, a clearer ownership boundary, or a **profiled** cold-path factor.
+- **One handle** — never the same object as both `NonNull<T>` and `&T`. Project fields once at the boundary; do not thread `&AllocatorInner` with `&PageMap` / `&Heaps`.
+- TLS hot paths: `ThreadHeap::{alloc,alloc_extent,free_run,free_extent,lookup}` take `NonNull<AllocatorInner>` (identity) + `&PageMap` projected once at `Allocator`. Cold unbound: `Allocator::{bind_alloc,free_remote}`.
+- Naming: short, clear, domain words only — same term means the same thing everywhere. No long compound jargon, invented synonyms, or parallel names for one concept. Frontend `alloc`, domain block/extent `allocate`, checkout `acquire`. Free protocol: `free` / `claim` / `accept`. Prefer existing vocabulary (`run`, `extent`, `heap`, `inbox`, `flush`, `bind`) over new coinages.
+- Indices: `Arena` / `HeapId` / `RunId` / `ExtentId` use `u32`; convert to `usize` only when indexing Rust arrays or doing pointer/byte math — no free cast-wrapper helpers.
+- Remote free: claim → `Heap::enqueue` (Active; lease only if newly queued) or `Heaps::lock` → `LockedHeap` → owner `flush` → `accept`. Coalesce by owner (`Inbox`), never a freer TLS batch.
+- Flush policy: sticky empty = local/OS acquire then flush (`refill`); unbound = flush then alloc; sticky free hit = `Run::free` only (no available relink).
 - `Layout` only at the public boundary → `LayoutSpec` inward once.
-- No root/shared ownership heap; every run/extent has `HeapId`. `HeapSlot` owns metadata via private `SlotHeap` (no thin public `Heap`).
-- One abort sink: `Allocator::abort`. Preserve abort kinds through `HeapError` (`InvalidRunPointer` / `InvalidExtentPointer` / `MissingExtent`). Never hold the directory lifecycle mutex across a user-memory copy.
+- No root/shared ownership heap; every run/extent has `HeapId`. `Heap` owns lifecycle, inboxes, and `RunHeap`/`ExtentHeap`. Active via `ThreadHeap`; Draining via `LockedHeap`.
+- One abort sink: `Allocator::abort`. Preserve abort kinds through `HeapError` (`InvalidRunPointer` / `InvalidExtentPointer` / `MissingExtent`). Never hold the heaps arena mutex across flush / accept / user-memory copies.
 - No allocator-internal `Vec` / `Box` / `HashMap` / `String` / formatting / panic unless recursion risk is addressed.
 - `#![deny(unsafe_op_in_unsafe_fn)]`. No test-only methods on production `impl` blocks.
 - No backward compatibility for public or internal APIs — reshape in place; delete dual paths, aliases, and parallel old names. Best architecture and code always win.

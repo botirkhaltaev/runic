@@ -20,12 +20,12 @@ fn configure_group(group: &mut criterion::BenchmarkGroup<'_, criterion::measurem
 
 pub fn register(c: &mut Criterion, suite: &str, targets: &[AllocatorTarget]) {
     register_setup_lifecycle_thread_local_churn(c, suite, targets);
-    register_setup_lifecycle_cross_thread_free_ring(c, suite, targets);
+    register_setup_lifecycle_remote_free_ring(c, suite, targets);
     register_setup_lifecycle_mixed_thread_random(c, suite, targets);
     register_setup_lifecycle_draining_late_free(c, suite, targets);
 
     register_persistent_local_churn(c, suite, targets);
-    register_persistent_cross_thread_ring(c, suite, targets);
+    register_persistent_free_ring(c, suite, targets);
     register_persistent_remote_fan_in(c, suite, targets);
     register_persistent_owner_concurrent(c, suite, targets);
     register_persistent_remote_reuse_latency(c, suite, targets);
@@ -58,12 +58,12 @@ fn register_setup_lifecycle_thread_local_churn(
     group.finish();
 }
 
-fn register_setup_lifecycle_cross_thread_free_ring(
+fn register_setup_lifecycle_remote_free_ring(
     c: &mut Criterion,
     suite: &str,
     targets: &[AllocatorTarget],
 ) {
-    let mut group = c.benchmark_group(format!("{suite}/setup_lifecycle_cross_thread_free_ring"));
+    let mut group = c.benchmark_group(format!("{suite}/setup_lifecycle_remote_free_ring"));
     configure_group(&mut group);
 
     for &target in targets {
@@ -73,8 +73,7 @@ fn register_setup_lifecycle_cross_thread_free_ring(
                 BenchmarkId::new(target.name(), threads),
                 &(target, threads),
                 |bench, &(target, threads)| {
-                    bench
-                        .iter(|| threaded::cross_thread_free_ring(target, threads, OPS_PER_THREAD));
+                    bench.iter(|| threaded::remote_free_ring(target, threads, OPS_PER_THREAD));
                 },
             );
         }
@@ -160,12 +159,8 @@ fn register_persistent_local_churn(c: &mut Criterion, suite: &str, targets: &[Al
     group.finish();
 }
 
-fn register_persistent_cross_thread_ring(
-    c: &mut Criterion,
-    suite: &str,
-    targets: &[AllocatorTarget],
-) {
-    let mut group = c.benchmark_group(format!("{suite}/persistent_cross_thread_ring"));
+fn register_persistent_free_ring(c: &mut Criterion, suite: &str, targets: &[AllocatorTarget]) {
+    let mut group = c.benchmark_group(format!("{suite}/persistent_free_ring"));
     configure_group(&mut group);
 
     for &target in targets {
@@ -177,8 +172,7 @@ fn register_persistent_cross_thread_ring(
                     &(target, threads, live),
                     |bench, &(target, threads, live)| {
                         bench.iter_custom(|iters| {
-                            let workers =
-                                threaded::PersistentCrossThreadRing::spawn(target, threads);
+                            let workers = threaded::FreeRing::spawn(target, threads);
                             let start = Instant::now();
                             for _ in 0..iters {
                                 black_box(workers.run_round(PERSISTENT_OPS, live));
@@ -317,8 +311,7 @@ fn register_persistent_bound_remote(c: &mut Criterion, suite: &str, targets: &[A
                 &(target, threads),
                 |bench, &(target, threads)| {
                     bench.iter_custom(|iters| {
-                        let workers =
-                            threaded::PersistentChannelFreeRemote::spawn_bound(target, threads);
+                        let workers = threaded::RemoteFree::spawn_bound(target, threads);
                         let mut elapsed = Duration::ZERO;
                         for _ in 0..iters {
                             black_box(workers.prepare_round(PERSISTENT_OPS));
@@ -349,8 +342,7 @@ fn register_persistent_unbound_remote(c: &mut Criterion, suite: &str, targets: &
                 &(target, threads),
                 |bench, &(target, threads)| {
                     bench.iter_custom(|iters| {
-                        let workers =
-                            threaded::PersistentChannelFreeRemote::spawn_unbound(target, threads);
+                        let workers = threaded::RemoteFree::spawn_unbound(target, threads);
                         let mut elapsed = Duration::ZERO;
                         for _ in 0..iters {
                             black_box(workers.prepare_round(PERSISTENT_OPS));
@@ -381,8 +373,7 @@ fn register_persistent_owner_accept(c: &mut Criterion, suite: &str, targets: &[A
                 &(target, threads),
                 |bench, &(target, threads)| {
                     bench.iter_custom(|iters| {
-                        let workers =
-                            threaded::PersistentChannelFreeRemote::spawn_bound(target, threads);
+                        let workers = threaded::RemoteFree::spawn_bound(target, threads);
                         let mut elapsed = Duration::ZERO;
                         for _ in 0..iters {
                             black_box(workers.prepare_round(PERSISTENT_OPS));
