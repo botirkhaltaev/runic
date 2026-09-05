@@ -48,20 +48,18 @@ page-map ownership. Heap lifecycle lives on `Heaps` / `Heap`
 (Heaps indexes each Heap; each `Heap` owns inboxes and `RunHeap`/`ExtentHeap`).
 
 Owner-local hit is a lockless TLS magazine (pop/push). `Run` is refill/`take` only.
-Measured on this host vs pre-magazine H0 (`compare_explicit` cycles/elem): 64-byte
-churn −41% (75.0 → 43.7). Isolated `owner_free` / `freelist_allocate` record
-flush/refill at watermark 32. #126 (O(1) free identity) skipped: post-magazine
-Where shows page-cache hit + page# on the free hit (~4% of churn); `PageMap::get`
-is cold on same-run churn; `owner_free_only` is `take` / `Run::free`. #128
-(batch take/refill) skipped: vs `5946084`, grouping take by run cost
-`owner_free_only` +53% (61.9 → 94.7) and regressed churn +29% (43.7 → 56.3);
-freelist −4% (under the ≥5% gate).
+#129 closeout on this host (`aa3a83a`, `compare_explicit` cycles/elem): 64-byte
+churn 43.6 vs snmalloc 27.4 (**1.6×**). Isolated `owner_free` 62.4 vs mimalloc
+13.6 (4.6×); `freelist` 44.6 vs snmalloc 16.3 (2.7×) — those phases pay
+`take`/`allocate` at watermark 32. Large 64 KiB churn: Runic **best** (110 vs
+mimalloc 133). Threaded local/4 is the same 1.6×; fan-in / ring are ~1.1–1.2×
+snmalloc. #126/#128 skipped (identity / batch take not ≥5% levers).
 
 The next milestone is:
 
 ```text
-Close out the local matrix (#129). Then #135 (per-CPU / RSEQ magazine).
-Do not retry identity or batch take; do not start #135 before the matrix.
+#135 per-CPU / RSEQ magazine vs this #129 baseline. Do not retry identity
+or batch take. Do not raise the watermark.
 ```
 
 ## Supported Scope
@@ -104,7 +102,7 @@ ML/lifetime placement
 stats dashboard
 ```
 
-After #129 only:
+Next:
 
 ```text
 per-CPU / RSEQ magazine (#135) — new entity, one hit, fail-closed DF
@@ -242,12 +240,29 @@ allocation paths.
 Current benchmark interpretation:
 
 ```text
-Owner-local hit is magazine pop/push (no per-op `Run`). Remaining small-churn
-cost is magazine links + TLS/`matches`, not PageMap. Isolated owner_free/freelist
-phases pay `take`/`allocate`. Do not raise the watermark to hide them.
+#129 matrix (this host, aa3a83a, compare_explicit cycles/elem):
 
-Remote fan-in improved via run-coalesced Inbox publication; cross-allocator ratios
-are informational (library/host drift) — use paired Runic cycles/op for PR gates.
+phase/64        runic  snmalloc  mimalloc  jemalloc   vs best
+owner_free       62.4      15.4      13.6      34.2    4.6× mi
+freelist         44.6      16.3      22.5      30.0    2.7× sn
+churn            43.6      27.4      33.4      32.1    1.6× sn
+
+Runic churn is flat ~43–45 across 8/64/80/4096. owner_free 50.9 / 62.4 / 62.6 /
+77.7. freelist 41.9 / 44.6 / 43.2 / 102.5 (4096 pays take).
+
+large_alloc_churn/65536: runic 110, mimalloc 133, jemalloc 883, snmalloc 1283.
+Runic wins on extent retention (Keep).
+
+threaded/4: local 46.3 vs snmalloc 29.2 (1.6×). fan-in 392 vs 349 (1.1×).
+ring 674 vs 576 (1.2×). Cross-allocator ratios are this-host Cost, not library drift.
+
+Owner-local hit is magazine pop/push (no per-op `Run`). Leftover small-churn
+cost is magazine links + TLS/`matches`. Isolated owner_free/freelist pay
+`take`/`allocate`. Do not raise the watermark to hide them. #135 is the next
+entity for the 1.6× churn gap.
+
+Remote fan-in is close (run-coalesced Inbox). Use paired Runic cycles/op for
+self-gates; use this table as the #135 competitor baseline.
 
 Dedicated extent churn is primarily controlled by mapping retention policy.
 Keep extent retention deterministic, bounded, and allocation-free.
@@ -338,7 +353,7 @@ tag: 0.5.0
 crates: runic-core 0.5.0, runic-alloc 0.5.0
 ```
 
-### v0.6 Next: Matrix closeout
+### v0.6 Delivered: Matrix closeout
 
 Goal:
 
@@ -347,36 +362,23 @@ After the magazine hit, only change owner-local identity or Run refill/take
 when Where shows a ≥5% lever. Otherwise close the local matrix honestly.
 ```
 
-Magazine landed on master (`#133`). Residue on the owner-local hit is no longer
-per-op `Run`. #126 (measured O(1) free identity) is **skip**: annotate of inlined
-`Allocator::dealloc` on this host (`5946084`) puts page# + TLS page-cache compare
-at ~10% of dealloc / ~4% of `single_size_churn`; `PageMap::get` / L1–L2 is ~0%
-on same-run churn. `owner_free_only` self-time is `free_magazine` / `RunHeap::free`
-/ `Magazine::allocate`, not lookup. Align-mask-to-`Run*` is also wrong here
-(out-of-line `Run` metadata).
-
-#128 (batch take/refill) is **skip**: one `Run` / available-list transition per
-taken group vs `5946084` Cost (`compare_explicit` cycles/elem) was
-`owner_free_only` 61.9 → 94.7 (+53%), `freelist_allocate_only` −4% (under gate),
-`single_size_churn` 43.7 → 56.3 (+29%). Per-block `Heap::free` on take stays.
-Do not raise the watermark.
-
-Cost remains `single_size_churn`. Isolated `owner_free_only` / `freelist_allocate_only`
-measure `take`/`allocate` and must not be gamed by raising the watermark.
-
-Acceptance gate:
+Delivered (`#129` on this host, `aa3a83a`):
 
 ```text
-#126: skip with Where (identity not a ≥5% lever)
-#128: skip with Cost (batch take not ≥5% on owner_free/freelist; churn must not regress)
-#129: matrix closeout vs best competitor; publish remaining gaps
-#135 waits on that baseline — do not start per-CPU in this milestone
-watermark stays 32
-owner-side validation of every remote free remains mandatory
-randomized cross-thread traces and abort cases remain intact
+magazine hit (#133): churn 75.0 → 43.6 (−42% vs H0)
+#125 native TLS: skip (LocalKey % was inlined dealloc)
+#126 identity: skip (~4% of churn; PageMap::get ~0%)
+#128 batch take: skip (owner_free +53%, churn +29%)
+#129 matrix: 1.6× snmalloc on churn/64; 4.6× mimalloc on owner_free/64;
+             2.7× snmalloc on freelist/64; Runic best on large 64 KiB
+             (110 vs mi 133); fan-in 1.1× / ring 1.2× snmalloc
+API audit: allocate_fresh → bump; no sticky / *_v2 leftovers
 ```
 
-### v0.7 Next after #129: Per-CPU / RSEQ magazine
+Raw Cost lives under `target/runic-profiles/*id129*`. Watermark stays 32.
+#135 uses this table as the competitor baseline.
+
+### v0.7 Next: Per-CPU / RSEQ magazine
 
 Goal:
 
@@ -386,7 +388,7 @@ A per-CPU (or RSEQ) magazine owns the next hit. One path. Fail-closed DF
 and remote exact-once stay. Not a port of snmalloc.
 ```
 
-Blocked on #129. Issue: `#135`.
+Baseline: #129 closeout on this host. Issue: `#135`.
 
 In:
 
