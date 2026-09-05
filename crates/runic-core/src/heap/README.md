@@ -52,4 +52,12 @@ Pop/push are `Cell` loads/stores and an intrusive payload `usize` link. No mutex
 
 **Linearization (take-closed DF).** Remote `claim` still handshakes against Free. A magazine-resident block is still Clear, so `claim` can win until `take`. That free is exact-once on the remote path. `Run::free` returns `Claimed` if claim already won (`accept` publishes). Owner double-free (two pushes of the same pointer) is detected at `take` (second `free` sees Free), not on the second push. Unbind takes every class so no magazine object is stranded.
 
-`lookup` + the page cache stay on owner free (dropping identity is a later issue). Extents have no magazine.
+`lookup` + the page cache stay on owner free. Post-magazine Where on this host
+(`5946084`): identity is page# + cache compare (~10% of inlined `dealloc`, ~4% of
+churn). `PageMap::get` is ~0% on same-run churn. Isolated `owner_free` is
+`take` / `Run::free`, not lookup. #126 skipped — not a ≥5% lever.
+
+#128 skipped: grouping a taken magazine by run (one `RunState` / available-list
+transition) vs `5946084` Cost: `owner_free_only` 61.9 → 94.7 cyc/elem (+53%),
+`freelist_allocate_only` −4% (under gate), `single_size_churn` 43.7 → 56.3
+(+29%). Per-block `Heap::free` on take stays. Extents have no magazine.

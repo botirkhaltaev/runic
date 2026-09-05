@@ -40,17 +40,21 @@ extents stamped with `HeapId`, private run claim-bitmap remote admission, run/ex
 page-map ownership. Heap lifecycle lives on `Heaps` / `Heap`
 (Heaps indexes each Heap; each `Heap` owns inboxes and `RunHeap`/`ExtentHeap`).
 
-Local free/churn hot paths use claim-bitmap run free (no owner `lock cmpxchg`) and
-owner-coalesced remote publication. Measured on Linux x86_64 (paired Runic cycles/op
-vs pre-claim-bitmap baseline): 64-byte owner_free −23%, churn −12%, fan-in −35%.
-Small local churn remains ~2.7× snmalloc on the same host (TLS + metadata residue;
-not parity).
+Owner-local hit is a lockless TLS magazine (pop/push). `Run` is refill/`take` only.
+Measured on this host vs pre-magazine H0 (`compare_explicit` cycles/elem): 64-byte
+churn −41% (75.0 → 43.7). Isolated `owner_free` / `freelist_allocate` record
+flush/refill at watermark 32. #126 (O(1) free identity) skipped: post-magazine
+Where shows page-cache hit + page# on the free hit (~4% of churn); `PageMap::get`
+is cold on same-run churn; `owner_free_only` is `take` / `Run::free`. #128
+(batch take/refill) skipped: vs `5946084`, grouping take by run cost
+`owner_free_only` +53% (61.9 → 94.7) and regressed churn +29% (43.7 → 56.3);
+freelist −4% (under the ≥5% gate).
 
 The next milestone is:
 
 ```text
-Reduce TLS entry and page-map lookup overhead on owner-local alloc/dealloc without
-weakening fail-closed ownership or multi-allocator thread safety.
+Close out the local matrix (#129). Do not rewrite identity or take/refill
+without a new ≥5% Where/Cost hit.
 ```
 
 ## Supported Scope
@@ -226,9 +230,9 @@ allocation paths.
 Current benchmark interpretation:
 
 ```text
-Owner-local run free no longer uses lock cmpxchg (claim-bitmap handshake). Remaining
-small-churn cost is mostly TLS entry (`LocalKey::with`) and page-map lookup, not
-per-block byte CAS.
+Owner-local hit is magazine pop/push (no per-op `Run`). Remaining small-churn
+cost is magazine links + TLS/`matches`, not PageMap. Isolated owner_free/freelist
+phases pay `take`/`allocate`. Do not raise the watermark to hide them.
 
 Remote fan-in improved via run-coalesced Inbox publication; cross-allocator ratios
 are informational (library/host drift) — use paired Runic cycles/op for PR gates.
@@ -322,31 +326,39 @@ tag: 0.5.0
 crates: runic-core 0.5.0, runic-alloc 0.5.0
 ```
 
-### v0.6 Next: Owner-local TLS and lookup overhead
+### v0.6 Next: Matrix closeout
 
 Goal:
 
 ```text
-Reduce TLS entry and page-map lookup cost on owner-local alloc/dealloc while
-preserving fail-closed ownership, multi-allocator thread safety, and the
-claim → enqueue → accept protocol.
+After the magazine hit, only change owner-local identity or Run refill/take
+when Where shows a ≥5% lever. Otherwise close the local matrix honestly.
 ```
 
-Residue on the owner-local hit was per-op `Run` (ClaimBits / locate / freelist),
-not TLS + PageMap. The magazine hit is lockless pop/push; `Run` is refill/flush only.
+Magazine landed on master (`#133`). Residue on the owner-local hit is no longer
+per-op `Run`. #126 (measured O(1) free identity) is **skip**: annotate of inlined
+`Allocator::dealloc` on this host (`5946084`) puts page# + TLS page-cache compare
+at ~10% of dealloc / ~4% of `single_size_churn`; `PageMap::get` / L1–L2 is ~0%
+on same-run churn. `owner_free_only` self-time is `free_magazine` / `RunHeap::free`
+/ `Magazine::allocate`, not lookup. Align-mask-to-`Run*` is also wrong here
+(out-of-line `Run` metadata).
 
-Cost is `single_size_churn` (alloc and free meet before flush). Isolated
-`owner_free_only` / `freelist_allocate_only` measure flush/refill and must not
-be gamed by raising the watermark.
+#128 (batch take/refill) is **skip**: one `Run` / available-list transition per
+taken group vs `5946084` Cost (`compare_explicit` cycles/elem) was
+`owner_free_only` 61.9 → 94.7 (+53%), `freelist_allocate_only` −4% (under gate),
+`single_size_churn` 43.7 → 56.3 (+29%). Per-block `Heap::free` on take stays.
+Do not raise the watermark.
+
+Cost remains `single_size_churn`. Isolated `owner_free_only` / `freelist_allocate_only`
+measure `take`/`allocate` and must not be gamed by raising the watermark.
 
 Acceptance gate:
 
 ```text
-≥5% improvement on single_size_churn vs paired baseline (magazine Cost)
-record owner_free_only / freelist_allocate_only (flush/refill; not pass/fail)
-watermark stays 32 — do not raise it to hide isolated free/alloc phases
-≤5% regression on remote rails (fan-in / owner_accept / reuse); leftover magazine
-must not stay live on the owner during remote phases
+#126: skip with Where (identity not a ≥5% lever)
+#128: skip with Cost (batch take not ≥5% on owner_free/freelist; churn must not regress)
+#129: matrix closeout vs best competitor; publish remaining gaps
+watermark stays 32
 owner-side validation of every remote free remains mandatory
 randomized cross-thread traces and abort cases remain intact
 ```
