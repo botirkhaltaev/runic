@@ -158,7 +158,7 @@ BlockStates    owns clear/Free per-block bytes (one AtomicU8 per block); Free bi
 ExtentHeap     owns Arena<Extent>, dedicated allocation policy, and mapping reuse.
 ExtentCache    owns retained extent mappings, eviction, and reuse lookup.
 Extent         owns dedicated allocation metadata, embedded InboxLink, and Claimed byte state.
-ThreadHeap     owns TLS bind, sticky runs, page→run cache, and the sole Active body path.
+ThreadHeap     owns TLS bind, per-class magazines, page→run cache, and the sole Active body path.
 ```
 
 Prefer direct methods on the entity that owns the state. Do not add passive
@@ -332,11 +332,21 @@ preserving fail-closed ownership, multi-allocator thread safety, and the
 claim → enqueue → accept protocol.
 ```
 
+Residue on the owner-local hit was per-op `Run` (ClaimBits / locate / freelist),
+not TLS + PageMap. The magazine hit is lockless pop/push; `Run` is refill/flush only.
+
+Cost is `single_size_churn` (alloc and free meet before flush). Isolated
+`owner_free_only` / `freelist_allocate_only` measure flush/refill and must not
+be gamed by raising the watermark.
+
 Acceptance gate:
 
 ```text
-≥5% improvement on phase-isolated owner_free and single_size_churn vs paired baseline
-≤3% regression on unaffected matrix rows
+≥5% improvement on single_size_churn vs paired baseline (magazine Cost)
+record owner_free_only / freelist_allocate_only (flush/refill; not pass/fail)
+watermark stays 32 — do not raise it to hide isolated free/alloc phases
+≤5% regression on remote rails (fan-in / owner_accept / reuse); leftover magazine
+must not stay live on the owner during remote phases
 owner-side validation of every remote free remains mandatory
 randomized cross-thread traces and abort cases remain intact
 ```

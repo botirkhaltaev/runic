@@ -2,13 +2,19 @@ use core::{cell::Cell, ptr::NonNull};
 
 use crate::{
     allocator::{Allocator, AllocatorInner},
-    heap::{Extent, ExtentInit, HeapError, HeapId, Run, RunError},
+    heap::{Extent, ExtentInit, HeapError, HeapId, Run},
     layout::LayoutSpec,
     memory::{PageMap, PageOwner},
     size_class::{SizeClass, SizeClasses},
 };
 
 use super::Heap;
+
+/// Magazine high-water. `take` then `Heap::free` when count reaches this.
+///
+/// Must stay well below the bench `PHASE_BATCH` (512) so `owner_free_only` is
+/// not a push-only lie, and so the claim window stays short.
+pub(crate) const MAGAZINE_WATERMARK: u8 = 32;
 
 /// Owner-local TLS free failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,22 +24,93 @@ pub(crate) enum ThreadFreeError {
     Heap(HeapError),
 }
 
-impl From<RunError> for ThreadFreeError {
-    fn from(error: RunError) -> Self {
-        Self::Heap(error.into())
+/// Per-class lockless TLS magazine: intrusive payload `usize` links, `Cell` only.
+struct Magazine {
+    head: Cell<Option<NonNull<u8>>>,
+    count: Cell<u8>,
+}
+
+impl Magazine {
+    const fn new() -> Self {
+        Self {
+            head: Cell::new(None),
+            count: Cell::new(0),
+        }
+    }
+
+    #[inline]
+    fn pop(&self) -> Option<NonNull<u8>> {
+        let head = self.head.get()?;
+        self.head.set(Self::read_next(head));
+        self.count.set(self.count.get().saturating_sub(1));
+        Some(head)
+    }
+
+    #[inline]
+    fn push(&self, ptr: NonNull<u8>) {
+        Self::write_next(ptr, self.head.get());
+        self.head.set(Some(ptr));
+        self.count.set(self.count.get().saturating_add(1));
+    }
+
+    #[inline]
+    fn read_next(ptr: NonNull<u8>) -> Option<NonNull<u8>> {
+        // SAFETY: magazine-resident blocks are owner-local payloads of size ≥ 8.
+        // The first usize is the next link written by `write_next` (0 = end).
+        let next = unsafe { ptr.cast::<usize>().read() };
+        NonNull::new(core::ptr::without_provenance_mut(next))
+    }
+
+    #[inline]
+    fn write_next(ptr: NonNull<u8>, next: Option<NonNull<u8>>) {
+        let word = next.map_or(0, |head| head.as_ptr().addr());
+        // SAFETY: owner just freed this block, or refill just allocated it and it
+        // is not yet user-visible. First usize is the intrusive magazine link.
+        unsafe { ptr.cast::<usize>().write(word) };
+    }
+
+    /// Move `head`/`count` out so the source is empty.
+    fn take(&self) -> Self {
+        Self {
+            head: Cell::new(self.head.take()),
+            count: Cell::new(self.count.replace(0)),
+        }
+    }
+
+    /// Refill: batch `Run::allocate` until watermark−1.
+    fn allocate(&self, run: &Run) {
+        while self.count.get() + 1 < MAGAZINE_WATERMARK {
+            match run.allocate() {
+                Some(ptr) => self.push(ptr),
+                None => break,
+            }
+        }
     }
 }
 
-/// Thread-local frontend: bound heap and cached runs.
+impl Iterator for Magazine {
+    type Item = NonNull<u8>;
+
+    fn next(&mut self) -> Option<NonNull<u8>> {
+        // Count is the walk bound: a cycled list (owner double-push) stops here.
+        if self.count.get() == 0 {
+            self.head.set(None);
+            return None;
+        }
+        self.pop()
+    }
+}
+
+/// Thread-local frontend: bound heap and per-class magazines.
 ///
 /// Hot paths take `NonNull<AllocatorInner>` for identity and `&PageMap` projected once
 /// at the `Allocator` boundary (avoids parent+field dual refs inside TLS).
-/// Sticky hit paths use no locks and no atomics.
+/// Hit paths are magazine pop/push only: no locks, no atomics, no `Run`.
 pub(crate) struct ThreadHeap {
     inner: Cell<*mut AllocatorInner>,
     heap_id: Cell<Option<HeapId>>,
     heap: Cell<*mut Heap>,
-    runs: [Cell<*mut Run>; SizeClasses::COUNT],
+    magazines: [Magazine; SizeClasses::COUNT],
     /// Last cached run page number (`usize::MAX` = empty). See `lookup`.
     page_cache_page: Cell<usize>,
     page_cache_owner: Cell<Option<PageOwner>>,
@@ -51,7 +128,7 @@ impl ThreadHeap {
             inner: Cell::new(core::ptr::null_mut()),
             heap_id: Cell::new(None),
             heap: Cell::new(core::ptr::null_mut()),
-            runs: [const { Cell::new(core::ptr::null_mut()) }; SizeClasses::COUNT],
+            magazines: [const { Magazine::new() }; SizeClasses::COUNT],
             page_cache_page: Cell::new(usize::MAX),
             page_cache_owner: Cell::new(None),
         }
@@ -83,10 +160,11 @@ impl ThreadHeap {
         Some(owner)
     }
 
-    /// Owner-local small allocation via the TLS run cache.
+    /// Owner-local small allocation via the TLS magazine.
     ///
     /// Returns `None` when this thread is not bound to `inner` (caller should `bind`).
-    /// Sticky hit is the straight-line body; empty sticky goes through `refill`.
+    /// Hit is `matches` + `pop`; empty magazine goes through `refill`.
+    #[inline]
     pub(crate) fn alloc(
         &self,
         inner: NonNull<AllocatorInner>,
@@ -97,20 +175,16 @@ impl ThreadHeap {
             return None;
         }
 
-        let cell = self.run_cell(class);
-
-        if let Some(run) = NonNull::new(cell.get()) {
-            // SAFETY: sticky run pointers are published from this heap's live arena.
-            match unsafe { run.as_ref() }.allocate() {
-                Some(ptr) => return Some(ptr),
-                None => cell.set(core::ptr::null_mut()),
-            }
+        let mag = self.magazine(class);
+        if let Some(ptr) = mag.pop() {
+            return Some(ptr);
         }
 
-        self.refill(class, pages, self.bound_heap())
+        self.refill(class, pages);
+        mag.pop()
     }
 
-    /// Owner-local large allocation via the bound heap (no sticky extent cache).
+    /// Owner-local large allocation via the bound heap (no extent magazine).
     ///
     /// Returns `None` when this thread is not bound to `inner` (caller should `bind`).
     pub(crate) fn alloc_extent(
@@ -170,8 +244,7 @@ impl ThreadHeap {
 
     /// Owner-local free for a run owned by the bound heap.
     ///
-    /// Sticky hit is the straight-line body (unbind clears sticky ⇒ sticky implies bound);
-    /// non-cached owner free goes through `Heap::free` after `matches` / `HeapId`.
+    /// Hit is `matches` + `HeapId` + magazine `push`. `Heap::free` runs on `take`.
     #[inline]
     pub(crate) fn free_run(
         &self,
@@ -180,23 +253,21 @@ impl ThreadHeap {
         ptr: NonNull<u8>,
         pages: &PageMap,
     ) -> Result<(), ThreadFreeError> {
+        if !self.matches(inner) {
+            return Err(ThreadFreeError::Remote);
+        }
         // SAFETY: PageMap stores only pointers published from this allocator's live arena.
         let run_ref = unsafe { run.as_ref() };
-        let class = run_ref.class();
-        // Sticky before matches: cells only park this heap's runs and are cleared on unbind.
-        if self.run_cell(class).get() == run.as_ptr() {
-            // Sticky hit: Run only — no available-list relink.
-            return run_ref.free(ptr).map_err(ThreadFreeError::from);
-        }
-
-        if !self.matches(inner) || self.heap_id.get() != Some(run_ref.heap_id()) {
+        if self.heap_id.get() != Some(run_ref.heap_id()) {
             return Err(ThreadFreeError::Remote);
         }
 
-        let heap = self.bound_heap();
-        // SAFETY: Active TLS owner for this bound heap.
-        unsafe { heap.as_ref().free(PageOwner::Run(run), ptr, pages) }
-            .map_err(ThreadFreeError::Heap)
+        let mag = self.magazine(run_ref.class());
+        mag.push(ptr);
+        if mag.count.get() >= MAGAZINE_WATERMARK {
+            self.free_magazine(inner, mag.take(), pages)?;
+        }
+        Ok(())
     }
 
     /// Owner-local free for an extent owned by the bound heap.
@@ -262,55 +333,88 @@ impl ThreadHeap {
         self.inner.get().is_null()
     }
 
-    /// Sticky empty: prefer local/OS runs, then flush inbox and retry.
+    /// Magazine empty: local/OS acquire first; inbox flush only if that misses.
+    ///
+    /// Deferring accept keeps leftover magazine live on the owner from forcing
+    /// a remote drain on every producer refill (fan-in).
     #[cold]
-    fn refill(
-        &self,
-        class: SizeClass,
-        pages: &PageMap,
-        heap: NonNull<Heap>,
-    ) -> Option<NonNull<u8>> {
-        let cell = self.run_cell(class);
-
+    fn refill(&self, class: SizeClass, pages: &PageMap) {
+        let heap = self.bound_heap();
         // SAFETY: Active TLS owner for this bound heap.
         let heap_ref = unsafe { heap.as_ref() };
-
-        // Prefer bump/available/OS before remote accept so a fast lock-free fan-in does not
-        // force the owner through flush on every sticky-empty refill.
-        let install = |run: NonNull<Run>| -> Option<NonNull<u8>> {
-            cell.set(run.as_ptr());
-            // SAFETY: run was just returned by this heap's live arena.
-            if let Some(ptr) = unsafe { run.as_ref() }.allocate() {
-                return Some(ptr);
-            }
-            cell.set(core::ptr::null_mut());
-            // Do not abandon a checked-out run off the available list.
-            // SAFETY: Active TLS owner returning a run acquired from this heap.
-            let _ = unsafe { heap_ref.push_available(run) };
-            None
-        };
+        let mag = self.magazine(class);
 
         // SAFETY: Active TLS owner. Inbox flush is deferred until local acquire fails.
-        if let Some(run) = unsafe { heap_ref.acquire_run(class, pages) }
-            && let Some(ptr) = install(run)
-        {
-            return Some(ptr);
+        if let Some(run) = unsafe { heap_ref.acquire_run(class, pages) } {
+            let full = {
+                // SAFETY: run was just returned by this heap's live arena.
+                let run_ref = unsafe { run.as_ref() };
+                mag.allocate(run_ref);
+                run_ref.is_full()
+            };
+            if !full {
+                // SAFETY: Active TLS owner; `&Run` is not live across this call.
+                let _ = unsafe { heap_ref.push_available(run) };
+            }
+            return;
         }
 
-        // Always flush (empty drain is cheap) then retry — never early-None on a stale empty check
-        // while a concurrent Active publish may still land.
+        // Always flush (empty drain is cheap) then retry — never early-return on a
+        // stale empty check while a concurrent Active publish may still land.
         // SAFETY: Active TLS owner.
-        unsafe { heap_ref.flush(pages) }.ok()?;
-
+        if unsafe { heap_ref.flush(pages) }.is_err() {
+            return;
+        }
         // SAFETY: Active TLS owner.
-        let run = unsafe { heap_ref.acquire_run(class, pages) }?;
-        install(run)
+        if let Some(run) = unsafe { heap_ref.acquire_run(class, pages) } {
+            let full = {
+                // SAFETY: run was just returned by this heap's live arena.
+                let run_ref = unsafe { run.as_ref() };
+                mag.allocate(run_ref);
+                run_ref.is_full()
+            };
+            if !full {
+                // SAFETY: Active TLS owner; `&Run` is not live across this call.
+                let _ = unsafe { heap_ref.push_available(run) };
+            }
+        }
     }
 
-    fn run_cell(&self, class: SizeClass) -> &Cell<*mut Run> {
-        debug_assert!(class.index() < self.runs.len());
+    /// Drain one taken magazine through `Heap::free` (no inbox flush).
+    #[cold]
+    fn free_magazine(
+        &self,
+        inner: NonNull<AllocatorInner>,
+        mag: Magazine,
+        pages: &PageMap,
+    ) -> Result<(), ThreadFreeError> {
+        let heap = self.bound_heap();
+        let mut error = None;
+        for ptr in mag {
+            let Some(owner) = self.lookup(inner, pages, ptr) else {
+                error.get_or_insert(ThreadFreeError::Heap(HeapError::InvalidRunPointer));
+                continue;
+            };
+            if !matches!(owner, PageOwner::Run(_)) {
+                error.get_or_insert(ThreadFreeError::Heap(HeapError::InvalidRunPointer));
+                continue;
+            }
+            // SAFETY: Active TLS owner; `owner` is a live PageMap run.
+            // `RunError::Claimed` is already `Ok` at `RunHeap::free` (`accept` publishes).
+            if let Err(err) = unsafe { heap.as_ref().free(owner, ptr, pages) } {
+                error.get_or_insert(ThreadFreeError::Heap(err));
+            }
+        }
+        match error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    fn magazine(&self, class: SizeClass) -> &Magazine {
+        debug_assert!(class.index() < self.magazines.len());
         // SAFETY: SizeClass values are created only by SizeClasses for indexes in this array.
-        unsafe { self.runs.get_unchecked(class.index()) }
+        unsafe { self.magazines.get_unchecked(class.index()) }
     }
 
     /// Bound heap pointer after a successful `matches` / heap-id check.
@@ -321,25 +425,22 @@ impl ThreadHeap {
         unsafe { NonNull::new_unchecked(heap) }
     }
 
-    fn clear_runs(&self) {
-        let Some(heap) = NonNull::new(self.heap.get()) else {
-            return;
-        };
-
-        for run in &self.runs {
-            let Some(run) = NonNull::new(run.replace(core::ptr::null_mut())) else {
-                continue;
-            };
-
-            // SAFETY: Active TLS owner until install fields are cleared in unbind.
-            let _ = unsafe { heap.as_ref().push_available(run) };
-        }
-    }
-
     /// Retire the bound heap and release the inner retain.
     #[cold]
     pub(crate) fn unbind(&self) {
-        self.clear_runs();
+        if let Some(inner) = NonNull::new(self.inner.get()) {
+            // SAFETY: this TLS entry retained inner while bound.
+            let pages = unsafe { inner.as_ref() }.pages();
+            let mut error = false;
+            for mag in &self.magazines {
+                if self.free_magazine(inner, mag.take(), pages).is_err() {
+                    error = true;
+                }
+            }
+            if error {
+                Allocator::abort();
+            }
+        }
         self.page_cache_page.set(usize::MAX);
         self.page_cache_owner.set(None);
         let Some(inner) = NonNull::new(self.inner.replace(core::ptr::null_mut())) else {

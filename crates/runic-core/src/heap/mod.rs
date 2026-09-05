@@ -219,7 +219,7 @@ impl Heap {
         Ok(())
     }
 
-    /// Flush inboxes if needed, then owner-local free.
+    /// Owner-local free (body only). Caller owns inbox `flush`.
     ///
     /// SAFETY: caller is the Active TLS owner or holds [`LockedHeap`].
     pub(super) unsafe fn free(
@@ -228,10 +228,6 @@ impl Heap {
         ptr: NonNull<u8>,
         pages: &PageMap,
     ) -> Result<(), HeapError> {
-        if !self.inboxes_empty() {
-            // SAFETY: same ownership contract as the method.
-            unsafe { self.flush(pages)? };
-        }
         // SAFETY: same ownership contract as the method.
         let body = unsafe { self.body_mut() };
         match owner {

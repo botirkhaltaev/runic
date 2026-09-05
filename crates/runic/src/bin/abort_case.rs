@@ -5,6 +5,9 @@ use std::{
 
 use runic::RunicAlloc;
 
+/// Refill leftover after the first alloc (watermark 32 − 2).
+const HOLD: usize = 30;
+
 #[global_allocator]
 static GLOBAL: RunicAlloc = RunicAlloc::new();
 
@@ -49,9 +52,17 @@ fn large_interior_free() {
 fn small_double_free() {
     let layout = Layout::from_size_align(64, 8).unwrap();
     let ptr = allocate(layout);
+    // Drain the refill leftover so the magazine is empty.
+    let mut hold = Vec::with_capacity(HOLD);
+    for _ in 0..HOLD {
+        hold.push(allocate(layout));
+    }
 
     unsafe { dealloc(ptr, layout) };
     unsafe { dealloc(ptr, layout) };
+    for p in hold {
+        unsafe { dealloc(p, layout) };
+    }
 }
 
 fn small_interior_realloc() {
@@ -71,9 +82,16 @@ fn large_interior_realloc() {
 fn small_realloc_after_free() {
     let layout = Layout::from_size_align(64, 8).unwrap();
     let ptr = allocate(layout);
+    let mut hold = Vec::with_capacity(HOLD);
+    for _ in 0..HOLD {
+        hold.push(allocate(layout));
+    }
 
     unsafe { dealloc(ptr, layout) };
     let _ = unsafe { realloc(ptr, layout, 128) };
+    for p in hold {
+        unsafe { dealloc(p, layout) };
+    }
 }
 
 fn allocate(layout: Layout) -> *mut u8 {
