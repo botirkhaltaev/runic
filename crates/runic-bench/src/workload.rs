@@ -14,7 +14,7 @@ pub const RECYCLED_LIVE_DEPTHS: &[usize] = &[1, 32, 256];
 ///
 /// `72` / `88` round into classes `80` / `96` and exercise non-power-of-two `locate`.
 pub const LOCAL_HOTSPOT_SIZES: &[usize] = &[64, 72, 80, 88];
-/// Phase-isolated local free/alloc probe sizes (small power-of-two, sticky, non-power-of-two, page-ish).
+/// Phase-isolated local free/alloc probe sizes (small power-of-two, non-power-of-two, page-ish).
 pub const LOCAL_PHASE_SIZES: &[usize] = &[8, 64, 80, 4096];
 pub const LARGE_SIZES: &[usize] = &[32769, 64 * 1024, 256 * 1024, 1024 * 1024];
 pub const ALIGNMENT_CASES: &[(usize, usize)] =

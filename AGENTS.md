@@ -51,4 +51,4 @@
 
 - v0.5 in: Linux x86_64, Rust stable, `GlobalAlloc`, owner-local heaps, run/extent retention, remote-free, `realloc` / `alloc_zeroed`, tests, benches.
 - v0.5 out: quarantine, canaries, hugepages, NUMA, C ABI, ML placement, dashboards, background purge.
-- After #129: per-CPU / RSEQ magazine (`#135`, `ROADMAP.md`). One entity, one hit. Do not retry identity or batch take. Do not port snmalloc.
+- Next: per-CPU / RSEQ magazine (`#135`, `ROADMAP.md`) vs the #129 baseline. One entity, one hit. Do not retry identity or batch take. Do not port snmalloc.

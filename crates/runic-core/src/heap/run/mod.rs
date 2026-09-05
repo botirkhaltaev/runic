@@ -403,7 +403,7 @@ impl Run {
                 self.blocks.set(index, BlockState::Clear, Ordering::Relaxed);
                 index
             }
-            None => self.allocate_fresh(state)?,
+            None => self.bump(state)?,
         };
         let ptr = self.address(index);
 
@@ -542,14 +542,14 @@ impl Run {
             Some(shift) => index.get() << shift.get(),
             None => index.get() * self.stride,
         };
-        // SAFETY: freelist / `allocate_fresh` only yield `index < capacity`, so
+        // SAFETY: freelist / `bump` only yield `index < capacity`, so
         // `byte_offset < RUN_SIZE` inside the payload span.
         unsafe { NonNull::new_unchecked(self.base.as_ptr().add(byte_offset)) }
     }
 
     #[cold]
     #[inline(never)]
-    fn allocate_fresh(&self, state: &mut RunState) -> Option<BlockIndex> {
+    fn bump(&self, state: &mut RunState) -> Option<BlockIndex> {
         if state.bump >= self.capacity {
             return None;
         }

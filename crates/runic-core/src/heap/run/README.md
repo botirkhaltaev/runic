@@ -12,7 +12,7 @@ Run metadata owns small size-class allocations.
 - A run owns one mapping and one size class. The mapping is `RUN_SIZE` payload bytes, one `AtomicU8` Free bit per block, pad to 8-byte alignment, then `AtomicU64` claim words; `Run::range` is the payload span only.
 - Returned blocks must be valid block boundaries inside the payload span.
 - `Run` caches `stride` / `stride_shift` for `address`; `locate` checks the payload span, then `SizeClass::index_of`, then capacity (rejects tail slack).
-- Owner Free/Live **authority** is freelist membership (+ bump). `allocate` is refill-only (pops/bumps then `live++`); bump allocate stores no `BlockStates`; freelist allocate rejects in-flight claims then `set(Clear)`.
+- Owner Free/Live **authority** is freelist membership (+ bump). `allocate` is refill-only (pops or `bump`, then `live++`); `bump` stores no `BlockStates`; freelist allocate rejects in-flight claims then `set(Clear)`.
 - Freelist head and intrusive payload links use raw `usize` / `FREE_END`.
 - Remote admission is the private claim bitmap. Owner `free` (magazine `take` only) stores Free (Release) then rechecks the claim bit (Acquire): `Claimed` if the bit won (`accept` publishes), `DoubleFree` for owner DF. `claim` sets the bit then Acquire-loads Free. TLS hit does not call `free`.
 - `Run` embeds an `InboxLink` (see `heap::inbox`) coalescing remote frees by run: `claim` sets a bit, then the freer `enqueue`s (Idle → Queued + link) and, only on a queue win, takes an Active enqueue lease. Repeat claims while Queued do not re-link.

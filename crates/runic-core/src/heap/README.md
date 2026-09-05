@@ -61,3 +61,7 @@ churn). `PageMap::get` is ~0% on same-run churn. Isolated `owner_free` is
 transition) vs `5946084` Cost: `owner_free_only` 61.9 → 94.7 cyc/elem (+53%),
 `freelist_allocate_only` −4% (under gate), `single_size_churn` 43.7 → 56.3
 (+29%). Per-block `Heap::free` on take stays. Extents have no magazine.
+
+#129 closeout (this host, `aa3a83a`): churn/64 is 43.6 vs snmalloc 27.4 (1.6×).
+`owner_free` / `freelist` are take/refill (4.6× mi / 2.7× sn). Large 64 KiB
+churn: Runic best (110 vs mi 133). Next entity is #135 (per-CPU / RSEQ).
