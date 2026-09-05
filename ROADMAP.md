@@ -30,6 +30,13 @@ idiomatic Rust, with `unsafe` only where ownership/OS boundaries or measured
 hot paths require it. Architecture should stay simple until a new entity owns a
 real lifecycle, invariant, or policy.
 
+The owner-local TLS magazine is that entity for v0.5. The leftover vs
+snmalloc on this host (~1.55× on 64B churn) is not identity or take/refill
+(#126/#128 skipped). The next entity is a per-CPU (or RSEQ) magazine — one
+path, fail-closed DF, not a line-for-line port (`#135`, after `#129`).
+Out-of-line metadata stays until Where shows an in-page run header is a ≥5%
+lever.
+
 ## Current Status
 
 Latest published release: `0.5.0`.
@@ -53,8 +60,8 @@ freelist −4% (under the ≥5% gate).
 The next milestone is:
 
 ```text
-Close out the local matrix (#129). Do not rewrite identity or take/refill
-without a new ≥5% Where/Cost hit.
+Close out the local matrix (#129). Then #135 (per-CPU / RSEQ magazine).
+Do not retry identity or batch take; do not start #135 before the matrix.
 ```
 
 ## Supported Scope
@@ -93,9 +100,14 @@ hugepages
 NUMA
 C ABI
 LD_PRELOAD
-per-CPU caches
 ML/lifetime placement
 stats dashboard
+```
+
+After #129 only:
+
+```text
+per-CPU / RSEQ magazine (#135) — new entity, one hit, fail-closed DF
 ```
 
 ## Core Invariants
@@ -358,12 +370,53 @@ Acceptance gate:
 #126: skip with Where (identity not a ≥5% lever)
 #128: skip with Cost (batch take not ≥5% on owner_free/freelist; churn must not regress)
 #129: matrix closeout vs best competitor; publish remaining gaps
+#135 waits on that baseline — do not start per-CPU in this milestone
 watermark stays 32
 owner-side validation of every remote free remains mandatory
 randomized cross-thread traces and abort cases remain intact
 ```
 
-### v0.7 Later: Hardening
+### v0.7 Next after #129: Per-CPU / RSEQ magazine
+
+Goal:
+
+```text
+The leftover vs competitors after the TLS magazine is not identity or take.
+A per-CPU (or RSEQ) magazine owns the next hit. One path. Fail-closed DF
+and remote exact-once stay. Not a port of snmalloc.
+```
+
+Blocked on #129. Issue: `#135`.
+
+In:
+
+```text
+one CPU (or RSEQ) magazine entity
+TLS magazine replaced or refilled in place (no dual hit)
+watermark stays 32 until Where says otherwise
+out-of-line Run metadata until a new ≥5% Where hit
+```
+
+Out:
+
+```text
+retry #126 / #128
+dual ThreadHeap + CPU magazine hits
+raising the watermark to hide take
+in-page Run header without Where
+hardening / hugepages (later)
+```
+
+Acceptance gate:
+
+```text
+≥5% vs #129 baseline on the phases the matrix names
+rails ≤5% regress
+record RSS / large / policy_grid
+fmt, clippy -D warnings, cargo test --workspace
+```
+
+### v0.8 Later: Hardening
 
 Goal:
 
@@ -381,7 +434,7 @@ guard pages for selected large allocations
 randomized placement only after deterministic paths are stable
 ```
 
-### v0.8 Later: Backend Regions And Hugepage-Aware Allocation
+### v0.9 Later: Backend Regions And Hugepage-Aware Allocation
 
 Goal:
 
@@ -416,7 +469,7 @@ Keep names simple and domain-specific.
 Keep allocator-internal caches allocation-free.
 Do not add allocator-internal Vec, Box, HashMap, String, formatting, or panic paths
 unless recursion risk is explicitly addressed.
-Do not add thread-local heaps, remote frees, hardening, or hugepage support before
-the milestone that owns the required invariants.
+Do not add thread-local heaps, remote frees, per-CPU/RSEQ, hardening, or hugepage
+support before the milestone that owns the required invariants.
 Track follow-up ideas in GitHub issues or focused docs, not as drive-by scope.
 ```
