@@ -119,7 +119,7 @@ impl Allocator {
             let Some(owner) = tls.lookup(inner, pages, ptr) else {
                 Self::abort();
             };
-            // Match here (not inside ThreadHeap) so the sticky run path stays typed and lean.
+            // Match here (not inside ThreadHeap) so the magazine free path stays typed and lean.
             match owner {
                 PageOwner::Run(run) => tls
                     .free_run(inner, run, ptr, pages)
@@ -465,6 +465,13 @@ impl From<RunError> for AllocatorError {
         match error {
             RunError::InvalidPointer => Self::InvalidRunPointer,
             RunError::DoubleFree => Self::DoubleFree,
+            RunError::Claimed => {
+                debug_assert!(
+                    false,
+                    "Claimed is handled at RunHeap::free / magazine drain"
+                );
+                Self::DoubleFree
+            }
         }
     }
 }
@@ -493,7 +500,7 @@ impl From<HeapError> for AllocatorError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::heap::thread::ThreadHeap;
+    use crate::heap::thread::{MAGAZINE_WATERMARK, ThreadHeap};
     use crate::heap::{Extent, Heap, HeapMode, Run};
     use std::sync::mpsc;
     use std::thread;
@@ -543,22 +550,197 @@ mod tests {
         extent
     }
 
+    /// Take `n` user-held blocks. The first alloc refills just under the
+    /// watermark; `n == MAGAZINE_WATERMARK - 1` leaves the magazine empty.
+    fn take_live(
+        tls: &ThreadHeap,
+        inner: NonNull<AllocatorInner>,
+        pages: &PageMap,
+        layout: Layout,
+        n: u8,
+    ) -> Vec<NonNull<u8>> {
+        (0..n)
+            .map(|_| bind_alloc_small(tls, inner, pages, layout))
+            .collect()
+    }
+
+    fn free_all(
+        tls: &ThreadHeap,
+        inner: NonNull<AllocatorInner>,
+        pages: &PageMap,
+        ptrs: &[NonNull<u8>],
+    ) -> Result<(), ThreadFreeError> {
+        let mut last = Ok(());
+        for &ptr in ptrs {
+            last = tls.free_run(inner, run_of(pages, ptr), ptr, pages);
+        }
+        last
+    }
+
     #[test]
-    fn allocator_reports_small_double_free() {
+    fn magazine_push_does_not_mark_or_publish() {
         let allocator = Allocator::new();
         let inner = allocator_inner_ptr(&allocator);
         let layout = Layout::from_size_align(64, 8).unwrap();
         THREAD_HEAP.with(|tls| {
             let _id = tls.bind(inner).unwrap();
-            // SAFETY: inner retained by allocator.
             let pages = unsafe { inner.as_ref() }.pages();
             let ptr = bind_alloc_small(tls, inner, pages, layout);
             let run = run_of(pages, ptr);
             assert_eq!(tls.free_run(inner, run, ptr, pages), Ok(()));
+            // SAFETY: run is live; magazine push must not drop live or publish.
+            assert!(unsafe { run.as_ref() }.is_live());
+            let stolen = unsafe { run.as_ref() }.allocate();
+            assert_ne!(stolen, Some(ptr));
+            if let Some(extra) = stolen {
+                assert!(unsafe { run.as_ref() }.free(extra).is_ok());
+            }
+            assert_eq!(bind_alloc_small(tls, inner, pages, layout), ptr);
+            assert_eq!(tls.free_run(inner, run, ptr, pages), Ok(()));
+            tls.unbind();
+        });
+    }
+
+    #[test]
+    fn magazine_flush_marks_and_refill_reuses() {
+        let allocator = Allocator::new();
+        let inner = allocator_inner_ptr(&allocator);
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        THREAD_HEAP.with(|tls| {
+            let _id = tls.bind(inner).unwrap();
+            let pages = unsafe { inner.as_ref() }.pages();
+            let mut ptrs = take_live(tls, inner, pages, layout, MAGAZINE_WATERMARK - 1);
+            let extra = bind_alloc_small(tls, inner, pages, layout);
+            let run = run_of(pages, ptrs[0]);
+            ptrs.push(extra);
+            assert_eq!(free_all(tls, inner, pages, &ptrs), Ok(()));
+            // SAFETY: leftover from the second refill plus these frees hit the watermark.
+            let published = unsafe { run.as_ref() }.allocate();
+            assert!(published.is_some());
+            if let Some(ptr) = published {
+                assert!(unsafe { run.as_ref() }.free(ptr).is_ok());
+            }
+            tls.unbind();
+        });
+    }
+
+    #[test]
+    fn unbind_flushes_nonempty_magazine() {
+        let allocator = Allocator::new();
+        let inner = allocator_inner_ptr(&allocator);
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        let ptr = THREAD_HEAP.with(|tls| {
+            let _id = tls.bind(inner).unwrap();
+            let pages = unsafe { inner.as_ref() }.pages();
+            let ptr = bind_alloc_small(tls, inner, pages, layout);
+            let run = run_of(pages, ptr);
+            assert_eq!(tls.free_run(inner, run, ptr, pages), Ok(()));
+            tls.unbind();
+            ptr
+        });
+        assert!(allocator_inner(&allocator).pages().get(ptr).is_some());
+        THREAD_HEAP.with(|tls| {
+            let _id = tls.bind(inner).unwrap();
+            let pages = unsafe { inner.as_ref() }.pages();
+            let reused = bind_alloc_small(tls, inner, pages, layout);
+            assert!(pages.get(reused).is_some());
+            let run = run_of(pages, reused);
+            assert_eq!(tls.free_run(inner, run, reused, pages), Ok(()));
+            tls.unbind();
+        });
+    }
+
+    #[test]
+    fn allocator_reports_small_double_free_at_flush() {
+        let allocator = Allocator::new();
+        let inner = allocator_inner_ptr(&allocator);
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        THREAD_HEAP.with(|tls| {
+            let _id = tls.bind(inner).unwrap();
+            let pages = unsafe { inner.as_ref() }.pages();
+            let live = take_live(tls, inner, pages, layout, MAGAZINE_WATERMARK - 1);
+            let ptr = live[0];
+            let extras = &live[1..];
+            let run = run_of(pages, ptr);
+            assert_eq!(tls.free_run(inner, run, ptr, pages), Ok(()));
+            assert_eq!(tls.free_run(inner, run, ptr, pages), Ok(()));
             assert_eq!(
-                tls.free_run(inner, run, ptr, pages),
+                free_all(tls, inner, pages, extras),
                 Err(ThreadFreeError::Heap(HeapError::DoubleFree))
             );
+            tls.unbind();
+        });
+    }
+
+    #[test]
+    fn magazine_resident_claim_wins_flush_does_not_publish() {
+        let allocator = Allocator::new();
+        let inner = allocator_inner_ptr(&allocator);
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        THREAD_HEAP.with(|tls| {
+            let _id = tls.bind(inner).unwrap();
+            let pages = unsafe { inner.as_ref() }.pages();
+            let live = take_live(tls, inner, pages, layout, MAGAZINE_WATERMARK);
+            let ptr = live[0];
+            let run = run_of(pages, ptr);
+            assert_eq!(tls.free_run(inner, run, ptr, pages), Ok(()));
+            // SAFETY: magazine-resident block is still Clear, so claim may win.
+            assert_eq!(unsafe { run.as_ref() }.claim(ptr), Ok(()));
+            assert_eq!(free_all(tls, inner, pages, &live[1..]), Ok(()));
+            // SAFETY: flush skipped publish; accept is the single publisher.
+            assert!(!unsafe { run.as_ref() }.accept());
+            let mut found = false;
+            while let Some(reused) = unsafe { run.as_ref() }.allocate() {
+                if reused == ptr {
+                    found = true;
+                    break;
+                }
+                assert!(unsafe { run.as_ref() }.free(reused).is_ok());
+            }
+            assert!(found, "accept must publish the claimed magazine block once");
+            assert!(unsafe { run.as_ref() }.free(ptr).is_ok());
+            tls.unbind();
+        });
+    }
+
+    #[test]
+    fn remote_claim_after_flush_is_exact_once() {
+        let allocator = Allocator::new();
+        let inner = allocator_inner_ptr(&allocator);
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        THREAD_HEAP.with(|tls| {
+            let _id = tls.bind(inner).unwrap();
+            let pages = unsafe { inner.as_ref() }.pages();
+            let live = take_live(tls, inner, pages, layout, MAGAZINE_WATERMARK);
+            let ptr = live[0];
+            let run = run_of(pages, ptr);
+            assert_eq!(free_all(tls, inner, pages, &live), Ok(()));
+            // SAFETY: flush stored Free, so a later claim must lose.
+            assert_eq!(
+                unsafe { run.as_ref() }.claim(ptr),
+                Err(crate::heap::RunError::DoubleFree)
+            );
+            tls.unbind();
+        });
+    }
+
+    #[test]
+    fn free_run_remote_on_foreign_allocator() {
+        let owner = Allocator::new();
+        let other = Allocator::new();
+        let inner = allocator_inner_ptr(&owner);
+        let foreign = allocator_inner_ptr(&other);
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        THREAD_HEAP.with(|tls| {
+            let _id = tls.bind(inner).unwrap();
+            let pages = unsafe { inner.as_ref() }.pages();
+            let ptr = bind_alloc_small(tls, inner, pages, layout);
+            let run = run_of(pages, ptr);
+            assert_eq!(
+                tls.free_run(foreign, run, ptr, pages),
+                Err(ThreadFreeError::Remote)
+            );
+            assert_eq!(tls.free_run(inner, run, ptr, pages), Ok(()));
             tls.unbind();
         });
     }
@@ -697,8 +879,8 @@ mod tests {
         let layout = Layout::from_size_align(64, 8).unwrap();
         let inner = allocator_inner_ptr(&allocator);
         let inner_addr = inner.as_ptr() as usize;
-        let (ready_a, wait_a) = mpsc::channel::<usize>();
-        let (ready_b, wait_b) = mpsc::channel::<usize>();
+        let (ready_a, wait_a) = mpsc::channel::<Vec<usize>>();
+        let (ready_b, wait_b) = mpsc::channel::<Vec<usize>>();
         let (go_a, start_a) = mpsc::channel::<()>();
         let (go_b, start_b) = mpsc::channel::<()>();
         let (done_a, finished_a) = mpsc::channel::<bool>();
@@ -715,9 +897,12 @@ mod tests {
                     let _id = tls.bind(inner).unwrap();
                     // SAFETY: inner retained by allocator.
                     let pages = unsafe { inner.as_ref() }.pages();
-                    let ptr = bind_alloc_small(tls, inner, pages, layout);
-                    let run = run_of(pages, ptr);
-                    ready_a.send(ptr.as_ptr() as usize).unwrap();
+                    // One refill batch so the magazine is empty (no leftover live).
+                    let live = take_live(tls, inner, pages, layout, MAGAZINE_WATERMARK - 1);
+                    let run = run_of(pages, live[0]);
+                    ready_a
+                        .send(live.iter().map(|p| p.as_ptr() as usize).collect())
+                        .unwrap();
                     start_a.recv().unwrap();
                     assert_eq!(tls.flush(inner, pages), Ok(()));
                     // SAFETY: run from this heap's arena.
@@ -735,9 +920,11 @@ mod tests {
                     let _id = tls.bind(inner).unwrap();
                     // SAFETY: inner retained by allocator.
                     let pages = unsafe { inner.as_ref() }.pages();
-                    let ptr = bind_alloc_small(tls, inner, pages, layout);
-                    let run = run_of(pages, ptr);
-                    ready_b.send(ptr.as_ptr() as usize).unwrap();
+                    let live = take_live(tls, inner, pages, layout, MAGAZINE_WATERMARK - 1);
+                    let run = run_of(pages, live[0]);
+                    ready_b
+                        .send(live.iter().map(|p| p.as_ptr() as usize).collect())
+                        .unwrap();
                     start_b.recv().unwrap();
                     assert_eq!(tls.flush(inner, pages), Ok(()));
                     // SAFETY: run from this heap's arena.
@@ -746,20 +933,28 @@ mod tests {
                 });
             });
 
-            let ptr_a = NonNull::new(wait_a.recv().unwrap() as *mut u8).unwrap();
-            let ptr_b = NonNull::new(wait_b.recv().unwrap() as *mut u8).unwrap();
+            let addrs_a = wait_a.recv().unwrap();
+            let addrs_b = wait_b.recv().unwrap();
             // SAFETY: owners still bound; PageMap entries live.
             let pages = unsafe { inner.as_ref() }.pages();
+            let ptr_a = NonNull::new(addrs_a[0] as *mut u8).unwrap();
+            let ptr_b = NonNull::new(addrs_b[0] as *mut u8).unwrap();
             let run_a = run_of(pages, ptr_a);
             let run_b = run_of(pages, ptr_b);
-            assert_eq!(
-                Allocator::free_remote(inner, PageOwner::Run(run_a), ptr_a),
-                Ok(())
-            );
-            assert_eq!(
-                Allocator::free_remote(inner, PageOwner::Run(run_b), ptr_b),
-                Ok(())
-            );
+            for addr in addrs_a {
+                let ptr = NonNull::new(addr as *mut u8).unwrap();
+                assert_eq!(
+                    Allocator::free_remote(inner, PageOwner::Run(run_a), ptr),
+                    Ok(())
+                );
+            }
+            for addr in addrs_b {
+                let ptr = NonNull::new(addr as *mut u8).unwrap();
+                assert_eq!(
+                    Allocator::free_remote(inner, PageOwner::Run(run_b), ptr),
+                    Ok(())
+                );
+            }
             go_a.send(()).unwrap();
             go_b.send(()).unwrap();
             assert!(!finished_a.recv().unwrap());
@@ -770,7 +965,8 @@ mod tests {
     #[test]
     fn concurrent_active_leases_exact_once() {
         const THREADS: usize = 4;
-        const PER_THREAD: usize = 64;
+        // Multiple of one refill batch so the magazine is empty (no leftover live).
+        const PER_THREAD: usize = 62;
 
         let allocator = Allocator::new();
         let inner = allocator_inner_ptr(&allocator);
@@ -832,10 +1028,12 @@ mod tests {
             let id = tls.bind(inner).unwrap();
             // SAFETY: inner retained by allocator.
             let pages = unsafe { inner.as_ref() }.pages();
-            let ptr = bind_alloc_small(tls, inner, pages, layout);
-            let run = run_of(pages, ptr);
-            // SAFETY: block was just allocated from this run.
-            unsafe { run.as_ref() }.claim(ptr).unwrap();
+            let live = take_live(tls, inner, pages, layout, MAGAZINE_WATERMARK - 1);
+            let run = run_of(pages, live[0]);
+            for ptr in live {
+                // SAFETY: block was just allocated from this run.
+                unsafe { run.as_ref() }.claim(ptr).unwrap();
+            }
             let heap = unsafe { inner.as_ref() }.heaps.get(id).unwrap();
             assert_eq!(heap.enqueue(id, PageOwner::Run(run)), Ok(()));
             assert_eq!(heap.close(id), Ok(()));
@@ -987,7 +1185,8 @@ mod tests {
             assert_ne!(reused.generation(), heap.generation());
             let pages = unsafe { inner.as_ref() }.pages();
             let reused_ptr = bind_alloc_small(tls, inner, pages, layout);
-            assert_eq!(reused_ptr, ptr);
+            assert!(pages.get(ptr).is_some());
+            assert!(pages.get(reused_ptr).is_some());
             let reused_run = run_of(pages, reused_ptr);
             assert_eq!(tls.free_run(inner, reused_run, reused_ptr, pages), Ok(()));
             tls.unbind();

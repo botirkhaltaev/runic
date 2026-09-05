@@ -93,6 +93,8 @@ impl Block {
 pub(crate) enum RunError {
     InvalidPointer,
     DoubleFree,
+    /// Remote `claim` won; `accept` publishes. Not a `HeapError`.
+    Claimed,
 }
 
 /// Per-block clear / Free.
@@ -158,7 +160,7 @@ impl BlockStates {
 ///
 /// Exactly one of owner `free` or remote `claim` linearizes a live block:
 /// - `claim`: `try_set` then Acquire-load Free; undo bit if Free already.
-/// - `free`: store Free (Release) then Acquire-load bit; undo Free if claimed.
+/// - `free`: store Free (Release) then Acquire-load bit; `Claimed` if the bit won.
 /// - `accept`: `test_and_clear` then publish to freelist.
 struct ClaimBits {
     /// 8-aligned claim words in the run mapping tail.
@@ -224,7 +226,7 @@ impl ClaimBits {
 }
 
 pub(crate) struct Run {
-    /// Owner-local freelist / live / bump — field order prefers sticky locality under
+    /// Owner-local freelist / live / bump — field order prefers refill/flush locality under
     /// `repr(Rust)` (not a layout guarantee; do not treat as ABI).
     state: UnsafeCell<RunState>,
     /// Cached `mapping.base()` — payload span start (`RUN_SIZE` bytes).
@@ -383,6 +385,7 @@ impl Run {
         AddressRange::new(self.base, RUN_SIZE)
     }
 
+    /// Refill only: pop/bump one block into the owner's magazine.
     #[inline]
     pub(crate) fn allocate(&self) -> Option<NonNull<u8>> {
         // SAFETY: owner-local methods are called only by the owning heap.
@@ -409,11 +412,11 @@ impl Run {
         Some(ptr)
     }
 
-    /// Owner-local: live → freelist without locked RMW.
+    /// Magazine-`take` only: live → freelist without locked RMW.
     ///
     /// Handshake vs remote `claim`: store Free (Release), then recheck claim bit
-    /// (Acquire). If the bit is set, undo Free→Clear and fail closed — `accept`
-    /// owns the freelist publish.
+    /// (Acquire). If the bit is set, undo Free→Clear and return `Claimed` —
+    /// `accept` owns the freelist publish. TLS hit does not call this.
     #[inline]
     pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
         let block = self.locate(ptr).ok_or(RunError::InvalidPointer)?;
@@ -431,7 +434,7 @@ impl Run {
         if self.claims.is_set(block.index()) {
             self.blocks
                 .set(block.index(), BlockState::Clear, Ordering::Relaxed);
-            return Err(RunError::DoubleFree);
+            return Err(RunError::Claimed);
         }
 
         debug_assert!(state.live > 0);
@@ -893,7 +896,7 @@ mod tests {
         let ptr = run.allocate().unwrap();
 
         assert_eq!(run.claim(ptr), Ok(()));
-        assert!(matches!(run.free(ptr), Err(RunError::DoubleFree)));
+        assert!(matches!(run.free(ptr), Err(RunError::Claimed)));
         assert!(!run.accept());
         assert_eq!(run.allocate(), Some(ptr));
     }
@@ -949,7 +952,7 @@ mod tests {
         let index = run.locate(ptr).unwrap().index();
 
         assert!(run.claims.try_set(index));
-        assert!(matches!(run.free(ptr), Err(RunError::DoubleFree)));
+        assert!(matches!(run.free(ptr), Err(RunError::Claimed)));
         assert!(run.claims.is_set(index));
         assert_eq!(
             run.blocks.state(index, Ordering::Relaxed),

@@ -17,6 +17,13 @@ impl From<RunError> for HeapError {
         match error {
             RunError::InvalidPointer => Self::InvalidRunPointer,
             RunError::DoubleFree => Self::DoubleFree,
+            RunError::Claimed => {
+                debug_assert!(
+                    false,
+                    "Claimed is handled at RunHeap::free / magazine drain"
+                );
+                Self::DoubleFree
+            }
         }
     }
 }
