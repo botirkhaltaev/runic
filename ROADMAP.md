@@ -39,9 +39,9 @@ lever.
 
 ## Current Status
 
-Latest published release: `0.5.0`.
+Latest published release: `0.6.0`.
 
-Current `master` ships the v0.5 owner-local heap frontend: TLS heaps own runs and
+Current `master` ships the v0.6 owner-local heap frontend: TLS heaps own runs and
 extents stamped with `HeapId`, private run claim-bitmap remote admission, run/extent
 `Inbox` coalesced by owner, and Draining lifecycle after thread exit, with explicit
 page-map ownership. Heap lifecycle lives on `Heaps` / `Heap`
@@ -353,7 +353,7 @@ tag: 0.5.0
 crates: runic-core 0.5.0, runic-alloc 0.5.0
 ```
 
-### v0.6 Delivered: Matrix closeout
+### v0.6 Released: Magazine hit and matrix closeout
 
 Goal:
 
@@ -377,6 +377,13 @@ API audit: allocate_fresh → bump; no sticky / *_v2 leftovers
 
 Raw Cost lives under `target/runic-profiles/*id129*`. Watermark stays 32.
 #135 uses this table as the competitor baseline.
+
+Release artifacts:
+
+```text
+tag: 0.6.0
+crates: runic-core 0.6.0, runic-alloc 0.6.0
+```
 
 ### v0.7 Next: Per-CPU / RSEQ magazine
 
