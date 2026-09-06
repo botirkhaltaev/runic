@@ -57,6 +57,7 @@ impl RunHeap {
         self.insert_run(index, id, run, pages)
     }
 
+    #[inline]
     pub(crate) fn free(&mut self, run: NonNull<Run>, ptr: NonNull<u8>) -> Result<(), HeapError> {
         // SAFETY: PageMap stores only pointers published from this allocator's live arena.
         let run_ref = unsafe { run.as_ref() };
@@ -106,6 +107,7 @@ impl RunHeap {
         false
     }
 
+    #[inline(never)]
     pub(crate) fn push_available(&mut self, mut run_ptr: NonNull<Run>) -> Result<(), HeapError> {
         // SAFETY: caller supplies a pointer derived from this allocator's live arena.
         let run = unsafe { run_ptr.as_mut() };
@@ -213,7 +215,11 @@ mod tests {
         let heap_id = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
         let mut run = heap.acquire(class, heap_id, pages)?;
         // SAFETY: RunHeap returns pointers to live runs from its arena.
-        let ptr = unsafe { run.as_mut() }.allocate()?;
+        let run_ref = unsafe { run.as_mut() };
+        let ptr = run_ref.allocate().or_else(|| {
+            run_ref.extend();
+            run_ref.allocate()
+        })?;
         // SAFETY: RunHeap returns pointers to live runs from its arena.
         if !unsafe { run.as_ref() }.is_full() {
             heap.push_available(run).ok()?;

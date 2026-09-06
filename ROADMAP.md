@@ -30,13 +30,13 @@ idiomatic Rust, with `unsafe` only where ownership/OS boundaries or measured
 hot paths require it. Architecture should stay simple until a new entity owns a
 real lifecycle, invariant, or policy.
 
-The owner-local TLS magazine is that entity for v0.5. The leftover vs
-snmalloc on this host is instruction count on the TLS-magazine hit, then
-take/refill. `#135` RSEQ per-CPU magazine was tried and reverted (churn/64
-65.3 vs 43.6, gate missed). This pass diets the #129 TLS hit and deletes
-per-block `BlockStates` (owner DF undefined; remote admission stays fail-closed).
-Out-of-line metadata stays until Where shows an in-page run header is a ≥5%
-lever.
+The owner-local current run is that entity for the small hit. The leftover vs
+snmalloc on this host is instruction count on that hit (`locate` / pop), not a
+per-class magazine. `#135` RSEQ per-CPU was tried and reverted (churn/64 65.3
+vs 43.6, gate missed). This pass deletes the magazine (`take` / `refill`) and
+diets the hit (TLS state byte, prologue, cross-crate inlining, `#[cold]` audit).
+Owner DF is undefined; remote admission stays fail-closed. Out-of-line metadata
+stays until Where shows an in-page run header is a ≥5% lever.
 
 ## Current Status
 
@@ -48,31 +48,39 @@ extents stamped with `HeapId`, private run claim-bitmap remote admission, run/ex
 page-map ownership. Heap lifecycle lives on `Heaps` / `Heap`
 (Heaps indexes each Heap; each `Heap` owns inboxes and `RunHeap`/`ExtentHeap`).
 
-Owner-local hit is a lockless TLS magazine (pop/push). `Run` is refill/`take` only.
-#129 closeout on this host (`aa3a83a`, `compare_explicit` cycles/elem): 64-byte
-churn 43.6 vs snmalloc 27.4 (**1.6×**). Isolated `owner_free` 62.4 vs mimalloc
-13.6 (4.6×); `freelist` 44.6 vs snmalloc 16.3 (2.7×) — those phases pay
-`take`/`allocate` at watermark 32. Large 64 KiB churn: Runic **best** (110 vs
-mimalloc 133). Threaded local/4 is the same 1.6×; fan-in / ring are ~1.1–1.2×
-snmalloc. #126/#128 skipped (identity / batch take not ≥5% levers).
-
-`#135` RSEQ per-CPU magazine: 65.3 vs 43.6 on churn/64, gate missed, reverted.
-This pass on the #129 TLS magazine (same-ELF Cost, `0bee169` baseline 43.7 /
-62.0 / 42.4):
+Owner-local hit is a TLS current run per class (pop) plus a one-entry own-heap
+page cache (`Heap::free_run`: `locate` + push). `Run::allocate` is pop only;
+`Run::extend` threads one page (min 32) of fresh blocks on miss.
+This pass `compare_explicit` (same host, cycles/elem):
 
 ```text
-                baseline   P1 hit    P2 take
-churn/64           43.7      41.3      43.0
-owner_free/64      62.0      70–72     71.5
-freelist/64        42.4      41.4      37.1
-large 64 KiB      109.5     123–136   123.5
+phase/64        runic  snmalloc  mimalloc  jemalloc   vs best
+churn            36.6      27.8      36.0      34.5    1.31× sn
+owner_free       23.0      14.3      13.6      36.1    1.69× mi
+freelist         19.0      16.4      22.3      27.8    1.16× sn
+large 64 KiB    120.9    1276.3     130.8     892.6    Runic best
 ```
 
-P1 hit diet met churn ≤41.4 (ins/elem 151→134). P2 deleted `BlockStates` and
-made owner DF undefined; freelist improved, owner_free did not (remaining cost
-is `locate` + magazine drain + available-list, not the Free byte). Do not raise
-the watermark. Do not retry #126 / #128 / RSEQ as a substitute for that take
-shape.
+#129 closeout was 1.6× / 4.6× / 2.7× on those 64-byte phases. #126/#128 skipped.
+
+`#135` RSEQ per-CPU: 65.3 vs 43.6 on churn/64, gate missed, reverted.
+`c1ecdeb` magazine + BlockStates diet (this host): churn/64 **40.5**,
+`owner_free` **74.0**, `freelist` **37.3**. This pass deletes the magazine.
+Same-host Cost vs `c1ecdeb`:
+
+```text
+                c1ecdeb    run-local
+churn/64           40.5         35.4
+owner_free/64      74.0         22.2
+freelist/64        37.3         18.5
+large 64 KiB      133.3        116.1
+local/4            43.7         36.8
+fan-in/4            380          334
+ring/4              676          663
+```
+
+owner_free / freelist beat their aims (25 / 22). Large recovered 133→116
+(#[cold] audit) but missed ≤112. `#135` RSEQ is later, vs this baseline.
 
 ## Supported Scope
 
@@ -88,7 +96,7 @@ mmap-backed extents for dedicated allocations (heap-local)
 out-of-line metadata
 page-indexed pointer lookup
 per-size-class available run lists
-pointer freelist + bump on runs (owner DF undefined)
+pointer freelist + extend on runs (owner DF undefined)
 private run claim-bitmap for remote admission (issued + try_set; no per-block Free byte)
 run/extent Inbox coalesced by owner (Treiber stack of runs/extents, not per-block nodes)
 configurable extent mapping retention and reuse
@@ -117,7 +125,7 @@ stats dashboard
 Next:
 
 ```text
-TLS hit + take/refill diet (this pass); #135 RSEQ retry only after the diet is measured
+#135 RSEQ vs this run-local baseline; do not retry #126 / #128
 ```
 
 ## Core Invariants
@@ -179,11 +187,11 @@ SizeClasses    owns size-class selection.
 OsMemory       maps anonymous pages; Mapping owns the mmap lifecycle (Drop munmaps).
 PageMap        owns page-indexed owner-pointer lookup.
 RunHeap        owns Arena<Run>, run checkout (acquire), and available run lists.
-Run            owns pointer freelist + bump + live, claim bitmap, and embedded InboxLink. Owner DF undefined.
+Run            owns pointer freelist + extend + live, claim bitmap, and embedded InboxLink. Owner DF undefined.
 ExtentHeap     owns Arena<Extent>, dedicated allocation policy, and mapping reuse.
 ExtentCache    owns retained extent mappings, eviction, and reuse lookup.
 Extent         owns dedicated allocation metadata, embedded InboxLink, and Claimed byte state.
-ThreadHeap     owns TLS bind, per-class magazines, page→run cache, and the sole Active body path.
+ThreadHeap     owns TLS bind, current[class], own-heap page cache, and the sole Active body path.
 ```
 
 Prefer direct methods on the entity that owns the state. Do not add passive
@@ -267,10 +275,9 @@ Runic wins on extent retention (Keep).
 threaded/4: local 46.3 vs snmalloc 29.2 (1.6×). fan-in 392 vs 349 (1.1×).
 ring 674 vs 576 (1.2×). Cross-allocator ratios are this-host Cost, not library drift.
 
-Owner-local hit is magazine pop/push (no per-op `Run`). Leftover small-churn
-cost is magazine links + TLS/`matches`. Isolated owner_free/freelist pay
-`take`/`allocate`. Do not raise the watermark to hide them. #135 is the next
-entity for the 1.6× churn gap.
+Owner-local hit is current-run pop / `Heap::free_run` (`locate` + push). Leftover
+small-churn cost is that hit's instruction count. Isolated owner_free / freelist
+are the same path (no take). #135 is the next entity for the 1.6× churn gap.
 
 Remote fan-in is close (run-coalesced Inbox). Use paired Runic cycles/op for
 self-gates; use this table as the #135 competitor baseline.
@@ -396,34 +403,36 @@ tag: 0.6.0
 crates: runic-core 0.6.0, runic-alloc 0.6.0
 ```
 
-### v0.7 Next: Per-CPU / RSEQ magazine
+### v0.7 Next: Run-local hot list + hit diet
 
 Goal:
 
 ```text
-The leftover vs competitors after the TLS magazine is not identity or take.
-A per-CPU (or RSEQ) magazine owns a later hit (`#135` missed its Cost gate
-and was reverted). This closeout is the TLS hit + take/refill diet. Remote
-exact-once stays. Owner DF is undefined. Not a port of snmalloc.
+Delete the per-class TLS magazine. The small hit is a current run per class
+plus a one-entry own-heap page cache. Diet the hit (TLS state byte, prologue,
+cross-crate inlining, `#[cold]` audit). Remote exact-once stays. Owner DF is
+undefined. Not a port of snmalloc. `#135` RSEQ is later, vs this baseline.
 ```
 
-Baseline: #129 closeout on this host. Issue: `#135`.
+Baseline: `c1ecdeb` on this host (churn/64 40.5, owner_free/64 74.0,
+freelist/64 37.3).
 
 In:
 
 ```text
-one CPU (or RSEQ) magazine entity
-TLS magazine replaced or refilled in place (no dual hit)
-watermark stays 32 until Where says otherwise
-out-of-line Run metadata until a new ≥5% Where hit
+ThreadHeap current[class] + own-heap-only page cache
+Run::allocate pop-only; Run::extend threads one page (min 32)
+unbind without take; UnbindGuard TLS; THREAD_HEAP no Drop
+Allocator hit-only + #[inline] so RunicAlloc inlines
+#[cold] only abort / bind / map / remote / unbind
 ```
 
 Out:
 
 ```text
-retry #126 / #128
-dual ThreadHeap + CPU magazine hits
-raising the watermark to hide take
+retry #126 / #128 / RSEQ
+multi-entry page cache
+Allocator singleton
 in-page Run header without Where
 hardening / hugepages (later)
 ```
@@ -431,9 +440,12 @@ hardening / hugepages (later)
 Acceptance gate:
 
 ```text
-≥5% vs #129 baseline on the phases the matrix names
-rails ≤5% regress
-record RSS / large / policy_grid
+churn/64 ≤ 38.5 (aim ≤ 33)
+owner_free/64 ≤ 40 (aim ≤ 25)
+freelist/64 ≤ 30 (aim ≤ 22)
+large 64 KiB ≤ 112
+threaded local/4, fan-in/4, ring/4 regress ≤ 5%
+objdump: no callee-saved in Allocator::alloc/dealloc; RunicAlloc inlines
 fmt, clippy -D warnings, cargo test --workspace
 ```
 
