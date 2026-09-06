@@ -31,12 +31,13 @@ hot paths require it. Architecture should stay simple until a new entity owns a
 real lifecycle, invariant, or policy.
 
 The owner-local current run is that entity for the small hit. The leftover vs
-snmalloc on this host is instruction count on that hit (`locate` / pop), not a
-per-class magazine. `#135` RSEQ per-CPU was tried and reverted (churn/64 65.3
-vs 43.6, gate missed). This pass deletes the magazine (`take` / `refill`) and
-diets the hit (TLS state byte, prologue, cross-crate inlining, `#[cold]` audit).
-Owner DF is undefined; remote admission stays fail-closed. Out-of-line metadata
-stays until Where shows an in-page run header is a ≥5% lever.
+snmalloc / mimalloc on this host is instruction count on that hit (`locate` /
+pop), not a magazine and not RSEQ. A per-CPU hit is a superset of the TLS hit on
+pinned single-thread churn — `#135` Cost 70.1 → 69.3 → 65.3 vs the #129 TLS
+magazine at 43.6 (gate ≤41.4). RSEQ is a footprint / thread-count lever, not a
+hit lever. Do not retry per-CPU on single-thread churn. Owner DF is undefined;
+remote admission stays fail-closed. Out-of-line metadata stays until Where shows
+an in-page run header is a ≥5% lever.
 
 ## Current Status
 
@@ -49,9 +50,20 @@ page-map ownership. Heap lifecycle lives on `Heaps` / `Heap`
 (Heaps indexes each Heap; each `Heap` owns inboxes and `RunHeap`/`ExtentHeap`).
 
 Owner-local hit is a TLS current run per class (pop) plus a one-entry own-heap
-page cache (`Heap::free_run`: `locate` + push). `Run::allocate` is pop only;
+page cache. `locate` is span + reciprocal (one path, no jump table). Empty page
+cache is `page_cache_page == usize::MAX`. `Run::allocate` is pop only;
 `Run::extend` threads one page (min 32) of fresh blocks on miss.
-This pass `compare_explicit` (same host, cycles/elem):
+This pass locate diet vs run-local `75bb578` (same host, cycles/elem):
+
+```text
+                75bb578    locate
+owner_free/64      22.0        16.9
+freelist/64        19.0        18.5
+churn/64           36.6        37.4
+large 64 KiB      120.9       116.8
+```
+
+`compare_explicit` at `75bb578` (same host, cycles/elem):
 
 ```text
 phase/64        runic  snmalloc  mimalloc  jemalloc   vs best
@@ -61,12 +73,19 @@ freelist         19.0      16.4      22.3      27.8    1.16× sn
 large 64 KiB    120.9    1276.3     130.8     892.6    Runic best
 ```
 
+Locate diet owner_free is 16.9 vs mimalloc 13.6 (~1.24×). Freelist still 1.16× snmalloc.
+
+Criterion `compare_explicit` without `-C force-frame-pointers` (512-elem, ns/elem):
+churn 7.46 vs sn 6.64 / mi 7.79; owner_free 4.43 vs sn 3.09 / mi 2.83; freelist 4.22 vs sn 4.02 / mi 4.35.
+Profile Cost gates still include the ~3-instruction frame-pointer tax C allocators do not pay.
+
 #129 closeout was 1.6× / 4.6× / 2.7× on those 64-byte phases. #126/#128 skipped.
 
-`#135` RSEQ per-CPU: 65.3 vs 43.6 on churn/64, gate missed, reverted.
-`c1ecdeb` magazine + BlockStates diet (this host): churn/64 **40.5**,
-`owner_free` **74.0**, `freelist` **37.3**. This pass deletes the magazine.
-Same-host Cost vs `c1ecdeb`:
+`#135` RSEQ per-CPU: 65.3 vs 43.6 on churn/64, retired (not the lever).
+O(1) TLS steal (this pass): freelist/64 18.5 → 22.9, gate missed; churn 37.4 → 31.3
+did not save the AND. Seeded `freelist_allocate_only` pays steal per sample. Reverted.
+
+Run-local `#140` vs `c1ecdeb` (this host):
 
 ```text
                 c1ecdeb    run-local
@@ -80,7 +99,7 @@ ring/4              676          663
 ```
 
 owner_free / freelist beat their aims (25 / 22). Large recovered 133→116
-(#[cold] audit) but missed ≤112. `#135` RSEQ is later, vs this baseline.
+(`#[cold]` audit) but missed ≤112.
 
 ## Supported Scope
 
@@ -125,7 +144,7 @@ stats dashboard
 Next:
 
 ```text
-#135 RSEQ vs this run-local baseline; do not retry #126 / #128
+Do not retry #126 / #128 / #135 (per-CPU on single-thread churn) / O(1) TLS steal
 ```
 
 ## Core Invariants
@@ -275,12 +294,13 @@ Runic wins on extent retention (Keep).
 threaded/4: local 46.3 vs snmalloc 29.2 (1.6×). fan-in 392 vs 349 (1.1×).
 ring 674 vs 576 (1.2×). Cross-allocator ratios are this-host Cost, not library drift.
 
-Owner-local hit is current-run pop / `Heap::free_run` (`locate` + push). Leftover
-small-churn cost is that hit's instruction count. Isolated owner_free / freelist
-are the same path (no take). #135 is the next entity for the 1.6× churn gap.
+Owner-local hit is current-run pop / page-cache `Run::free` (`locate` + push).
+Leftover small-churn cost is that hit's instruction count (`locate` / pop).
+Isolated owner_free / freelist are the same path (no take). `#135` RSEQ is not
+the lever — see thesis.
 
 Remote fan-in is close (run-coalesced Inbox). Use paired Runic cycles/op for
-self-gates; use this table as the #135 competitor baseline.
+self-gates; use this table as the competitor baseline.
 
 Dedicated extent churn is primarily controlled by mapping retention policy.
 Keep extent retention deterministic, bounded, and allocation-free.
@@ -394,7 +414,7 @@ API audit: allocate_fresh → bump; no sticky / *_v2 leftovers
 ```
 
 Raw Cost lives under `target/runic-profiles/*id129*`. Watermark stays 32.
-#135 uses this table as the competitor baseline.
+`#135` RSEQ is retired (not the lever). This table stays the competitor baseline.
 
 Release artifacts:
 
@@ -411,7 +431,7 @@ Goal:
 Delete the per-class TLS magazine. The small hit is a current run per class
 plus a one-entry own-heap page cache. Diet the hit (TLS state byte, prologue,
 cross-crate inlining, `#[cold]` audit). Remote exact-once stays. Owner DF is
-undefined. Not a port of snmalloc. `#135` RSEQ is later, vs this baseline.
+undefined. Not a port of snmalloc. `#135` RSEQ is retired (not the lever).
 ```
 
 Baseline: `c1ecdeb` on this host (churn/64 40.5, owner_free/64 74.0,
@@ -430,7 +450,7 @@ Allocator hit-only + #[inline] so RunicAlloc inlines
 Out:
 
 ```text
-retry #126 / #128 / RSEQ
+retry #126 / #128 / RSEQ / O(1) TLS steal
 multi-entry page cache
 Allocator singleton
 in-page Run header without Where

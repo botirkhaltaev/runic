@@ -1,6 +1,6 @@
 use core::{
     cell::UnsafeCell,
-    mem::size_of,
+    mem::{align_of, size_of},
     num::NonZeroU32,
     ptr::NonNull,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -114,6 +114,17 @@ impl ClaimBits {
         capacity.div_ceil(CLAIM_WORD_BITS)
     }
 
+    fn new(base: NonNull<u8>, offset: usize, capacity: usize) -> Option<Self> {
+        let addr = base.as_ptr().wrapping_byte_add(offset).expose_provenance();
+        if !addr.is_multiple_of(align_of::<AtomicU64>()) {
+            return None;
+        }
+        Some(Self {
+            words: NonNull::new(core::ptr::with_exposed_provenance_mut(addr))?,
+            word_count: Self::word_count(capacity),
+        })
+    }
+
     #[inline]
     fn try_set(&self, index: BlockIndex) -> bool {
         let (word, mask) = index.claim_word_bit();
@@ -153,12 +164,13 @@ pub(crate) struct Run {
     state: UnsafeCell<RunState>,
     /// Cached `mapping.base()` — payload span start (`RUN_SIZE` bytes).
     base: NonNull<u8>,
-    claims: ClaimBits,
-    /// `trailing_zeros(stride)` when power-of-two; `None` means multiply.
-    stride_shift: Option<NonZeroU32>,
-    class: SizeClass,
-    capacity: usize,
+    /// `capacity * stride` — payload bytes that are real blocks (≤ `RUN_SIZE`).
+    span: u32,
+    /// `ceil(2^32 / stride)` — exact `floor(offset / stride)` for `offset < 2^16`.
+    recip: u32,
     stride: usize,
+    claims: ClaimBits,
+    class: SizeClass,
     id: RunId,
     heap: HeapId,
     mapping: Mapping,
@@ -184,6 +196,7 @@ const FREE_END: usize = 0;
 
 struct RunState {
     live: usize,
+    capacity: usize,
     bump: usize,
     available_next: Option<NonNull<Run>>,
     /// `FREE_END` or a payload address of a free block.
@@ -210,42 +223,33 @@ impl Run {
             return None;
         }
 
-        #[allow(clippy::cast_ptr_alignment)] // `claim_offset` is 8-aligned above.
-        // SAFETY: `claim_offset` is 8-aligned (`mapping_offset`) and within
-        // `need`; the span holds `word_count` zeroed `AtomicU64` slots for this
-        // run's lifetime.
-        let claim_words = unsafe {
-            NonNull::new_unchecked(
-                mapping
-                    .base()
-                    .as_ptr()
-                    .add(claim_offset)
-                    .cast::<AtomicU64>(),
-            )
-        };
-        let claims = ClaimBits {
-            words: claim_words,
-            word_count: ClaimBits::word_count(capacity),
-        };
-        // Min size class is 8 (`trailing_zeros` ≥ 3); never zero for our table.
-        let stride_shift = stride
-            .is_power_of_two()
-            .then(|| NonZeroU32::new(stride.trailing_zeros()))
-            .flatten();
+        let claims = ClaimBits::new(mapping.base(), claim_offset, capacity)?;
+        debug_assert!(stride >= size_of::<usize>());
+        let span = u32::try_from(capacity.checked_mul(stride)?).ok()?;
         Some(Self {
-            state: UnsafeCell::new(RunState::new(stride)),
+            state: UnsafeCell::new(RunState::new(capacity)),
             base: mapping.base(),
-            claims,
-            stride_shift,
-            class,
-            capacity,
+            span,
+            recip: Self::recip(u32::try_from(stride).ok()?)?,
             stride,
+            claims,
+            class,
             id,
             heap,
             mapping,
             issued: AtomicUsize::new(0),
             link: InboxLink::new(),
         })
+    }
+
+    /// `ceil(2^32 / stride)` — exact `floor(offset / stride)` for `offset < 2^16`.
+    fn recip(stride: u32) -> Option<u32> {
+        u32::try_from((1_u64 << 32).div_ceil(u64::from(stride))).ok()
+    }
+
+    /// `floor(offset / stride)` via `recip`.
+    fn index(offset: u64, recip: u32) -> u64 {
+        offset.wrapping_mul(u64::from(recip)) >> 32
     }
 
     pub(crate) const fn id(&self) -> RunId {
@@ -265,12 +269,11 @@ impl Run {
     }
 
     /// True when every block is outstanding (allocated or remote-claimed).
-    ///
-    /// Used by `RunHeap` before `free` / `accept` for available-list relink.
     #[inline]
     pub(crate) fn is_full(&self) -> bool {
         // SAFETY: owner-local methods are called only by the owning heap.
-        unsafe { &*self.state.get() }.live == self.capacity
+        let state = unsafe { &*self.state.get() };
+        state.live == state.capacity
     }
 
     /// Outstanding blocks on this run (allocated or remote-claimed).
@@ -303,7 +306,7 @@ impl Run {
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
         let ptr = Self::pop_free(state)?;
-        debug_assert!(state.live < self.capacity);
+        debug_assert!(state.live < state.capacity);
         state.live += 1;
         Some(ptr)
     }
@@ -315,11 +318,11 @@ impl Run {
     pub(crate) fn extend(&self) -> bool {
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
-        if state.bump >= self.capacity {
+        if state.bump >= state.capacity {
             return false;
         }
         let page_worth = PAGE_SIZE / self.stride;
-        let n = page_worth.max(32).min(self.capacity - state.bump);
+        let n = page_worth.max(32).min(state.capacity - state.bump);
         if n == 0 {
             return false;
         }
@@ -338,18 +341,19 @@ impl Run {
         true
     }
 
-    /// Owner-local: live → pointer freelist.
+    /// Owner-local: live → pointer freelist. `Ok(true)` when the run was full.
     ///
     /// Owner double-free is undefined. Remote admission is `claim` / `accept`.
     #[inline]
-    pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
+    pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<bool, RunError> {
         let block = self.locate(ptr).ok_or(RunError::InvalidPointer)?;
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
+        let was_full = state.live == state.capacity;
         debug_assert!(state.live > 0);
         state.live -= 1;
         Self::push_free(state, block.ptr());
-        Ok(())
+        Ok(was_full)
     }
 
     /// Freer: reserve remote admission before publish / payload reuse.
@@ -383,7 +387,7 @@ impl Run {
                 let bit = usize::try_from(bits.trailing_zeros()).unwrap();
                 bits &= bits - 1;
                 let index = BlockIndex::new(word * CLAIM_WORD_BITS + bit);
-                debug_assert!(index.get() < self.capacity);
+                debug_assert!(index.get() < state.capacity);
                 debug_assert!(state.live > 0);
                 state.live -= 1;
                 Self::push_free(state, self.address(index));
@@ -418,28 +422,28 @@ impl Run {
 
     #[inline]
     pub(crate) fn locate(&self, ptr: NonNull<u8>) -> Option<Block> {
-        // Out-of-span (incl. below base) wraps to a large offset ≥ `RUN_SIZE`.
-        let offset = ptr.as_ptr().addr().wrapping_sub(self.base.as_ptr().addr());
-        if offset >= self.range().len() {
+        // Out-of-span (incl. below base) wraps to a large offset ≥ `span`.
+        let offset = u64::try_from(ptr.as_ptr().addr().wrapping_sub(self.base.as_ptr().addr()))
+            .unwrap_or(u64::MAX);
+        if offset >= u64::from(self.span) {
             return None;
         }
-
-        let index = self.class.index_of(offset)?;
-        if index >= self.capacity {
+        let index = Self::index(offset, self.recip);
+        if index.wrapping_mul(u64::try_from(self.stride).ok()?) != offset {
             return None;
         }
-
-        Some(Block::new(BlockIndex::new(index), ptr))
+        Some(Block::new(
+            BlockIndex::new(usize::try_from(index).ok()?),
+            ptr,
+        ))
     }
 
     /// Payload pointer for a freelist or extend index in `0..capacity`.
     #[inline]
     fn address(&self, index: BlockIndex) -> NonNull<u8> {
-        debug_assert!(index.get() < self.capacity);
-        let byte_offset = match self.stride_shift {
-            Some(shift) => index.get() << shift.get(),
-            None => index.get() * self.stride,
-        };
+        // SAFETY: owner-local methods are called only by the owning heap.
+        debug_assert!(index.get() < unsafe { &*self.state.get() }.capacity);
+        let byte_offset = index.get() * self.stride;
         // SAFETY: freelist / `extend` only yield `index < capacity`, so
         // `byte_offset < RUN_SIZE` inside the payload span.
         unsafe { NonNull::new_unchecked(self.base.as_ptr().add(byte_offset)) }
@@ -479,11 +483,10 @@ impl Run {
 }
 
 impl RunState {
-    fn new(block_size: usize) -> Self {
-        debug_assert!(block_size >= size_of::<usize>());
-
+    fn new(capacity: usize) -> Self {
         Self {
             live: 0,
+            capacity,
             bump: 0,
             available_next: None,
             free: FREE_END,
@@ -622,6 +625,26 @@ mod tests {
         let ptr = alloc_block(&run).unwrap();
 
         assert_eq!(run.resize_in_place(ptr, new), Ok(false));
+    }
+
+    #[test]
+    fn recip_matches_index_of_for_all_classes() {
+        for &size in &SizeClasses::SIZES {
+            let stride = u32::try_from(size).unwrap();
+            let recip = Run::recip(stride).unwrap();
+            let span = (RUN_SIZE / size) * size;
+            for offset in 0..span {
+                let index = Run::index(u64::try_from(offset).unwrap(), recip);
+                let ok = index.wrapping_mul(u64::try_from(size).unwrap())
+                    == u64::try_from(offset).unwrap();
+                let class = class_id(size, 8);
+                assert_eq!(
+                    ok.then_some(usize::try_from(index).unwrap()),
+                    class.index_of(offset),
+                    "size={size} offset={offset}"
+                );
+            }
+        }
     }
 
     #[test]

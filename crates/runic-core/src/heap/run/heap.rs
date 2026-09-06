@@ -61,9 +61,7 @@ impl RunHeap {
     pub(crate) fn free(&mut self, run: NonNull<Run>, ptr: NonNull<u8>) -> Result<(), HeapError> {
         // SAFETY: PageMap stores only pointers published from this allocator's live arena.
         let run_ref = unsafe { run.as_ref() };
-        let was_full = run_ref.is_full();
-        run_ref.free(ptr).map_err(HeapError::from)?;
-        if was_full {
+        if run_ref.free(ptr).map_err(HeapError::from)? {
             self.push_available(run)?;
         }
         Ok(())

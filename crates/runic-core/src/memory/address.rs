@@ -40,7 +40,7 @@ impl AddressRange {
         };
 
         offset
-            .checked_add(range.len)
-            .is_some_and(|end| end <= self.len)
+            .checked_add(range.len())
+            .is_some_and(|end| end <= self.len())
     }
 }

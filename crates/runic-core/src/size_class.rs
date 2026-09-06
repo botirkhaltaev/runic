@@ -40,8 +40,9 @@ impl SizeClass {
 
 pub(crate) struct SizeClasses;
 
-/// One hand-authored size list. Indexes, `SIZES`, `COUNT`, and `SizeClass::index_of`
-/// arms are generated together so they cannot drift.
+/// One hand-authored size list. Indexes, `SIZES`, and `COUNT` are generated
+/// together so they cannot drift. `index_of` is test-only; the free hit uses
+/// `Run` span + reciprocal.
 macro_rules! define_size_classes {
     ($($size:literal),+ $(,)?) => {
         define_size_classes!(@zip
@@ -73,7 +74,7 @@ macro_rules! define_size_classes {
     (@go [$(($i:literal, $size:literal))+] [] []) => {
         impl SizeClass {
             /// Block index of a payload offset for this class; rejects non-boundary offsets.
-            #[inline]
+            #[cfg(test)]
             pub(crate) fn index_of(self, offset: usize) -> Option<usize> {
                 // SAFETY: `SizeClass` is only minted for indexes in `0..COUNT`.
                 let shift = unsafe { *SizeClasses::SHIFTS.get_unchecked(self.index()) };
@@ -87,7 +88,7 @@ macro_rules! define_size_classes {
                 }
             }
 
-            #[inline]
+            #[cfg(test)]
             fn index_match(index: usize, offset: usize) -> Option<usize> {
                 match index {
                     $(
@@ -106,6 +107,7 @@ macro_rules! define_size_classes {
             pub(crate) const COUNT: usize = Self::SIZES.len();
             /// `trailing_zeros(size)` for power-of-two classes; `0` means use the
             /// const-divisor match in [`SizeClass::index_of`] (minimum power-of-two class is 8).
+            #[cfg(test)]
             #[allow(clippy::indexing_slicing)]
             const SHIFTS: [u32; Self::COUNT] = {
                 let mut table = [0u32; Self::COUNT];
@@ -229,11 +231,11 @@ impl SizeClasses {
         let align = spec.align().get();
         let required = size.max(align);
 
-        if align <= Self::MIN_ALIGNMENT {
-            if required > Self::SMALL_MAX {
-                return None;
-            }
+        if required > Self::SMALL_MAX {
+            return None;
+        }
 
+        if align <= Self::MIN_ALIGNMENT {
             // SAFETY: `required` is in `1..=SMALL_MAX`, so the table slot is
             // initialized; every stored class index is `< COUNT`.
             let index = usize::from(unsafe { *Self::CLASS_FOR_SIZE.get_unchecked(required) });
@@ -241,7 +243,7 @@ impl SizeClasses {
             return Some(unsafe { SizeClass::new_unchecked(index) });
         }
 
-        if align > PAGE_SIZE || required > Self::SMALL_MAX {
+        if align > PAGE_SIZE {
             return None;
         }
 
