@@ -31,9 +31,10 @@ hot paths require it. Architecture should stay simple until a new entity owns a
 real lifecycle, invariant, or policy.
 
 The owner-local TLS magazine is that entity for v0.5. The leftover vs
-snmalloc on this host (~1.55× on 64B churn) is not identity or take/refill
-(#126/#128 skipped). The next entity is a per-CPU (or RSEQ) magazine — one
-path, fail-closed DF, not a line-for-line port (`#135`, after `#129`).
+snmalloc on this host is instruction count on the TLS-magazine hit, then
+take/refill. `#135` RSEQ per-CPU magazine was tried and reverted (churn/64
+65.3 vs 43.6, gate missed). This pass diets the #129 TLS hit and deletes
+per-block `BlockStates` (owner DF undefined; remote admission stays fail-closed).
 Out-of-line metadata stays until Where shows an in-page run header is a ≥5%
 lever.
 
@@ -55,12 +56,23 @@ churn 43.6 vs snmalloc 27.4 (**1.6×**). Isolated `owner_free` 62.4 vs mimalloc
 mimalloc 133). Threaded local/4 is the same 1.6×; fan-in / ring are ~1.1–1.2×
 snmalloc. #126/#128 skipped (identity / batch take not ≥5% levers).
 
-The next milestone is:
+`#135` RSEQ per-CPU magazine: 65.3 vs 43.6 on churn/64, gate missed, reverted.
+This pass on the #129 TLS magazine (same-ELF Cost, `0bee169` baseline 43.7 /
+62.0 / 42.4):
 
 ```text
-#135 per-CPU / RSEQ magazine vs this #129 baseline. Do not retry identity
-or batch take. Do not raise the watermark.
+                baseline   P1 hit    P2 take
+churn/64           43.7      41.3      43.0
+owner_free/64      62.0      70–72     71.5
+freelist/64        42.4      41.4      37.1
+large 64 KiB      109.5     123–136   123.5
 ```
+
+P1 hit diet met churn ≤41.4 (ins/elem 151→134). P2 deleted `BlockStates` and
+made owner DF undefined; freelist improved, owner_free did not (remaining cost
+is `locate` + magazine drain + available-list, not the Free byte). Do not raise
+the watermark. Do not retry #126 / #128 / RSEQ as a substitute for that take
+shape.
 
 ## Supported Scope
 
@@ -76,8 +88,8 @@ mmap-backed extents for dedicated allocations (heap-local)
 out-of-line metadata
 page-indexed pointer lookup
 per-size-class available run lists
-per-block AtomicU8 clear/Free on runs (Free bit DF fail-closed; freelist+bump own Free/Live)
-private run claim-bitmap for remote admission (no byte Claimed on runs)
+pointer freelist + bump on runs (owner DF undefined)
+private run claim-bitmap for remote admission (issued + try_set; no per-block Free byte)
 run/extent Inbox coalesced by owner (Treiber stack of runs/extents, not per-block nodes)
 configurable extent mapping retention and reuse
 runs retained for the heap lifetime (no empty-run OS release in v0.5)
@@ -105,7 +117,7 @@ stats dashboard
 Next:
 
 ```text
-per-CPU / RSEQ magazine (#135) — new entity, one hit, fail-closed DF
+TLS hit + take/refill diet (this pass); #135 RSEQ retry only after the diet is measured
 ```
 
 ## Core Invariants
@@ -167,8 +179,7 @@ SizeClasses    owns size-class selection.
 OsMemory       maps anonymous pages; Mapping owns the mmap lifecycle (Drop munmaps).
 PageMap        owns page-indexed owner-pointer lookup.
 RunHeap        owns Arena<Run>, run checkout (acquire), and available run lists.
-Run            owns fixed-block allocation metadata, freelist-primary Free/Live, bump, and embedded InboxLink.
-BlockStates    owns clear/Free per-block bytes (one AtomicU8 per block); Free bit is DF fail-closed, not Free/Live authority.
+Run            owns pointer freelist + bump + live, claim bitmap, and embedded InboxLink. Owner DF undefined.
 ExtentHeap     owns Arena<Extent>, dedicated allocation policy, and mapping reuse.
 ExtentCache    owns retained extent mappings, eviction, and reuse lookup.
 Extent         owns dedicated allocation metadata, embedded InboxLink, and Claimed byte state.
@@ -391,8 +402,9 @@ Goal:
 
 ```text
 The leftover vs competitors after the TLS magazine is not identity or take.
-A per-CPU (or RSEQ) magazine owns the next hit. One path. Fail-closed DF
-and remote exact-once stay. Not a port of snmalloc.
+A per-CPU (or RSEQ) magazine owns a later hit (`#135` missed its Cost gate
+and was reverted). This closeout is the TLS hit + take/refill diet. Remote
+exact-once stays. Owner DF is undefined. Not a port of snmalloc.
 ```
 
 Baseline: #129 closeout on this host. Issue: `#135`.

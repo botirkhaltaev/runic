@@ -236,6 +236,18 @@ impl Heap {
         }
     }
 
+    /// Owner-local run free (body only). Caller owns inbox `flush`.
+    ///
+    /// SAFETY: caller is the Active TLS owner or holds [`LockedHeap`].
+    pub(super) unsafe fn free_run(
+        &self,
+        run: NonNull<Run>,
+        ptr: NonNull<u8>,
+    ) -> Result<(), HeapError> {
+        // SAFETY: same ownership contract as the method.
+        unsafe { self.body_mut() }.runs.free(run, ptr)
+    }
+
     /// Flush inboxes if needed, then allocate one large block.
     ///
     /// SAFETY: caller is the Active TLS owner for this heap.
