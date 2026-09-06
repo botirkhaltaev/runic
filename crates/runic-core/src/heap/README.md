@@ -53,5 +53,5 @@ A small block is on exactly one of: user, run freelist, or remote-claimed.
 
 #129 closeout (this host, `aa3a83a`): churn/64 is 43.6 vs snmalloc 27.4 (1.6×).
 This pass vs `c1ecdeb`: churn/64 **35.4**, `owner_free` **22.2**, `freelist` **18.5**.
-Isolated owner_free / freelist are the hit (`locate` / pop), not take.
+Isolated owner_free / freelist are the hit (`locate` / pop).
 `#135` RSEQ per-CPU: 65.3 vs 43.6, reverted.

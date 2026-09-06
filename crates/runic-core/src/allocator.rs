@@ -97,15 +97,11 @@ impl Allocator {
     /// incompatible layout violates the allocator contract and may abort.
     #[inline]
     pub unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
-        if ptr.is_null() {
-            return;
-        }
-
-        let Some(inner) = self.inner() else {
-            Self::abort();
-        };
         let Some(ptr) = NonNull::new(ptr) else {
             return;
+        };
+        let Some(inner) = self.inner() else {
+            Self::abort();
         };
         if let Some((heap, run)) = THREAD_HEAP.with(|tls| tls.cached_run(inner, ptr)) {
             // SAFETY: `cached_run` returns this TLS heap and a live own-heap run.
@@ -542,7 +538,6 @@ mod tests {
     fn bind_alloc_small(
         tls: &ThreadHeap,
         inner: NonNull<AllocatorInner>,
-        _pages: &PageMap,
         layout: Layout,
     ) -> NonNull<u8> {
         let class = SizeClasses::class_for(LayoutSpec::from_layout(layout)).unwrap();
@@ -576,15 +571,14 @@ mod tests {
         extent
     }
 
-    fn take_live(
+    fn alloc_live(
         tls: &ThreadHeap,
         inner: NonNull<AllocatorInner>,
-        pages: &PageMap,
         layout: Layout,
         n: u32,
     ) -> Vec<NonNull<u8>> {
         (0..n)
-            .map(|_| bind_alloc_small(tls, inner, pages, layout))
+            .map(|_| bind_alloc_small(tls, inner, layout))
             .collect()
     }
 
@@ -609,7 +603,7 @@ mod tests {
         THREAD_HEAP.with(|tls| {
             let _id = tls.bind(inner).unwrap();
             let pages = unsafe { inner.as_ref() }.pages();
-            let ptr = bind_alloc_small(tls, inner, pages, layout);
+            let ptr = bind_alloc_small(tls, inner, layout);
             let run = run_of(pages, ptr);
             assert_eq!(tls.free_run(inner, run, ptr), Ok(()));
             // SAFETY: owner free is locate + push; the block is on the run freelist.
@@ -628,17 +622,17 @@ mod tests {
         THREAD_HEAP.with(|tls| {
             let _id = tls.bind(inner).unwrap();
             let pages = unsafe { inner.as_ref() }.pages();
-            let first = bind_alloc_small(tls, inner, pages, layout);
+            let first = bind_alloc_small(tls, inner, layout);
             let run_a = run_of(pages, first);
             let capacity = crate::heap::run::RUN_SIZE / 64;
             let mut ptrs = Vec::with_capacity(capacity + 1);
             ptrs.push(first);
             for _ in 1..capacity {
-                ptrs.push(bind_alloc_small(tls, inner, pages, layout));
+                ptrs.push(bind_alloc_small(tls, inner, layout));
             }
             // SAFETY: just filled this run.
             assert!(unsafe { run_a.as_ref() }.is_full());
-            let extra = bind_alloc_small(tls, inner, pages, layout);
+            let extra = bind_alloc_small(tls, inner, layout);
             let run_b = run_of(pages, extra);
             assert_ne!(run_a, run_b);
             ptrs.push(extra);
@@ -658,22 +652,22 @@ mod tests {
             let capacity = crate::heap::run::RUN_SIZE / 64;
             let mut a_ptrs = Vec::with_capacity(capacity);
             for _ in 0..capacity {
-                a_ptrs.push(bind_alloc_small(tls, inner, pages, layout));
+                a_ptrs.push(bind_alloc_small(tls, inner, layout));
             }
             let run_a = run_of(pages, a_ptrs[0]);
             // SAFETY: just filled this run.
             assert!(unsafe { run_a.as_ref() }.is_full());
-            let b = bind_alloc_small(tls, inner, pages, layout);
+            let b = bind_alloc_small(tls, inner, layout);
             let run_b = run_of(pages, b);
             assert_ne!(run_a, run_b);
             assert_eq!(tls.free_run(inner, run_a, a_ptrs[0]), Ok(()));
             let mut b_ptrs = vec![b];
             for _ in 1..capacity {
-                b_ptrs.push(bind_alloc_small(tls, inner, pages, layout));
+                b_ptrs.push(bind_alloc_small(tls, inner, layout));
             }
             // SAFETY: B is now full; next alloc must take A from available.
             assert!(unsafe { run_b.as_ref() }.is_full());
-            let reused = bind_alloc_small(tls, inner, pages, layout);
+            let reused = bind_alloc_small(tls, inner, layout);
             assert_eq!(reused, a_ptrs[0]);
             assert_eq!(run_of(pages, reused), run_a);
             assert_eq!(tls.free_run(inner, run_a, reused), Ok(()));
@@ -692,11 +686,10 @@ mod tests {
         let layout = Layout::from_size_align(64, 8).unwrap();
         THREAD_HEAP.with(|tls| {
             let _id = tls.bind(inner).unwrap();
-            let pages = unsafe { inner.as_ref() }.pages();
-            let ptr = bind_alloc_small(tls, inner, pages, layout);
+            let ptr = bind_alloc_small(tls, inner, layout);
             assert!(tls.cached_run(inner, ptr).is_none());
             assert_eq!(tls.free_slow(inner, ptr), Ok(()));
-            let again = bind_alloc_small(tls, inner, pages, layout);
+            let again = bind_alloc_small(tls, inner, layout);
             assert_eq!(again, ptr);
             let Some((_, run)) = tls.cached_run(inner, again) else {
                 panic!("page cache should hold the own-heap run after free_slow");
@@ -717,7 +710,7 @@ mod tests {
         let (id, ptr, run) = THREAD_HEAP.with(|tls| {
             let id = tls.bind(inner).unwrap();
             let pages = unsafe { inner.as_ref() }.pages();
-            let ptr = bind_alloc_small(tls, inner, pages, layout);
+            let ptr = bind_alloc_small(tls, inner, layout);
             let run = run_of(pages, ptr);
             // SAFETY: user-held; unbind must not take / change live.
             assert!(unsafe { run.as_ref() }.is_live());
@@ -749,7 +742,7 @@ mod tests {
         THREAD_HEAP.with(|tls| {
             let _id = tls.bind(inner).unwrap();
             let pages = unsafe { inner.as_ref() }.pages();
-            let ptr = bind_alloc_small(tls, inner, pages, layout);
+            let ptr = bind_alloc_small(tls, inner, layout);
             let run = run_of(pages, ptr);
             // SAFETY: user-held block; claim is the remote admission path.
             assert_eq!(unsafe { run.as_ref() }.claim(ptr), Ok(()));
@@ -770,7 +763,7 @@ mod tests {
         THREAD_HEAP.with(|tls| {
             let _id = tls.bind(inner).unwrap();
             let pages = unsafe { inner.as_ref() }.pages();
-            let ptr = bind_alloc_small(tls, inner, pages, layout);
+            let ptr = bind_alloc_small(tls, inner, layout);
             let run = run_of(pages, ptr);
             assert_eq!(
                 tls.free_run(foreign, run, ptr),
@@ -826,7 +819,7 @@ mod tests {
             let id = tls.bind(inner).unwrap();
             // SAFETY: inner retained by allocator.
             let pages = unsafe { inner.as_ref() }.pages();
-            let ptr = bind_alloc_small(tls, inner, pages, layout);
+            let ptr = bind_alloc_small(tls, inner, layout);
             let run = run_of(pages, ptr);
             // SAFETY: PageMap stores only live run pointers.
             assert_eq!(unsafe { run.as_ref() }.heap_id(), id);
@@ -862,7 +855,7 @@ mod tests {
             let _id = tls.bind(inner).unwrap();
             // SAFETY: inner retained by allocator.
             let pages = unsafe { inner.as_ref() }.pages();
-            let ptr = bind_alloc_small(tls, inner, pages, layout);
+            let ptr = bind_alloc_small(tls, inner, layout);
             let run = run_of(pages, ptr);
             // Heap stays Active (still bound). free_remote is the cross-thread path —
             // claim+enqueue twice must report DoubleFree on the second claim.
@@ -887,7 +880,7 @@ mod tests {
             let id = tls.bind(inner).unwrap();
             // SAFETY: inner retained by allocator.
             let pages = unsafe { inner.as_ref() }.pages();
-            let ptr = bind_alloc_small(tls, inner, pages, layout);
+            let ptr = bind_alloc_small(tls, inner, layout);
             let run = run_of(pages, ptr);
             // SAFETY: block was just allocated from this run.
             assert_eq!(unsafe { run.as_ref() }.claim(ptr), Ok(()));
@@ -933,7 +926,7 @@ mod tests {
                     let _id = tls.bind(inner).unwrap();
                     // SAFETY: inner retained by allocator.
                     let pages = unsafe { inner.as_ref() }.pages();
-                    let live = take_live(tls, inner, pages, layout, 8);
+                    let live = alloc_live(tls, inner, layout, 8);
                     let run = run_of(pages, live[0]);
                     ready_a
                         .send(live.iter().map(|p| p.as_ptr() as usize).collect())
@@ -955,7 +948,7 @@ mod tests {
                     let _id = tls.bind(inner).unwrap();
                     // SAFETY: inner retained by allocator.
                     let pages = unsafe { inner.as_ref() }.pages();
-                    let live = take_live(tls, inner, pages, layout, 8);
+                    let live = alloc_live(tls, inner, layout, 8);
                     let run = run_of(pages, live[0]);
                     ready_b
                         .send(live.iter().map(|p| p.as_ptr() as usize).collect())
@@ -1067,7 +1060,7 @@ mod tests {
             let id = tls.bind(inner).unwrap();
             // SAFETY: inner retained by allocator.
             let pages = unsafe { inner.as_ref() }.pages();
-            let live = take_live(tls, inner, pages, layout, 8);
+            let live = alloc_live(tls, inner, layout, 8);
             let run = run_of(pages, live[0]);
             for ptr in live {
                 // SAFETY: block was just allocated from this run.
@@ -1135,8 +1128,8 @@ mod tests {
             let id = tls.bind(inner).unwrap();
             // SAFETY: inner retained by allocator.
             let pages = unsafe { inner.as_ref() }.pages();
-            let first = bind_alloc_small(tls, inner, pages, layout);
-            let second = bind_alloc_small(tls, inner, pages, layout);
+            let first = bind_alloc_small(tls, inner, layout);
+            let second = bind_alloc_small(tls, inner, layout);
             let first_run = run_of(pages, first);
             let second_run = run_of(pages, second);
             tls.unbind();
@@ -1176,7 +1169,7 @@ mod tests {
             let heap = tls.bind(inner).unwrap();
             // SAFETY: inner retained by allocator.
             let pages = unsafe { inner.as_ref() }.pages();
-            let ptr = bind_alloc_small(tls, inner, pages, layout);
+            let ptr = bind_alloc_small(tls, inner, layout);
             let run = run_of(pages, ptr);
             tls.unbind();
             (heap, ptr, run)
@@ -1207,7 +1200,7 @@ mod tests {
             let heap = tls.bind(inner).unwrap();
             // SAFETY: inner retained by allocator.
             let pages = unsafe { inner.as_ref() }.pages();
-            let ptr = bind_alloc_small(tls, inner, pages, layout);
+            let ptr = bind_alloc_small(tls, inner, layout);
             let run = run_of(pages, ptr);
             assert_eq!(tls.free_run(inner, run, ptr), Ok(()));
             assert!(pages.get(ptr).is_some());
@@ -1223,7 +1216,7 @@ mod tests {
             assert_eq!(reused.index(), heap.index());
             assert_ne!(reused.generation(), heap.generation());
             let pages = unsafe { inner.as_ref() }.pages();
-            let reused_ptr = bind_alloc_small(tls, inner, pages, layout);
+            let reused_ptr = bind_alloc_small(tls, inner, layout);
             assert!(pages.get(ptr).is_some());
             assert!(pages.get(reused_ptr).is_some());
             let reused_run = run_of(pages, reused_ptr);

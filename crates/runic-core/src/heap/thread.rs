@@ -85,12 +85,9 @@ impl ThreadHeap {
         if !self.matches(inner) {
             return None;
         }
-        let run = self.current(class).get();
-        if run.is_null() {
-            return None;
-        }
+        let run = NonNull::new(self.current(class).get())?;
         // SAFETY: `current` stores only live arena run pointers while bound.
-        unsafe { (*run).allocate() }
+        unsafe { run.as_ref().allocate() }
     }
 
     /// Freelist empty: `extend`, else `acquire_run`, else flush then retry.
@@ -108,33 +105,29 @@ impl ThreadHeap {
         }
         // SAFETY: caller is the Active TLS owner; inner is retained while bound.
         let pages = unsafe { inner.as_ref() }.pages();
-        let heap = self.bound_heap();
         // SAFETY: Active TLS owner for this bound heap.
-        let heap_ref = unsafe { heap.as_ref() };
+        let heap = unsafe { self.bound_heap().as_ref() };
         // SAFETY: Active TLS owner. Inbox flush is deferred until local acquire fails.
-        if let Some(run) = unsafe { heap_ref.acquire_run(class, pages) } {
+        if let Some(run) = unsafe { heap.acquire_run(class, pages) } {
             return self.install_current(class, run);
         }
         // SAFETY: Active TLS owner.
-        if unsafe { heap_ref.flush(pages) }.is_err() {
+        if unsafe { heap.flush(pages) }.is_err() {
             return None;
         }
         // SAFETY: Active TLS owner.
-        if let Some(run) = unsafe { heap_ref.acquire_run(class, pages) } {
+        if let Some(run) = unsafe { heap.acquire_run(class, pages) } {
             return self.install_current(class, run);
         }
         None
     }
 
     fn extend_current(&self, class: SizeClass) -> Option<NonNull<u8>> {
-        let run = self.current(class).get();
-        if run.is_null() {
-            return None;
-        }
+        let run = NonNull::new(self.current(class).get())?;
         // SAFETY: `current` stores only live arena run pointers while bound.
-        let run_ref = unsafe { &*run };
-        if run_ref.extend() {
-            return run_ref.allocate();
+        let run = unsafe { run.as_ref() };
+        if run.extend() {
+            return run.allocate();
         }
         None
     }
@@ -173,7 +166,6 @@ impl ThreadHeap {
     }
 
     /// Unbound path after `bind`: flush inboxes, then owner-local run alloc.
-    #[cold]
     pub(crate) fn alloc_after_bind(
         &self,
         inner: NonNull<AllocatorInner>,
@@ -186,7 +178,6 @@ impl ThreadHeap {
     }
 
     /// Unbound path after `bind`: flush inboxes, then owner-local extent alloc.
-    #[cold]
     pub(crate) fn alloc_extent_after_bind(
         &self,
         inner: NonNull<AllocatorInner>,
@@ -213,8 +204,6 @@ impl ThreadHeap {
     }
 
     /// Page-cache own-heap run for `ptr`, if this TLS is bound to `inner`.
-    ///
-    /// Tiny so `LocalKey::with` inlines; the caller runs `Heap::free_run`.
     #[inline]
     pub(crate) fn cached_run(
         &self,
@@ -251,17 +240,11 @@ impl ThreadHeap {
         if self.heap_id.get() != Some(unsafe { run.as_ref() }.heap_id()) {
             return Err(ThreadFreeError::Remote);
         }
-        self.owner_free(run, ptr);
-        Ok(())
-    }
-
-    #[inline]
-    fn owner_free(&self, run: NonNull<Run>, ptr: NonNull<u8>) {
-        let heap = self.bound_heap();
-        // SAFETY: Active TLS owner; `run` is a live arena run.
-        if unsafe { heap.as_ref().free_run(run, ptr) }.is_err() {
+        // SAFETY: Active TLS owner; `run` is a live arena run of this heap.
+        if unsafe { self.bound_heap().as_ref().free_run(run, ptr) }.is_err() {
             Allocator::abort();
         }
+        Ok(())
     }
 
     /// Owner-local free for an extent owned by the bound heap.

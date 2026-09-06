@@ -310,7 +310,7 @@ impl Run {
 
     /// Thread one page of fresh blocks (at least 32, or remaining) onto the freelist.
     ///
-    /// `issued` advances once. Returns `false` when bump is exhausted.
+    /// `issued` advances once. Returns `false` when no fresh blocks remain.
     #[inline(never)]
     pub(crate) fn extend(&self) -> bool {
         // SAFETY: owner-local methods are called only by the owning heap.
@@ -507,7 +507,7 @@ mod tests {
         SizeClasses::class_for(layout_spec(size, align)).unwrap()
     }
 
-    fn take(run: &Run) -> Option<NonNull<u8>> {
+    fn alloc_block(run: &Run) -> Option<NonNull<u8>> {
         run.allocate().or_else(|| {
             run.extend();
             run.allocate()
@@ -536,7 +536,7 @@ mod tests {
         let mut seen = vec![false; capacity];
 
         for _ in 0..capacity {
-            let ptr = take(&run).unwrap();
+            let ptr = alloc_block(&run).unwrap();
             let block = run.locate(ptr).unwrap();
             let index = block.index().get();
 
@@ -585,7 +585,7 @@ mod tests {
         )
         .expect("test run");
 
-        let ptr = take(&run).unwrap();
+        let ptr = alloc_block(&run).unwrap();
 
         assert!(run.free(ptr).is_ok());
 
@@ -603,7 +603,7 @@ mod tests {
         )
         .expect("test run");
         let new = layout_spec(64, 8);
-        let ptr = take(&run).unwrap();
+        let ptr = alloc_block(&run).unwrap();
 
         assert_eq!(run.resize_in_place(ptr, new), Ok(true));
     }
@@ -619,7 +619,7 @@ mod tests {
         )
         .expect("test run");
         let new = layout_spec(80, 8);
-        let ptr = take(&run).unwrap();
+        let ptr = alloc_block(&run).unwrap();
 
         assert_eq!(run.resize_in_place(ptr, new), Ok(false));
     }
@@ -634,7 +634,7 @@ mod tests {
             class,
         )
         .expect("test run");
-        let ptr = take(&run).unwrap();
+        let ptr = alloc_block(&run).unwrap();
         let interior = unsafe { NonNull::new_unchecked(ptr.as_ptr().add(1)) };
 
         assert!(run.locate(interior).is_none());
@@ -653,7 +653,7 @@ mod tests {
             .expect("test run");
             let capacity = RUN_SIZE / size;
 
-            let first = take(&run).unwrap();
+            let first = alloc_block(&run).unwrap();
             assert!(run.locate(first).is_some(), "size={size}");
             assert!(
                 run.locate(unsafe { NonNull::new_unchecked(first.as_ptr().add(1)) })
@@ -681,7 +681,7 @@ mod tests {
             class,
         )
         .expect("test run");
-        let ptr = take(&run).unwrap();
+        let ptr = alloc_block(&run).unwrap();
         let interior = unsafe { NonNull::new_unchecked(ptr.as_ptr().add(1)) };
 
         assert!(run.locate(ptr).is_some());
@@ -699,7 +699,7 @@ mod tests {
                 class,
             )
             .expect("test run");
-            let ptr = take(&run).unwrap();
+            let ptr = alloc_block(&run).unwrap();
 
             assert!(run.locate(ptr).is_some(), "size={size}");
             assert!(run.free(ptr).is_ok(), "size={size}");
@@ -738,7 +738,7 @@ mod tests {
             class,
         )
         .expect("test run");
-        let ptr = take(&run).unwrap();
+        let ptr = alloc_block(&run).unwrap();
 
         assert_eq!(run.claim(ptr), Ok(()));
         assert_eq!(run.claim(ptr), Err(RunError::DoubleFree));
@@ -754,7 +754,7 @@ mod tests {
             class,
         )
         .expect("test run");
-        let ptr = take(&run).unwrap();
+        let ptr = alloc_block(&run).unwrap();
 
         assert_eq!(run.claim(ptr), Ok(()));
         assert!(!run.accept());
@@ -771,10 +771,10 @@ mod tests {
             class,
         )
         .expect("test run");
-        let ptr = take(&run).unwrap();
+        let ptr = alloc_block(&run).unwrap();
         assert!(!run.accept());
         // `ptr`'s block is still live (never claimed), so the next allocate is fresh.
-        assert_ne!(take(&run).unwrap(), ptr);
+        assert_ne!(alloc_block(&run).unwrap(), ptr);
     }
 
     #[test]
@@ -788,7 +788,7 @@ mod tests {
                 class,
             )
             .expect("test run");
-            let ptr = take(&run).unwrap();
+            let ptr = alloc_block(&run).unwrap();
             assert_eq!(run.claim(ptr), Ok(()), "size={size}");
             assert!(!run.accept(), "size={size}");
             assert_eq!(run.allocate(), Some(ptr), "size={size}");
@@ -808,7 +808,7 @@ mod tests {
         let capacity = RUN_SIZE / class.size();
 
         for _ in 0..capacity {
-            let ptr = take(&run).unwrap();
+            let ptr = alloc_block(&run).unwrap();
             assert_eq!(ptr.as_ptr() as usize % 16, 0);
         }
     }
@@ -843,8 +843,8 @@ mod tests {
             class,
         )
         .expect("test run");
-        let a = take(&run).unwrap();
-        let b = take(&run).unwrap();
+        let a = alloc_block(&run).unwrap();
+        let b = alloc_block(&run).unwrap();
         let inbox: Inbox<Run> = Inbox::new();
         let run_ptr = NonNull::from(&run);
 
@@ -888,7 +888,7 @@ mod tests {
         // Addresses, not `NonNull<u8>`: a raw-pointer `Vec` is not `Sync`, and this slice
         // only ever crosses the thread boundary by shared reference below.
         let addrs: Vec<usize> = (0..capacity)
-            .map(|_| take(&run).unwrap().as_ptr() as usize)
+            .map(|_| alloc_block(&run).unwrap().as_ptr() as usize)
             .collect();
         let inbox: Inbox<Run> = Inbox::new();
         let done = AtomicBool::new(false);
