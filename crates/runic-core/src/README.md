@@ -10,7 +10,7 @@ Allocator core organized around entities and invariants.
 - `heap`: owner-local heaps, TLS current run, run/extent heaps, `Heaps`, and thread binding.
 - `layout`: normalized layout semantics and mapping sizing (`align` as `NonZeroUsize`; `mapping_len` uses `size + align - 1`).
 - `memory`: address ranges, mmap ownership, and page-indexed owner lookup.
-- `size_class`: one size-class declaration generates `SizeClass::index_of` and lookup tables. `SizeClass` is minted only by `SizeClasses::class_for`.
+- `size_class`: one size-class declaration generates lookup tables. `SizeClass` is minted only by `SizeClasses::class_for`. Free-hit geometry lives on `Run` (span + reciprocal).
 
 ## Invariant
 

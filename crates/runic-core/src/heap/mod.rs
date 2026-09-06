@@ -229,7 +229,7 @@ impl Heap {
         ptr: NonNull<u8>,
         pages: &PageMap,
     ) -> Result<(), HeapError> {
-        // SAFETY: same ownership contract as the method.
+        // SAFETY: caller holds exclusive Active / Draining body access.
         let body = unsafe { self.body_mut() };
         match owner {
             PageOwner::Run(run) => body.runs.free(run, ptr),
@@ -246,8 +246,17 @@ impl Heap {
         run: NonNull<Run>,
         ptr: NonNull<u8>,
     ) -> Result<(), HeapError> {
-        // SAFETY: same ownership contract as the method.
+        // SAFETY: caller holds exclusive Active / Draining body access.
         unsafe { self.body_mut() }.runs.free(run, ptr)
+    }
+
+    /// Insert a run that just left full onto the available list. Not on the free hit.
+    ///
+    /// SAFETY: caller is the Active TLS owner or holds [`LockedHeap`]; `run` is a
+    /// live arena run of this heap.
+    pub(super) unsafe fn push_available(&self, run: NonNull<Run>) -> Result<(), HeapError> {
+        // SAFETY: caller holds exclusive Active / Draining body access.
+        unsafe { self.body_mut() }.runs.push_available(run)
     }
 
     /// Flush inboxes if needed, then allocate one large block.

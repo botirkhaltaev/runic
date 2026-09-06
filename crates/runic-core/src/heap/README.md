@@ -33,7 +33,7 @@ Owner-local heap frontend: runs for small size classes, extents for dedicated la
 - Draining reclaim observes live ownership via `RunHeap` ∨ `ExtentHeap` (`has_live`). In-flight claim bits keep the heap live. Only `LockedHeap` Drop may reclaim.
 - Never-bound freers enqueue each successful claim in `Allocator::free_remote` (no TLS batch; no stranded claims). Bound producers coalesce by run/extent, not by thread batch.
 - Owner free composition stays on private `Heap` body helpers invoked only from `ThreadHeap` / `LockedHeap`; domain ops are `free` / `claim` / `accept` on `Run`/`Extent`. Failures after claim abort (no rollback).
-- Current-run empty: `extend` then local/OS `acquire_run` first; inbox flush only if that misses, then retry. Unbound cold path: `alloc_after_bind` / `alloc_extent_after_bind`. Hit: current pop / `Heap::free_run`. Inbox `flush` is remote `accept`.
+- Current-run empty: `extend` then local/OS `acquire_run` first; inbox flush only if that misses, then retry. Unbound cold path: `alloc_after_bind` / `alloc_extent_after_bind`. Hit: current pop / page-cache `Run::free`. Inbox `flush` is remote `accept`.
 - `HeapState` packs generation, mode (`Free` / `Active` / `Draining`), retired, and in-flight **lease** count for Active **enqueue** admits only (not inbox depth — that stays live via claim bits / `has_live`).
 - `Heaps` publishes stable heap pointers per index once; `get` is lock-free. Arena mutex covers claim/reuse only — never flush/accept.
 - `THREAD_HEAP` has no destructor. `UnbindGuard` (touched in `bind`) retires the heap on thread exit.
@@ -45,13 +45,14 @@ A small block is on exactly one of: user, run freelist, or remote-claimed.
 | Hit | Work | Not on the hit |
 |-----|------|----------------|
 | **alloc** | `matches` → `current[class]` → `Run::allocate` (pop) | `extend`, ClaimBits, locks, atomics, acquire, flush |
-| **owner free** | page-cache (own-heap runs only) → `Heap::free_run` (`locate` + `live--` + push) | ClaimBits, `extend`, locks, atomics |
+| **owner free** | page-cache sentinel (`usize::MAX` empty) → `Run::free` (span+reciprocal `locate` + `live--` + push); `push_available` only on `was_full` | ClaimBits, `extend`, locks, atomics, jump table |
 
 `current[class]` is a hint, not ownership. Available list is the reservoir; a run may be both current and listed. Frees never touch `current`. Interior pointers abort on `locate` (hit). Owner DF is undefined.
 
 `lookup` + the page cache stay on owner free. Cache stores only runs whose `HeapId` matches this TLS.
 
 #129 closeout (this host, `aa3a83a`): churn/64 is 43.6 vs snmalloc 27.4 (1.6×).
-This pass vs `c1ecdeb`: churn/64 **35.4**, `owner_free` **22.2**, `freelist` **18.5**.
-Isolated owner_free / freelist are the hit (`locate` / pop).
-`#135` RSEQ per-CPU: 65.3 vs 43.6, reverted.
+This pass vs `75bb578`: `owner_free` **16.9** (was 22.0), `freelist` **18.5**, churn **37.4**.
+Isolated owner_free is span+reciprocal `locate` (no jump table).
+`#135` RSEQ per-CPU: 65.3 vs 43.6, retired (superset of the TLS hit on pinned churn).
+O(1) TLS steal: freelist 18.5 → 22.9, reverted.

@@ -20,7 +20,7 @@ pub(crate) enum ThreadFreeError {
 
 /// Thread-local frontend: bound heap and per-class current run.
 ///
-/// Hot paths take `NonNull<AllocatorInner>` for identity. `&PageMap` is projected
+/// Hot paths take a raw inner pointer for identity. `&PageMap` is projected
 /// only on miss. Hit is current-run pop / page-cache `Run::free`.
 pub(crate) struct ThreadHeap {
     inner: Cell<*mut AllocatorInner>,
@@ -29,7 +29,7 @@ pub(crate) struct ThreadHeap {
     current: [Cell<*mut Run>; SizeClasses::COUNT],
     /// Last cached run page number (`usize::MAX` = empty).
     page_cache_page: Cell<usize>,
-    /// Cached own-heap run pointer (`null` = empty). Extents are never cached.
+    /// Live own-heap run when `page_cache_page != usize::MAX`. Extents are never cached.
     page_cache_run: Cell<*mut Run>,
 }
 
@@ -53,21 +53,20 @@ impl ThreadHeap {
         ptr: NonNull<u8>,
     ) -> Option<PageOwner> {
         let page = ptr.as_ptr().addr() / PAGE_SIZE;
-        if self.matches(inner) && self.page_cache_page.get() == page {
-            let run = self.page_cache_run.get();
-            if !run.is_null() {
-                // SAFETY: cache stores only live own-heap arena run pointers while bound.
-                return Some(PageOwner::Run(unsafe { NonNull::new_unchecked(run) }));
-            }
+        if self.matches(inner.as_ptr()) && self.page_cache_page.get() == page {
+            // SAFETY: a matching page is stored only with a live own-heap run.
+            return Some(PageOwner::Run(unsafe {
+                NonNull::new_unchecked(self.page_cache_run.get())
+            }));
         }
         let owner = pages.get(ptr)?;
-        if self.matches(inner)
+        if self.matches(inner.as_ptr())
             && let PageOwner::Run(run) = owner
         {
             // SAFETY: PageMap stores only live arena run pointers.
             if self.heap_id.get() == Some(unsafe { run.as_ref() }.heap_id()) {
-                self.page_cache_page.set(page);
                 self.page_cache_run.set(run.as_ptr());
+                self.page_cache_page.set(page);
             }
         }
         Some(owner)
@@ -75,11 +74,11 @@ impl ThreadHeap {
 
     /// Owner-local small allocation via the current run for `class`.
     ///
-    /// Hit is `matches` + pop. Empty / unbound → caller `alloc_miss` / `bind`.
+    /// Hit is `matches` + pop. Empty / unbound / uninit → caller miss.
     #[inline]
     pub(crate) fn alloc(
         &self,
-        inner: NonNull<AllocatorInner>,
+        inner: *mut AllocatorInner,
         class: SizeClass,
     ) -> Option<NonNull<u8>> {
         if !self.matches(inner) {
@@ -97,7 +96,7 @@ impl ThreadHeap {
         inner: NonNull<AllocatorInner>,
         class: SizeClass,
     ) -> Option<NonNull<u8>> {
-        if !self.matches(inner) {
+        if !self.matches(inner.as_ptr()) {
             return None;
         }
         if let Some(ptr) = self.extend_current(class) {
@@ -156,7 +155,7 @@ impl ThreadHeap {
         pages: &PageMap,
         init: ExtentInit,
     ) -> Option<NonNull<u8>> {
-        if !self.matches(inner) {
+        if !self.matches(inner.as_ptr()) {
             return None;
         }
 
@@ -195,7 +194,7 @@ impl ThreadHeap {
         inner: NonNull<AllocatorInner>,
         pages: &PageMap,
     ) -> Result<(), HeapError> {
-        if !self.matches(inner) {
+        if !self.matches(inner.as_ptr()) {
             return Err(HeapError::InvalidHeap);
         }
         let heap = self.bound_heap();
@@ -204,12 +203,14 @@ impl ThreadHeap {
     }
 
     /// Page-cache own-heap run for `ptr`, if this TLS is bound to `inner`.
+    ///
+    /// Empty cache is `page_cache_page == usize::MAX`; no run-null test.
     #[inline]
     pub(crate) fn cached_run(
         &self,
-        inner: NonNull<AllocatorInner>,
+        inner: *mut AllocatorInner,
         ptr: NonNull<u8>,
-    ) -> Option<(NonNull<Heap>, NonNull<Run>)> {
+    ) -> Option<NonNull<Run>> {
         if !self.matches(inner) {
             return None;
         }
@@ -217,12 +218,17 @@ impl ThreadHeap {
         if self.page_cache_page.get() != page {
             return None;
         }
-        let run = self.page_cache_run.get();
-        if run.is_null() {
-            return None;
+        // SAFETY: a matching page is stored only with a live own-heap run.
+        Some(unsafe { NonNull::new_unchecked(self.page_cache_run.get()) })
+    }
+
+    /// Available-list insert after a full run took a free. Off the free hit.
+    #[inline(never)]
+    pub(crate) fn push_available(&self, run: NonNull<Run>) {
+        // SAFETY: caller just owner-freed `run` on this bound heap.
+        if unsafe { self.bound_heap().as_ref().push_available(run) }.is_err() {
+            Allocator::abort();
         }
-        // SAFETY: cache stores only live own-heap arena run pointers while bound.
-        Some((self.bound_heap(), unsafe { NonNull::new_unchecked(run) }))
     }
 
     /// Owner-local free for a run owned by the bound heap.
@@ -233,7 +239,7 @@ impl ThreadHeap {
         run: NonNull<Run>,
         ptr: NonNull<u8>,
     ) -> Result<(), ThreadFreeError> {
-        if !self.matches(inner) {
+        if !self.matches(inner.as_ptr()) {
             return Err(ThreadFreeError::Remote);
         }
         // SAFETY: caller supplies a PageMap / arena run pointer.
@@ -257,7 +263,7 @@ impl ThreadHeap {
     ) -> Result<(), ThreadFreeError> {
         // SAFETY: PageMap stores only pointers published from this allocator's live arena.
         let heap_id = unsafe { extent.as_ref() }.heap_id();
-        if !self.matches(inner) || self.heap_id.get() != Some(heap_id) {
+        if !self.matches(inner.as_ptr()) || self.heap_id.get() != Some(heap_id) {
             return Err(ThreadFreeError::Remote);
         }
 
@@ -274,7 +280,7 @@ impl ThreadHeap {
     #[cold]
     pub(crate) fn bind(&self, inner: NonNull<AllocatorInner>) -> Option<HeapId> {
         UNBIND_GUARD.with(|_| {});
-        if self.matches(inner) {
+        if self.matches(inner.as_ptr()) {
             return self.heap_id.get();
         }
 
@@ -303,8 +309,8 @@ impl ThreadHeap {
         self.inner.set(inner.as_ptr());
     }
 
-    fn matches(&self, inner: NonNull<AllocatorInner>) -> bool {
-        self.inner.get() == inner.as_ptr()
+    fn matches(&self, inner: *mut AllocatorInner) -> bool {
+        self.inner.get() == inner
     }
 
     /// No allocator retain — never bound, or after `unbind`.

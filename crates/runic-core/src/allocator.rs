@@ -76,16 +76,17 @@ impl Allocator {
     #[inline]
     pub unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let spec = LayoutSpec::from_layout(layout);
-        let Some(inner) = self.inner() else {
-            return self.alloc_uninit(layout);
-        };
+        let inner = self.inner.load(Ordering::Acquire);
         if let Some(class) = SizeClasses::class_for(spec) {
             if let Some(ptr) = THREAD_HEAP.with(|tls| tls.alloc(inner, class)) {
                 return ptr.as_ptr();
             }
-            return Self::alloc_miss(inner, class);
+            return self.alloc_miss(inner, class, layout);
         }
-        Self::alloc_extent(inner, spec, ExtentInit::Uninit)
+        if let Some(inner) = NonNull::new(inner) {
+            return Self::alloc_extent(inner, spec, ExtentInit::Uninit);
+        }
+        self.alloc_uninit(layout)
     }
 
     /// Deallocates memory previously returned by this allocator.
@@ -100,13 +101,13 @@ impl Allocator {
         let Some(ptr) = NonNull::new(ptr) else {
             return;
         };
-        let Some(inner) = self.inner() else {
-            Self::abort();
-        };
-        if let Some((heap, run)) = THREAD_HEAP.with(|tls| tls.cached_run(inner, ptr)) {
-            // SAFETY: `cached_run` returns this TLS heap and a live own-heap run.
-            if unsafe { heap.as_ref().free_run(run, ptr) }.is_err() {
-                Self::abort();
+        let inner = self.inner.load(Ordering::Acquire);
+        if let Some(run) = THREAD_HEAP.with(|tls| tls.cached_run(inner, ptr)) {
+            // SAFETY: `cached_run` returns a live own-heap run.
+            match unsafe { run.as_ref().free(ptr) } {
+                Ok(false) => {}
+                Ok(true) => THREAD_HEAP.with(|tls| tls.push_available(run)),
+                Err(_) => Self::abort(),
             }
             return;
         }
@@ -199,21 +200,22 @@ impl Allocator {
     #[inline]
     pub unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let spec = LayoutSpec::from_layout(layout);
-        let Some(inner) = self.inner() else {
+        let inner = self.inner.load(Ordering::Acquire);
+        let Some(class) = SizeClasses::class_for(spec) else {
+            if let Some(inner) = NonNull::new(inner) {
+                return Self::alloc_extent(inner, spec, ExtentInit::Zeroed);
+            }
             if self.init().is_none() {
                 return null_mut();
             }
             // SAFETY: inner is installed; same contract as the public method.
             return unsafe { self.alloc_zeroed(layout) };
         };
-        let Some(class) = SizeClasses::class_for(spec) else {
-            return Self::alloc_extent(inner, spec, ExtentInit::Zeroed);
-        };
 
         let ptr = if let Some(ptr) = THREAD_HEAP.with(|tls| tls.alloc(inner, class)) {
             ptr.as_ptr()
         } else {
-            Self::alloc_miss(inner, class)
+            self.alloc_miss(inner, class, layout)
         };
         if !ptr.is_null() {
             // SAFETY: ptr was just allocated for layout and is valid for layout.size() bytes.
@@ -343,16 +345,22 @@ impl Allocator {
 
     /// Page-cache miss / remote / extent after the TLS hit missed.
     #[inline(never)]
-    fn dealloc_slow(inner: NonNull<AllocatorInner>, ptr: NonNull<u8>) {
+    fn dealloc_slow(inner: *mut AllocatorInner, ptr: NonNull<u8>) {
+        let Some(inner) = NonNull::new(inner) else {
+            Self::abort();
+        };
         match THREAD_HEAP.with(|tls| tls.free_slow(inner, ptr)) {
             Ok(()) => {}
             Err(error) => Self::free_fail(inner, ptr, error),
         }
     }
 
-    /// Current-run empty or unbound: extend / acquire if bound, else bind.
+    /// Current-run empty, unbound, or inner not yet installed.
     #[inline(never)]
-    fn alloc_miss(inner: NonNull<AllocatorInner>, class: SizeClass) -> *mut u8 {
+    fn alloc_miss(&self, inner: *mut AllocatorInner, class: SizeClass, layout: Layout) -> *mut u8 {
+        let Some(inner) = NonNull::new(inner) else {
+            return self.alloc_uninit(layout);
+        };
         if let Some(ptr) = THREAD_HEAP.with(|tls| tls.alloc_miss(inner, class)) {
             return ptr.as_ptr();
         }
@@ -541,7 +549,7 @@ mod tests {
         layout: Layout,
     ) -> NonNull<u8> {
         let class = SizeClasses::class_for(LayoutSpec::from_layout(layout)).unwrap();
-        tls.alloc(inner, class)
+        tls.alloc(inner.as_ptr(), class)
             .or_else(|| tls.alloc_miss(inner, class))
             .unwrap()
     }
@@ -687,16 +695,16 @@ mod tests {
         THREAD_HEAP.with(|tls| {
             let _id = tls.bind(inner).unwrap();
             let ptr = bind_alloc_small(tls, inner, layout);
-            assert!(tls.cached_run(inner, ptr).is_none());
+            assert!(tls.cached_run(inner.as_ptr(), ptr).is_none());
             assert_eq!(tls.free_slow(inner, ptr), Ok(()));
             let again = bind_alloc_small(tls, inner, layout);
             assert_eq!(again, ptr);
-            let Some((_, run)) = tls.cached_run(inner, again) else {
+            let Some(run) = tls.cached_run(inner.as_ptr(), again) else {
                 panic!("page cache should hold the own-heap run after free_slow");
             };
             assert_eq!(tls.free_run(inner, run, again), Ok(()));
             let _ = tls.bind(foreign).unwrap();
-            assert!(tls.cached_run(inner, ptr).is_none());
+            assert!(tls.cached_run(inner.as_ptr(), ptr).is_none());
             let _ = tls.bind(inner).unwrap();
             tls.unbind();
         });
@@ -1010,7 +1018,7 @@ mod tests {
             let mut addrs = Vec::with_capacity(THREADS * PER_THREAD);
             for _ in 0..THREADS * PER_THREAD {
                 addrs.push(
-                    tls.alloc(inner, class)
+                    tls.alloc(inner.as_ptr(), class)
                         .or_else(|| tls.alloc_miss(inner, class))
                         .unwrap()
                         .as_ptr() as usize,
