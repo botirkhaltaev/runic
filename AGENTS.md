@@ -5,21 +5,21 @@
 - Performance is the top priority on hot paths — but **data-driven only**: profile before and after (`scripts/profile.sh`); never infer micro-opts, inlining, or layout “wins” without measurements.
 - Clean, idiomatic, readable Rust. No hacks at code or architecture level (no clever dual paths, kludges, or “temporary” shims that become permanent).
 - Safe Rust first; `unsafe` only for OS/ownership contracts or **measured** hot paths (narrow + SAFETY).
-- Explicit ownership entities, fail-closed frees, auditable invariants — not line-for-line ports.
+- Explicit ownership entities, fail-closed remote admission and interior/foreign pointers, auditable invariants — not line-for-line ports. Owner double-free is undefined.
 - Composable APIs: behavior on the owning entity; no one-caller shims, pass-throughs, dual APIs, or `*_v2` / `*_slow` / `*_miss` / `*_nonlocal` names (`#[cold]` only).
 
 ## Conventions
 
 - Prefer `NonZero*` / `NonNull` / named fields. No useless helpers — especially free (module-level) one-liners / cast wrappers / pass-throughs. Put behavior on the owning type; helpers only for real reuse, a clearer ownership boundary, or a **profiled** cold-path factor.
 - **One handle** — never the same object as both `NonNull<T>` and `&T`. Project fields once at the boundary; do not thread `&AllocatorInner` with `&PageMap` / `&Heaps`.
-- TLS hot paths: `ThreadHeap::{alloc,alloc_extent,free_run,free_extent,lookup}` take `NonNull<AllocatorInner>` (identity) + `&PageMap` projected once at `Allocator`. Cold unbound: `Allocator::{bind_alloc,free_remote}`.
+- Small hit: `ThreadHeap::{alloc,free_hit}` take `NonNull<AllocatorInner>` only (`&PageMap` on miss / take / refill). Cold unbound: `Allocator::{bind_alloc,free_remote}`.
 - Naming: short, clear, domain words only — same term means the same thing everywhere. No long compound jargon, invented synonyms, or parallel names for one concept. Frontend `alloc`, domain block/extent `allocate`, checkout `acquire`. Free protocol: `free` / `claim` / `accept`. Prefer existing vocabulary (`run`, `extent`, `heap`, `inbox`, `flush`, `bind`) over new coinages.
 - Indices: `Arena` / `HeapId` / `RunId` / `ExtentId` use `u32`; convert to `usize` only when indexing Rust arrays or doing pointer/byte math — no free cast-wrapper helpers.
 - Remote free: claim → `Heap::enqueue` (Active; lease before new `try_queue`) or `Heaps::lock` → `LockedHeap` → owner `flush` → `accept`. Coalesce by owner (`Inbox`), never a freer TLS batch.
-- Flush policy: magazine-empty = local/OS acquire first, inbox flush only on miss (`refill`); unbound = `alloc_after_bind` / `alloc_extent_after_bind` (flush then alloc); hit = magazine pop/push; magazine `take` then `Heap::free` (inbox `flush` is separate). Isolated owner_free/freelist benches pay refill/`take` — do not raise the watermark to game them.
+- Flush policy: magazine-empty = local/OS acquire first, inbox flush only on miss (`refill`); unbound = `alloc_after_bind` / `alloc_extent_after_bind` (flush then alloc); hit = magazine pop/push; magazine `take` then `Heap::free_run` (inbox `flush` is separate). Isolated owner_free/freelist benches pay refill/`take` — do not raise the watermark to game them.
 - `Layout` only at the public boundary → `LayoutSpec` inward once.
 - No root/shared ownership heap; every run/extent has `HeapId`. Capabilities: shared `&Heap` = atomics only (`enqueue` / mode); Active body = `ThreadHeap` only; Draining body + reclaim = `LockedHeap` only (`Heaps::lock`). No `Heap::state()` projection; no `*_fresh` dual alloc APIs.
-- One abort sink: `Allocator::abort`. Preserve abort kinds through `HeapError` (`InvalidRunPointer` / `InvalidExtentPointer` / `MissingExtent`). Never hold the heaps arena mutex across flush / accept / user-memory copies.
+- One abort sink: `Allocator::abort`. Preserve abort kinds through `HeapError` (`InvalidRunPointer` / `InvalidExtentPointer` / `MissingExtent`). `HeapError::DoubleFree` is remote `claim` / interior-foreign only — not owner DF. Never hold the heaps arena mutex across flush / accept / user-memory copies.
 - No allocator-internal `Vec` / `Box` / `HashMap` / `String` / formatting / panic unless recursion risk is addressed.
 - `#![deny(unsafe_op_in_unsafe_fn)]`. No test-only methods on production `impl` blocks.
 - No backward compatibility for public or internal APIs — reshape in place; delete dual paths, aliases, and parallel old names. Best architecture and code always win.

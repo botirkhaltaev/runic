@@ -7,8 +7,6 @@ use crate::{
     size_class::{SizeClass, SizeClasses},
 };
 
-use super::RunError;
-
 pub(crate) struct RunHeap {
     runs: Arena<Run>,
     available: [Option<NonNull<Run>>; SizeClasses::COUNT],
@@ -63,11 +61,7 @@ impl RunHeap {
         // SAFETY: PageMap stores only pointers published from this allocator's live arena.
         let run_ref = unsafe { run.as_ref() };
         let was_full = run_ref.is_full();
-        match run_ref.free(ptr) {
-            Ok(()) => {}
-            Err(RunError::Claimed) => return Ok(()),
-            Err(err) => return Err(err.into()),
-        }
+        run_ref.free(ptr).map_err(HeapError::from)?;
         if was_full {
             self.push_available(run)?;
         }
