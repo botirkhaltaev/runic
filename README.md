@@ -36,7 +36,7 @@ Runic v0.6 implements:
 
 - `GlobalAlloc`
 - owner-local heaps via `Heaps` / `ThreadHeap`
-- lockless TLS magazine on the owner-local hit (`Run` is refill/`take` only)
+- lockless TLS current run on the owner-local hit (`Run::allocate` is pop only; `extend` on miss)
 - `HeapId` ownership on runs and extents
 - lock-free remote-free run/extent inboxes with claim → enqueue → flush/`accept`
 - private run claim-bitmap remote admission (owner free uses store/recheck, not byte CAS)

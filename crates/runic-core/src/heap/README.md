@@ -33,37 +33,25 @@ Owner-local heap frontend: runs for small size classes, extents for dedicated la
 - Draining reclaim observes live ownership via `RunHeap` ∨ `ExtentHeap` (`has_live`). In-flight claim bits keep the heap live. Only `LockedHeap` Drop may reclaim.
 - Never-bound freers enqueue each successful claim in `Allocator::free_remote` (no TLS batch; no stranded claims). Bound producers coalesce by run/extent, not by thread batch.
 - Owner free composition stays on private `Heap` body helpers invoked only from `ThreadHeap` / `LockedHeap`; domain ops are `free` / `claim` / `accept` on `Run`/`Extent`. Failures after claim abort (no rollback).
-- Magazine-empty refill: local/OS `acquire_run` first; inbox flush only if that misses, then retry. Batch `Run::allocate` into the magazine (stop at watermark−1). Unbound cold path: `alloc_after_bind` / `alloc_extent_after_bind` (one flush-then-alloc; no `*_fresh`). Hit: lockless pop/push only (below). Magazine drain is `take` then `Heap::free` (body only; not inbox `flush`).
+- Current-run empty: `extend` then local/OS `acquire_run` first; inbox flush only if that misses, then retry. Unbound cold path: `alloc_after_bind` / `alloc_extent_after_bind`. Hit: current pop / `Heap::free_run`. Inbox `flush` is remote `accept`.
 - `HeapState` packs generation, mode (`Free` / `Active` / `Draining`), retired, and in-flight **lease** count for Active **enqueue** admits only (not inbox depth — that stays live via claim bits / `has_live`).
 - `Heaps` publishes stable heap pointers per index once; `get` is lock-free. Arena mutex covers claim/reuse only — never flush/accept.
+- `THREAD_HEAP` has no destructor. `UnbindGuard` (touched in `bind`) retires the heap on thread exit.
 
-## Magazine (hit vs take)
+## Current run (hit)
 
-A small block is on exactly one of: user, magazine, run freelist, or remote-claimed.
+A small block is on exactly one of: user, run freelist, or remote-claimed.
 
 | Hit | Work | Not on the hit |
 |-----|------|----------------|
-| **alloc** | `class` → `matches` → magazine `pop` | `Run::allocate`, ClaimBits, `live`, locks, atomics, refill |
-| **owner free** | page-cache → `HeapId` → magazine `push` | `locate`, ClaimBits, `push_free`, `live--`, locks, atomics, take |
+| **alloc** | `matches` → `current[class]` → `Run::allocate` (pop) | `extend`, ClaimBits, locks, atomics, acquire, flush |
+| **owner free** | page-cache (own-heap runs only) → `Heap::free_run` (`locate` + `live--` + push) | ClaimBits, `extend`, locks, atomics |
 
-Pop/push are `Cell` loads/stores and an intrusive payload `usize` link. No mutex, no CAS, no `Atomic*` on magazine links, no `Run` body on that path. Cold outlines (`refill`, take, extent, bind) are `#[cold] #[inline(never)]`.
+`current[class]` is a hint, not ownership. Available list is the reservoir; a run may be both current and listed. Frees never touch `current`. Interior pointers abort on `locate` (hit). Owner DF is undefined.
 
-`Run::free` (locate + pointer push) and freelist publish happen only when the magazine is **taken** (count ≥ watermark, or unbind). Isolated `owner_free_only` / `freelist_allocate_only` benches still pay that `take`/`allocate` work; they are not the hit. Do not raise the watermark to hide them. Inbox `flush` is a different operation (remote `accept`).
-
-**Remote admission.** `claim` is `issued` + `try_set` (duplicate remote claim fails closed). `accept` publishes. Owner double-free and realloc-after-free are undefined. Interior / foreign pointers still abort. Unbind takes every class so no magazine object is stranded.
-
-`lookup` + the page cache stay on owner free. Post-magazine Where on this host
-(`5946084`): identity is page# + cache compare (~10% of inlined `dealloc`, ~4% of
-churn). `PageMap::get` is ~0% on same-run churn. Isolated `owner_free` is
-`take` / `Run::free`, not lookup. #126 skipped — not a ≥5% lever.
-
-#128 skipped: grouping a taken magazine by run (one `RunState` / available-list
-transition) vs `5946084` Cost: `owner_free_only` 61.9 → 94.7 cyc/elem (+53%),
-`freelist_allocate_only` −4% (under gate), `single_size_churn` 43.7 → 56.3
-(+29%). Per-block `Heap::free` on take stays. Extents have no magazine.
+`lookup` + the page cache stay on owner free. Cache stores only runs whose `HeapId` matches this TLS.
 
 #129 closeout (this host, `aa3a83a`): churn/64 is 43.6 vs snmalloc 27.4 (1.6×).
-This pass (hit diet + take/refill diet): churn/64 **41.3** (P1, ≤41.4 gate),
-then **43.0** after P2. `owner_free` 62→72 (take still locate + magazine drain;
-BlockStates deletion did not close the 4.6× gap). `freelist` 42.4→37.1.
-`#135` RSEQ per-CPU: 65.3 vs 43.6, reverted. Watermark stays 32.
+This pass vs `c1ecdeb`: churn/64 **35.4**, `owner_free` **22.2**, `freelist` **18.5**.
+Isolated owner_free / freelist are the hit (`locate` / pop), not take.
+`#135` RSEQ per-CPU: 65.3 vs 43.6, reverted.

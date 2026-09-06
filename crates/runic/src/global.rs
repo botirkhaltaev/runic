@@ -84,18 +84,22 @@ impl ExtentBuilder {
 }
 
 unsafe impl GlobalAlloc for RunicAlloc {
+    #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         unsafe { self.allocator.alloc(layout) }
     }
 
+    #[inline]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { self.allocator.dealloc(ptr, layout) };
     }
 
+    #[inline]
     unsafe fn realloc(&self, ptr: *mut u8, old: Layout, new_size: usize) -> *mut u8 {
         unsafe { self.allocator.realloc(ptr, old, new_size) }
     }
 
+    #[inline]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         unsafe { self.allocator.alloc_zeroed(layout) }
     }

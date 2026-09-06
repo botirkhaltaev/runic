@@ -10,7 +10,7 @@ pub(crate) mod heap;
 
 use crate::{
     layout::LayoutSpec,
-    memory::{AddressRange, Mapping},
+    memory::{AddressRange, Mapping, PAGE_SIZE},
     size_class::SizeClass,
 };
 
@@ -148,7 +148,7 @@ impl ClaimBits {
 }
 
 pub(crate) struct Run {
-    /// Owner-local freelist / live / bump — field order prefers refill/flush locality under
+    /// Owner-local freelist / live / bump — field order prefers extend/flush locality under
     /// `repr(Rust)` (not a layout guarantee; do not treat as ABI).
     state: UnsafeCell<RunState>,
     /// Cached `mapping.base()` — payload span start (`RUN_SIZE` bytes).
@@ -267,6 +267,7 @@ impl Run {
     /// True when every block is outstanding (allocated or remote-claimed).
     ///
     /// Used by `RunHeap` before `free` / `accept` for available-list relink.
+    #[inline]
     pub(crate) fn is_full(&self) -> bool {
         // SAFETY: owner-local methods are called only by the owning heap.
         unsafe { &*self.state.get() }.live == self.capacity
@@ -296,22 +297,48 @@ impl Run {
         AddressRange::new(self.base, RUN_SIZE)
     }
 
-    /// Refill only: pop/bump one block into the owner's magazine.
+    /// Hit: pop one block from the pointer freelist. Empty → caller `extend`.
     #[inline]
     pub(crate) fn allocate(&self) -> Option<NonNull<u8>> {
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
-        let ptr = match Self::pop_free(state) {
-            Some(ptr) => ptr,
-            None => self.address(self.bump(state)?),
-        };
-
+        let ptr = Self::pop_free(state)?;
         debug_assert!(state.live < self.capacity);
         state.live += 1;
         Some(ptr)
     }
 
-    /// Magazine-`take` only: live → pointer freelist.
+    /// Thread one page of fresh blocks (at least 32, or remaining) onto the freelist.
+    ///
+    /// `issued` advances once. Returns `false` when bump is exhausted.
+    #[inline(never)]
+    pub(crate) fn extend(&self) -> bool {
+        // SAFETY: owner-local methods are called only by the owning heap.
+        let state = unsafe { &mut *self.state.get() };
+        if state.bump >= self.capacity {
+            return false;
+        }
+        let page_worth = PAGE_SIZE / self.stride;
+        let n = page_worth.max(32).min(self.capacity - state.bump);
+        if n == 0 {
+            return false;
+        }
+        let start = state.bump;
+        let end = start + n;
+        for index in start..end - 1 {
+            Self::write_link(
+                self.address(BlockIndex::new(index)),
+                self.address(BlockIndex::new(index + 1)).as_ptr().addr(),
+            );
+        }
+        Self::write_link(self.address(BlockIndex::new(end - 1)), state.free);
+        state.free = self.address(BlockIndex::new(start)).as_ptr().addr();
+        state.bump = end;
+        self.issued.store(end, Ordering::Relaxed);
+        true
+    }
+
+    /// Owner-local: live → pointer freelist.
     ///
     /// Owner double-free is undefined. Remote admission is `claim` / `accept`.
     #[inline]
@@ -405,7 +432,7 @@ impl Run {
         Some(Block::new(BlockIndex::new(index), ptr))
     }
 
-    /// Payload pointer for a freelist or bump index in `0..capacity`.
+    /// Payload pointer for a freelist or extend index in `0..capacity`.
     #[inline]
     fn address(&self, index: BlockIndex) -> NonNull<u8> {
         debug_assert!(index.get() < self.capacity);
@@ -413,21 +440,9 @@ impl Run {
             Some(shift) => index.get() << shift.get(),
             None => index.get() * self.stride,
         };
-        // SAFETY: freelist / `bump` only yield `index < capacity`, so
+        // SAFETY: freelist / `extend` only yield `index < capacity`, so
         // `byte_offset < RUN_SIZE` inside the payload span.
         unsafe { NonNull::new_unchecked(self.base.as_ptr().add(byte_offset)) }
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn bump(&self, state: &mut RunState) -> Option<BlockIndex> {
-        if state.bump >= self.capacity {
-            return None;
-        }
-        let index = BlockIndex::new(state.bump);
-        state.bump += 1;
-        self.issued.store(state.bump, Ordering::Relaxed);
-        Some(index)
     }
 
     #[inline]
@@ -492,6 +507,13 @@ mod tests {
         SizeClasses::class_for(layout_spec(size, align)).unwrap()
     }
 
+    fn take(run: &Run) -> Option<NonNull<u8>> {
+        run.allocate().or_else(|| {
+            run.extend();
+            run.allocate()
+        })
+    }
+
     fn test_heap_id() -> HeapId {
         HeapId::new(0, NonZeroU32::MIN).unwrap()
     }
@@ -514,7 +536,7 @@ mod tests {
         let mut seen = vec![false; capacity];
 
         for _ in 0..capacity {
-            let ptr = run.allocate().unwrap();
+            let ptr = take(&run).unwrap();
             let block = run.locate(ptr).unwrap();
             let index = block.index().get();
 
@@ -530,6 +552,29 @@ mod tests {
     }
 
     #[test]
+    fn extend_threads_fresh_blocks_onto_freelist() {
+        let class = class_id(64, 8);
+        let run = Run::new(
+            RunId::from_index(21).unwrap(),
+            test_heap_id(),
+            map_for_class(class),
+            class,
+        )
+        .expect("test run");
+        assert!(run.allocate().is_none());
+        assert!(run.extend());
+        let first = run.allocate().unwrap();
+        assert_eq!(first, run.range().base());
+        let page_worth = PAGE_SIZE / class.size();
+        for _ in 1..page_worth.max(32) {
+            assert!(run.allocate().is_some());
+        }
+        assert!(run.allocate().is_none());
+        assert!(run.extend());
+        assert!(run.allocate().is_some());
+    }
+
+    #[test]
     fn reusable_run_reuses_returned_block() {
         let class = class_id(128, 8);
         let run = Run::new(
@@ -540,7 +585,7 @@ mod tests {
         )
         .expect("test run");
 
-        let ptr = run.allocate().unwrap();
+        let ptr = take(&run).unwrap();
 
         assert!(run.free(ptr).is_ok());
 
@@ -558,7 +603,7 @@ mod tests {
         )
         .expect("test run");
         let new = layout_spec(64, 8);
-        let ptr = run.allocate().unwrap();
+        let ptr = take(&run).unwrap();
 
         assert_eq!(run.resize_in_place(ptr, new), Ok(true));
     }
@@ -574,7 +619,7 @@ mod tests {
         )
         .expect("test run");
         let new = layout_spec(80, 8);
-        let ptr = run.allocate().unwrap();
+        let ptr = take(&run).unwrap();
 
         assert_eq!(run.resize_in_place(ptr, new), Ok(false));
     }
@@ -589,7 +634,7 @@ mod tests {
             class,
         )
         .expect("test run");
-        let ptr = run.allocate().unwrap();
+        let ptr = take(&run).unwrap();
         let interior = unsafe { NonNull::new_unchecked(ptr.as_ptr().add(1)) };
 
         assert!(run.locate(interior).is_none());
@@ -608,7 +653,7 @@ mod tests {
             .expect("test run");
             let capacity = RUN_SIZE / size;
 
-            let first = run.allocate().unwrap();
+            let first = take(&run).unwrap();
             assert!(run.locate(first).is_some(), "size={size}");
             assert!(
                 run.locate(unsafe { NonNull::new_unchecked(first.as_ptr().add(1)) })
@@ -636,7 +681,7 @@ mod tests {
             class,
         )
         .expect("test run");
-        let ptr = run.allocate().unwrap();
+        let ptr = take(&run).unwrap();
         let interior = unsafe { NonNull::new_unchecked(ptr.as_ptr().add(1)) };
 
         assert!(run.locate(ptr).is_some());
@@ -654,7 +699,7 @@ mod tests {
                 class,
             )
             .expect("test run");
-            let ptr = run.allocate().unwrap();
+            let ptr = take(&run).unwrap();
 
             assert!(run.locate(ptr).is_some(), "size={size}");
             assert!(run.free(ptr).is_ok(), "size={size}");
@@ -693,7 +738,7 @@ mod tests {
             class,
         )
         .expect("test run");
-        let ptr = run.allocate().unwrap();
+        let ptr = take(&run).unwrap();
 
         assert_eq!(run.claim(ptr), Ok(()));
         assert_eq!(run.claim(ptr), Err(RunError::DoubleFree));
@@ -709,7 +754,7 @@ mod tests {
             class,
         )
         .expect("test run");
-        let ptr = run.allocate().unwrap();
+        let ptr = take(&run).unwrap();
 
         assert_eq!(run.claim(ptr), Ok(()));
         assert!(!run.accept());
@@ -726,10 +771,10 @@ mod tests {
             class,
         )
         .expect("test run");
-        let ptr = run.allocate().unwrap();
+        let ptr = take(&run).unwrap();
         assert!(!run.accept());
         // `ptr`'s block is still live (never claimed), so the next allocate is fresh.
-        assert_ne!(run.allocate().unwrap(), ptr);
+        assert_ne!(take(&run).unwrap(), ptr);
     }
 
     #[test]
@@ -743,7 +788,7 @@ mod tests {
                 class,
             )
             .expect("test run");
-            let ptr = run.allocate().unwrap();
+            let ptr = take(&run).unwrap();
             assert_eq!(run.claim(ptr), Ok(()), "size={size}");
             assert!(!run.accept(), "size={size}");
             assert_eq!(run.allocate(), Some(ptr), "size={size}");
@@ -763,7 +808,7 @@ mod tests {
         let capacity = RUN_SIZE / class.size();
 
         for _ in 0..capacity {
-            let ptr = run.allocate().unwrap();
+            let ptr = take(&run).unwrap();
             assert_eq!(ptr.as_ptr() as usize % 16, 0);
         }
     }
@@ -798,8 +843,8 @@ mod tests {
             class,
         )
         .expect("test run");
-        let a = run.allocate().unwrap();
-        let b = run.allocate().unwrap();
+        let a = take(&run).unwrap();
+        let b = take(&run).unwrap();
         let inbox: Inbox<Run> = Inbox::new();
         let run_ptr = NonNull::from(&run);
 
@@ -843,7 +888,7 @@ mod tests {
         // Addresses, not `NonNull<u8>`: a raw-pointer `Vec` is not `Sync`, and this slice
         // only ever crosses the thread boundary by shared reference below.
         let addrs: Vec<usize> = (0..capacity)
-            .map(|_| run.allocate().unwrap().as_ptr() as usize)
+            .map(|_| take(&run).unwrap().as_ptr() as usize)
             .collect();
         let inbox: Inbox<Run> = Inbox::new();
         let done = AtomicBool::new(false);

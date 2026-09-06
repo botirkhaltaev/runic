@@ -158,6 +158,7 @@ impl Heap {
     }
 
     /// SAFETY: caller is the Active TLS owner (`ThreadHeap`) or holds [`LockedHeap`].
+    #[inline]
     #[allow(clippy::mut_from_ref)]
     unsafe fn body_mut(&self) -> &mut Body {
         // SAFETY: same ownership contract as the method.
@@ -239,6 +240,7 @@ impl Heap {
     /// Owner-local run free (body only). Caller owns inbox `flush`.
     ///
     /// SAFETY: caller is the Active TLS owner or holds [`LockedHeap`].
+    #[inline]
     pub(super) unsafe fn free_run(
         &self,
         run: NonNull<Run>,
@@ -277,12 +279,6 @@ impl Heap {
         // SAFETY: Active TLS owner.
         let body = unsafe { self.body_mut() };
         body.runs.acquire(class, body.id, pages)
-    }
-
-    /// SAFETY: caller is the Active TLS owner for this heap.
-    pub(super) unsafe fn push_available(&self, run: NonNull<Run>) -> Result<(), HeapError> {
-        // SAFETY: Active TLS owner.
-        unsafe { self.body_mut() }.runs.push_available(run)
     }
 
     /// Take the Draining exclusive token. Caller must have observed Draining for `id`.

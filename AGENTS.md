@@ -6,17 +6,17 @@
 - Clean, idiomatic, readable Rust. No hacks at code or architecture level (no clever dual paths, kludges, or “temporary” shims that become permanent).
 - Safe Rust first; `unsafe` only for OS/ownership contracts or **measured** hot paths (narrow + SAFETY).
 - Explicit ownership entities, fail-closed remote admission and interior/foreign pointers, auditable invariants — not line-for-line ports. Owner double-free is undefined.
-- Composable APIs: behavior on the owning entity; no one-caller shims, pass-throughs, dual APIs, or `*_v2` / `*_slow` / `*_miss` / `*_nonlocal` names (`#[cold]` only).
+- Composable APIs: behavior on the owning entity; no one-caller shims, pass-throughs, dual APIs, or `*_v2` / `*_nonlocal` names. `#[inline(never)]` outlines only (`alloc_miss` / `dealloc_slow`); `#[cold]` is abort / bind / map / remote / unbind.
 
 ## Conventions
 
 - Prefer `NonZero*` / `NonNull` / named fields. No useless helpers — especially free (module-level) one-liners / cast wrappers / pass-throughs. Put behavior on the owning type; helpers only for real reuse, a clearer ownership boundary, or a **profiled** cold-path factor.
 - **One handle** — never the same object as both `NonNull<T>` and `&T`. Project fields once at the boundary; do not thread `&AllocatorInner` with `&PageMap` / `&Heaps`.
-- Small hit: `ThreadHeap::{alloc,free_hit}` take `NonNull<AllocatorInner>` only (`&PageMap` on miss / take / refill). Cold unbound: `Allocator::{bind_alloc,free_remote}`.
-- Naming: short, clear, domain words only — same term means the same thing everywhere. No long compound jargon, invented synonyms, or parallel names for one concept. Frontend `alloc`, domain block/extent `allocate`, checkout `acquire`. Free protocol: `free` / `claim` / `accept`. Prefer existing vocabulary (`run`, `extent`, `heap`, `inbox`, `flush`, `bind`) over new coinages.
+- Small hit: `ThreadHeap::{alloc,cached_run}` take `NonNull<AllocatorInner>` only (`&PageMap` on miss). Cold unbound: `Allocator::{bind_alloc,free_remote}`.
+- Naming: short, clear, domain words only — same term means the same thing everywhere. No long compound jargon, invented synonyms, or parallel names for one concept. Frontend `alloc`, domain block/extent `allocate`, checkout `acquire`, current-run `extend`. Free protocol: `free` / `claim` / `accept`. Prefer existing vocabulary (`run`, `extent`, `heap`, `inbox`, `flush`, `bind`, `current`, `extend`) over new coinages.
 - Indices: `Arena` / `HeapId` / `RunId` / `ExtentId` use `u32`; convert to `usize` only when indexing Rust arrays or doing pointer/byte math — no free cast-wrapper helpers.
 - Remote free: claim → `Heap::enqueue` (Active; lease before new `try_queue`) or `Heaps::lock` → `LockedHeap` → owner `flush` → `accept`. Coalesce by owner (`Inbox`), never a freer TLS batch.
-- Flush policy: magazine-empty = local/OS acquire first, inbox flush only on miss (`refill`); unbound = `alloc_after_bind` / `alloc_extent_after_bind` (flush then alloc); hit = magazine pop/push; magazine `take` then `Heap::free_run` (inbox `flush` is separate). Isolated owner_free/freelist benches pay refill/`take` — do not raise the watermark to game them.
+- Flush policy: current-run empty = `extend` then local/OS `acquire_run` first, inbox flush only on miss; unbound = `alloc_after_bind` / `alloc_extent_after_bind` (flush then alloc); hit = current pop / `Heap::free_run`. Inbox `flush` is remote `accept` only.
 - `Layout` only at the public boundary → `LayoutSpec` inward once.
 - No root/shared ownership heap; every run/extent has `HeapId`. Capabilities: shared `&Heap` = atomics only (`enqueue` / mode); Active body = `ThreadHeap` only; Draining body + reclaim = `LockedHeap` only (`Heaps::lock`). No `Heap::state()` projection; no `*_fresh` dual alloc APIs.
 - One abort sink: `Allocator::abort`. Preserve abort kinds through `HeapError` (`InvalidRunPointer` / `InvalidExtentPointer` / `MissingExtent`). `HeapError::DoubleFree` is remote `claim` / interior-foreign only — not owner DF. Never hold the heaps arena mutex across flush / accept / user-memory copies.
@@ -49,6 +49,6 @@
 
 ## Scope
 
-- v0.6 in: Linux x86_64, Rust stable, `GlobalAlloc`, owner-local heaps, TLS magazine, run/extent retention, remote-free, `realloc` / `alloc_zeroed`, tests, benches.
+- v0.6 in: Linux x86_64, Rust stable, `GlobalAlloc`, owner-local heaps, TLS current run, run/extent retention, remote-free, `realloc` / `alloc_zeroed`, tests, benches.
 - v0.6 out: quarantine, canaries, hugepages, NUMA, C ABI, ML placement, dashboards, background purge.
-- Next: per-CPU / RSEQ magazine (`#135`, `ROADMAP.md`) vs the #129 baseline. One entity, one hit. Do not retry identity or batch take. Do not port snmalloc.
+- Next: `#135` RSEQ vs this run-local baseline. Do not retry identity or batch take. Do not port snmalloc.

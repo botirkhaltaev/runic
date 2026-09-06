@@ -73,10 +73,11 @@ impl Allocator {
     /// The returned pointer is raw, uninitialized memory. The caller must use it
     /// only according to `layout`, avoid out-of-bounds access, and eventually
     /// pass the same pointer and a compatible layout back to this allocator.
+    #[inline]
     pub unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let spec = LayoutSpec::from_layout(layout);
-        let Some(inner) = self.inner().or_else(|| self.init()) else {
-            return null_mut();
+        let Some(inner) = self.inner() else {
+            return self.alloc_uninit(layout);
         };
         if let Some(class) = SizeClasses::class_for(spec) {
             if let Some(ptr) = THREAD_HEAP.with(|tls| tls.alloc(inner, class)) {
@@ -94,6 +95,7 @@ impl Allocator {
     /// `ptr` must be null or a pointer previously returned by this allocator
     /// for `layout`. Passing an unknown pointer, an interior pointer, or an
     /// incompatible layout violates the allocator contract and may abort.
+    #[inline]
     pub unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
         if ptr.is_null() {
             return;
@@ -105,12 +107,14 @@ impl Allocator {
         let Some(ptr) = NonNull::new(ptr) else {
             return;
         };
-        if !THREAD_HEAP.with(|tls| tls.free_hit(inner, ptr)) {
-            match THREAD_HEAP.with(|tls| tls.free_slow(inner, ptr)) {
-                Ok(()) => {}
-                Err(error) => Self::free_fail(inner, ptr, error),
+        if let Some((heap, run)) = THREAD_HEAP.with(|tls| tls.cached_run(inner, ptr)) {
+            // SAFETY: `cached_run` returns this TLS heap and a live own-heap run.
+            if unsafe { heap.as_ref().free_run(run, ptr) }.is_err() {
+                Self::abort();
             }
+            return;
         }
+        Self::dealloc_slow(inner, ptr);
     }
 
     /// Changes the size of an allocation using allocate-copy-free semantics.
@@ -120,6 +124,7 @@ impl Allocator {
     /// `ptr` must be null or a pointer previously returned by this allocator
     /// for `old`. If a non-null pointer is supplied, no other live reference may
     /// be used to access the old allocation after successful reallocation.
+    #[inline]
     pub unsafe fn realloc(&self, ptr: *mut u8, old: Layout, new_size: usize) -> *mut u8 {
         if ptr.is_null() {
             let Ok(new_layout) = Layout::from_size_align(new_size, old.align()) else {
@@ -195,10 +200,15 @@ impl Allocator {
     /// The returned pointer is raw, zero-initialized memory. The caller must use it
     /// only according to `layout` and eventually pass it back to this allocator with a
     /// compatible layout.
+    #[inline]
     pub unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let spec = LayoutSpec::from_layout(layout);
-        let Some(inner) = self.inner().or_else(|| self.init()) else {
-            return null_mut();
+        let Some(inner) = self.inner() else {
+            if self.init().is_none() {
+                return null_mut();
+            }
+            // SAFETY: inner is installed; same contract as the public method.
+            return unsafe { self.alloc_zeroed(layout) };
         };
         let Some(class) = SizeClasses::class_for(spec) else {
             return Self::alloc_extent(inner, spec, ExtentInit::Zeroed);
@@ -225,6 +235,7 @@ impl Allocator {
         unsafe { libc::abort() }
     }
 
+    #[inline]
     fn inner(&self) -> Option<NonNull<AllocatorInner>> {
         NonNull::new(self.inner.load(Ordering::Acquire))
     }
@@ -324,8 +335,26 @@ impl Allocator {
         }
     }
 
-    /// Magazine empty or unbound: refill if bound, else bind.
-    #[cold]
+    /// Inner not yet installed: init then take the ordinary alloc path.
+    #[inline(never)]
+    fn alloc_uninit(&self, layout: Layout) -> *mut u8 {
+        if self.init().is_none() {
+            return null_mut();
+        }
+        // SAFETY: inner is installed; same contract as the public method.
+        unsafe { self.alloc(layout) }
+    }
+
+    /// Page-cache miss / remote / extent after the TLS hit missed.
+    #[inline(never)]
+    fn dealloc_slow(inner: NonNull<AllocatorInner>, ptr: NonNull<u8>) {
+        match THREAD_HEAP.with(|tls| tls.free_slow(inner, ptr)) {
+            Ok(()) => {}
+            Err(error) => Self::free_fail(inner, ptr, error),
+        }
+    }
+
+    /// Current-run empty or unbound: extend / acquire if bound, else bind.
     #[inline(never)]
     fn alloc_miss(inner: NonNull<AllocatorInner>, class: SizeClass) -> *mut u8 {
         if let Some(ptr) = THREAD_HEAP.with(|tls| tls.alloc_miss(inner, class)) {
@@ -335,7 +364,6 @@ impl Allocator {
     }
 
     /// Bound-extent miss: TLS extent alloc, else bind.
-    #[cold]
     #[inline(never)]
     fn alloc_extent(inner: NonNull<AllocatorInner>, spec: LayoutSpec, init: ExtentInit) -> *mut u8 {
         // SAFETY: caller retains `inner` for this cold extent alloc.
@@ -496,7 +524,7 @@ impl From<HeapError> for AllocatorError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::heap::thread::{MAGAZINE_WATERMARK, ThreadHeap};
+    use crate::heap::thread::ThreadHeap;
     use crate::heap::{Extent, Heap, HeapMode, Run};
     use std::sync::mpsc;
     use std::thread;
@@ -548,8 +576,6 @@ mod tests {
         extent
     }
 
-    /// Take `n` user-held blocks. The first alloc refills just under the
-    /// watermark; `n == MAGAZINE_WATERMARK - 1` leaves the magazine empty.
     fn take_live(
         tls: &ThreadHeap,
         inner: NonNull<AllocatorInner>,
@@ -576,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn magazine_push_does_not_mark_or_publish() {
+    fn owner_free_publishes_immediately() {
         let allocator = Allocator::new();
         let inner = allocator_inner_ptr(&allocator);
         let layout = Layout::from_size_align(64, 8).unwrap();
@@ -586,66 +612,133 @@ mod tests {
             let ptr = bind_alloc_small(tls, inner, pages, layout);
             let run = run_of(pages, ptr);
             assert_eq!(tls.free_run(inner, run, ptr), Ok(()));
-            // SAFETY: run is live; magazine push must not drop live or publish.
-            assert!(unsafe { run.as_ref() }.is_live());
-            let stolen = unsafe { run.as_ref() }.allocate();
-            assert_ne!(stolen, Some(ptr));
-            if let Some(extra) = stolen {
-                assert!(unsafe { run.as_ref() }.free(extra).is_ok());
-            }
-            assert_eq!(bind_alloc_small(tls, inner, pages, layout), ptr);
+            // SAFETY: owner free is locate + push; the block is on the run freelist.
+            assert!(!unsafe { run.as_ref() }.is_live());
+            assert_eq!(unsafe { run.as_ref() }.allocate(), Some(ptr));
             assert_eq!(tls.free_run(inner, run, ptr), Ok(()));
             tls.unbind();
         });
     }
 
     #[test]
-    fn magazine_flush_marks_and_refill_reuses() {
+    fn current_run_switches_when_full() {
         let allocator = Allocator::new();
         let inner = allocator_inner_ptr(&allocator);
         let layout = Layout::from_size_align(64, 8).unwrap();
         THREAD_HEAP.with(|tls| {
             let _id = tls.bind(inner).unwrap();
             let pages = unsafe { inner.as_ref() }.pages();
-            let mut ptrs = take_live(tls, inner, pages, layout, MAGAZINE_WATERMARK - 1);
+            let first = bind_alloc_small(tls, inner, pages, layout);
+            let run_a = run_of(pages, first);
+            let capacity = crate::heap::run::RUN_SIZE / 64;
+            let mut ptrs = Vec::with_capacity(capacity + 1);
+            ptrs.push(first);
+            for _ in 1..capacity {
+                ptrs.push(bind_alloc_small(tls, inner, pages, layout));
+            }
+            // SAFETY: just filled this run.
+            assert!(unsafe { run_a.as_ref() }.is_full());
             let extra = bind_alloc_small(tls, inner, pages, layout);
-            let run = run_of(pages, ptrs[0]);
+            let run_b = run_of(pages, extra);
+            assert_ne!(run_a, run_b);
             ptrs.push(extra);
             assert_eq!(free_all(tls, inner, pages, &ptrs), Ok(()));
-            // SAFETY: leftover from the second refill plus these frees hit the watermark.
-            let published = unsafe { run.as_ref() }.allocate();
-            assert!(published.is_some());
-            if let Some(ptr) = published {
-                assert!(unsafe { run.as_ref() }.free(ptr).is_ok());
-            }
             tls.unbind();
         });
     }
 
     #[test]
-    fn unbind_flushes_nonempty_magazine() {
+    fn free_to_non_current_full_run_relinks_available() {
         let allocator = Allocator::new();
         let inner = allocator_inner_ptr(&allocator);
         let layout = Layout::from_size_align(64, 8).unwrap();
-        let ptr = THREAD_HEAP.with(|tls| {
-            let _id = tls.bind(inner).unwrap();
-            let pages = unsafe { inner.as_ref() }.pages();
-            let ptr = bind_alloc_small(tls, inner, pages, layout);
-            let run = run_of(pages, ptr);
-            assert_eq!(tls.free_run(inner, run, ptr), Ok(()));
-            tls.unbind();
-            ptr
-        });
-        assert!(allocator_inner(&allocator).pages().get(ptr).is_some());
         THREAD_HEAP.with(|tls| {
             let _id = tls.bind(inner).unwrap();
             let pages = unsafe { inner.as_ref() }.pages();
+            let capacity = crate::heap::run::RUN_SIZE / 64;
+            let mut a_ptrs = Vec::with_capacity(capacity);
+            for _ in 0..capacity {
+                a_ptrs.push(bind_alloc_small(tls, inner, pages, layout));
+            }
+            let run_a = run_of(pages, a_ptrs[0]);
+            // SAFETY: just filled this run.
+            assert!(unsafe { run_a.as_ref() }.is_full());
+            let b = bind_alloc_small(tls, inner, pages, layout);
+            let run_b = run_of(pages, b);
+            assert_ne!(run_a, run_b);
+            assert_eq!(tls.free_run(inner, run_a, a_ptrs[0]), Ok(()));
+            let mut b_ptrs = vec![b];
+            for _ in 1..capacity {
+                b_ptrs.push(bind_alloc_small(tls, inner, pages, layout));
+            }
+            // SAFETY: B is now full; next alloc must take A from available.
+            assert!(unsafe { run_b.as_ref() }.is_full());
             let reused = bind_alloc_small(tls, inner, pages, layout);
-            assert!(pages.get(reused).is_some());
-            let run = run_of(pages, reused);
-            assert_eq!(tls.free_run(inner, run, reused), Ok(()));
+            assert_eq!(reused, a_ptrs[0]);
+            assert_eq!(run_of(pages, reused), run_a);
+            assert_eq!(tls.free_run(inner, run_a, reused), Ok(()));
+            assert_eq!(free_all(tls, inner, pages, &a_ptrs[1..]), Ok(()));
+            assert_eq!(free_all(tls, inner, pages, &b_ptrs), Ok(()));
             tls.unbind();
         });
+    }
+
+    #[test]
+    fn page_cache_stores_only_own_heap_runs() {
+        let owner = Allocator::new();
+        let other = Allocator::new();
+        let inner = allocator_inner_ptr(&owner);
+        let foreign = allocator_inner_ptr(&other);
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        THREAD_HEAP.with(|tls| {
+            let _id = tls.bind(inner).unwrap();
+            let pages = unsafe { inner.as_ref() }.pages();
+            let ptr = bind_alloc_small(tls, inner, pages, layout);
+            assert!(tls.cached_run(inner, ptr).is_none());
+            assert_eq!(tls.free_slow(inner, ptr), Ok(()));
+            let again = bind_alloc_small(tls, inner, pages, layout);
+            assert_eq!(again, ptr);
+            let Some((_, run)) = tls.cached_run(inner, again) else {
+                panic!("page cache should hold the own-heap run after free_slow");
+            };
+            assert_eq!(tls.free_run(inner, run, again), Ok(()));
+            let _ = tls.bind(foreign).unwrap();
+            assert!(tls.cached_run(inner, ptr).is_none());
+            let _ = tls.bind(inner).unwrap();
+            tls.unbind();
+        });
+    }
+
+    #[test]
+    fn unbind_with_current_runs_leaves_exact_live() {
+        let allocator = Allocator::new();
+        let inner = allocator_inner_ptr(&allocator);
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        let (id, ptr, run) = THREAD_HEAP.with(|tls| {
+            let id = tls.bind(inner).unwrap();
+            let pages = unsafe { inner.as_ref() }.pages();
+            let ptr = bind_alloc_small(tls, inner, pages, layout);
+            let run = run_of(pages, ptr);
+            // SAFETY: user-held; unbind must not take / change live.
+            assert!(unsafe { run.as_ref() }.is_live());
+            tls.unbind();
+            (id, ptr, run)
+        });
+        let inner_ref = allocator_inner(&allocator);
+        assert_eq!(
+            inner_ref.heaps.get(id).map(Heap::mode),
+            Some(HeapMode::Draining)
+        );
+        // SAFETY: run stays arena-resident through Draining.
+        assert!(unsafe { run.as_ref() }.is_live());
+        {
+            let mut locked = inner_ref.heaps.lock(id).unwrap();
+            assert_eq!(
+                locked.free(PageOwner::Run(run), ptr, inner_ref.pages()),
+                Ok(())
+            );
+        }
+        assert!(inner_ref.heaps.get(id).is_none());
     }
 
     #[test]
@@ -840,8 +933,7 @@ mod tests {
                     let _id = tls.bind(inner).unwrap();
                     // SAFETY: inner retained by allocator.
                     let pages = unsafe { inner.as_ref() }.pages();
-                    // One refill batch so the magazine is empty (no leftover live).
-                    let live = take_live(tls, inner, pages, layout, MAGAZINE_WATERMARK - 1);
+                    let live = take_live(tls, inner, pages, layout, 8);
                     let run = run_of(pages, live[0]);
                     ready_a
                         .send(live.iter().map(|p| p.as_ptr() as usize).collect())
@@ -863,7 +955,7 @@ mod tests {
                     let _id = tls.bind(inner).unwrap();
                     // SAFETY: inner retained by allocator.
                     let pages = unsafe { inner.as_ref() }.pages();
-                    let live = take_live(tls, inner, pages, layout, MAGAZINE_WATERMARK - 1);
+                    let live = take_live(tls, inner, pages, layout, 8);
                     let run = run_of(pages, live[0]);
                     ready_b
                         .send(live.iter().map(|p| p.as_ptr() as usize).collect())
@@ -908,8 +1000,7 @@ mod tests {
     #[test]
     fn concurrent_active_leases_exact_once() {
         const THREADS: usize = 4;
-        // Multiple of one refill batch so the magazine is empty (no leftover live).
-        const PER_THREAD: usize = 62;
+        const PER_THREAD: usize = 16;
 
         let allocator = Allocator::new();
         let inner = allocator_inner_ptr(&allocator);
@@ -976,7 +1067,7 @@ mod tests {
             let id = tls.bind(inner).unwrap();
             // SAFETY: inner retained by allocator.
             let pages = unsafe { inner.as_ref() }.pages();
-            let live = take_live(tls, inner, pages, layout, MAGAZINE_WATERMARK - 1);
+            let live = take_live(tls, inner, pages, layout, 8);
             let run = run_of(pages, live[0]);
             for ptr in live {
                 // SAFETY: block was just allocated from this run.
