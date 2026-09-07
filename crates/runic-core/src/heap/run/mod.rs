@@ -247,11 +247,6 @@ impl Run {
         u32::try_from((1_u64 << 32).div_ceil(u64::from(stride))).ok()
     }
 
-    /// `floor(offset / stride)` via `recip`.
-    fn index(offset: u64, recip: u32) -> u64 {
-        offset.wrapping_mul(u64::from(recip)) >> 32
-    }
-
     pub(crate) const fn id(&self) -> RunId {
         self.id
     }
@@ -428,10 +423,16 @@ impl Run {
         if offset >= u64::from(self.span) {
             return None;
         }
-        let index = Self::index(offset, self.recip);
-        if index.wrapping_mul(u64::try_from(self.stride).ok()?) != offset {
+        // `recip = ceil(2^32 / stride)` is exact for `offset < 2^16`, `stride ≤ 2^15`.
+        // `stride | offset` iff the low 32 bits of `offset * recip` are `< recip`.
+        let product = offset.wrapping_mul(u64::from(self.recip));
+        // Keep the truncation in place — a helper does not inline on this hit.
+        #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+        let remainder = product as u32;
+        if remainder >= self.recip {
             return None;
         }
+        let index = product >> 32;
         Some(Block::new(
             BlockIndex::new(usize::try_from(index).ok()?),
             ptr,
@@ -634,9 +635,20 @@ mod tests {
             let recip = Run::recip(stride).unwrap();
             let span = (RUN_SIZE / size) * size;
             for offset in 0..span {
-                let index = Run::index(u64::try_from(offset).unwrap(), recip);
+                let product = u64::try_from(offset)
+                    .unwrap()
+                    .wrapping_mul(u64::from(recip));
+                #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+                let divisible = (product as u32) < recip;
+                assert_eq!(
+                    divisible,
+                    offset.is_multiple_of(size),
+                    "divisibility size={size} offset={offset}"
+                );
+                let index = product >> 32;
                 let ok = index.wrapping_mul(u64::try_from(size).unwrap())
                     == u64::try_from(offset).unwrap();
+                assert_eq!(ok, divisible, "product size={size} offset={offset}");
                 let class = class_id(size, 8);
                 assert_eq!(
                     ok.then_some(usize::try_from(index).unwrap()),

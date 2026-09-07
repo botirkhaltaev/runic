@@ -50,10 +50,28 @@ page-map ownership. Heap lifecycle lives on `Heaps` / `Heap`
 (Heaps indexes each Heap; each `Heap` owns inboxes and `RunHeap`/`ExtentHeap`).
 
 Owner-local hit is a TLS current run per class (pop) plus a one-entry own-heap
-page cache. `locate` is span + reciprocal (one path, no jump table). Empty page
-cache is `page_cache_page == usize::MAX`. `Run::allocate` is pop only;
-`Run::extend` threads one page (min 32) of fresh blocks on miss.
-This pass locate diet vs run-local `75bb578` (same host, cycles/elem):
+run cache (`cache_base == usize::MAX` empty; probe `ptr - base < RUN_SIZE`).
+`locate` is span + reciprocal divisibility (Lemire; one path, no jump table).
+`Run::allocate` is pop only; `Run::extend` threads one page (min 32) of fresh
+blocks on miss. Owner miss free is `Run::free` without Inner; `push_available`
+only on `was_full`.
+
+This pass owner-free hit diet vs post-#142 `82dd8b5` (same host, cycles/elem):
+
+```text
+                post142     diet     snmalloc
+owner_free/64      15.3      11.1        11.5
+freelist/64        20.4      20.4        18.9
+churn/64           31.6      30.2        28.3
+```
+
+owner_free insn/elem 45.6 → 35.4 (sn 37.7); `free_slow` share 1.96% → <0.05%.
+This diet owner_free is 11.1 vs snmalloc 11.5. Freelist still 1.08× snmalloc
+(cycles flat; insn 58.7 → 65.3 is IPC, not a target).
+`owner_free/4096` 30.7 cycles/elem; `recycled_churn/64/live:256` 57.2;
+`programs/sh6bench/runic/1` 9488 (no post142 pair).
+
+Locate diet vs run-local `75bb578` (same host, cycles/elem):
 
 ```text
                 75bb578    locate
@@ -73,7 +91,7 @@ freelist         19.0      16.4      22.3      27.8    1.16× sn
 large 64 KiB    120.9    1276.3     130.8     892.6    Runic best
 ```
 
-Locate diet owner_free is 16.9 vs mimalloc 13.6 (~1.24×). Freelist still 1.16× snmalloc.
+Locate diet owner_free was 16.9 vs mimalloc 13.6 (~1.24×).
 
 Criterion `compare_explicit` without `-C force-frame-pointers` (512-elem, ns/elem):
 churn 7.46 vs sn 6.64 / mi 7.79; owner_free 4.43 vs sn 3.09 / mi 2.83; freelist 4.22 vs sn 4.02 / mi 4.35.
@@ -214,7 +232,7 @@ Run            owns pointer freelist + extend + live, claim bitmap, and embedded
 ExtentHeap     owns Arena<Extent>, dedicated allocation policy, and mapping reuse.
 ExtentCache    owns an intrusive head list of retained extents and exact-budget reuse.
 Extent         owns dedicated allocation metadata, embedded InboxLink, and Claimed byte state.
-ThreadHeap     owns TLS bind, current[class], own-heap page cache, and the sole Active body path.
+ThreadHeap     owns TLS bind, current[class], own-heap run cache, and the sole Active body path.
 ```
 
 Prefer direct methods on the entity that owns the state. Do not add passive
@@ -297,7 +315,7 @@ Runic wins on extent retention (Keep).
 threaded/4: local 46.3 vs snmalloc 29.2 (1.6×). fan-in 392 vs 349 (1.1×).
 ring 674 vs 576 (1.2×). Cross-allocator ratios are this-host Cost, not library drift.
 
-Owner-local hit is current-run pop / page-cache `Run::free` (`locate` + push).
+Owner-local hit is current-run pop / run-cache `Run::free` (`locate` + push).
 Leftover small-churn cost is that hit's instruction count (`locate` / pop).
 Isolated owner_free / freelist are the same path (no take). `#135` RSEQ is not
 the lever — see thesis.

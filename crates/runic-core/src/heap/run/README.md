@@ -11,7 +11,7 @@ Run metadata owns small size-class allocations.
 
 - A run owns one mapping and one size class. The mapping is `RUN_SIZE` payload bytes, pad to 8-byte alignment, then `AtomicU64` claim words; `Run::range` is the payload span only.
 - Returned blocks must be valid block boundaries inside the payload span.
-- `Run` packs `span` / `recip` / `stride` next to `RunState`. `locate` is `offset >= span` then `idx = (offset * recip) >> 32` with `idx * stride == offset` (rejects interior and tail slack). No jump table.
+- `Run` packs `span` / `recip` / `stride` next to `RunState`. `locate` is `offset >= span` then Lemire `stride | offset` via `(offset * recip) as u32 < recip` (rejects interior and tail slack). Index is `product >> 32` when callers need it. No jump table.
 - Owner Free/Live **authority** is freelist membership + `live` (+ bump). `allocate` is pop only. Empty freelist → `extend` threads one page of fresh blocks (at least 32, or remaining) and advances `issued` once. `free` is `locate` → `live--` → pointer push. Owner double-free is undefined.
 - Freelist head and intrusive payload links are payload addresses (`0` = end).
 - Remote admission is the private claim bitmap. `claim` is `issued` + `try_set` (second claim is `DoubleFree`). `accept` drains bits onto the freelist.

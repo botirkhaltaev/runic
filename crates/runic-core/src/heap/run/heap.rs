@@ -50,16 +50,6 @@ impl RunHeap {
         self.insert_run(index, id, run, pages)
     }
 
-    #[inline]
-    pub(crate) fn free(&mut self, run: NonNull<Run>, ptr: NonNull<u8>) -> Result<(), HeapError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
-        let run_ref = unsafe { run.as_ref() };
-        if run_ref.free(ptr).map_err(HeapError::from)? {
-            self.push_available(run)?;
-        }
-        Ok(())
-    }
-
     /// Owner: drain every claimed bit on `run` and publish the freed blocks.
     ///
     /// Returns whether the caller must `Inbox::push` `run` again because a straggling claim
@@ -218,7 +208,9 @@ mod tests {
         }
 
         assert_eq!(available_run_id(&heap, class_index), None);
-        assert_eq!(heap.free(run_ptr, first), Ok(()));
+        // SAFETY: run_ptr is the live page-map run we just filled.
+        assert_eq!(unsafe { run_ptr.as_ref() }.free(first), Ok(true));
+        assert_eq!(heap.push_available(run_ptr), Ok(()));
         assert_eq!(available_run_id(&heap, class_index), Some(id));
 
         let (_run, reused) = alloc_block(&mut heap, class, &pages).unwrap();
