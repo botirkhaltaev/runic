@@ -27,7 +27,7 @@ pub(crate) use extent::Extent;
 pub(crate) use extent::heap::{ExtentHeap, ExtentInit};
 pub(crate) use heaps::Heaps;
 pub(crate) use id::HeapId;
-pub(crate) use run::{Run, RunError, RunHeap, RunId};
+pub(crate) use run::{RUN_SIZE, Run, RunError, RunHeap, RunId};
 pub(crate) use state::HeapMode;
 pub(crate) use thread::{THREAD_HEAP, ThreadFreeError};
 
@@ -237,20 +237,16 @@ impl Heap {
         ctx: &HeapCtx<'_>,
     ) -> Result<(), HeapError> {
         match owner {
-            PageOwner::Run(run) => inner.runs.free(run, ptr),
+            PageOwner::Run(run) => {
+                // SAFETY: PageMap / inbox carry only live arena run pointers.
+                if unsafe { run.as_ref() }.free(ptr).map_err(HeapError::from)? {
+                    inner.runs.push_available(run)
+                } else {
+                    Ok(())
+                }
+            }
             PageOwner::Extent(extent) => inner.extents.free(extent, ptr, ctx.pages),
         }
-    }
-
-    /// Owner-local run free (Inner only). Caller owns inbox `flush`.
-    #[allow(clippy::unused_self)]
-    pub(super) fn free_run(
-        &self,
-        inner: &mut HeapInner,
-        run: NonNull<Run>,
-        ptr: NonNull<u8>,
-    ) -> Result<(), HeapError> {
-        inner.runs.free(run, ptr)
     }
 
     /// Insert a run that just left full onto the available list. Not on the free hit.

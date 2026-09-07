@@ -16,7 +16,7 @@
 - Naming: short, clear, domain words only — same term means the same thing everywhere. No long compound jargon, invented synonyms, or parallel names for one concept. Frontend `alloc`, domain block/extent `allocate`, checkout `acquire`, current-run `extend`. Free protocol: `free` / `claim` / `accept`. Prefer existing vocabulary (`run`, `extent`, `heap`, `inbox`, `flush`, `bind`, `current`, `extend`) over new coinages.
 - Indices: `Arena` / `HeapId` / `RunId` / `ExtentId` use `u32`; convert to `usize` only when indexing Rust arrays or doing pointer/byte math — no free cast-wrapper helpers.
 - Remote free: claim → `Heap::enqueue` (Active; lease before new `try_queue`) or `Heaps::{enqueue,free,flush}` (Draining). Coalesce by owner (`Inbox`), never a freer TLS batch.
-- Flush policy: current-run empty = `extend`; inbox flush if nonempty; then local/OS `acquire_run`. Unbound = `alloc_after_bind` / `alloc_extent_after_bind` (flush then alloc); hit = current pop / page-cache `Run::free` (`push_available` only on `was_full`). Inbox `flush` is remote `accept` only.
+- Flush policy: current-run empty = `extend`; inbox flush if nonempty; then local/OS `acquire_run`. Unbound = `alloc_after_bind` / `alloc_extent_after_bind` (flush then alloc); hit = current pop / run-cache `Run::free` (`push_available` only on `was_full`). Inbox `flush` is remote `accept` only.
 - `Layout` only at the public boundary → `LayoutSpec` inward once.
 - No root/shared ownership heap; every run/extent has `HeapId`. Capabilities: shared `&Heap` = atomics only (`enqueue` / mode); Active exclusive = `ThreadHeap` + `try_inner` + `HeapCtx { pages }`; Draining = `Heaps::{enqueue,free,flush}` + `HeapsCtx`. No `Heap::state()` projection; no `*_fresh` dual alloc APIs.
 - One abort sink: `Allocator::abort`. Preserve abort kinds through `HeapError` (`InvalidRunPointer` / `InvalidExtentPointer` / `MissingExtent`). `HeapError::DoubleFree` is remote `claim` / interior-foreign only — not owner DF. Never hold the heaps arena mutex across flush / accept / user-memory copies.
@@ -51,4 +51,4 @@
 
 - v0.6 in: Linux x86_64, Rust stable, `GlobalAlloc`, owner-local heaps, TLS current run, run/extent retention, remote-free, `realloc` / `alloc_zeroed`, tests, benches.
 - v0.6 out: quarantine, canaries, hugepages, NUMA, C ABI, ML placement, dashboards, background purge.
-- Next: leftover vs snmalloc is still hit instruction count after the locate diet. Do not retry identity, batch take, O(1) TLS steal, or `#135` RSEQ on single-thread churn. Do not port snmalloc.
+- Next: leftover vs snmalloc is churn (30.2 vs 28.3) and freelist after the owner-free hit diet. Do not retry identity, batch take, O(1) TLS steal, or `#135` RSEQ on single-thread churn. Do not port snmalloc.

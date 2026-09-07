@@ -688,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn page_cache_stores_only_own_heap_runs() {
+    fn run_cache_stores_only_own_heap_runs() {
         let owner = Allocator::new();
         let other = Allocator::new();
         let inner = allocator_inner_ptr(&owner);
@@ -702,7 +702,7 @@ mod tests {
             let again = bind_alloc_small(tls, inner, layout);
             assert_eq!(again, ptr);
             let Some(run) = tls.cached_run(inner.as_ptr(), again) else {
-                panic!("page cache should hold the own-heap run after free_slow");
+                panic!("run cache should hold the own-heap run after free_slow");
             };
             assert_eq!(tls.free_run(inner, run, again), Ok(()));
             let _ = tls.bind(foreign).unwrap();
