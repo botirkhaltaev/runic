@@ -2,7 +2,7 @@ use core::{cell::Cell, ptr::NonNull};
 
 use crate::{
     allocator::{Allocator, AllocatorInner},
-    heap::{Extent, ExtentInit, HeapError, HeapId, RUN_SIZE, Run},
+    heap::{Extent, ExtentInit, HeapError, HeapId, Run, RunCache},
     layout::LayoutSpec,
     memory::{PageMap, PageOwner},
     size_class::{SizeClass, SizeClasses},
@@ -21,19 +21,13 @@ pub(crate) enum ThreadFreeError {
 /// Thread-local frontend: bound heap and per-class current run.
 ///
 /// Hot paths take a raw inner pointer for identity. `&PageMap` is projected
-/// only on miss. Hit is current-run pop / run-cache `Run::free`.
+/// only on miss. Hit is current-run pop / `RunCache` `Run::free`.
 pub(crate) struct ThreadHeap {
     inner: Cell<*mut AllocatorInner>,
     heap_id: Cell<Option<HeapId>>,
     heap: Cell<*mut Heap>,
     current: [Cell<*mut Run>; SizeClasses::COUNT],
-    /// Cached run payload base (`usize::MAX` = empty).
-    ///
-    /// Empty probe: `ptr.wrapping_sub(MAX) == ptr + 1`, which is `< RUN_SIZE`
-    /// only for addresses in the first 64 KiB — never a published mapping.
-    cache_base: Cell<usize>,
-    /// Live own-heap run when `cache_base != usize::MAX`. Extents are never cached.
-    cache_run: Cell<*mut Run>,
+    cache: RunCache,
 }
 
 impl ThreadHeap {
@@ -43,8 +37,7 @@ impl ThreadHeap {
             heap_id: Cell::new(None),
             heap: Cell::new(core::ptr::null_mut()),
             current: [const { Cell::new(core::ptr::null_mut()) }; SizeClasses::COUNT],
-            cache_base: Cell::new(usize::MAX),
-            cache_run: Cell::new(core::ptr::null_mut()),
+            cache: RunCache::new(),
         }
     }
 
@@ -56,7 +49,7 @@ impl ThreadHeap {
         ptr: NonNull<u8>,
     ) -> Option<PageOwner> {
         if self.matches(inner.as_ptr())
-            && let Some(run) = self.cache_hit(ptr)
+            && let Some(run) = self.cache.hit(ptr)
         {
             return Some(PageOwner::Run(run));
         }
@@ -65,10 +58,8 @@ impl ThreadHeap {
             && let PageOwner::Run(run) = owner
         {
             // SAFETY: PageMap stores only live arena run pointers.
-            let run_ref = unsafe { run.as_ref() };
-            if self.heap_id.get() == Some(run_ref.heap_id()) {
-                self.cache_run.set(run.as_ptr());
-                self.cache_base.set(run_ref.range().base().as_ptr().addr());
+            if self.heap_id.get() == Some(unsafe { run.as_ref() }.heap_id()) {
+                self.cache.store(run);
             }
         }
         Some(owner)
@@ -212,9 +203,7 @@ impl ThreadHeap {
         heap.flush(&mut inner, &ctx)
     }
 
-    /// Run-cache own-heap run for `ptr`, if this TLS is bound to `inner`.
-    ///
-    /// Empty cache is `cache_base == usize::MAX`; no run-null test.
+    /// [`RunCache`] hit for `ptr`, if this TLS is bound to `inner`.
     #[inline]
     pub(crate) fn cached_run(
         &self,
@@ -224,17 +213,7 @@ impl ThreadHeap {
         if !self.matches(inner) {
             return None;
         }
-        self.cache_hit(ptr)
-    }
-
-    /// Payload-range hit. Caller already `matches`.
-    #[inline]
-    fn cache_hit(&self, ptr: NonNull<u8>) -> Option<NonNull<Run>> {
-        if ptr.as_ptr().addr().wrapping_sub(self.cache_base.get()) >= RUN_SIZE {
-            return None;
-        }
-        // SAFETY: a matching range is stored only with a live own-heap run.
-        Some(unsafe { NonNull::new_unchecked(self.cache_run.get()) })
+        self.cache.hit(ptr)
     }
 
     /// Available-list insert after a full run took a free. Off the free hit.
@@ -386,8 +365,7 @@ impl ThreadHeap {
         for cell in &self.current {
             cell.set(core::ptr::null_mut());
         }
-        self.cache_base.set(usize::MAX);
-        self.cache_run.set(core::ptr::null_mut());
+        self.cache.clear();
         let Some(inner) = NonNull::new(self.inner.replace(core::ptr::null_mut())) else {
             return;
         };

@@ -5,6 +5,7 @@ Run metadata owns small size-class allocations.
 ## Files
 
 - `mod.rs`: `Run`, `RunId`, pointer freelist + `extend`, and a private claim bitmap in the mapping tail.
+- `cache.rs`: `RunCache` — one-entry TLS payload-range probe (`hit` / `store` / `clear`). Not heap retention.
 - `heap.rs`: `RunHeap` with `Arena<Run>`, available-run lists, page-map publication, and arena-wide `HeapId` rebind.
 
 ## Invariants

@@ -27,7 +27,7 @@ pub(crate) use extent::Extent;
 pub(crate) use extent::heap::{ExtentHeap, ExtentInit};
 pub(crate) use heaps::Heaps;
 pub(crate) use id::HeapId;
-pub(crate) use run::{RUN_SIZE, Run, RunError, RunHeap, RunId};
+pub(crate) use run::{Run, RunCache, RunError, RunHeap, RunId};
 pub(crate) use state::HeapMode;
 pub(crate) use thread::{THREAD_HEAP, ThreadFreeError};
 

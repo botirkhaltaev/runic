@@ -11,7 +11,7 @@ Owner-local heap frontend: runs for small size classes, extents for dedicated la
 - `state.rs`: `HeapMode`, `HeapState`, `Lease` (`store` is module-private to reactivate / bump).
 - `inbox.rs`: `Inbox` / `InboxLink`.
 - `thread.rs`: `ThreadHeap`.
-- `run/`: size-classed fixed-block runs (`Run`, `RunHeap` with `Arena<Run>`).
+- `run/`: size-classed fixed-block runs (`Run`, `RunHeap` with `Arena<Run>`, `RunCache`).
 - `extent/`: dedicated mappings (`Extent`, `ExtentHeap` with `Arena<Extent>`, `ExtentCache`).
 
 ## Capabilities
@@ -33,7 +33,7 @@ Owner-local heap frontend: runs for small size classes, extents for dedicated la
 - Draining reclaim observes live ownership via `RunHeap` ∨ `ExtentHeap` (`has_live`). In-flight claim bits keep the heap live. `Heap::reclaim` (via `HeapsCtx`) returns a Free heap to the table freelist.
 - Never-bound freers enqueue each successful claim in `Allocator::free_remote` (no TLS batch; no stranded claims). Bound producers coalesce by run/extent, not by thread batch.
 - Owner free: `Run::free` (lock-free); `push_available` only on `was_full`. Draining late free uses `Heap::free` (`&mut HeapInner` + ctx). Domain ops are `free` / `claim` / `accept` on `Run`/`Extent`. Failures after claim abort (no rollback).
-- Current-run empty: `extend`; accept inbox if nonempty (same as `alloc_extent`); then local/OS `acquire_run`. Unbound cold path: `alloc_after_bind` / `alloc_extent_after_bind`. Hit: current pop / run-cache `Run::free`. Inbox `flush` is remote `accept`.
+- Current-run empty: `extend`; accept inbox if nonempty (same as `alloc_extent`); then local/OS `acquire_run`. Unbound cold path: `alloc_after_bind` / `alloc_extent_after_bind`. Hit: current pop / `RunCache` `Run::free`. Inbox `flush` is remote `accept`.
 - `HeapState` packs generation, mode (`Free` / `Active` / `Draining`), retired, and in-flight **lease** count for Active **enqueue** admits only (not inbox depth — that stays live via claim bits / `has_live`).
 - `Heaps` is `RwLock<Arena<Heap>>`. `get` takes a read lock only to index, then returns `&Heap` (occupied slots never move). Write lock covers acquire/reuse only — never flush/accept. Free heaps sit on an intrusive index freelist (occupied `Free` slots, not Arena vacant slots). Fail only when the OS will not map more.
 - `THREAD_HEAP` has no destructor. `UnbindGuard` (touched in `bind`) retires the heap on thread exit.
@@ -45,11 +45,11 @@ A small block is on exactly one of: user, run freelist, or remote-claimed.
 | Hit | Work | Not on the hit |
 |-----|------|----------------|
 | **alloc** | `matches` → `current[class]` → `Run::allocate` (pop) | `extend`, ClaimBits, locks, atomics, acquire, flush |
-| **owner free** | run-cache sentinel (`cache_base == usize::MAX` empty; probe `ptr - base < RUN_SIZE`) → `Run::free` (span + reciprocal divisibility `locate` + `live--` + push); `push_available` only on `was_full` | ClaimBits, `extend`, locks, atomics, jump table |
+| **owner free** | `RunCache::hit` (`base == usize::MAX` empty; probe `ptr - base < RUN_SIZE`) → `Run::free` (span + reciprocal divisibility `locate` + `live--` + push); `push_available` only on `was_full` | ClaimBits, `extend`, locks, atomics, jump table |
 
 `current[class]` is a hint, not ownership. Available list is the reservoir; a run may be both current and listed. Frees never touch `current`. Interior pointers abort on `locate` (hit). Owner DF is undefined.
 
-`lookup` + the run cache stay on owner free. Cache stores only runs whose `HeapId` matches this TLS.
+`lookup` + `RunCache` stay on owner free. The cache stores only runs whose `HeapId` matches this TLS. `ExtentCache` is heap-level mapping reuse, not a TLS free probe.
 
 #129 closeout (this host, `aa3a83a`): churn/64 is 43.6 vs snmalloc 27.4 (1.6×).
 This pass vs post-#142 `82dd8b5`: `owner_free` **11.1** (was 15.3; sn 11.5), churn **30.2** (was 31.6), `freelist` **20.4** (flat guard).

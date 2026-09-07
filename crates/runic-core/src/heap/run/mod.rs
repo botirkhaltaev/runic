@@ -6,6 +6,7 @@ use core::{
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
+pub(crate) mod cache;
 pub(crate) mod heap;
 
 use crate::{
@@ -19,6 +20,7 @@ use super::{
     inbox::{InboxLink, InboxNode},
 };
 
+pub(crate) use cache::RunCache;
 pub(crate) use heap::RunHeap;
 
 pub(crate) const RUN_SIZE: usize = 64 * 1024;

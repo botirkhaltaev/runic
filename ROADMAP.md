@@ -50,7 +50,7 @@ page-map ownership. Heap lifecycle lives on `Heaps` / `Heap`
 (Heaps indexes each Heap; each `Heap` owns inboxes and `RunHeap`/`ExtentHeap`).
 
 Owner-local hit is a TLS current run per class (pop) plus a one-entry own-heap
-run cache (`cache_base == usize::MAX` empty; probe `ptr - base < RUN_SIZE`).
+`RunCache` (`base == usize::MAX` empty; probe `ptr - base < RUN_SIZE`).
 `locate` is span + reciprocal divisibility (Lemire; one path, no jump table).
 `Run::allocate` is pop only; `Run::extend` threads one page (min 32) of fresh
 blocks on miss. Owner miss free is `Run::free` without Inner; `push_available`
@@ -232,7 +232,7 @@ Run            owns pointer freelist + extend + live, claim bitmap, and embedded
 ExtentHeap     owns Arena<Extent>, dedicated allocation policy, and mapping reuse.
 ExtentCache    owns an intrusive head list of retained extents and exact-budget reuse.
 Extent         owns dedicated allocation metadata, embedded InboxLink, and Claimed byte state.
-ThreadHeap     owns TLS bind, current[class], own-heap run cache, and the sole Active body path.
+ThreadHeap     owns TLS bind, current[class], RunCache, and the sole Active body path.
 ```
 
 Prefer direct methods on the entity that owns the state. Do not add passive
