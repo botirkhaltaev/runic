@@ -1,14 +1,11 @@
 # runic-bench/src/bin
 
-Benchmark support binaries.
+`metrics` runs each allocator/case in a fresh subprocess and prints RSS peak, plateau after free, VMA count, minor faults, and optional syscall counts.
 
-`rss` runs isolated allocator/workload combinations and reports resident-set size. It uses fresh subprocesses so one allocator's cached memory does not affect another row.
-
-`policy_grid` runs configured Runic allocator variants in fresh subprocesses and reports the same RSS/timing CSV shape for policy comparison.
-
-## Run
+Runic extent configs (`runic:extent_drop`, `runic:extent_tight`) are targets here, not Criterion ids.
 
 ```sh
-cargo run -p runic-bench --bin rss
-cargo run -p runic-bench --release --bin policy_grid
+cargo run -p runic-bench --release --bin metrics
+cargo run -p runic-bench --release --bin metrics -- --cases sh6bench,large_churn --targets runic,mimalloc
+cargo run -p runic-bench --release --bin metrics -- --syscalls --threads 4 --cases larson
 ```

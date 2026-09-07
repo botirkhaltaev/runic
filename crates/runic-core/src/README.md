@@ -5,7 +5,7 @@ Allocator core organized around entities and invariants.
 ## Modules
 
 - `allocator`: public core facade and abort boundary used by the global wrapper.
-- `arena`: grow-on-demand freelist object table for heap/run/extent metadata (each chunk owns a `Mapping`; hard `max`; fixed chunk directory).
+- `arena`: mmap slab (`vacant` / `insert` / `remove`; slots never move). Sharing is the caller's lock, not interior atomics. Heap/run/extent metadata; each chunk owns a `Mapping`.
 - `config`: allocator and extent retention/reuse configuration.
 - `heap`: owner-local heaps, TLS current run, run/extent heaps, `Heaps`, and thread binding.
 - `layout`: normalized layout semantics and mapping sizing (`align` as `NonZeroUsize`; `mapping_len` uses `size + align - 1`).

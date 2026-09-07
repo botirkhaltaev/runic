@@ -14,12 +14,14 @@ runic = { package = "runic-alloc", path = "../runic" }
 mimalloc = "0.1"
 snmalloc-rs = "0.3"
 tikv-jemallocator = "0.6"
-
-[dev-dependencies]
-criterion = "0.7"
+# No `rayon`: Criterion bootstrap would spawn one thread per CPU (96 here);
+# analysis allocates through `#[global_allocator]` and that thread storm is
+# not what we are measuring.
+# No `plotters`: report generation allocates through `#[global_allocator]`.
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]
-name = "explicit"
+name = "micro"
 harness = false
 
 [[bench]]
@@ -27,11 +29,7 @@ name = "threaded"
 harness = false
 
 [[bench]]
-name = "compare_explicit"
-harness = false
-
-[[bench]]
-name = "compare_threaded"
+name = "programs"
 harness = false
 
 [[bench]]

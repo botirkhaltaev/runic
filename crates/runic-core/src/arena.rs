@@ -1,131 +1,145 @@
-//! Grow-on-demand mmap object table with an intrusive freelist.
+//! Grow-on-demand mmap slab. A slot is vacant or occupied.
+//! [`Arena::vacant`] is the next vacant index (maps storage, does not occupy).
+//! [`Arena::insert`] occupies that index; [`Arena::remove`] returns it to vacant.
+//! Mutation is `&mut self`.
 //!
 //! Indices are `u32` end-to-end (matching `HeapId` / `RunId` / `ExtentId`). Use `usize`
 //! only when indexing Rust arrays or doing pointer/byte math.
 //!
-//! `new(max)` records a hard index limit only — no slots are mapped until
-//! `claim`. Growth appends fixed-size slot chunks, each a normal [`Mapping`]
-//! owned by [`Chunk`]. Indices are stable for the arena lifetime. Callers that
-//! fail after `claim` and before `insert` must `release` the index.
+//! Growth appends fixed-size slot chunks and doubles an mmap-backed descriptor
+//! directory like `Vec<Box<[Slot<T>]>>`. The directory moves; occupied slots do not.
+//! Sharing is the caller's lock (`RwLock<Arena<T>>`), not interior atomics.
 
-use core::{mem::MaybeUninit, ptr::NonNull};
+use core::{
+    marker::PhantomData,
+    mem,
+    ptr::{self, NonNull},
+};
 
-use crate::memory::{Mapping, OsMemory};
+use crate::memory::{Mapping, OsMemory, PAGE_SIZE};
 
-const FREE_END: u32 = u32::MAX;
+const VACANT_END: u32 = u32::MAX;
 
 /// Target bytes of slot storage per growth step (page-rounded by [`OsMemory::map`]).
 const CHUNK_BYTES: usize = 256 * 1024;
 
-/// In-struct chunk directory. Sized for `SLOT_CAPACITY` at modest slot
-/// sizes while keeping `Arena` small enough to embed in a heap slot.
-const MAX_CHUNKS: u32 = 32;
-const MAX_CHUNKS_LEN: usize = 32;
-const _: () = assert!(MAX_CHUNKS == 32 && MAX_CHUNKS_LEN == 32);
-
 pub(crate) struct Arena<T> {
-    max: u32,
-    /// One past the highest index ever handed out by bump `claim`.
+    /// One past the highest index ever occupied by bump insert.
     bump: u32,
-    free_head: u32,
+    vacant_head: u32,
     slots_per_chunk: u32,
     chunk_count: u32,
-    chunks: [Option<Chunk<T>>; MAX_CHUNKS_LEN],
+    directory: Option<Directory<T>>,
 }
 
 /// One slot group: sole owner of its mmap and a typed pointer to its slots.
 struct Chunk<T> {
     mapping: Mapping,
     slots: NonNull<Slot<T>>,
-    len: u32,
+}
+
+/// Movable descriptor storage. Descriptors move on growth; their slot mappings do not.
+struct Directory<T> {
+    mapping: Mapping,
+    chunks: NonNull<Chunk<T>>,
+    capacity: u32,
 }
 
 // SAFETY: Arena owns mmap-backed storage. Moving ownership does not permit concurrent mutation.
 unsafe impl<T: Send> Send for Arena<T> {}
 
 impl<T> Arena<T> {
-    pub(crate) fn new(max: u32) -> Self {
-        let slots_per_chunk = Self::slots_per_chunk();
-        let max_supported = slots_per_chunk.saturating_mul(MAX_CHUNKS);
-        let max = max.min(max_supported);
-
+    pub(crate) fn new() -> Self {
         Self {
-            max,
             bump: 0,
-            free_head: FREE_END,
-            slots_per_chunk,
+            vacant_head: VACANT_END,
+            slots_per_chunk: Self::slots_per_chunk(),
             chunk_count: 0,
-            chunks: [const { None }; MAX_CHUNKS_LEN],
+            directory: None,
         }
     }
 
-    pub(crate) fn claim(&mut self) -> Option<u32> {
-        if self.free_head != FREE_END {
-            let index = self.free_head;
-            let next = {
-                let slot = self.slot_mut(index)?;
-                debug_assert!(!slot.is_occupied());
-                slot.take_next()
-            };
-            self.free_head = next;
-            return Some(index);
+    /// Next vacant index. Maps the chunk if this is a new bump slot.
+    /// Does not occupy; a second call returns the same index until [`Self::insert`].
+    pub(crate) fn vacant(&mut self) -> Option<u32> {
+        if self.vacant_head != VACANT_END {
+            return Some(self.vacant_head);
         }
-
-        if self.bump >= self.max {
+        if self.bump == u32::MAX {
             return None;
         }
-
         self.ensure_chunk(self.bump)?;
-        let index = self.bump;
-        self.bump += 1;
-        Some(index)
+        Some(self.bump)
     }
 
-    pub(crate) fn release(&mut self, index: u32) {
-        let next = self.free_head;
-        let Some(slot) = self.slot_mut(index) else {
-            return;
-        };
-        if slot.is_occupied() {
-            return;
+    /// Occupy `index` from [`Self::vacant`]. Any other index is rejected.
+    pub(crate) fn insert(&mut self, index: u32, value: T) -> Option<&mut T> {
+        if self.vacant_head != VACANT_END {
+            if index != self.vacant_head {
+                return None;
+            }
+            let next = match self.slot(index)? {
+                Slot::Vacant { next } => *next,
+                Slot::Occupied(_) => return None,
+            };
+            self.vacant_head = next;
+            *self.slot_mut(index)? = Slot::Occupied(value);
+            return self.get_mut(index);
         }
 
-        slot.set_empty(next);
-        self.free_head = index;
-    }
-
-    pub(crate) fn insert(&mut self, index: u32, value: T) -> Option<&mut T> {
-        let slot = self.slot_mut(index)?;
-        if slot.is_occupied() {
+        if index != self.bump {
             return None;
         }
-
-        slot.occupy(value);
-        slot.get_mut()
+        if self.bump == u32::MAX {
+            return None;
+        }
+        self.ensure_chunk(index)?;
+        // SAFETY: ensure_chunk mapped this bump slot; it has never been initialized.
+        unsafe { self.slot_ptr_unchecked(index).write(Slot::Occupied(value)) };
+        self.bump += 1;
+        self.get_mut(index)
     }
 
     pub(crate) fn get(&self, index: u32) -> Option<&T> {
-        self.slot(index)?.get()
+        match self.slot(index)? {
+            Slot::Vacant { .. } => None,
+            Slot::Occupied(value) => Some(value),
+        }
     }
 
     pub(crate) fn get_mut(&mut self, index: u32) -> Option<&mut T> {
-        self.slot_mut(index)?.get_mut()
+        match self.slot_mut(index)? {
+            Slot::Vacant { .. } => None,
+            Slot::Occupied(value) => Some(value),
+        }
     }
 
     pub(crate) fn remove(&mut self, index: u32) -> Option<T> {
-        let value = self.slot_mut(index)?.remove()?;
-        self.release(index);
+        let next = self.vacant_head;
+        let slot = self.slot_mut(index)?;
+        if matches!(slot, Slot::Vacant { .. }) {
+            return None;
+        }
+        let Slot::Occupied(value) = mem::replace(slot, Slot::Vacant { next }) else {
+            unreachable!();
+        };
+        self.vacant_head = index;
         Some(value)
     }
 
-    /// Hard index limit passed to [`Self::new`] (after directory support clamp).
-    pub(crate) fn capacity(&self) -> u32 {
-        self.max
+    pub(crate) fn iter(&self) -> Iter<'_, T> {
+        Iter {
+            arena: self,
+            index: 0,
+        }
     }
 
-    /// Number of indices ever committed by bump growth.
-    pub(crate) fn len(&self) -> u32 {
-        self.bump
+    pub(crate) fn iter_mut(&mut self) -> IterMut<'_, T> {
+        IterMut {
+            arena: NonNull::from(self),
+            index: 0,
+            marker: PhantomData,
+        }
     }
 
     fn slots_per_chunk() -> u32 {
@@ -137,33 +151,48 @@ impl<T> Arena<T> {
 
     fn ensure_chunk(&mut self, index: u32) -> Option<()> {
         let chunk_index = index / self.slots_per_chunk;
-        let slot = self.chunks.get_mut(usize::try_from(chunk_index).ok()?)?;
-        if slot.is_some() {
+        if chunk_index < self.chunk_count {
             return Some(());
         }
         if chunk_index != self.chunk_count {
             return None;
         }
 
-        let start = chunk_index.checked_mul(self.slots_per_chunk)?;
-        if start >= self.max {
-            return None;
-        }
-        let len = self.slots_per_chunk.min(self.max - start);
-        let byte_len = usize::try_from(len)
+        self.ensure_directory(chunk_index.checked_add(1)?)?;
+        let byte_len = usize::try_from(self.slots_per_chunk)
             .ok()?
             .checked_mul(core::mem::size_of::<Slot<T>>())?;
         let mapping = OsMemory::map(byte_len)?;
         debug_assert!(mapping.len().get() >= byte_len);
         let slots = mapping.base().cast::<Slot<T>>();
 
-        *slot = Some(Chunk {
-            mapping,
-            slots,
-            len,
-        });
+        let directory = self.directory.as_mut()?;
+        // SAFETY: ensure_directory provides capacity for chunk_index; each descriptor is
+        // written exactly once before chunk_count publishes it.
+        unsafe {
+            directory
+                .chunks
+                .as_ptr()
+                .add(usize::try_from(chunk_index).ok()?)
+                .write(Chunk { mapping, slots });
+        }
         self.chunk_count += 1;
         Some(())
+    }
+
+    fn ensure_directory(&mut self, needed: u32) -> Option<()> {
+        let Some(directory) = &mut self.directory else {
+            self.directory = Some(Directory::new()?);
+            return self
+                .directory
+                .as_ref()
+                .filter(|directory| directory.capacity >= needed)
+                .map(|_| ());
+        };
+        if needed <= directory.capacity {
+            return Some(());
+        }
+        directory.grow(self.chunk_count, needed)
     }
 
     fn slot(&self, index: u32) -> Option<&Slot<T>> {
@@ -185,13 +214,18 @@ impl<T> Arena<T> {
 
         let chunk_index = index / self.slots_per_chunk;
         let offset = index % self.slots_per_chunk;
-        let chunk = self
-            .chunks
-            .get(usize::try_from(chunk_index).ok()?)?
-            .as_ref()?;
-        if offset >= chunk.len {
+        if chunk_index >= self.chunk_count {
             return None;
         }
+        let directory = self.directory.as_ref()?;
+        // SAFETY: chunk_index is below published chunk_count, so the descriptor is initialized.
+        let chunk = unsafe {
+            directory
+                .chunks
+                .as_ptr()
+                .add(usize::try_from(chunk_index).ok()?)
+                .as_ref()?
+        };
 
         debug_assert_eq!(
             chunk.slots.as_ptr().cast::<u8>(),
@@ -199,84 +233,152 @@ impl<T> Arena<T> {
         );
 
         let offset = usize::try_from(offset).ok()?;
-        // SAFETY: `slots` points at `chunk.len` slots in `mapping`; `offset` is in range.
+        // SAFETY: `slots` points at `slots_per_chunk` slots in `mapping`; `offset` is in range.
         Some(unsafe { NonNull::new_unchecked(chunk.slots.as_ptr().add(offset)) })
+    }
+}
+
+impl<T> Directory<T> {
+    fn new() -> Option<Self> {
+        let mapping = OsMemory::map(PAGE_SIZE)?;
+        let capacity = u32::try_from(mapping.len().get() / mem::size_of::<Chunk<T>>()).ok()?;
+        if capacity == 0 {
+            return None;
+        }
+        let chunks = mapping.base().cast::<Chunk<T>>();
+        Some(Self {
+            mapping,
+            chunks,
+            capacity,
+        })
+    }
+
+    fn grow(&mut self, initialized: u32, needed: u32) -> Option<()> {
+        let mut capacity = self.capacity;
+        while capacity < needed {
+            capacity = capacity.checked_mul(2)?;
+        }
+        let byte_len = usize::try_from(capacity)
+            .ok()?
+            .checked_mul(mem::size_of::<Chunk<T>>())?;
+        let mapping = OsMemory::map(byte_len)?;
+        let chunks = mapping.base().cast::<Chunk<T>>();
+        // SAFETY: source has initialized descriptors through initialized; destination is
+        // disjoint mapped storage with sufficient alignment and capacity. This moves each
+        // Mapping owner bitwise; source descriptors are never dropped before their mmap goes.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                self.chunks.as_ptr(),
+                chunks.as_ptr(),
+                usize::try_from(initialized).ok()?,
+            );
+        }
+        let old = mem::replace(&mut self.mapping, mapping);
+        self.chunks = chunks;
+        self.capacity = capacity;
+        drop(old);
+        Some(())
+    }
+}
+
+pub(crate) struct Iter<'a, T> {
+    arena: &'a Arena<T>,
+    index: u32,
+}
+
+impl<'a, T> Iterator for Iter<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.index < self.arena.bump {
+            let index = self.index;
+            self.index += 1;
+            if let Some(value) = self.arena.get(index) {
+                return Some(value);
+            }
+        }
+        None
+    }
+}
+
+pub(crate) struct IterMut<'a, T> {
+    arena: NonNull<Arena<T>>,
+    index: u32,
+    marker: PhantomData<&'a mut Arena<T>>,
+}
+
+impl<'a, T> Iterator for IterMut<'a, T> {
+    type Item = &'a mut T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // SAFETY: IterMut owns the exclusive Arena borrow for 'a. Indices increase
+        // monotonically, so each occupied slot is yielded at most once.
+        let arena = unsafe { self.arena.as_mut() };
+        while self.index < arena.bump {
+            let index = self.index;
+            self.index += 1;
+            if let Some(value) = arena.get_mut(index) {
+                let value = NonNull::from(value);
+                // SAFETY: this slot has not been yielded before and remains stable.
+                return Some(unsafe { &mut *value.as_ptr() });
+            }
+        }
+        None
+    }
+}
+
+enum Slot<T> {
+    Vacant { next: u32 },
+    Occupied(T),
+}
+
+impl<T> Arena<T> {
+    unsafe fn slot_ptr_unchecked(&self, index: u32) -> *mut Slot<T> {
+        let chunk_index = index / self.slots_per_chunk;
+        let offset = index % self.slots_per_chunk;
+        let directory = self
+            .directory
+            .as_ref()
+            .expect("mapped slot must have a directory");
+        // SAFETY: caller guarantees the chunk and slot are mapped.
+        let chunk = unsafe {
+            &*directory
+                .chunks
+                .as_ptr()
+                .add(usize::try_from(chunk_index).expect("u32 fits usize"))
+        };
+        // SAFETY: caller guarantees offset is in this fixed-size chunk.
+        unsafe {
+            chunk
+                .slots
+                .as_ptr()
+                .add(usize::try_from(offset).expect("u32 fits usize"))
+        }
     }
 }
 
 impl<T> Drop for Arena<T> {
     fn drop(&mut self) {
-        // Drop occupied values before chunk mappings munmap the backing pages.
         for index in 0..self.bump {
             if let Some(slot) = self.slot_mut(index) {
-                slot.drop_value();
+                // SAFETY: every committed slot contains a valid Slot<T>.
+                unsafe { ptr::drop_in_place(slot) };
             }
         }
-        for chunk in &mut self.chunks {
-            if let Some(chunk) = chunk.take() {
-                drop(chunk.mapping);
+        let Some(directory) = &self.directory else {
+            return;
+        };
+        for index in 0..self.chunk_count {
+            // SAFETY: descriptors below chunk_count are initialized and uniquely owned.
+            unsafe {
+                ptr::drop_in_place(
+                    directory
+                        .chunks
+                        .as_ptr()
+                        .add(usize::try_from(index).expect("u32 fits usize")),
+                );
             }
         }
-    }
-}
-
-#[repr(C)]
-struct Slot<T> {
-    value: MaybeUninit<T>,
-    /// Freelist next when empty; unused when occupied.
-    next: u32,
-    occupied: u8,
-}
-
-impl<T> Slot<T> {
-    fn set_empty(&mut self, next: u32) {
-        self.occupied = 0;
-        self.next = next;
-    }
-
-    fn take_next(&mut self) -> u32 {
-        debug_assert!(!self.is_occupied());
-        self.next
-    }
-
-    fn is_occupied(&self) -> bool {
-        self.occupied != 0
-    }
-
-    fn occupy(&mut self, value: T) {
-        debug_assert!(!self.is_occupied());
-        self.value.write(value);
-        self.occupied = 1;
-        self.next = FREE_END;
-    }
-
-    fn get_mut(&mut self) -> Option<&mut T> {
-        if !self.is_occupied() {
-            return None;
-        }
-        // SAFETY: occupied is set only after value.write.
-        Some(unsafe { self.value.assume_init_mut() })
-    }
-
-    fn get(&self) -> Option<&T> {
-        if !self.is_occupied() {
-            return None;
-        }
-        // SAFETY: occupied is set only after value.write.
-        Some(unsafe { self.value.assume_init_ref() })
-    }
-
-    fn remove(&mut self) -> Option<T> {
-        if !self.is_occupied() {
-            return None;
-        }
-        self.occupied = 0;
-        // SAFETY: occupied was true, so value is initialized.
-        Some(unsafe { self.value.assume_init_read() })
-    }
-
-    fn drop_value(&mut self) {
-        let _ = self.remove();
     }
 }
 
@@ -296,111 +398,137 @@ mod tests {
         }
     }
 
-    #[test]
-    fn arena_zero_capacity_claims_none() {
-        let mut arena = Arena::<u32>::new(0);
-        assert_eq!(arena.claim(), None);
+    fn occupy(arena: &mut Arena<u32>, value: u32) -> u32 {
+        let index = arena.vacant().unwrap();
+        arena.insert(index, value).unwrap();
+        index
     }
 
     #[test]
-    fn arena_claims_from_zero() {
-        let mut arena = Arena::<u32>::new(4);
-        assert_eq!(arena.claim(), Some(0));
-        assert_eq!(arena.claim(), Some(1));
+    fn arena_vacant_assigns_indices_from_zero() {
+        let mut arena = Arena::<u32>::new();
+        assert_eq!(occupy(&mut arena, 10), 0);
+        assert_eq!(occupy(&mut arena, 20), 1);
+        assert_eq!(arena.get(0).copied(), Some(10));
+        assert_eq!(arena.get(1).copied(), Some(20));
     }
 
     #[test]
-    fn arena_respects_capacity() {
-        let mut arena = Arena::<u32>::new(2);
-        assert_eq!(arena.claim(), Some(0));
-        assert_eq!(arena.claim(), Some(1));
-        assert_eq!(arena.claim(), None);
+    fn arena_vacant_without_insert_consumes_nothing() {
+        let mut arena = Arena::<u32>::new();
+        assert_eq!(arena.vacant(), Some(0));
+        assert_eq!(arena.vacant(), Some(0));
     }
 
     #[test]
-    fn arena_release_returns_index_to_freelist() {
-        let mut arena = Arena::<u32>::new(4);
-        let first = arena.claim().unwrap();
-        let second = arena.claim().unwrap();
-        arena.release(first);
-        assert_eq!(second, 1);
-        assert_eq!(arena.claim(), Some(first));
+    fn arena_insert_rejects_index_that_is_not_vacant() {
+        let mut arena = Arena::<u32>::new();
+        let index = arena.vacant().unwrap();
+        assert!(arena.insert(index + 1, 1).is_none());
+        assert_eq!(arena.vacant(), Some(index));
+    }
+
+    #[test]
+    fn arena_remove_returns_index_to_vacant() {
+        let mut arena = Arena::<u32>::new();
+        let first = occupy(&mut arena, 10);
+        assert_eq!(occupy(&mut arena, 20), 1);
+        assert_eq!(arena.remove(first), Some(10));
+        assert_eq!(arena.vacant(), Some(first));
+        assert_eq!(occupy(&mut arena, 30), first);
     }
 
     #[test]
     fn arena_insert_get_remove_round_trip() {
-        let mut arena = Arena::<u32>::new(4);
-        let index = arena.claim().unwrap();
-        assert_eq!(arena.insert(index, 42).copied(), Some(42));
+        let mut arena = Arena::<u32>::new();
+        let index = occupy(&mut arena, 42);
         assert_eq!(arena.get(index).copied(), Some(42));
         assert_eq!(arena.remove(index), Some(42));
         assert_eq!(arena.get(index), None);
-        assert_eq!(arena.claim(), Some(index));
+        assert_eq!(occupy(&mut arena, 7), index);
     }
 
     #[test]
-    fn arena_rejects_insert_on_occupied() {
-        let mut arena = Arena::<u32>::new(4);
-        let index = arena.claim().unwrap();
-        assert!(arena.insert(index, 1).is_some());
-        assert!(arena.insert(index, 2).is_none());
-        assert_eq!(arena.get(index).copied(), Some(1));
+    fn arena_iterators_yield_occupied_only() {
+        let mut arena = Arena::<u32>::new();
+        for value in 1..=3 {
+            occupy(&mut arena, value);
+        }
+        assert_eq!(arena.remove(1), Some(2));
+        assert_eq!(arena.iter().copied().collect::<Vec<_>>(), vec![1, 3]);
+        for value in arena.iter_mut() {
+            *value *= 2;
+        }
+        assert_eq!(arena.iter().copied().collect::<Vec<_>>(), vec![2, 6]);
     }
 
     #[test]
     fn arena_drop_drops_occupied_only() {
         let drops = Cell::new(0);
         {
-            let mut arena = Arena::new(4);
-            let occupied = arena.claim().unwrap();
-            let claimed = arena.claim().unwrap();
-            assert!(
-                arena
-                    .insert(occupied, DropCounter { drops: &drops })
-                    .is_some()
-            );
-            assert_ne!(occupied, claimed);
-            // `claimed` is released by dropping the arena without insert — no DropCounter.
+            let mut arena = Arena::new();
+            let first = arena.vacant().unwrap();
+            arena.insert(first, DropCounter { drops: &drops }).unwrap();
+            let removed = arena.vacant().unwrap();
+            arena
+                .insert(removed, DropCounter { drops: &drops })
+                .unwrap();
+            drop(arena.remove(removed));
+            assert_eq!(arena.vacant(), Some(removed));
         }
-        assert_eq!(drops.get(), 1);
+        assert_eq!(drops.get(), 2);
     }
 
     #[test]
-    fn arena_grows_across_chunks_without_eager_len() {
-        let mut arena = Arena::<u32>::new(4_096);
-        assert_eq!(arena.len(), 0);
-
-        let first = arena.claim().unwrap();
-        assert_eq!(first, 0);
-        assert_eq!(arena.len(), 1);
-        assert!(arena.insert(first, 7).is_some());
-
-        let limit = arena.capacity().min(arena.slots_per_chunk + 1);
-        while arena.len() < limit {
-            let index = arena.claim().unwrap();
-            assert!(arena.insert(index, index).is_some());
-        }
-        assert_eq!(arena.len(), limit);
-        assert_eq!(arena.get(0).copied(), Some(7));
-        assert_eq!(arena.get(limit - 1).copied(), Some(limit - 1));
-        assert!(arena.chunk_count >= 2 || limit <= arena.slots_per_chunk);
-    }
-
-    #[test]
-    fn arena_each_chunk_owns_a_mapping() {
-        // Large elements force small slots_per_chunk so two chunks fit under max.
+    fn arena_grows_past_thirty_two_chunks() {
         #[repr(C)]
         struct Large([u8; 4096]);
 
-        let mut arena = Arena::<Large>::new(64);
-        let need = arena.slots_per_chunk + 1;
-        assert!(need <= arena.capacity());
-        while arena.len() < need {
-            let index = arena.claim().unwrap();
-            assert!(arena.insert(index, Large([0; 4096])).is_some());
+        let mut arena = Arena::<Large>::new();
+        let entries = arena.slots_per_chunk * 32 + 1;
+        for index in 0..entries {
+            let mut value = Large([0; 4096]);
+            value.0[..4].copy_from_slice(&index.to_le_bytes());
+            let slot = arena.vacant().unwrap();
+            arena.insert(slot, value).unwrap();
         }
-        assert_eq!(arena.chunk_count, 2);
-        assert!(arena.chunks[0].as_ref().unwrap().mapping.len().get() > 0);
-        assert!(arena.chunks[1].as_ref().unwrap().mapping.len().get() > 0);
+
+        assert_eq!(arena.chunk_count, 33);
+        assert_eq!(&arena.get(0).unwrap().0[..4], &0u32.to_le_bytes());
+        assert_eq!(
+            &arena.get(entries - 1).unwrap().0[..4],
+            &(entries - 1).to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn arena_directory_grows_without_moving_slots() {
+        #[repr(C)]
+        struct Large([u8; 4096]);
+
+        let mut arena = Arena::<Large>::new();
+        let first_index = arena.vacant().unwrap();
+        arena.insert(first_index, Large([0; 4096])).unwrap();
+        let first = NonNull::from(arena.get(0).unwrap());
+        let initial_capacity = arena.directory.as_ref().unwrap().capacity;
+        let entries = initial_capacity
+            .checked_mul(arena.slots_per_chunk)
+            .and_then(|value| value.checked_add(1))
+            .unwrap();
+
+        for index in 1..entries {
+            let mut value = Large([0; 4096]);
+            value.0[..4].copy_from_slice(&index.to_le_bytes());
+            let slot = arena.vacant().unwrap();
+            arena.insert(slot, value).unwrap();
+        }
+
+        assert!(arena.directory.as_ref().unwrap().capacity > initial_capacity);
+        assert_eq!(NonNull::from(arena.get(0).unwrap()), first);
+        assert_eq!(arena.iter().count(), usize::try_from(entries).unwrap());
+        assert_eq!(
+            &arena.get(entries - 1).unwrap().0[..4],
+            &(entries - 1).to_le_bytes()
+        );
     }
 }

@@ -1,10 +1,13 @@
 use criterion::{Criterion, criterion_group, criterion_main};
+use runic_bench::suite;
 
-mod common;
-
-fn global_collections(c: &mut Criterion) {
-    common::register_global_collections(c, "system");
+fn collections(c: &mut Criterion) {
+    suite::collections::register(c, "system");
 }
 
-criterion_group!(global_system, global_collections);
+criterion_group! {
+    name = global_system;
+    config = suite::criterion();
+    targets = collections
+}
 criterion_main!(global_system);

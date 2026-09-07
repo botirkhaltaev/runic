@@ -17,6 +17,9 @@ description = "A correctness-first Rust allocator"
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 
+[profile.bench]
+debug = "line-tables-only"
+
 [workspace.lints.clippy]
 
 # Deny correctness issues (likely bugs)

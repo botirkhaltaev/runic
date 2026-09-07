@@ -1,13 +1,16 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-
-mod common;
+use runic_bench::suite;
 
 #[global_allocator]
 static ALLOC: runic::RunicAlloc = runic::RunicAlloc::new();
 
-fn global_collections(c: &mut Criterion) {
-    common::register_global_collections(c, "runic");
+fn collections(c: &mut Criterion) {
+    suite::collections::register(c, "runic");
 }
 
-criterion_group!(global_runic, global_collections);
+criterion_group! {
+    name = global_runic;
+    config = suite::criterion();
+    targets = collections
+}
 criterion_main!(global_runic);

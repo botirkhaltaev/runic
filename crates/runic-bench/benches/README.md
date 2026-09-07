@@ -1,115 +1,65 @@
 # runic-bench/benches
 
-Criterion benchmark entry points.
+Thin Criterion entry points. Registration lives in `src/suite/`.
 
-## Runic Targets
+## Targets
 
-- `explicit`: Runic-only direct `GlobalAlloc` workloads.
-- `threaded`: Runic-only threaded workloads (setup-lifecycle + persistent).
-- `global_runic`: process-global Runic allocator workloads.
+- `micro`: direct `GlobalAlloc` for every allocator (`runic`, `system`, `mimalloc`, `jemalloc`, `snmalloc`). Filter selects one.
+- `threaded`: persistent workers + `lifecycle`.
+- `programs`: larson, xmalloc, cache_thrash, cache_scratch, sh6bench, cfrac.
+- `global_{runic,system,mimalloc,jemalloc,snmalloc}`: `#[global_allocator]` collections.
 
-Use these targets for same-machine `perf stat` comparisons of Runic changes without noise from external allocator comparison runs.
+## Naming
 
-## Manual Comparison Targets
+- `micro/<group>/<alloc>/<param>` — `micro/owner_free/runic/64`, `micro/recycled_churn/runic/64/live:256`
+- `threaded/<group>/<alloc>/<threads>[/live:N]` — `threaded/remote_fan_in/runic/4/live:256`
+- `threaded/lifecycle/<alloc>/<threads>` — spawn, churn, join
+- `programs/<group>/<alloc>/<threads>` — `programs/sh6bench/runic/4`
+- `global/<alloc>/<group>` — `global/runic/tree`
 
-- `compare_explicit`: direct `GlobalAlloc` workloads across Runic and external allocators.
-- `compare_threaded`: threaded workloads across Runic and external allocators.
-- `global_system`: process-global system allocator workloads.
-- `global_mimalloc`: process-global mimalloc workloads.
-- `global_jemalloc`: process-global jemalloc workloads.
-- `global_snmalloc`: process-global snmalloc workloads.
-- `common`: shared benchmark target setup.
+## Filters
 
-## Threaded filters
+Phase-isolated local:
 
-Setup/lifecycle (spawn/join inside the timed region — not for hot-path profiles):
+- `micro/owner_free/runic/{8|64|80|4096}`
+- `micro/freelist_allocate/runic/{8|64|80|4096}`
 
-- `threaded/setup_lifecycle_thread_local_churn/runic/4`
-- `threaded/setup_lifecycle_remote_free_ring/runic/4`
-- `threaded/setup_lifecycle_draining_late_free/runic/4`
+Size-class matrix:
 
-Persistent workers (preferred for allocator profiles):
+- `micro/recycled_churn/runic/{size}/live:{depth}`
+- `micro/recycled_hotspot/runic/{64|72|80|88}/live:{depth}`
 
-- `threaded/persistent_local_churn/runic/4`
-- `threaded/persistent_free_ring/runic/4/live:256`
-- `threaded/persistent_remote_fan_in/runic/4/live:256` — freer backlog depth is real
-- `threaded/persistent_owner_concurrent/runic/4/live:256` — owner-local churn + remote frees
-- `threaded/persistent_remote_reuse_latency/runic/live:1` (also `live:32`, `live:256`) — Criterion time is measured reuse latency; emits `runic_mean_reuse_ns=`
-- `threaded/persistent_bound_remote/runic/4` — channel-free bound freer drains
-- `threaded/persistent_unbound_remote/runic/4` — channel-free unbound freer drains
-- `threaded/persistent_owner_accept/runic/4` — prepare+free outside timing; owner accept/flush only
+Persistent threaded:
 
-Phase-isolated local free/alloc (setup outside timed window):
-
-- `explicit/owner_free_only/runic/{8|64|80|4096}`
-- `explicit/freelist_allocate_only/runic/{8|64|80|4096}`
-
-Local size-class matrix (full + focused hotspot subset):
-
-- `explicit/recycled_live_churn/runic/{size}/live:{depth}` — all 27 classes
-- `explicit/recycled_live_hotspot/runic/{64|72|80|88}/live:{depth}` — PoT vs non-PoT index gate
+- `threaded/local_churn/runic/4`
+- `threaded/free_ring/runic/4/live:256`
+- `threaded/remote_fan_in/runic/4/live:256`
+- `threaded/owner_concurrent/runic/4/live:256`
+- `threaded/remote_reuse/runic/live:1`
+- `threaded/bound_remote/runic/4`
+- `threaded/unbound_remote/runic/4`
+- `threaded/owner_accept/runic/4`
 
 ## Run
 
 ```sh
-cargo bench -p runic-bench
-cargo bench -p runic-bench --bench global_runic
-cargo bench -p runic-bench --bench compare_explicit
+cargo bench -p runic-bench --bench micro
+cargo bench -p runic-bench --bench programs -- 'programs/larson/runic/4'
 ```
 
 ## Perf
 
-Benches are ordinary Criterion targets. `scripts/profile.sh` only orchestrates tools on the
-resolved ELF (build hygiene, CPU pin, `perf` / flamegraph / samply / callgrind).
-
-Optimize only with four facts, in order:
-
-1. **Cost** — `metrics.txt` (cycles/insn/branches per elem, IPC) vs self and competitors;
-   `--compare` before/after. Use phase filters for free/alloc/remote.
-2. **Where** — open `perf.data` with `perf report` / `perf annotate`, or samply / flamegraph.
-   Inlining hides work inside symbols; annotate answers that, not name guessing.
-3. **Why** — counter groups in `perf-stat.txt` (IPC, branches, cache/TLB); threaded phases for contention.
-4. **Causal** — temporary A/B after Where points at a hypothesis; accept only if Cost improves
-   enough (e.g. ≥5% cyc/elem) and remote gates do not regress.
+`scripts/profile.sh` wraps the resolved ELF. Cost is `metrics.txt` / `--compare`.
 
 ```sh
 scripts/profile.sh --preflight
-scripts/profile.sh -l baseline explicit 'explicit/single_size_churn/runic/64'
-scripts/profile.sh -l baseline explicit 'explicit/owner_free_only/runic/64'
-scripts/profile.sh -l baseline explicit 'explicit/freelist_allocate_only/runic/64'
-scripts/profile.sh -l baseline explicit 'explicit/recycled_live_churn/runic/64/live:1'
+scripts/profile.sh -l baseline micro 'micro/single_size_churn/runic/64'
+scripts/profile.sh -l baseline micro 'micro/owner_free/runic/64'
+scripts/profile.sh -l baseline micro 'micro/freelist_allocate/runic/64'
+scripts/profile.sh -l baseline micro 'micro/recycled_churn/runic/64/live:1'
 scripts/profile.sh -l baseline -t 20 \
-  threaded 'threaded/persistent_remote_fan_in/runic/4/live:256'
+  threaded 'threaded/remote_fan_in/runic/4/live:256'
 scripts/profile.sh -l baseline -t 20 \
-  threaded 'threaded/persistent_owner_accept/runic/4'
+  threaded 'threaded/owner_accept/runic/4'
+scripts/profile.sh --with callgrind micro 'micro/owner_free/runic/64'
 ```
-
-After a run:
-
-```sh
-OUT=target/runic-profiles/<run-dir>
-perf report -i "$OUT/perf.data"
-perf annotate -i "$OUT/perf.data" --symbol '<symbol from report>'
-# optional:
-scripts/profile.sh --with flamegraph,samply ...
-samply load "$OUT/samply.json"
-```
-
-Optional Callgrind (owner-local only):
-
-```sh
-scripts/profile.sh --with callgrind explicit 'explicit/owner_free_only/runic/64'
-```
-
-Artifacts under `target/runic-profiles/` (`RUNIC_PROFILE_DIR` or `-o`):
-`manifest.txt`, `metrics.txt`, `perf-stat.txt`, `perf.data`, `perf-report-*.txt`,
-`summary.txt`, plus optional flamegraph/samply/callgrind.
-
-Compare Cost:
-
-```sh
-scripts/profile.sh --compare \
-  target/runic-profiles/run-before target/runic-profiles/run-after
-```
-
-Prefer separate git worktrees built from exact commits for before/after on the same machine.

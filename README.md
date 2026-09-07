@@ -87,7 +87,7 @@ benches; script wraps the resolved ELF under perf). Cost is `metrics.txt` /
 
 ```sh
 scripts/profile.sh --preflight
-scripts/profile.sh -l baseline explicit 'explicit/single_size_churn/runic/64'
+scripts/profile.sh -l baseline micro 'micro/single_size_churn/runic/64'
 scripts/profile.sh --compare target/runic-profiles/run-before target/runic-profiles/run-after
 ```
 

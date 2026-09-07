@@ -1,52 +1,37 @@
-use std::{
-    hint::black_box,
-    time::{Duration, Instant},
-};
+use std::{hint::black_box, time::Duration, time::Instant};
 
 use criterion::{BenchmarkId, Criterion, Throughput};
-use runic_bench::{allocator_target::AllocatorTarget, threaded};
 
-#[path = "configure.rs"]
-mod configure;
-use configure::configure_group;
+use crate::{suite::elems, target::AllocatorTarget, threaded};
 
 const THREAD_COUNTS: &[usize] = &[2, 4];
-const OPS_PER_THREAD: usize = 512;
+const LIFECYCLE_OPS: usize = 512;
 const PERSISTENT_OPS: usize = 2_048;
 const LIVE_DEPTHS: &[usize] = &[1, 32, 256];
 
-pub fn register(c: &mut Criterion, suite: &str, targets: &[AllocatorTarget]) {
-    register_setup_lifecycle_thread_local_churn(c, suite, targets);
-    register_setup_lifecycle_remote_free_ring(c, suite, targets);
-    register_setup_lifecycle_mixed_thread_random(c, suite, targets);
-    register_setup_lifecycle_draining_late_free(c, suite, targets);
-
-    register_persistent_local_churn(c, suite, targets);
-    register_persistent_free_ring(c, suite, targets);
-    register_persistent_remote_fan_in(c, suite, targets);
-    register_persistent_owner_concurrent(c, suite, targets);
-    register_persistent_remote_reuse_latency(c, suite, targets);
-    register_persistent_bound_remote(c, suite, targets);
-    register_persistent_unbound_remote(c, suite, targets);
-    register_persistent_owner_accept(c, suite, targets);
+pub fn register(c: &mut Criterion, targets: &[AllocatorTarget]) {
+    register_lifecycle(c, targets);
+    register_local_churn(c, targets);
+    register_free_ring(c, targets);
+    register_remote_fan_in(c, targets);
+    register_owner_concurrent(c, targets);
+    register_remote_reuse(c, targets);
+    register_bound_remote(c, targets);
+    register_unbound_remote(c, targets);
+    register_owner_accept(c, targets);
 }
 
-fn register_setup_lifecycle_thread_local_churn(
-    c: &mut Criterion,
-    suite: &str,
-    targets: &[AllocatorTarget],
-) {
-    let mut group = c.benchmark_group(format!("{suite}/setup_lifecycle_thread_local_churn"));
-    configure_group(&mut group);
+fn register_lifecycle(c: &mut Criterion, targets: &[AllocatorTarget]) {
+    let mut group = c.benchmark_group("threaded/lifecycle");
 
     for &target in targets {
         for &threads in THREAD_COUNTS {
-            group.throughput(Throughput::Elements((threads * OPS_PER_THREAD) as u64));
+            group.throughput(Throughput::Elements(elems(threads * LIFECYCLE_OPS)));
             group.bench_with_input(
                 BenchmarkId::new(target.name(), threads),
                 &(target, threads),
                 |bench, &(target, threads)| {
-                    bench.iter(|| threaded::thread_local_churn(target, threads, OPS_PER_THREAD));
+                    bench.iter(|| threaded::lifecycle(target, threads, LIFECYCLE_OPS));
                 },
             );
         }
@@ -55,91 +40,18 @@ fn register_setup_lifecycle_thread_local_churn(
     group.finish();
 }
 
-fn register_setup_lifecycle_remote_free_ring(
-    c: &mut Criterion,
-    suite: &str,
-    targets: &[AllocatorTarget],
-) {
-    let mut group = c.benchmark_group(format!("{suite}/setup_lifecycle_remote_free_ring"));
-    configure_group(&mut group);
+fn register_local_churn(c: &mut Criterion, targets: &[AllocatorTarget]) {
+    let mut group = c.benchmark_group("threaded/local_churn");
 
     for &target in targets {
         for &threads in THREAD_COUNTS {
-            group.throughput(Throughput::Elements((threads * OPS_PER_THREAD) as u64));
-            group.bench_with_input(
-                BenchmarkId::new(target.name(), threads),
-                &(target, threads),
-                |bench, &(target, threads)| {
-                    bench.iter(|| threaded::remote_free_ring(target, threads, OPS_PER_THREAD));
-                },
-            );
-        }
-    }
-
-    group.finish();
-}
-
-fn register_setup_lifecycle_mixed_thread_random(
-    c: &mut Criterion,
-    suite: &str,
-    targets: &[AllocatorTarget],
-) {
-    let mut group = c.benchmark_group(format!("{suite}/setup_lifecycle_mixed_thread_random"));
-    configure_group(&mut group);
-
-    for &target in targets {
-        for &threads in THREAD_COUNTS {
-            group.throughput(Throughput::Elements((threads * OPS_PER_THREAD) as u64));
-            group.bench_with_input(
-                BenchmarkId::new(target.name(), threads),
-                &(target, threads),
-                |bench, &(target, threads)| {
-                    bench.iter(|| threaded::mixed_thread_random(target, threads, OPS_PER_THREAD));
-                },
-            );
-        }
-    }
-
-    group.finish();
-}
-
-fn register_setup_lifecycle_draining_late_free(
-    c: &mut Criterion,
-    suite: &str,
-    targets: &[AllocatorTarget],
-) {
-    let mut group = c.benchmark_group(format!("{suite}/setup_lifecycle_draining_late_free"));
-    configure_group(&mut group);
-
-    for &target in targets {
-        for &threads in THREAD_COUNTS {
-            group.throughput(Throughput::Elements((threads * OPS_PER_THREAD) as u64));
-            group.bench_with_input(
-                BenchmarkId::new(target.name(), threads),
-                &(target, threads),
-                |bench, &(target, threads)| {
-                    bench.iter(|| threaded::draining_late_free(target, threads, OPS_PER_THREAD));
-                },
-            );
-        }
-    }
-
-    group.finish();
-}
-
-fn register_persistent_local_churn(c: &mut Criterion, suite: &str, targets: &[AllocatorTarget]) {
-    let mut group = c.benchmark_group(format!("{suite}/persistent_local_churn"));
-    configure_group(&mut group);
-
-    for &target in targets {
-        for &threads in THREAD_COUNTS {
-            group.throughput(Throughput::Elements((threads * PERSISTENT_OPS) as u64));
+            group.throughput(Throughput::Elements(elems(threads * PERSISTENT_OPS)));
             group.bench_with_input(
                 BenchmarkId::new(target.name(), threads),
                 &(target, threads),
                 |bench, &(target, threads)| {
                     bench.iter_custom(|iters| {
-                        let workers = threaded::PersistentLocalChurn::spawn(target, threads);
+                        let workers = threaded::LocalChurn::spawn(target, threads);
                         let start = Instant::now();
                         for _ in 0..iters {
                             black_box(workers.run_round(PERSISTENT_OPS));
@@ -156,14 +68,13 @@ fn register_persistent_local_churn(c: &mut Criterion, suite: &str, targets: &[Al
     group.finish();
 }
 
-fn register_persistent_free_ring(c: &mut Criterion, suite: &str, targets: &[AllocatorTarget]) {
-    let mut group = c.benchmark_group(format!("{suite}/persistent_free_ring"));
-    configure_group(&mut group);
+fn register_free_ring(c: &mut Criterion, targets: &[AllocatorTarget]) {
+    let mut group = c.benchmark_group("threaded/free_ring");
 
     for &target in targets {
         for &threads in THREAD_COUNTS {
             for &live in LIVE_DEPTHS {
-                group.throughput(Throughput::Elements((threads * PERSISTENT_OPS) as u64));
+                group.throughput(Throughput::Elements(elems(threads * PERSISTENT_OPS)));
                 group.bench_with_input(
                     BenchmarkId::new(target.name(), format!("{threads}/live:{live}")),
                     &(target, threads, live),
@@ -187,20 +98,19 @@ fn register_persistent_free_ring(c: &mut Criterion, suite: &str, targets: &[Allo
     group.finish();
 }
 
-fn register_persistent_remote_fan_in(c: &mut Criterion, suite: &str, targets: &[AllocatorTarget]) {
-    let mut group = c.benchmark_group(format!("{suite}/persistent_remote_fan_in"));
-    configure_group(&mut group);
+fn register_remote_fan_in(c: &mut Criterion, targets: &[AllocatorTarget]) {
+    let mut group = c.benchmark_group("threaded/remote_fan_in");
 
     for &target in targets {
         for &threads in THREAD_COUNTS {
             for &live in LIVE_DEPTHS {
-                group.throughput(Throughput::Elements((threads * PERSISTENT_OPS) as u64));
+                group.throughput(Throughput::Elements(elems(threads * PERSISTENT_OPS)));
                 group.bench_with_input(
                     BenchmarkId::new(target.name(), format!("{threads}/live:{live}")),
                     &(target, threads, live),
                     |bench, &(target, threads, live)| {
                         bench.iter_custom(|iters| {
-                            let workers = threaded::PersistentRemoteFanIn::spawn(target, threads);
+                            let workers = threaded::RemoteFanIn::spawn(target, threads);
                             let start = Instant::now();
                             for _ in 0..iters {
                                 black_box(workers.run_round(PERSISTENT_OPS, live));
@@ -218,28 +128,21 @@ fn register_persistent_remote_fan_in(c: &mut Criterion, suite: &str, targets: &[
     group.finish();
 }
 
-fn register_persistent_owner_concurrent(
-    c: &mut Criterion,
-    suite: &str,
-    targets: &[AllocatorTarget],
-) {
-    let mut group = c.benchmark_group(format!("{suite}/persistent_owner_concurrent"));
-    configure_group(&mut group);
+fn register_owner_concurrent(c: &mut Criterion, targets: &[AllocatorTarget]) {
+    let mut group = c.benchmark_group("threaded/owner_concurrent");
 
     for &target in targets {
         for &threads in THREAD_COUNTS {
             for &live in LIVE_DEPTHS {
-                // Elements: owner local churn steps + remote frees (ops * freers).
-                group.throughput(Throughput::Elements(
-                    (PERSISTENT_OPS + threads * PERSISTENT_OPS) as u64,
-                ));
+                group.throughput(Throughput::Elements(elems(
+                    PERSISTENT_OPS + threads * PERSISTENT_OPS,
+                )));
                 group.bench_with_input(
                     BenchmarkId::new(target.name(), format!("{threads}/live:{live}")),
                     &(target, threads, live),
                     |bench, &(target, threads, live)| {
                         bench.iter_custom(|iters| {
-                            let workers =
-                                threaded::PersistentOwnerConcurrent::spawn(target, threads);
+                            let workers = threaded::OwnerConcurrent::spawn(target, threads);
                             let start = Instant::now();
                             for _ in 0..iters {
                                 black_box(workers.run_round(PERSISTENT_OPS, live));
@@ -257,23 +160,18 @@ fn register_persistent_owner_concurrent(
     group.finish();
 }
 
-fn register_persistent_remote_reuse_latency(
-    c: &mut Criterion,
-    suite: &str,
-    targets: &[AllocatorTarget],
-) {
-    let mut group = c.benchmark_group(format!("{suite}/persistent_remote_reuse_latency"));
-    configure_group(&mut group);
+fn register_remote_reuse(c: &mut Criterion, targets: &[AllocatorTarget]) {
+    let mut group = c.benchmark_group("threaded/remote_reuse");
 
     for &target in targets {
         for &live in LIVE_DEPTHS {
-            group.throughput(Throughput::Elements(PERSISTENT_OPS as u64));
+            group.throughput(Throughput::Elements(elems(PERSISTENT_OPS)));
             group.bench_with_input(
                 BenchmarkId::new(target.name(), format!("live:{live}")),
                 &(target, live),
                 |bench, &(target, live)| {
                     bench.iter_custom(|iters| {
-                        let workers = threaded::PersistentRemoteReuse::spawn(target);
+                        let workers = threaded::RemoteReuse::spawn(target);
                         let mut elapsed = Duration::ZERO;
                         for _ in 0..iters {
                             black_box(workers.run_round(PERSISTENT_OPS, live));
@@ -282,7 +180,6 @@ fn register_persistent_remote_reuse_latency(
                             }
                         }
                         if let Some(mean_ns) = workers.mean_reuse_ns() {
-                            // Parseable marker for scripts/profile.sh → metrics.txt.
                             eprintln!("runic_mean_reuse_ns={mean_ns}");
                         }
                         drop(workers);
@@ -296,13 +193,12 @@ fn register_persistent_remote_reuse_latency(
     group.finish();
 }
 
-fn register_persistent_bound_remote(c: &mut Criterion, suite: &str, targets: &[AllocatorTarget]) {
-    let mut group = c.benchmark_group(format!("{suite}/persistent_bound_remote"));
-    configure_group(&mut group);
+fn register_bound_remote(c: &mut Criterion, targets: &[AllocatorTarget]) {
+    let mut group = c.benchmark_group("threaded/bound_remote");
 
     for &target in targets {
         for &threads in THREAD_COUNTS {
-            group.throughput(Throughput::Elements((threads * PERSISTENT_OPS) as u64));
+            group.throughput(Throughput::Elements(elems(threads * PERSISTENT_OPS)));
             group.bench_with_input(
                 BenchmarkId::new(target.name(), threads),
                 &(target, threads),
@@ -313,7 +209,7 @@ fn register_persistent_bound_remote(c: &mut Criterion, suite: &str, targets: &[A
                         for _ in 0..iters {
                             black_box(workers.prepare_round(PERSISTENT_OPS));
                             let start = Instant::now();
-                            black_box(workers.run_free_round());
+                            black_box(workers.run_free_round(PERSISTENT_OPS));
                             elapsed += start.elapsed();
                         }
                         drop(workers);
@@ -327,13 +223,12 @@ fn register_persistent_bound_remote(c: &mut Criterion, suite: &str, targets: &[A
     group.finish();
 }
 
-fn register_persistent_unbound_remote(c: &mut Criterion, suite: &str, targets: &[AllocatorTarget]) {
-    let mut group = c.benchmark_group(format!("{suite}/persistent_unbound_remote"));
-    configure_group(&mut group);
+fn register_unbound_remote(c: &mut Criterion, targets: &[AllocatorTarget]) {
+    let mut group = c.benchmark_group("threaded/unbound_remote");
 
     for &target in targets {
         for &threads in THREAD_COUNTS {
-            group.throughput(Throughput::Elements((threads * PERSISTENT_OPS) as u64));
+            group.throughput(Throughput::Elements(elems(threads * PERSISTENT_OPS)));
             group.bench_with_input(
                 BenchmarkId::new(target.name(), threads),
                 &(target, threads),
@@ -344,7 +239,7 @@ fn register_persistent_unbound_remote(c: &mut Criterion, suite: &str, targets: &
                         for _ in 0..iters {
                             black_box(workers.prepare_round(PERSISTENT_OPS));
                             let start = Instant::now();
-                            black_box(workers.run_free_round());
+                            black_box(workers.run_free_round(PERSISTENT_OPS));
                             elapsed += start.elapsed();
                         }
                         drop(workers);
@@ -358,13 +253,12 @@ fn register_persistent_unbound_remote(c: &mut Criterion, suite: &str, targets: &
     group.finish();
 }
 
-fn register_persistent_owner_accept(c: &mut Criterion, suite: &str, targets: &[AllocatorTarget]) {
-    let mut group = c.benchmark_group(format!("{suite}/persistent_owner_accept"));
-    configure_group(&mut group);
+fn register_owner_accept(c: &mut Criterion, targets: &[AllocatorTarget]) {
+    let mut group = c.benchmark_group("threaded/owner_accept");
 
     for &target in targets {
         for &threads in THREAD_COUNTS {
-            group.throughput(Throughput::Elements(PERSISTENT_OPS as u64));
+            group.throughput(Throughput::Elements(elems(PERSISTENT_OPS)));
             group.bench_with_input(
                 BenchmarkId::new(target.name(), threads),
                 &(target, threads),
@@ -374,7 +268,7 @@ fn register_persistent_owner_accept(c: &mut Criterion, suite: &str, targets: &[A
                         let mut elapsed = Duration::ZERO;
                         for _ in 0..iters {
                             black_box(workers.prepare_round(PERSISTENT_OPS));
-                            black_box(workers.run_free_round());
+                            black_box(workers.run_free_round(PERSISTENT_OPS));
                             let start = Instant::now();
                             black_box(workers.run_accept_round(PERSISTENT_OPS));
                             elapsed += start.elapsed();

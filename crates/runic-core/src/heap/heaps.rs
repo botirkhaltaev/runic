@@ -1,75 +1,65 @@
 use core::{
     hint,
     num::NonZeroU32,
-    ptr::{self, NonNull},
-    sync::atomic::{AtomicPtr, Ordering},
+    ptr::NonNull,
+    sync::atomic::{AtomicU32, Ordering},
 };
 
-use spin::Mutex;
+use spin::RwLock;
 
-use crate::{arena::Arena, config::AllocatorConfig, heap::HeapError, memory::PageMap};
+use crate::{
+    arena::Arena,
+    config::AllocatorConfig,
+    heap::HeapError,
+    memory::{PageMap, PageOwner},
+};
 
 use super::state::HeapMode;
-use super::{Heap, HeapId, LockedHeap};
+use super::{Heap, HeapCtx, HeapId, HeapInner, HeapsCtx};
 
-const MAX_HEAPS: u32 = 64;
-const MAX_HEAPS_LEN: usize = 64;
-const _: () = assert!(MAX_HEAPS == 64 && MAX_HEAPS_LEN == 64);
+const FREE_END: u32 = u32::MAX;
 
-/// Indexes and publishes heaps. Arena mutex covers claim/reuse only — never flush/accept.
+/// Indexes heaps. `RwLock` covers claim/reuse only — never flush/accept.
 pub(crate) struct Heaps {
-    published: [AtomicPtr<Heap>; MAX_HEAPS_LEN],
-    arena: Mutex<Arena<Heap>>,
+    arena: RwLock<Arena<Heap>>,
+    /// Intrusive Free-heap stack (`Heap::free_next`). Pushed from [`Heap::reclaim`].
+    free_head: AtomicU32,
     config: AllocatorConfig,
 }
 
-// SAFETY: published pointers are stable atomics; arena mutex serializes claim/reuse.
+// SAFETY: `RwLock` serializes arena directory access; occupied slots never move; config is immutable.
 unsafe impl Send for Heaps {}
-// SAFETY: Sync via atomics + Mutex; config is immutable after `new`.
+// SAFETY: same as Send — `get` copies `&Heap` out of a read guard (immovable slots).
 unsafe impl Sync for Heaps {}
 
 impl Heaps {
     pub(crate) fn new(config: AllocatorConfig) -> Self {
         Self {
-            published: [const { AtomicPtr::new(ptr::null_mut()) }; MAX_HEAPS_LEN],
-            arena: Mutex::new(Arena::new(MAX_HEAPS)),
+            arena: RwLock::new(Arena::new()),
+            free_head: AtomicU32::new(FREE_END),
             config,
         }
     }
 
-    /// Acquire a heap for TLS bind: reuse a Free heap or claim a fresh one.
+    /// Acquire a heap for TLS bind: pop a Free heap or claim a fresh one.
     pub(crate) fn acquire(&self) -> Option<(HeapId, NonNull<Heap>)> {
-        let mut arena = self.arena.lock();
-        if let Some(acquired) = Self::reuse(&mut arena) {
+        let mut arena = self.arena.write();
+        if let Some(acquired) = self.reuse(&arena) {
             return Some(acquired);
         }
 
-        let index = arena.claim()?;
+        let index = arena.vacant()?;
         let generation = NonZeroU32::MIN;
-        let Some(id) = HeapId::new(index, generation) else {
-            arena.release(index);
-            return None;
-        };
-        let heap = Heap::new(id, self.config);
+        let id = HeapId::new(index, generation)?;
+        let heap = arena.insert(index, Heap::new(id, self.config))?;
 
-        if arena.insert(index, heap).is_none() {
-            arena.release(index);
-            return None;
-        }
-
-        let heap = NonNull::from(arena.get_mut(index)?);
-        // SAFETY: Arena claim indices are always < MAX_HEAPS.
-        self.published
-            .get(usize::try_from(index).ok()?)?
-            .store(heap.as_ptr(), Ordering::Release);
-        Some((id, heap))
+        Some((id, NonNull::from(heap)))
     }
 
-    fn reuse(arena: &mut Arena<Heap>) -> Option<(HeapId, NonNull<Heap>)> {
-        for index in 0..MAX_HEAPS {
-            let Some(heap) = arena.get(index) else {
-                continue;
-            };
+    fn reuse(&self, arena: &Arena<Heap>) -> Option<(HeapId, NonNull<Heap>)> {
+        loop {
+            let index = self.pop_free(arena)?;
+            let heap = arena.get(index)?;
             if heap.state.is_retired() || !heap.state.is_free() {
                 continue;
             }
@@ -79,36 +69,124 @@ impl Heaps {
             heap.reactivate(id);
             return Some((id, NonNull::from(heap)));
         }
-
-        None
     }
 
-    /// Generation-checked shared borrow (lock-free via published pointers).
+    fn pop_free(&self, arena: &Arena<Heap>) -> Option<u32> {
+        let mut index = self.free_head.load(Ordering::Acquire);
+        loop {
+            if index == FREE_END {
+                return None;
+            }
+            let heap = arena.get(index)?;
+            let next = heap.free_next.load(Ordering::Relaxed);
+            match self.free_head.compare_exchange_weak(
+                index,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(index),
+                Err(current) => index = current,
+            }
+        }
+    }
+
+    /// Link a just-reclaimed Free heap. Caller holds Inner.
+    pub(super) fn push_free(&self, heap: &Heap, index: u32) {
+        let mut prev = self.free_head.load(Ordering::Relaxed);
+        loop {
+            heap.free_next.store(prev, Ordering::Relaxed);
+            match self.free_head.compare_exchange_weak(
+                prev,
+                index,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(current) => prev = current,
+            }
+        }
+    }
+
+    /// Generation-checked shared borrow. Read lock covers the index only.
     pub(crate) fn get(&self, id: HeapId) -> Option<&Heap> {
-        let ptr = self
-            .published
-            .get(usize::try_from(id.index()).ok()?)?
-            .load(Ordering::Acquire);
-        let heap = NonNull::new(ptr)?;
-        // SAFETY: published pointers are set once on claim and never cleared; arena keeps storage.
-        let heap = unsafe { heap.as_ref() };
-        heap.state.matches(id).then_some(heap)
+        let arena = self.arena.read();
+        let heap = arena.get(id.index())?;
+        if !heap.state.matches(id) {
+            return None;
+        }
+        let heap = NonNull::from(heap);
+        drop(arena);
+        // SAFETY: occupied slots never move for the Arena lifetime (chunked append).
+        // The read guard only indexes the directory; Heap bytes live in a stable mmap slot.
+        Some(unsafe { heap.as_ref() })
     }
 
-    /// Exclusive Draining access to one heap (per-heap token; not the heaps arena mutex).
-    pub(crate) fn lock(&self, id: HeapId) -> Result<LockedHeap<'_>, HeapError> {
+    /// Try to return a Draining heap to the Free list. No inbox accept.
+    pub(crate) fn reclaim(&self, id: HeapId) -> Result<(), HeapError> {
+        let (heap, inner) = self.admit(id)?;
+        let pages = PageMap::new();
+        let ctx = HeapsCtx {
+            heaps: self,
+            pages: &pages,
+        };
+        heap.reclaim(&inner, &ctx, id.index());
+        Ok(())
+    }
+
+    /// Inbox push while Draining (no Active lease). Then reclaim.
+    pub(crate) fn enqueue(&self, id: HeapId, owner: PageOwner) -> Result<(), HeapError> {
+        let (heap, inner) = self.admit(id)?;
+        let pages = PageMap::new();
+        let ctx = HeapsCtx {
+            heaps: self,
+            pages: &pages,
+        };
+        heap.drain_enqueue(owner);
+        heap.reclaim(&inner, &ctx, id.index());
+        Ok(())
+    }
+
+    /// Late free while Draining. Then reclaim.
+    pub(crate) fn free(
+        &self,
+        id: HeapId,
+        owner: PageOwner,
+        ptr: NonNull<u8>,
+        pages: &PageMap,
+    ) -> Result<(), HeapError> {
+        let (heap, mut inner) = self.admit(id)?;
+        let ctx = HeapsCtx { heaps: self, pages };
+        heap.free(&mut inner, owner, ptr, &HeapCtx { pages: ctx.pages })?;
+        heap.reclaim(&inner, &ctx, id.index());
+        Ok(())
+    }
+
+    /// Accept inboxes while Draining. Then reclaim.
+    pub(crate) fn flush(&self, id: HeapId, pages: &PageMap) -> Result<(), HeapError> {
+        let (heap, mut inner) = self.admit(id)?;
+        let ctx = HeapsCtx { heaps: self, pages };
+        heap.flush(&mut inner, &HeapCtx { pages: ctx.pages })?;
+        heap.reclaim(&inner, &ctx, id.index());
+        Ok(())
+    }
+
+    fn admit(&self, id: HeapId) -> Result<(&Heap, spin::MutexGuard<'_, HeapInner>), HeapError> {
         let heap = self.get(id).ok_or(HeapError::InvalidHeap)?;
         if heap.mode() != HeapMode::Draining {
             return Err(HeapError::InvalidHeap);
         }
-        heap.lock_exclusive(id)
+        let inner = heap.lock_inner();
+        if !heap.state.matches(id) || heap.mode() != HeapMode::Draining {
+            return Err(HeapError::InvalidHeap);
+        }
+        Ok((heap, inner))
     }
 
-    /// Owner thread gives up the heap: close Active, wait leases, flush, reclaim.
+    /// Owner thread gives up the heap: close Active, wait leases, reclaim, flush.
     pub(crate) fn retire(&self, id: HeapId, pages: &PageMap) -> Result<(), HeapError> {
         {
             let Some(heap) = self.get(id) else {
-                // Already reclaimed / stale id — unbind races with LockedHeap Drop.
                 return Ok(());
             };
             heap.close(id)?;
@@ -116,14 +194,16 @@ impl Heaps {
 
         self.wait_leases(id);
 
-        let mut locked = match self.lock(id) {
-            Ok(locked) => locked,
-            // A concurrent Draining accept already reclaimed this generation.
+        match self.reclaim(id) {
+            Ok(()) => {}
             Err(HeapError::InvalidHeap) => return Ok(()),
             Err(error) => return Err(error),
-        };
-        locked.flush(pages)?;
-        Ok(())
+        }
+
+        match self.flush(id, pages) {
+            Ok(()) | Err(HeapError::InvalidHeap) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     fn wait_leases(&self, id: HeapId) {
@@ -182,20 +262,17 @@ mod tests {
         let index = id.index();
         let max_gen = NonZeroU32::new(u32::MAX).unwrap();
         {
-            let arena = heaps.arena.lock();
+            let arena = heaps.arena.write();
             let heap = arena.get(index).unwrap();
-            // Drive route to terminal generation under Draining; LockedHeap Drop reclaims.
+            // Drive route to terminal generation under Draining; flush reclaims.
             heap.state.store(max_gen, HeapMode::Draining, false, 0);
         }
         let id_max = HeapId::new(index, max_gen).unwrap();
-        {
-            let locked = heaps.lock(id_max).unwrap();
-            drop(locked);
-        }
+        assert_eq!(heaps.reclaim(id_max), Ok(()));
         assert!(heaps.get(id).is_none());
         assert!(heaps.get(id_max).is_none());
         {
-            let arena = heaps.arena.lock();
+            let arena = heaps.arena.write();
             assert!(arena.get(index).unwrap().state.is_retired());
         }
         let (other, _) = heaps.acquire().unwrap();
@@ -230,5 +307,38 @@ mod tests {
         });
 
         assert!(heaps.get(id).is_none());
+    }
+
+    #[test]
+    fn acquire_grows_past_sixty_four_live_heaps() {
+        const LIVE: usize = 96;
+        let heaps = Heaps::new(AllocatorConfig::new());
+        let (tx, rx) = mpsc::channel();
+        thread::scope(|scope| {
+            let heaps = &heaps;
+            for _ in 0..LIVE {
+                let tx = tx.clone();
+                scope.spawn(move || {
+                    let (id, _) = heaps.acquire().unwrap();
+                    tx.send(id).unwrap();
+                });
+            }
+            drop(tx);
+            let ids: Vec<_> = rx.iter().collect();
+            assert_eq!(ids.len(), LIVE);
+
+            let mut indexes: Vec<u32> = ids.iter().map(|id| id.index()).collect();
+            indexes.sort_unstable();
+            let unique = indexes.len();
+            indexes.dedup();
+            assert_eq!(indexes.len(), unique);
+
+            for id in ids {
+                assert_eq!(heaps.retire(id, &PageMap::new()), Ok(()));
+            }
+        });
+
+        let (reused, _) = heaps.acquire().unwrap();
+        assert!(reused.index() < u32::try_from(LIVE).unwrap());
     }
 }

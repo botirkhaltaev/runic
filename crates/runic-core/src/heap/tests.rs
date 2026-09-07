@@ -1,5 +1,5 @@
 //! Heap lifecycle / lease tests. Active body + inbox reclaim live in `allocator` tests
-//! (require `ThreadHeap::bind` / `LockedHeap`).
+//! (require `ThreadHeap::bind` / `Heaps::{enqueue,free,flush}`).
 
 use super::*;
 use crate::{config::AllocatorConfig, memory::PageMap};
@@ -41,14 +41,12 @@ fn reclaim_rejects_nonzero_leases() {
     let lease = heap.state.acquire_lease(id).unwrap();
     assert_eq!(heap.state.close(id), Ok(()));
     {
-        let locked = heaps.lock(id).unwrap();
-        drop(locked);
+        assert_eq!(heaps.reclaim(id), Ok(()));
     }
     assert!(heaps.get(id).is_some());
     drop(lease);
     {
-        let locked = heaps.lock(id).unwrap();
-        drop(locked);
+        assert_eq!(heaps.reclaim(id), Ok(()));
     }
     assert!(heaps.get(id).is_none());
 }

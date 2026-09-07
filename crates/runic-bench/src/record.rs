@@ -1,6 +1,6 @@
 use std::{alloc::Layout, ptr::NonNull};
 
-use crate::allocator_target::AllocatorTarget;
+use crate::target::AllocatorTarget;
 
 pub struct AllocationRecord {
     target: AllocatorTarget,
@@ -62,20 +62,10 @@ impl AllocationRecord {
         self.layout
     }
 
-    pub fn write_pattern(&self) {
-        for index in 0..self.layout.size() {
-            unsafe { self.ptr.as_ptr().add(index).write(self.byte_at(index)) };
-        }
-    }
-
     pub fn write_markers(&self) {
         for index in marker_indices(self.layout.size()) {
             unsafe { self.ptr.as_ptr().add(index).write(self.byte_at(index)) };
         }
-    }
-
-    pub fn check_pattern(&self) {
-        self.check_markers();
     }
 
     /// Checks marker bytes against the record pattern.
@@ -86,18 +76,6 @@ impl AllocationRecord {
     pub fn check_markers(&self) {
         for index in marker_indices(self.layout.size()) {
             let byte = unsafe { self.ptr.as_ptr().add(index).read() };
-            assert_eq!(byte, self.byte_at(index));
-        }
-    }
-
-    /// Checks every byte in `ptr[..len]` against the record pattern.
-    ///
-    /// # Panics
-    ///
-    /// Panics if any byte differs from the expected pattern.
-    pub fn check_prefix(&self, ptr: NonNull<u8>, len: usize) {
-        for index in 0..len {
-            let byte = unsafe { ptr.as_ptr().add(index).read() };
             assert_eq!(byte, self.byte_at(index));
         }
     }
@@ -124,7 +102,7 @@ impl AllocationRecord {
     /// Panics if reallocation fails, returns an unaligned pointer, or corrupts
     /// preserved marker bytes.
     pub fn realloc(&mut self, new_size: usize) {
-        self.check_pattern();
+        self.check_markers();
         let old = self.layout;
         let new_ptr = self.target.realloc(self.ptr, old, new_size);
         assert_eq!(new_ptr.as_ptr() as usize % old.align(), 0);
