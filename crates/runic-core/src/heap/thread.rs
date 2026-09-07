@@ -8,7 +8,7 @@ use crate::{
     size_class::{SizeClass, SizeClasses},
 };
 
-use super::Heap;
+use super::{Heap, HeapCtx};
 
 /// Owner-local TLS free failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,7 +89,7 @@ impl ThreadHeap {
         unsafe { run.as_ref().allocate() }
     }
 
-    /// Freelist empty: `extend`, else `acquire_run`, else flush then retry.
+    /// Freelist empty: `extend`, accept inbox if needed, then local/OS `acquire_run`.
     #[inline(never)]
     pub(crate) fn alloc_miss(
         &self,
@@ -106,16 +106,16 @@ impl ThreadHeap {
         let pages = unsafe { inner.as_ref() }.pages();
         // SAFETY: Active TLS owner for this bound heap.
         let heap = unsafe { self.bound_heap().as_ref() };
-        // SAFETY: Active TLS owner. Inbox flush is deferred until local acquire fails.
-        if let Some(run) = unsafe { heap.acquire_run(class, pages) } {
-            return self.install_current(class, run);
+        let ctx = HeapCtx { pages };
+        let Some(mut inner) = heap.try_inner() else {
+            Allocator::abort();
+        };
+        // Same as `Heap::alloc_extent`: accept remote claims before mapping another run.
+        // Mapping first fills the run arena with claimed-full runs and `alloc` returns null.
+        if !heap.inboxes_empty() {
+            heap.flush(&mut inner, &ctx).ok()?;
         }
-        // SAFETY: Active TLS owner.
-        if unsafe { heap.flush(pages) }.is_err() {
-            return None;
-        }
-        // SAFETY: Active TLS owner.
-        if let Some(run) = unsafe { heap.acquire_run(class, pages) } {
+        if let Some(run) = heap.acquire_run(&mut inner, class, &ctx) {
             return self.install_current(class, run);
         }
         None
@@ -159,9 +159,13 @@ impl ThreadHeap {
             return None;
         }
 
-        let heap = self.bound_heap();
         // SAFETY: Active TLS owner for this bound heap.
-        unsafe { heap.as_ref().alloc_extent(spec, pages, init) }
+        let heap = unsafe { self.bound_heap().as_ref() };
+        let ctx = HeapCtx { pages };
+        let Some(mut inner) = heap.try_inner() else {
+            Allocator::abort();
+        };
+        heap.alloc_extent(&mut inner, spec, init, &ctx)
     }
 
     /// Unbound path after `bind`: flush inboxes, then owner-local run alloc.
@@ -197,9 +201,13 @@ impl ThreadHeap {
         if !self.matches(inner.as_ptr()) {
             return Err(HeapError::InvalidHeap);
         }
-        let heap = self.bound_heap();
         // SAFETY: Active TLS owner for this bound heap.
-        unsafe { heap.as_ref().flush(pages) }
+        let heap = unsafe { self.bound_heap().as_ref() };
+        let ctx = HeapCtx { pages };
+        let Some(mut inner) = heap.try_inner() else {
+            Allocator::abort();
+        };
+        heap.flush(&mut inner, &ctx)
     }
 
     /// Page-cache own-heap run for `ptr`, if this TLS is bound to `inner`.
@@ -226,7 +234,11 @@ impl ThreadHeap {
     #[inline(never)]
     pub(crate) fn push_available(&self, run: NonNull<Run>) {
         // SAFETY: caller just owner-freed `run` on this bound heap.
-        if unsafe { self.bound_heap().as_ref().push_available(run) }.is_err() {
+        let heap = unsafe { self.bound_heap().as_ref() };
+        let Some(mut inner) = heap.try_inner() else {
+            Allocator::abort();
+        };
+        if heap.push_available(&mut inner, run).is_err() {
             Allocator::abort();
         }
     }
@@ -247,7 +259,11 @@ impl ThreadHeap {
             return Err(ThreadFreeError::Remote);
         }
         // SAFETY: Active TLS owner; `run` is a live arena run of this heap.
-        if unsafe { self.bound_heap().as_ref().free_run(run, ptr) }.is_err() {
+        let heap = unsafe { self.bound_heap().as_ref() };
+        let Some(mut inner) = heap.try_inner() else {
+            Allocator::abort();
+        };
+        if heap.free_run(&mut inner, run, ptr).is_err() {
             Allocator::abort();
         }
         Ok(())
@@ -267,9 +283,13 @@ impl ThreadHeap {
             return Err(ThreadFreeError::Remote);
         }
 
-        let heap = self.bound_heap();
         // SAFETY: Active TLS owner for this bound heap.
-        unsafe { heap.as_ref().free(PageOwner::Extent(extent), ptr, pages) }
+        let heap = unsafe { self.bound_heap().as_ref() };
+        let ctx = HeapCtx { pages };
+        let Some(mut inner) = heap.try_inner() else {
+            Allocator::abort();
+        };
+        heap.free(&mut inner, PageOwner::Extent(extent), ptr, &ctx)
             .map_err(ThreadFreeError::Heap)
     }
 

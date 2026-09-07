@@ -1,45 +1,43 @@
 # Runic Benchmarks
 
-This crate contains Runic's allocator iteration benchsuite.
+Internal allocator benchsuite. Not published.
 
-It is internal to the workspace and is not published to crates.io.
-
-## Timing Benchmarks
-
-Run all Criterion benchmarks:
+## Criterion suites
 
 ```sh
-cargo bench -p runic-bench
-```
-
-Run one benchmark target:
-
-```sh
-cargo bench -p runic-bench --bench explicit
+cargo bench -p runic-bench --bench micro
 cargo bench -p runic-bench --bench threaded
+cargo bench -p runic-bench --bench programs
 cargo bench -p runic-bench --bench global_runic
 ```
 
-## Benchmark Families
-
-- `explicit`: calls each allocator through `GlobalAlloc` directly and compares Runic, System, mimalloc, jemalloc, and snmalloc in one Criterion report.
-- `threaded`: exercises global-lock contention and cross-thread frees.
-- `global_*`: uses one process-global allocator per binary for real Rust collection workloads.
-
-The default Criterion settings are intentionally developer-sized. They are meant to make allocator changes easy to compare during iteration, not to replace a long dedicated benchmarking run.
-
-## RSS Report
-
-Run the footprint smoke report:
+Filter by allocator and case (every suite includes all allocators except `global_*`):
 
 ```sh
-cargo run -p runic-bench --bin rss
+cargo bench -p runic-bench --bench micro -- 'micro/owner_free/runic/64' --exact
 ```
 
-The RSS runner spawns a fresh subprocess per allocator/workload pair so rows do not inherit cached memory from earlier allocator runs.
+- `micro`: owner-local phase isolation and size-class matrix through `GlobalAlloc`.
+- `threaded`: persistent workers plus one `lifecycle` bind/unbind path.
+- `programs`: real-world-shaped workloads (larson, xmalloc, cache, sh6bench, cfrac).
+- `global_*`: process-global allocator, std collections (`Vec`, `String`, `HashMap`, tree, word-count).
+
+Default Criterion settings are developer-sized (`sample_size=10`, 1s, 2000 resamples, no plots, no Rayon). CLI flags (`--measurement-time`, `--sample-size`, `--profile-time`) override them. Rayon is off because Criterion analysis allocates through `#[global_allocator]`.
+
+## Metrics (RSS / VMA / faults)
+
+```sh
+cargo run -p runic-bench --release --bin metrics
+cargo run -p runic-bench --release --bin metrics -- --cases sh6bench --targets runic,mimalloc
+cargo run -p runic-bench --release --bin metrics -- --syscalls --cases larson --targets runic
+```
+
+Each allocator/case pair runs in a fresh subprocess so `VmHWM` is per case. Columns: peak RSS, plateau RSS after free, VMA count, minor faults, optional `mmap`/`madvise` syscall counts.
+
+Runic extent configs: `--targets runic:extent_drop,runic:extent_tight`.
 
 ## Validation
 
-Benchmark workloads touch allocated memory, validate returned alignment, and check sampled realloc prefix preservation. Full byte-for-byte randomized correctness remains covered by the allocator test suite; benchmark validation is sampled so timing is not dominated by memory scanning.
+Workloads touch allocated memory, check alignment, and sample realloc prefix markers. Full correctness stays in the allocator test suite.
 
-See `src/README.md` and `benches/README.md` for module and benchmark-target details.
+See `src/README.md` and `benches/README.md`.

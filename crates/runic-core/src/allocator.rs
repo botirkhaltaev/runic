@@ -274,7 +274,7 @@ impl Allocator {
         ptr.map_or(null_mut(), NonNull::as_ptr)
     }
 
-    /// Cross-heap free: Active claim → enqueue, or exclusive late free under Draining.
+    /// Cross-heap free: Active claim → enqueue, or `Heaps::free` under Draining.
     ///
     /// Coalescing is by owner inbox. `Remote` callers only — heap-domain errors abort
     /// in `dealloc` before this runs.
@@ -302,8 +302,9 @@ impl Allocator {
         let heap = heaps.get(heap_id).ok_or(AllocatorError::InvalidMetadata)?;
 
         if !heap.is_active() {
-            let mut locked = heaps.lock(heap_id).map_err(AllocatorError::from)?;
-            return locked.free(owner, ptr, pages).map_err(AllocatorError::from);
+            return heaps
+                .free(heap_id, owner, ptr, pages)
+                .map_err(AllocatorError::from);
         }
 
         match owner {
@@ -325,9 +326,10 @@ impl Allocator {
             Ok(()) => Ok(()),
             // Close won: claim held, not queued — Draining push+flush (no stranded Queued).
             Err(HeapError::InvalidHeap) => {
-                let mut locked = heaps.lock(heap_id).map_err(AllocatorError::from)?;
-                locked.enqueue(owner);
-                locked.flush(pages).map_err(AllocatorError::from)
+                heaps
+                    .enqueue(heap_id, owner)
+                    .map_err(AllocatorError::from)?;
+                heaps.flush(heap_id, pages).map_err(AllocatorError::from)
             }
             Err(error) => Err(AllocatorError::from(error)),
         }
@@ -732,13 +734,12 @@ mod tests {
         );
         // SAFETY: run stays arena-resident through Draining.
         assert!(unsafe { run.as_ref() }.is_live());
-        {
-            let mut locked = inner_ref.heaps.lock(id).unwrap();
-            assert_eq!(
-                locked.free(PageOwner::Run(run), ptr, inner_ref.pages()),
-                Ok(())
-            );
-        }
+        assert_eq!(
+            inner_ref
+                .heaps
+                .free(id, PageOwner::Run(run), ptr, inner_ref.pages()),
+            Ok(())
+        );
         assert!(inner_ref.heaps.get(id).is_none());
     }
 
@@ -902,10 +903,8 @@ mod tests {
             inner_ref.heaps.get(id).map(Heap::mode),
             Some(HeapMode::Draining)
         );
-        let mut locked = inner_ref.heaps.lock(id).unwrap();
-        locked.enqueue(PageOwner::Run(run));
-        assert_eq!(locked.flush(inner_ref.pages()), Ok(()));
-        drop(locked);
+        assert_eq!(inner_ref.heaps.enqueue(id, PageOwner::Run(run)), Ok(()));
+        assert_eq!(inner_ref.heaps.flush(id, inner_ref.pages()), Ok(()));
         assert!(inner_ref.heaps.get(id).is_none());
         let _ = ptr;
     }
@@ -1081,15 +1080,9 @@ mod tests {
         });
 
         let inner_ref = allocator_inner(&allocator);
-        {
-            let locked = inner_ref.heaps.lock(id).unwrap();
-            drop(locked);
-        }
+        assert_eq!(inner_ref.heaps.reclaim(id), Ok(()));
         assert!(inner_ref.heaps.get(id).is_some());
-        {
-            let mut locked = inner_ref.heaps.lock(id).unwrap();
-            locked.flush(inner_ref.pages()).unwrap();
-        }
+        assert_eq!(inner_ref.heaps.flush(id, inner_ref.pages()), Ok(()));
         assert!(inner_ref.heaps.get(id).is_none());
         THREAD_HEAP.with(ThreadHeap::unbind);
     }
@@ -1114,15 +1107,9 @@ mod tests {
         });
 
         let inner_ref = allocator_inner(&allocator);
-        {
-            let locked = inner_ref.heaps.lock(id).unwrap();
-            drop(locked);
-        }
+        assert_eq!(inner_ref.heaps.reclaim(id), Ok(()));
         assert!(inner_ref.heaps.get(id).is_some());
-        {
-            let mut locked = inner_ref.heaps.lock(id).unwrap();
-            locked.flush(inner_ref.pages()).unwrap();
-        }
+        assert_eq!(inner_ref.heaps.flush(id, inner_ref.pages()), Ok(()));
         assert!(inner_ref.heaps.get(id).is_none());
         THREAD_HEAP.with(ThreadHeap::unbind);
     }
@@ -1150,21 +1137,19 @@ mod tests {
             inner_ref.heaps.get(id).map(Heap::mode),
             Some(HeapMode::Draining)
         );
-        {
-            let mut locked = inner_ref.heaps.lock(id).unwrap();
-            assert_eq!(
-                locked.free(PageOwner::Run(first_run), first, inner_ref.pages()),
-                Ok(())
-            );
-        }
+        assert_eq!(
+            inner_ref
+                .heaps
+                .free(id, PageOwner::Run(first_run), first, inner_ref.pages()),
+            Ok(())
+        );
         assert!(inner_ref.heaps.get(id).is_some());
-        {
-            let mut locked = inner_ref.heaps.lock(id).unwrap();
-            assert_eq!(
-                locked.free(PageOwner::Run(second_run), second, inner_ref.pages()),
-                Ok(())
-            );
-        }
+        assert_eq!(
+            inner_ref
+                .heaps
+                .free(id, PageOwner::Run(second_run), second, inner_ref.pages()),
+            Ok(())
+        );
         assert!(inner_ref.heaps.get(id).is_none());
     }
 
@@ -1184,13 +1169,12 @@ mod tests {
         });
 
         let inner_ref = allocator_inner(&allocator);
-        {
-            let mut locked = inner_ref.heaps.lock(heap).unwrap();
-            assert_eq!(
-                locked.free(PageOwner::Run(run), ptr, inner_ref.pages()),
-                Ok(())
-            );
-        }
+        assert_eq!(
+            inner_ref
+                .heaps
+                .free(heap, PageOwner::Run(run), ptr, inner_ref.pages()),
+            Ok(())
+        );
         assert!(inner_ref.pages().get(ptr).is_some());
         THREAD_HEAP.with(|tls| {
             let reused = tls.bind(inner).unwrap();

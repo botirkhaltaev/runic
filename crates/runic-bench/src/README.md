@@ -1,30 +1,27 @@
 # runic-bench/src
 
-Shared benchmark machinery for Criterion benchmarks and RSS reports.
+Shared machinery for Criterion suites and the `metrics` binary.
 
 ## Modules
 
-- `allocation`: allocation records and low-level allocation operations used by workloads.
-- `allocator_target`: allocator selection across Runic, system, mimalloc, jemalloc, and snmalloc.
-- `global_workload`: workloads that exercise a process-global allocator through ordinary Rust allocations.
-- `rng`: deterministic random number generation.
-- `rss`: resident-set-size subprocess runner support.
-- `threaded`: threaded and persistent-worker workload definitions.
-- `workload`: common workload shapes and validation.
+- `target`: `AllocatorTarget` and `TARGETS` (runic, system, mimalloc, jemalloc, snmalloc).
+- `record`: allocation records with marker validation.
+- `rng`: deterministic `TraceRng`.
+- `micro`: owner-local phase workloads and `Live` guard.
+- `threaded`: `Workers` pool and persistent / lifecycle workloads.
+- `programs`: larson, xmalloc, cache_thrash/scratch, sh6bench, cfrac.
+- `collections`: process-global `Vec` / `String` / `HashMap` / tree / word-count.
+- `metrics`: RSS peak/plateau, VMA count, minor faults, CSV.
+- `suite`: Criterion registration. `criterion()` sets defaults (no plots, 2000 resamples); CLI overrides via `configure_from_args`. Criterion is built without Rayon so `global_*` analysis cannot exhaust Runic's 64 heaps.
 
-Benchmark entry points live in `../benches/`; RSS and policy binaries live in
-`bin/`. `policy_grid` is extent-policy-only; small and threaded frontend work
-belongs in the Criterion benchmark targets.
+## Threaded
 
-## Threaded workloads
+- Persistent groups spawn `Workers` once per Criterion sample (`iter_custom`) and time only `run_round`.
+- `lifecycle` times spawn + one churn round + join (bind/unbind/drain).
+- `bound_remote` / `unbound_remote` allocate in `prepare_round` and time only freer drains.
+- `owner_accept` prepares and frees outside timing; measures owner accept/flush only.
+- `remote_reuse` Criterion duration is measured reuse latency; emits `runic_mean_reuse_ns=`.
 
-- `setup_lifecycle_*` Criterion groups call spawn/join inside each iteration — use for lifecycle noise, not allocator hot-path profiles.
-- `persistent_*` groups spawn workers once per Criterion sample via `iter_custom` and time only `run_round` — use with `scripts/profile.sh`.
-- `persistent_bound_remote` / `persistent_unbound_remote` allocate outside the timed region (`prepare_round`) and time only channel-free freer drains (`run_free_round`).
-- `persistent_owner_accept` runs prepare + free outside timing and measures owner `run_accept_round` (flush/accept) only.
-- `persistent_remote_fan_in` honors freer `live` backlog depth; `persistent_owner_concurrent` mixes owner-local churn with remote frees (not a fan-in alias).
-- `persistent_remote_reuse_latency` varies freer backlog via `live:{1,32,256}`; Criterion duration is measured reuse latency and emits `runic_mean_reuse_ns=`.
+## Phase-isolated local
 
-## Phase-isolated local workloads
-
-- `owner_free_only` / `freelist_allocate_only` in `workload` fill or seed outside the timed window (`LOCAL_PHASE_SIZES`: 8 / 64 / 80 / 4096).
+- `owner_free` / `freelist_allocate` use `iter_batched` so fill/seed/drop sit outside the timed window (`LOCAL_PHASE_SIZES`: 8 / 64 / 80 / 4096).

@@ -1,12 +1,13 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use runic_bench::allocator_target::RUNIC_TARGETS;
-
-#[path = "common/threaded.rs"]
-mod threaded_common;
+use runic_bench::{suite, target::TARGETS};
 
 fn threaded(c: &mut Criterion) {
-    threaded_common::register(c, "threaded", RUNIC_TARGETS);
+    suite::threaded::register(c, TARGETS);
 }
 
-criterion_group!(threaded_benches, threaded);
+criterion_group! {
+    name = threaded_benches;
+    config = suite::criterion();
+    targets = threaded
+}
 criterion_main!(threaded_benches);

@@ -83,8 +83,7 @@ impl Default for ExtentConfig {
 
 /// Slot and byte limits for allocator mapping caches.
 ///
-/// Cache implementations use fixed internal storage and clamp active slots to
-/// their internal maximum. The byte limit is still enforced exactly.
+/// Slot and byte limits are enforced exactly. There is no internal clamp.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Budget {
     slots: usize,
@@ -118,8 +117,7 @@ pub enum ExtentPolicy {
     /// that compare against unretained large-allocation churn.
     Drop,
     /// Retain a freed mapping only while both slot and byte budget have free
-    /// capacity; otherwise the mapping is released back to the OS. This is
-    /// the measured default: policy-grid benchmarks showed no reliable
-    /// latency win from oldest-first eviction over this fixed-capacity story.
+    /// capacity; otherwise the mapping is released back to the OS. Keep never
+    /// evicts a retained mapping to admit another.
     Keep,
 }

@@ -20,9 +20,6 @@ pub struct AllocatorTarget {
     allocator: &'static (dyn GlobalAlloc + Sync),
 }
 
-unsafe impl Send for AllocatorTarget {}
-unsafe impl Sync for AllocatorTarget {}
-
 impl AllocatorTarget {
     #[must_use]
     pub const fn new(name: &'static str, allocator: &'static (dyn GlobalAlloc + Sync)) -> Self {
@@ -86,9 +83,7 @@ pub const TARGETS: &[AllocatorTarget] = &[
     AllocatorTarget::new("snmalloc", &SNMALLOC),
 ];
 
-pub const RUNIC_TARGETS: &[AllocatorTarget] = &[AllocatorTarget::new("runic", &RUNIC)];
-
 #[must_use]
-pub fn target_by_name(name: &str) -> Option<AllocatorTarget> {
+pub fn by_name(name: &str) -> Option<AllocatorTarget> {
     TARGETS.iter().copied().find(|target| target.name() == name)
 }

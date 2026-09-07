@@ -18,9 +18,9 @@ pub(crate) struct RunHeap {
 unsafe impl Send for RunHeap {}
 
 impl RunHeap {
-    pub(crate) fn new(capacity: u32) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            runs: Arena::new(capacity),
+            runs: Arena::new(),
             available: [None; SizeClasses::COUNT],
         }
     }
@@ -44,16 +44,9 @@ impl RunHeap {
         pages: &PageMap,
     ) -> Option<NonNull<Run>> {
         let mapping = OsMemory::map(Run::mapping_len(class)?)?;
-        let index = self.runs.claim()?;
-        let Some(id) = RunId::from_index(index) else {
-            self.runs.release(index);
-            return None;
-        };
-
-        let Some(run) = Run::new(id, heap_id, mapping, class) else {
-            self.runs.release(index);
-            return None;
-        };
+        let index = self.runs.vacant()?;
+        let id = RunId::from_index(index)?;
+        let run = Run::new(id, heap_id, mapping, class)?;
         self.insert_run(index, id, run, pages)
     }
 
@@ -84,25 +77,14 @@ impl RunHeap {
     }
 
     pub(crate) fn rebind(&mut self, heap_id: HeapId) {
-        debug_assert!(self.runs.len() <= self.runs.capacity());
-        let len = self.runs.len();
-        for index in 0..len {
-            let Some(run) = self.runs.get_mut(index) else {
-                continue;
-            };
+        for run in self.runs.iter_mut() {
             run.set_heap_id(heap_id);
         }
     }
 
     /// Any occupied run with outstanding allocated or claimed blocks.
     pub(crate) fn has_live(&self) -> bool {
-        let len = self.runs.len();
-        for index in 0..len {
-            if self.runs.get(index).is_some_and(Run::is_live) {
-                return true;
-            }
-        }
-        false
+        self.runs.iter().any(Run::is_live)
     }
 
     #[inline(never)]
@@ -147,15 +129,7 @@ impl RunHeap {
         run: Run,
         pages: &PageMap,
     ) -> Option<NonNull<Run>> {
-        if self.runs.insert(index, run).is_none() {
-            self.runs.release(index);
-            return None;
-        }
-
-        let Some(inserted_run) = self.runs.get_mut(index) else {
-            let _removed = self.runs.remove(id.index());
-            return None;
-        };
+        let inserted_run = self.runs.insert(index, run)?;
         debug_assert_eq!(inserted_run.id(), id);
         let run_ptr = NonNull::from(&mut *inserted_run);
 
@@ -227,7 +201,7 @@ mod tests {
 
     #[test]
     fn run_heap_relinks_previously_full_run_after_free() {
-        let mut heap = RunHeap::new(2);
+        let mut heap = RunHeap::new();
         let pages = PageMap::new();
         let class = class_id(64, 8);
         let class_index = class.index();
@@ -255,9 +229,9 @@ mod tests {
 
     #[test]
     fn failed_run_page_publication_removes_map_entry() {
-        let mut heap = RunHeap::new(4);
+        let mut heap = RunHeap::new();
         let pages = PageMap::new();
-        let index = heap.runs.claim().unwrap();
+        let index = heap.runs.vacant().unwrap();
         let id = RunId::from_index(index).unwrap();
         assert_eq!(id.index(), index);
         let run = reusable_run(id);
@@ -273,7 +247,7 @@ mod tests {
 
     #[test]
     fn rebind_rebinds_runs_off_the_available_list() {
-        let mut heap = RunHeap::new(2);
+        let mut heap = RunHeap::new();
         let pages = PageMap::new();
         let class = class_id(64, 8);
         let old = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();

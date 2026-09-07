@@ -1,9 +1,11 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
-pub mod allocation;
-pub mod allocator_target;
-pub mod global_workload;
+pub mod collections;
+pub mod metrics;
+pub mod micro;
+pub mod programs;
+pub mod record;
 pub mod rng;
-pub mod rss;
+pub mod suite;
+pub mod target;
 pub mod threaded;
-pub mod workload;

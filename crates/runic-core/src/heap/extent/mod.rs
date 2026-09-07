@@ -75,6 +75,8 @@ pub(crate) struct Extent {
     /// exactly one claim can be outstanding (`Claimed`), so no bulk scan is needed —
     /// unlike `Run`, `accept` is a single exact-pointer transition.
     link: InboxLink<Extent>,
+    /// Rest of the cache list. Owner-exclusive; never set while inbox-linked.
+    next: Option<NonNull<Extent>>,
 }
 
 impl InboxNode for Extent {
@@ -102,6 +104,7 @@ impl Extent {
                 range,
                 state: AtomicU8::new(ExtentState::Allocated.raw()),
                 link: InboxLink::new(),
+                next: None,
             })
         } else {
             None
@@ -118,6 +121,22 @@ impl Extent {
 
     pub(crate) fn set_heap_id(&mut self, heap_id: HeapId) {
         self.heap = heap_id;
+    }
+
+    pub(crate) const fn next(&self) -> Option<NonNull<Extent>> {
+        self.next
+    }
+
+    pub(crate) fn set_next(&mut self, next: Option<NonNull<Extent>>) {
+        self.next = next;
+    }
+
+    /// Walk this extent then each [`Self::next`] link.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Self> {
+        core::iter::successors(Some(self), |extent| {
+            // SAFETY: caller owns the list; `next` is only written owner-exclusively.
+            extent.next().map(|ptr| unsafe { ptr.as_ref() })
+        })
     }
 
     pub(crate) const fn ptr(&self) -> NonNull<u8> {

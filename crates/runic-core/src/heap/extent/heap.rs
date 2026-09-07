@@ -27,9 +27,9 @@ pub(crate) enum ExtentInit {
 }
 
 impl ExtentHeap {
-    pub(crate) fn new(capacity: u32, config: ExtentConfig) -> Self {
+    pub(crate) fn new(config: ExtentConfig) -> Self {
         Self {
-            extents: Arena::new(capacity),
+            extents: Arena::new(),
             cache: ExtentCache::new(config),
         }
     }
@@ -38,21 +38,11 @@ impl ExtentHeap {
     ///
     /// Cached Free extents stay in the arena while published but are not live.
     pub(crate) fn has_live(&self) -> bool {
-        let len = self.extents.len();
-        for index in 0..len {
-            if self.extents.get(index).is_some_and(Extent::is_live) {
-                return true;
-            }
-        }
-        false
+        self.extents.iter().any(Extent::is_live)
     }
 
     pub(crate) fn rebind(&mut self, heap_id: HeapId) {
-        let len = self.extents.len();
-        for index in 0..len {
-            let Some(extent) = self.extents.get_mut(index) else {
-                continue;
-            };
+        for extent in self.extents.iter_mut() {
             extent.set_heap_id(heap_id);
         }
     }
@@ -65,7 +55,7 @@ impl ExtentHeap {
         init: ExtentInit,
     ) -> Option<NonNull<u8>> {
         let len = spec.mapping_len(OsMemory::page_size())?;
-        if let Some(mut extent_ptr) = self.cache.take(len) {
+        if let Some(mut extent_ptr) = self.cache.acquire(len) {
             // SAFETY: cache only stores live arena extents owned by this heap.
             let extent = unsafe { extent_ptr.as_mut() };
             if let Some(ptr) = extent.reuse(heap_id, spec) {
@@ -90,15 +80,9 @@ impl ExtentHeap {
         mapping: crate::memory::Mapping,
         pages: &PageMap,
     ) -> Option<NonNull<u8>> {
-        let index = self.extents.claim()?;
-        let Some(id) = ExtentId::from_index(index) else {
-            self.extents.release(index);
-            return None;
-        };
-        let Some(extent) = Extent::new(id, heap_id, mapping, spec) else {
-            self.extents.release(index);
-            return None;
-        };
+        let index = self.extents.vacant()?;
+        let id = ExtentId::from_index(index)?;
+        let extent = Extent::new(id, heap_id, mapping, spec)?;
         debug_assert_eq!(extent.id(), id);
         let ptr = extent.ptr();
 
@@ -172,15 +156,7 @@ impl ExtentHeap {
         extent: Extent,
         pages: &PageMap,
     ) -> Option<NonNull<Extent>> {
-        if self.extents.insert(index, extent).is_none() {
-            self.extents.release(index);
-            return None;
-        }
-
-        let Some(inserted_extent) = self.extents.get_mut(index) else {
-            let _removed = self.extents.remove(index);
-            return None;
-        };
+        let inserted_extent = self.extents.insert(index, extent)?;
         debug_assert_eq!(inserted_extent.id(), id);
         let extent_ptr = NonNull::from(&mut *inserted_extent);
 
@@ -223,9 +199,9 @@ mod tests {
 
     #[test]
     fn failed_extent_page_publication_removes_map_entry() {
-        let mut heap = ExtentHeap::new(4, ExtentConfig::new());
+        let mut heap = ExtentHeap::new(ExtentConfig::new());
         let pages = PageMap::new();
-        let index = heap.extents.claim().unwrap();
+        let index = heap.extents.vacant().unwrap();
         let id = ExtentId::from_index(index).unwrap();
         let extent = reusable_extent(id);
         let existing = NonNull::dangling();
@@ -240,7 +216,7 @@ mod tests {
 
     #[test]
     fn keep_free_leaves_page_map_entry_published() {
-        let mut heap = ExtentHeap::new(4, ExtentConfig::new());
+        let mut heap = ExtentHeap::new(ExtentConfig::new());
         let pages = PageMap::new();
         let spec = layout_spec(128 * 1024, 4096);
         let heap_id = HeapId::new(0, NonZeroU32::MIN).unwrap();
@@ -259,7 +235,7 @@ mod tests {
 
     #[test]
     fn keep_cache_hit_reuses_without_republish() {
-        let mut heap = ExtentHeap::new(4, ExtentConfig::new());
+        let mut heap = ExtentHeap::new(ExtentConfig::new());
         let pages = PageMap::new();
         let spec = layout_spec(128 * 1024, 4096);
         let heap_id = HeapId::new(0, NonZeroU32::MIN).unwrap();
@@ -281,7 +257,7 @@ mod tests {
 
     #[test]
     fn drop_policy_unpublishes_on_free() {
-        let mut heap = ExtentHeap::new(4, ExtentConfig::new().with_policy(ExtentPolicy::Drop));
+        let mut heap = ExtentHeap::new(ExtentConfig::new().with_policy(ExtentPolicy::Drop));
         let pages = PageMap::new();
         let spec = layout_spec(128 * 1024, 4096);
         let heap_id = HeapId::new(0, NonZeroU32::MIN).unwrap();
@@ -300,7 +276,7 @@ mod tests {
 
     #[test]
     fn double_free_while_cached_is_rejected() {
-        let mut heap = ExtentHeap::new(4, ExtentConfig::new());
+        let mut heap = ExtentHeap::new(ExtentConfig::new());
         let pages = PageMap::new();
         let spec = layout_spec(128 * 1024, 4096);
         let heap_id = HeapId::new(0, NonZeroU32::MIN).unwrap();
@@ -319,7 +295,7 @@ mod tests {
 
     #[test]
     fn zeroed_allocate_clears_cached_mapping() {
-        let mut heap = ExtentHeap::new(4, ExtentConfig::new());
+        let mut heap = ExtentHeap::new(ExtentConfig::new());
         let pages = PageMap::new();
         let spec = layout_spec(128 * 1024, 4096);
         let size = 128 * 1024;
@@ -355,7 +331,7 @@ mod tests {
 
     #[test]
     fn uninit_allocate_preserves_cached_bytes() {
-        let mut heap = ExtentHeap::new(4, ExtentConfig::new());
+        let mut heap = ExtentHeap::new(ExtentConfig::new());
         let pages = PageMap::new();
         let spec = layout_spec(128 * 1024, 4096);
         let size = 128 * 1024;

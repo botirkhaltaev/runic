@@ -7,12 +7,10 @@ pub(crate) mod run;
 mod state;
 pub(crate) mod thread;
 
-use core::{
-    cell::UnsafeCell,
-    hint,
-    ptr::NonNull,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use core::ptr::NonNull;
+use core::sync::atomic::AtomicU32;
+
+use spin::Mutex;
 
 use crate::{
     config::AllocatorConfig,
@@ -33,37 +31,46 @@ pub(crate) use run::{Run, RunError, RunHeap, RunId};
 pub(crate) use state::HeapMode;
 pub(crate) use thread::{THREAD_HEAP, ThreadFreeError};
 
-/// Max run/extent arena indices per heap (grow-on-demand; not pre-touched).
-const HEAP_CAPACITY: u32 = 16_384;
-
 /// Indexed heap entry: lifecycle, remote-free inboxes, and owner-local run/extent metadata.
 ///
 /// Shared (`get`): atomics only — `enqueue`, mode queries.
-/// Active body mutation: [`ThreadHeap`](thread::ThreadHeap) only.
-/// Draining body mutation + reclaim: [`LockedHeap`] only.
+/// Active exclusive metadata: [`ThreadHeap`](thread::ThreadHeap) via [`Heap::try_inner`].
+/// Draining exclusive metadata: [`Heaps::{enqueue,free,flush}`](Heaps).
 pub(crate) struct Heap {
     /// Lifecycle word — `pub(super)` so `Heaps` can close / wait / reactivate without a
     /// public `&HeapState` projection.
     pub(super) state: HeapState,
     run_inbox: RunInbox,
     extent_inbox: ExtentInbox,
-    body: UnsafeCell<Body>,
-    /// Draining exclusive flag for [`LockedHeap`] — never touched on the Active hot path.
-    exclusive: AtomicBool,
+    inner: Mutex<HeapInner>,
+    /// Next Free heap index for [`Heaps`] (`u32::MAX` = end).
+    pub(super) free_next: AtomicU32,
 }
 
-struct Body {
+/// Exclusive run/extent metadata. Caller holds `MutexGuard<HeapInner>`.
+pub(super) struct HeapInner {
     id: HeapId,
     runs: RunHeap,
     extents: ExtentHeap,
 }
 
-impl Body {
+/// Parent bits Active body ops need from outside [`Heap`] (`PageMap`).
+pub(super) struct HeapCtx<'a> {
+    pub pages: &'a PageMap,
+}
+
+/// Parent bits Draining reclaim needs from the table (`Heaps` + `PageMap`).
+pub(super) struct HeapsCtx<'a> {
+    pub heaps: &'a Heaps,
+    pub pages: &'a PageMap,
+}
+
+impl HeapInner {
     fn new(id: HeapId, config: AllocatorConfig) -> Self {
         Self {
             id,
-            runs: RunHeap::new(HEAP_CAPACITY),
-            extents: ExtentHeap::new(HEAP_CAPACITY, config.extent()),
+            runs: RunHeap::new(),
+            extents: ExtentHeap::new(config.extent()),
         }
     }
 
@@ -78,20 +85,14 @@ impl Body {
     }
 }
 
-// SAFETY: state/inbox are atomic; body is mutated only by Active TLS (`ThreadHeap`) or
-// `LockedHeap` (holds `exclusive`).
-unsafe impl Send for Heap {}
-// SAFETY: shared readers use state/inbox atomics; body mutation follows the rules above.
-unsafe impl Sync for Heap {}
-
 impl Heap {
     pub(crate) fn new(id: HeapId, config: AllocatorConfig) -> Self {
         Self {
             state: HeapState::new(id.generation(), HeapMode::Active),
             run_inbox: RunInbox::new(),
             extent_inbox: ExtentInbox::new(),
-            body: UnsafeCell::new(Body::new(id, config)),
-            exclusive: AtomicBool::new(false),
+            inner: Mutex::new(HeapInner::new(id, config)),
+            free_next: AtomicU32::new(u32::MAX),
         }
     }
 
@@ -137,7 +138,19 @@ impl Heap {
         }
     }
 
-    fn inboxes_empty(&self) -> bool {
+    /// Inbox push without an Active lease. Draining only.
+    pub(super) fn drain_enqueue(&self, owner: PageOwner) {
+        match owner {
+            PageOwner::Run(run) => {
+                let _ = self.run_inbox.push(run);
+            }
+            PageOwner::Extent(extent) => {
+                let _ = self.extent_inbox.push(extent);
+            }
+        }
+    }
+
+    pub(super) fn inboxes_empty(&self) -> bool {
         self.run_inbox.is_empty() && self.extent_inbox.is_empty()
     }
 
@@ -157,32 +170,27 @@ impl Heap {
         self.state.close(id)
     }
 
-    /// SAFETY: caller is the Active TLS owner (`ThreadHeap`) or holds [`LockedHeap`].
-    #[inline]
-    #[allow(clippy::mut_from_ref)]
-    unsafe fn body_mut(&self) -> &mut Body {
-        // SAFETY: same ownership contract as the method.
-        unsafe { &mut *self.body.get() }
+    pub(super) fn try_inner(&self) -> Option<spin::MutexGuard<'_, HeapInner>> {
+        self.inner.try_lock()
+    }
+
+    pub(super) fn lock_inner(&self) -> spin::MutexGuard<'_, HeapInner> {
+        self.inner.lock()
     }
 
     pub(super) fn reactivate(&self, id: HeapId) {
-        // Rebind retained metadata first, then publish Active with Release.
-        // SAFETY: Free reactivation runs under the heaps arena lock with leases == 0.
-        unsafe { self.body_mut() }.rebind(id);
+        self.lock_inner().rebind(id);
         self.state
             .store(id.generation(), HeapMode::Active, false, 0);
     }
 
     /// Mark Free and bump generation when Draining, empty, and leases == 0.
-    ///
-    /// Only [`LockedHeap`] Drop may call this (holds `exclusive`).
-    fn reclaim(&self) -> bool {
+    pub(super) fn reclaim(&self, inner: &HeapInner, ctx: &HeapsCtx<'_>, index: u32) -> bool {
         let snap = self.state.load();
         if snap.retired || snap.mode != HeapMode::Draining || snap.leases != 0 {
             return false;
         }
-        // SAFETY: `LockedHeap` serializes Draining reclaim against body mutation.
-        if unsafe { self.body_mut() }.has_live() || !self.inboxes_empty() {
+        if inner.has_live() || !self.inboxes_empty() {
             return false;
         }
         let again = self.state.load();
@@ -193,19 +201,18 @@ impl Heap {
             return false;
         }
         self.state.bump_or_retire();
+        if !self.state.is_retired() {
+            ctx.heaps.push_free(self, index);
+        }
         true
     }
 
     /// Drain both inboxes into run/extent metadata (accept).
-    ///
-    /// SAFETY: caller is the Active TLS owner or holds [`LockedHeap`].
-    pub(super) unsafe fn flush(&self, pages: &PageMap) -> Result<(), HeapError> {
-        // SAFETY: same ownership contract as the method.
-        let body = unsafe { self.body_mut() };
+    pub(super) fn flush(&self, inner: &mut HeapInner, ctx: &HeapCtx<'_>) -> Result<(), HeapError> {
         while let Some(chain) = self.run_inbox.drain() {
             for run in chain {
                 // SAFETY: dequeued from this heap's run inbox; live arena run.
-                if body.runs.accept(run)? {
+                if inner.runs.accept(run)? {
                     let _ = self.run_inbox.push(run);
                 }
             }
@@ -214,138 +221,71 @@ impl Heap {
             for extent in chain {
                 // SAFETY: dequeued from this heap's extent inbox; live arena extent.
                 let ptr = unsafe { extent.as_ref() }.ptr();
-                body.extents.accept(extent, ptr, pages)?;
+                inner.extents.accept(extent, ptr, ctx.pages)?;
             }
         }
         Ok(())
     }
 
-    /// Owner-local free (body only). Caller owns inbox `flush`.
-    ///
-    /// SAFETY: caller is the Active TLS owner or holds [`LockedHeap`].
-    pub(super) unsafe fn free(
+    /// Owner-local free (Inner only). Caller owns inbox `flush`.
+    #[allow(clippy::unused_self)]
+    pub(super) fn free(
         &self,
+        inner: &mut HeapInner,
         owner: PageOwner,
         ptr: NonNull<u8>,
-        pages: &PageMap,
+        ctx: &HeapCtx<'_>,
     ) -> Result<(), HeapError> {
-        // SAFETY: caller holds exclusive Active / Draining body access.
-        let body = unsafe { self.body_mut() };
         match owner {
-            PageOwner::Run(run) => body.runs.free(run, ptr),
-            PageOwner::Extent(extent) => body.extents.free(extent, ptr, pages),
+            PageOwner::Run(run) => inner.runs.free(run, ptr),
+            PageOwner::Extent(extent) => inner.extents.free(extent, ptr, ctx.pages),
         }
     }
 
-    /// Owner-local run free (body only). Caller owns inbox `flush`.
-    ///
-    /// SAFETY: caller is the Active TLS owner or holds [`LockedHeap`].
-    #[inline]
-    pub(super) unsafe fn free_run(
+    /// Owner-local run free (Inner only). Caller owns inbox `flush`.
+    #[allow(clippy::unused_self)]
+    pub(super) fn free_run(
         &self,
+        inner: &mut HeapInner,
         run: NonNull<Run>,
         ptr: NonNull<u8>,
     ) -> Result<(), HeapError> {
-        // SAFETY: caller holds exclusive Active / Draining body access.
-        unsafe { self.body_mut() }.runs.free(run, ptr)
+        inner.runs.free(run, ptr)
     }
 
     /// Insert a run that just left full onto the available list. Not on the free hit.
-    ///
-    /// SAFETY: caller is the Active TLS owner or holds [`LockedHeap`]; `run` is a
-    /// live arena run of this heap.
-    pub(super) unsafe fn push_available(&self, run: NonNull<Run>) -> Result<(), HeapError> {
-        // SAFETY: caller holds exclusive Active / Draining body access.
-        unsafe { self.body_mut() }.runs.push_available(run)
+    #[allow(clippy::unused_self)]
+    pub(super) fn push_available(
+        &self,
+        inner: &mut HeapInner,
+        run: NonNull<Run>,
+    ) -> Result<(), HeapError> {
+        inner.runs.push_available(run)
     }
 
     /// Flush inboxes if needed, then allocate one large block.
-    ///
-    /// SAFETY: caller is the Active TLS owner for this heap.
-    pub(super) unsafe fn alloc_extent(
+    pub(super) fn alloc_extent(
         &self,
+        inner: &mut HeapInner,
         spec: LayoutSpec,
-        pages: &PageMap,
         init: ExtentInit,
+        ctx: &HeapCtx<'_>,
     ) -> Option<NonNull<u8>> {
         if !self.inboxes_empty() {
-            // SAFETY: Active TLS owner.
-            unsafe { self.flush(pages) }.ok()?;
+            self.flush(inner, ctx).ok()?;
         }
-        // SAFETY: Active TLS owner.
-        let body = unsafe { self.body_mut() };
-        body.extents.allocate(spec, body.id, pages, init)
+        inner.extents.allocate(spec, inner.id, ctx.pages, init)
     }
 
     /// Acquire a run without flushing the inbox (caller owns flush policy).
-    ///
-    /// SAFETY: caller is the Active TLS owner for this heap.
-    pub(super) unsafe fn acquire_run(
+    #[allow(clippy::unused_self)]
+    pub(super) fn acquire_run(
         &self,
+        inner: &mut HeapInner,
         class: SizeClass,
-        pages: &PageMap,
+        ctx: &HeapCtx<'_>,
     ) -> Option<NonNull<Run>> {
-        // SAFETY: Active TLS owner.
-        let body = unsafe { self.body_mut() };
-        body.runs.acquire(class, body.id, pages)
-    }
-
-    /// Take the Draining exclusive token. Caller must have observed Draining for `id`.
-    pub(super) fn lock_exclusive(&self, id: HeapId) -> Result<LockedHeap<'_>, HeapError> {
-        while self
-            .exclusive
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            hint::spin_loop();
-        }
-        if !self.state.matches(id) || self.state.mode() != HeapMode::Draining {
-            self.exclusive.store(false, Ordering::Release);
-            return Err(HeapError::InvalidHeap);
-        }
-        Ok(LockedHeap { heap: self })
-    }
-}
-
-/// Exclusive Draining access to one [`Heap`]. Drop attempts reclaim.
-pub(crate) struct LockedHeap<'a> {
-    heap: &'a Heap,
-}
-
-impl LockedHeap<'_> {
-    /// Queue+link `owner` onto its inbox (Draining; no Active enqueue lease).
-    pub(crate) fn enqueue(&mut self, owner: PageOwner) {
-        match owner {
-            PageOwner::Run(run) => {
-                let _ = self.heap.run_inbox.push(run);
-            }
-            PageOwner::Extent(extent) => {
-                let _ = self.heap.extent_inbox.push(extent);
-            }
-        }
-    }
-
-    /// Direct late free while exclusive.
-    pub(crate) fn free(
-        &mut self,
-        owner: PageOwner,
-        ptr: NonNull<u8>,
-        pages: &PageMap,
-    ) -> Result<(), HeapError> {
-        // SAFETY: exclusive Draining token held.
-        unsafe { self.heap.free(owner, ptr, pages) }
-    }
-
-    pub(crate) fn flush(&mut self, pages: &PageMap) -> Result<(), HeapError> {
-        // SAFETY: exclusive Draining token held.
-        unsafe { self.heap.flush(pages) }
-    }
-}
-
-impl Drop for LockedHeap<'_> {
-    fn drop(&mut self) {
-        let _ = self.heap.reclaim();
-        self.heap.exclusive.store(false, Ordering::Release);
+        inner.runs.acquire(class, inner.id, ctx.pages)
     }
 }
 

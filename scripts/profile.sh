@@ -25,8 +25,8 @@ Usage: scripts/profile.sh [options] <bench-target> <criterion-filter>
        scripts/profile.sh --preflight
 
 Positional:
-  bench-target       Criterion bench binary (explicit, threaded, compare_explicit, ...)
-  criterion-filter   Exact Criterion filter (e.g. explicit/single_size_churn/runic/64)
+  bench-target       Criterion bench binary (micro, threaded, programs, ...)
+  criterion-filter   Exact Criterion filter (e.g. micro/single_size_churn/runic/64)
 
 Options:
   -t, --time SEC         Criterion --profile-time seconds (default: 30)
@@ -68,11 +68,11 @@ User-space tools (auto-installed when selected, or via --install-tools):
 
 Examples:
   scripts/profile.sh --preflight
-  scripts/profile.sh explicit 'explicit/single_size_churn/runic/64'
+  scripts/profile.sh micro 'micro/single_size_churn/runic/64'
   scripts/profile.sh -l baseline -t 20 \
-    threaded 'threaded/persistent_remote_fan_in/runic/4/live:256'
+    threaded 'threaded/remote_fan_in/runic/4/live:256'
   scripts/profile.sh --with flamegraph,samply,callgrind \
-    explicit 'explicit/owner_free_only/runic/64'
+    micro 'micro/owner_free/runic/64'
   scripts/profile.sh --compare \
     target/runic-profiles/foo-before target/runic-profiles/foo-after
 
@@ -485,7 +485,7 @@ ALLOWED_CPUS=$(awk '/^Cpus_allowed_list:/ { print $2 }' /proc/self/status)
 [[ -n $ALLOWED_CPUS ]] || die "cannot determine profiling CPU affinity"
 if [[ -n ${RUNIC_PROFILE_CPUS:-} ]]; then
   PROFILE_CPUS=$RUNIC_PROFILE_CPUS
-elif [[ $BENCH_TARGET == *threaded* ]]; then
+elif [[ $BENCH_TARGET == *threaded* || $BENCH_TARGET == *programs* ]]; then
   PROFILE_CPUS=$ALLOWED_CPUS
 else
   PROFILE_CPUS=${ALLOWED_CPUS%%,*}
@@ -499,10 +499,8 @@ else
   GIT_DIRTY=yes
 fi
 
-if [[ $CRITERION_FILTER == *setup_lifecycle* ]]; then
-  warn "setup_lifecycle filters intentionally include spawn/join/unbind noise"
-elif [[ $BENCH_TARGET == *threaded* && $CRITERION_FILTER != *persistent_* ]]; then
-  warn "non-persistent threaded filters may include thread-setup noise; prefer persistent_*"
+if [[ $CRITERION_FILTER == *lifecycle* ]]; then
+  warn "lifecycle filters intentionally include spawn/join/unbind noise"
 fi
 
 if want_tool callgrind && [[ $BENCH_TARGET == *threaded* || $CRITERION_FILTER == *remote* || $CRITERION_FILTER == *fan_in* || $CRITERION_FILTER == *free_ring* ]]; then

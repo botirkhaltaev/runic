@@ -173,7 +173,7 @@ GlobalAlloc
   -> RunicAlloc
       -> Allocator
           -> AllocatorInner { refs, pages: PageMap, heaps: Heaps }
-              -> Heaps { published[], arena: Mutex<Arena<Heap>>, config }
+              -> Heaps { RwLock<Arena<Heap>>, free list, config }
                   -> ThreadHeap
               -> Heap { HeapState, Inbox, id, RunHeap, ExtentHeap }
                   -> RunHeap { Arena<Run>, available[] }
@@ -183,11 +183,13 @@ GlobalAlloc
               -> OsMemory
 ```
 
-`Heaps::get` / Active enqueue are lock-free via published pointers and
-`HeapState` enqueue leases (lease before new `try_queue`). Arena mutex covers
-acquire / Free reactivation only. Draining exclusivity is `LockedHeap` (not the
-heaps arena mutex across flush). Shared `&Heap` is atomics-only; Active body
-mutation is `ThreadHeap` only; reclaim is `LockedHeap` Drop only.
+`Heaps::get` takes a short `RwLock` read to index `Arena<Heap>`, then returns
+`&Heap` (occupied slots never move). Active enqueue uses `HeapState` leases
+(lease before new `try_queue`). Write lock covers acquire / Free reactivation
+only. Draining exclusivity is `Mutex<HeapInner>` via `Heaps::{enqueue,free,flush,reclaim}`
+(not the arena lock across flush).
+Shared `&Heap` is atomics-only; Active body mutation is `ThreadHeap` + `try_inner`;
+reclaim is `Heap::reclaim` through `HeapsCtx`.
 Same-thread small-run hits use TLS-owned heap metadata with no locks or atomics.
 `PageMap` stays outside heaps arena locks so dealloc lookup is not heaps-locked.
 
@@ -197,10 +199,12 @@ Same-thread small-run hits use TLS-owned heap metadata with no locks or atomics.
 RunicAlloc     owns the Rust GlobalAlloc boundary.
 Allocator      owns the core public allocator API, abort, and cold unbound routing.
 AllocatorInner owns the refcounted mmap instance: PageMap, Heaps, and self-hosting Mapping.
-Heaps           owns published heap pointers, lock-free get, arena acquire/reuse, and LockedHeap construction (`lock`).
-Heap           owns HeapState, Inbox, and run/extent metadata; shared surface is atomics only (`enqueue` / mode).
-LockedHeap     owns exclusive Draining body access to one Heap (flush / late free / reclaim on Drop).
-Arena          owns fixed-capacity freelist metadata storage.
+Heaps           owns `RwLock<Arena<Heap>>`, Free-heap freelist, and Draining `enqueue` / `free` / `flush` / `reclaim`.
+Heap           owns HeapState, Inbox, and `Mutex<HeapInner>`; shared surface is atomics only (`enqueue` / mode).
+HeapInner      owns RunHeap / ExtentHeap (exclusive metadata).
+HeapCtx        borrows PageMap for Active body ops.
+HeapsCtx       borrows Heaps + PageMap for Draining reclaim.
+Arena          owns grow-on-demand mmap slab storage (`vacant` / `insert` / `remove`; slots never move).
 LayoutSpec     owns normalized layout semantics.
 SizeClasses    owns size-class selection.
 OsMemory       maps anonymous pages; Mapping owns the mmap lifecycle (Drop munmaps).
@@ -208,7 +212,7 @@ PageMap        owns page-indexed owner-pointer lookup.
 RunHeap        owns Arena<Run>, run checkout (acquire), and available run lists.
 Run            owns pointer freelist + extend + live, claim bitmap, and embedded InboxLink. Owner DF undefined.
 ExtentHeap     owns Arena<Extent>, dedicated allocation policy, and mapping reuse.
-ExtentCache    owns retained extent mappings, eviction, and reuse lookup.
+ExtentCache    owns an intrusive head list of retained extents and exact-budget reuse.
 Extent         owns dedicated allocation metadata, embedded InboxLink, and Claimed byte state.
 ThreadHeap     owns TLS bind, current[class], own-heap page cache, and the sole Active body path.
 ```
@@ -229,7 +233,7 @@ crates/runic-test-support
   reusable test support; not published
 
 crates/runic-bench
-  Criterion, RSS, threaded, and policy-grid benchmark harnesses; not published
+  Criterion suites (micro / threaded / programs / global_*), metrics binary; not published
 ```
 
 ## Current Test Shape
@@ -266,8 +270,7 @@ Use benchmarks to choose architecture, not to justify special cases.
 Required checks for allocator-policy changes:
 
 ```text
-cargo run -p runic-bench --release --bin policy_grid
-cargo run -p runic-bench --release --bin rss -- --case runic large_alloc_churn_256k
+cargo run -p runic-bench --release --bin metrics
 cargo bench -p runic-bench --no-run
 ```
 
@@ -347,7 +350,7 @@ In scope:
 ```text
 AllocatorConfig and ExtentConfig
 ExtentPolicy::{Drop, Keep} with exact-length reuse
-ExtentCache fixed-slot storage
+ExtentCache intrusive head list, exact slot and byte budgets
 policy_grid benchmark coverage
 page-map publication/removal invariants for cached mappings
 clear API documentation for policy and reuse semantics
