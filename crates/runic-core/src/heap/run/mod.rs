@@ -7,11 +7,12 @@ use core::{
 };
 
 pub(crate) mod cache;
+pub(crate) mod config;
 pub(crate) mod heap;
 
 use crate::{
     layout::LayoutSpec,
-    memory::{AddressRange, Mapping, PAGE_SIZE},
+    memory::{AddressRange, OsMemory, PAGE_SIZE},
     size_class::SizeClass,
 };
 
@@ -20,10 +21,20 @@ use super::{
     inbox::{InboxLink, InboxNode},
 };
 
+use config::RunPolicy;
+
 pub(crate) use cache::RunCache;
 pub(crate) use heap::RunHeap;
 
 pub(crate) const RUN_SIZE: usize = 64 * 1024;
+/// Payload plus claim tail, `RUN_SIZE`-aligned.
+pub(crate) const RUN_SPACE: usize = RUN_SIZE * 2;
+/// Runs per heap-owned payload map.
+pub(crate) const MAP_RUNS: usize = 16;
+pub(crate) const MAP_SIZE: usize = MAP_RUNS * RUN_SPACE;
+
+const _: () = assert!(RUN_SPACE >= RUN_SIZE + (RUN_SIZE / 8).div_ceil(64) * 8);
+const _: () = assert!(MAP_SIZE == 2 * 1024 * 1024);
 /// Bits per claim-bitmap word (`AtomicU64`).
 const CLAIM_WORD_BITS: usize = 64;
 
@@ -96,7 +107,7 @@ pub(crate) enum RunError {
 /// `DoubleFree`. Owner `free` does not consult this map (owner DF is undefined).
 /// `accept` drains bits onto the pointer freelist.
 struct ClaimBits {
-    /// 8-aligned claim words in the run mapping tail.
+    /// 8-aligned claim words in the space tail.
     words: NonNull<AtomicU64>,
     word_count: usize,
 }
@@ -107,8 +118,8 @@ impl ClaimBits {
         words.checked_mul(size_of::<u64>())
     }
 
-    /// Byte offset of the claim span from the mapping base (`RUN_SIZE`, 8-aligned).
-    fn mapping_offset() -> Option<usize> {
+    /// Byte offset of the claim span from the space base (`RUN_SIZE`, 8-aligned).
+    fn space_offset() -> Option<usize> {
         RUN_SIZE.checked_next_multiple_of(size_of::<u64>())
     }
 
@@ -154,8 +165,8 @@ impl ClaimBits {
 
     fn word_unchecked(&self, word: usize) -> &AtomicU64 {
         debug_assert!(word < self.word_count);
-        // SAFETY: `word < word_count`; `words` points at the claim span carved
-        // from this run's mapping and aligned for `AtomicU64`.
+        // SAFETY: `word < word_count`; `words` points at the claim span in this
+        // run's space tail and aligned for `AtomicU64`.
         unsafe { &*self.words.as_ptr().add(word) }
     }
 }
@@ -164,7 +175,7 @@ pub(crate) struct Run {
     /// Owner-local freelist / live / bump — field order prefers extend/flush locality under
     /// `repr(Rust)` (not a layout guarantee; do not treat as ABI).
     state: UnsafeCell<RunState>,
-    /// Cached `mapping.base()` — payload span start (`RUN_SIZE` bytes).
+    /// Cached payload base (`RUN_SIZE` bytes) in a heap-owned map.
     base: NonNull<u8>,
     /// `capacity * stride` — payload bytes that are real blocks (≤ `RUN_SIZE`).
     span: u32,
@@ -175,7 +186,7 @@ pub(crate) struct Run {
     class: SizeClass,
     id: RunId,
     heap: HeapId,
-    mapping: Mapping,
+    policy: RunPolicy,
     /// Mirror of `RunState.bump` for remote `claim`. Cold.
     issued: AtomicUsize,
     /// Coalesced-by-run inbox membership (see `heap::inbox`). Cold.
@@ -208,34 +219,31 @@ struct RunState {
 }
 
 impl Run {
-    /// Bytes for one run mapping: payload + pad + claim bitmap words.
-    pub(crate) fn mapping_len(class: SizeClass) -> Option<usize> {
+    pub(crate) fn new(
+        id: RunId,
+        heap: HeapId,
+        base: NonNull<u8>,
+        class: SizeClass,
+        policy: RunPolicy,
+    ) -> Option<Self> {
         let stride = class.size();
         let capacity = RUN_SIZE.checked_div(stride).filter(|&count| count > 0)?;
         let claim_bytes = ClaimBits::byte_len(capacity)?;
-        let claim_offset = ClaimBits::mapping_offset()?;
-        claim_offset.checked_add(claim_bytes)
-    }
-
-    pub(crate) fn new(id: RunId, heap: HeapId, mapping: Mapping, class: SizeClass) -> Option<Self> {
-        let stride = class.size();
-        let capacity = RUN_SIZE.checked_div(stride).filter(|&count| count > 0)?;
-        let claim_bytes = ClaimBits::byte_len(capacity)?;
-        let claim_offset = ClaimBits::mapping_offset()?;
+        let claim_offset = ClaimBits::space_offset()?;
         let need = claim_offset.checked_add(claim_bytes)?;
-        if mapping.len().get() < need {
+        if RUN_SPACE < need {
             return None;
         }
-        if mapping.base().as_ptr().addr() & (RUN_SIZE - 1) != 0 {
+        if base.as_ptr().addr() & (RUN_SIZE - 1) != 0 {
             return None;
         }
 
-        let claims = ClaimBits::new(mapping.base(), claim_offset, capacity)?;
+        let claims = ClaimBits::new(base, claim_offset, capacity)?;
         debug_assert!(stride >= size_of::<usize>());
         let span = u32::try_from(capacity.checked_mul(stride)?).ok()?;
         Some(Self {
             state: UnsafeCell::new(RunState::new(capacity)),
-            base: mapping.base(),
+            base,
             span,
             recip: Self::recip(u32::try_from(stride).ok()?)?,
             stride,
@@ -243,7 +251,7 @@ impl Run {
             class,
             id,
             heap,
-            mapping,
+            policy,
             issued: AtomicUsize::new(0),
             link: InboxLink::new(),
         })
@@ -307,10 +315,6 @@ impl Run {
         state.available_next.take()
     }
 
-    pub(crate) fn mapping(&self) -> &Mapping {
-        &self.mapping
-    }
-
     pub(crate) fn range(&self) -> AddressRange {
         AddressRange::new(self.base, RUN_SIZE)
     }
@@ -368,6 +372,9 @@ impl Run {
         debug_assert!(state.live > 0);
         state.live -= 1;
         Self::push_free(state, block.ptr());
+        if state.live == 0 && self.policy == RunPolicy::Discard {
+            self.maybe_discard(state);
+        }
         Ok(was_full)
     }
 
@@ -409,7 +416,19 @@ impl Run {
             }
         }
 
+        if state.live == 0 && self.policy == RunPolicy::Discard {
+            self.maybe_discard(state);
+        }
         self.claims.any_set()
+    }
+
+    fn maybe_discard(&self, state: &mut RunState) {
+        debug_assert_eq!(self.policy, RunPolicy::Discard);
+        debug_assert_eq!(state.live, 0);
+        state.bump = 0;
+        state.free = FREE_END;
+        self.issued.store(0, Ordering::Relaxed);
+        OsMemory::discard(self.range());
     }
 
     pub(crate) fn allocated(&self, ptr: NonNull<u8>) -> Result<Block, RunError> {
@@ -519,9 +538,30 @@ impl RunState {
 mod tests {
     use core::alloc::Layout;
 
-    use crate::{layout::LayoutSpec, memory::OsMemory, size_class::SizeClasses};
+    use core::ops::Deref;
+
+    use crate::{
+        layout::LayoutSpec,
+        memory::{Mapping, OsMemory},
+        size_class::SizeClasses,
+    };
+
+    use super::config::RunPolicy;
 
     use super::*;
+
+    struct TestRun {
+        run: Run,
+        _map: Mapping,
+    }
+
+    impl Deref for TestRun {
+        type Target = Run;
+
+        fn deref(&self) -> &Run {
+            &self.run
+        }
+    }
 
     fn layout_spec(size: usize, align: usize) -> LayoutSpec {
         LayoutSpec::from_layout(Layout::from_size_align(size, align).unwrap())
@@ -542,20 +582,31 @@ mod tests {
         HeapId::new(0, NonZeroU32::MIN).unwrap()
     }
 
-    fn map_for_class(class: SizeClass) -> Mapping {
-        OsMemory::map_aligned(Run::mapping_len(class).unwrap(), RUN_SIZE).unwrap()
+    fn test_run(index: u32, class: SizeClass) -> TestRun {
+        test_run_with(index, class, RunPolicy::Keep)
+    }
+
+    fn test_run_discard(index: u32, class: SizeClass) -> TestRun {
+        test_run_with(index, class, RunPolicy::Discard)
+    }
+
+    fn test_run_with(index: u32, class: SizeClass, policy: RunPolicy) -> TestRun {
+        let map = OsMemory::map_aligned(RUN_SPACE, RUN_SIZE).unwrap();
+        let run = Run::new(
+            RunId::from_index(index).unwrap(),
+            test_heap_id(),
+            map.base(),
+            class,
+            policy,
+        )
+        .expect("test run");
+        TestRun { run, _map: map }
     }
 
     #[test]
     fn reusable_run_takes_each_block_once() {
         let class = class_id(64, 8);
-        let run = Run::new(
-            RunId::from_index(0).unwrap(),
-            test_heap_id(),
-            map_for_class(class),
-            class,
-        )
-        .expect("test run");
+        let run = test_run(0, class);
         let capacity = RUN_SIZE / class.size();
         let mut seen = vec![false; capacity];
 
@@ -578,13 +629,7 @@ mod tests {
     #[test]
     fn extend_threads_fresh_blocks_onto_freelist() {
         let class = class_id(64, 8);
-        let run = Run::new(
-            RunId::from_index(21).unwrap(),
-            test_heap_id(),
-            map_for_class(class),
-            class,
-        )
-        .expect("test run");
+        let run = test_run(21, class);
         assert!(run.allocate().is_none());
         assert!(run.extend());
         let first = run.allocate().unwrap();
@@ -601,13 +646,7 @@ mod tests {
     #[test]
     fn reusable_run_reuses_returned_block() {
         let class = class_id(128, 8);
-        let run = Run::new(
-            RunId::from_index(1).unwrap(),
-            test_heap_id(),
-            map_for_class(class),
-            class,
-        )
-        .expect("test run");
+        let run = test_run(1, class);
 
         let ptr = alloc_block(&run).unwrap();
 
@@ -619,13 +658,7 @@ mod tests {
     #[test]
     fn reusable_run_resizes_block_in_place_for_same_class_layout() {
         let class = class_id(64, 8);
-        let run = Run::new(
-            RunId::from_index(7).unwrap(),
-            test_heap_id(),
-            map_for_class(class),
-            class,
-        )
-        .expect("test run");
+        let run = test_run(7, class);
         let new = layout_spec(64, 8);
         let ptr = alloc_block(&run).unwrap();
 
@@ -635,13 +668,7 @@ mod tests {
     #[test]
     fn reusable_run_rejects_allocated_block_that_needs_larger_class() {
         let class = class_id(64, 8);
-        let run = Run::new(
-            RunId::from_index(8).unwrap(),
-            test_heap_id(),
-            map_for_class(class),
-            class,
-        )
-        .expect("test run");
+        let run = test_run(8, class);
         let new = layout_spec(80, 8);
         let ptr = alloc_block(&run).unwrap();
 
@@ -682,13 +709,7 @@ mod tests {
     #[test]
     fn reusable_run_rejects_interior_pointer() {
         let class = class_id(64, 8);
-        let run = Run::new(
-            RunId::from_index(2).unwrap(),
-            test_heap_id(),
-            map_for_class(class),
-            class,
-        )
-        .expect("test run");
+        let run = test_run(2, class);
         let ptr = alloc_block(&run).unwrap();
         let interior = unsafe { NonNull::new_unchecked(ptr.as_ptr().add(1)) };
 
@@ -699,13 +720,7 @@ mod tests {
     fn reusable_run_locate_covers_all_classes_boundaries_and_tail_slack() {
         for (run_index, &size) in SizeClasses::SIZES.iter().enumerate() {
             let class = class_id(size, 8);
-            let run = Run::new(
-                RunId::from_index(u32::try_from(run_index).unwrap()).unwrap(),
-                test_heap_id(),
-                map_for_class(class),
-                class,
-            )
-            .expect("test run");
+            let run = test_run(u32::try_from(run_index).unwrap(), class);
             let capacity = RUN_SIZE / size;
 
             let first = alloc_block(&run).unwrap();
@@ -729,13 +744,7 @@ mod tests {
     #[test]
     fn reusable_run_rejects_interior_pointer_for_non_power_of_two_class() {
         let class = class_id(24, 8);
-        let run = Run::new(
-            RunId::from_index(2).unwrap(),
-            test_heap_id(),
-            map_for_class(class),
-            class,
-        )
-        .expect("test run");
+        let run = test_run(2, class);
         let ptr = alloc_block(&run).unwrap();
         let interior = unsafe { NonNull::new_unchecked(ptr.as_ptr().add(1)) };
 
@@ -747,13 +756,7 @@ mod tests {
     fn reusable_run_round_trips_hotspot_non_power_of_two_classes() {
         for (run_index, size) in [80, 96].into_iter().enumerate() {
             let class = class_id(size, 8);
-            let run = Run::new(
-                RunId::from_index(u32::try_from(run_index).unwrap()).unwrap(),
-                test_heap_id(),
-                map_for_class(class),
-                class,
-            )
-            .expect("test run");
+            let run = test_run(u32::try_from(run_index).unwrap(), class);
             let ptr = alloc_block(&run).unwrap();
 
             assert!(run.locate(ptr).is_some(), "size={size}");
@@ -765,13 +768,7 @@ mod tests {
     #[test]
     fn reusable_run_rejects_claim_tail() {
         let class = class_id(64, 8);
-        let run = Run::new(
-            RunId::from_index(3).unwrap(),
-            test_heap_id(),
-            map_for_class(class),
-            class,
-        )
-        .expect("test run");
+        let run = test_run(3, class);
         let claim_tail =
             unsafe { NonNull::new_unchecked(run.range().base().as_ptr().add(RUN_SIZE)) };
 
@@ -781,20 +778,8 @@ mod tests {
     #[test]
     fn reusable_run_rejects_foreign_run_same_offset() {
         let class = class_id(64, 8);
-        let run_a = Run::new(
-            RunId::from_index(4).unwrap(),
-            test_heap_id(),
-            map_for_class(class),
-            class,
-        )
-        .expect("test run a");
-        let run_b = Run::new(
-            RunId::from_index(5).unwrap(),
-            test_heap_id(),
-            map_for_class(class),
-            class,
-        )
-        .expect("test run b");
+        let run_a = test_run(4, class);
+        let run_b = test_run(5, class);
         let ptr = alloc_block(&run_b).unwrap();
 
         assert!(run_b.locate(ptr).is_some());
@@ -805,13 +790,7 @@ mod tests {
     fn reusable_run_rejects_aligned_tail_slack() {
         for (run_index, size) in [80, 96].into_iter().enumerate() {
             let class = class_id(size, 8);
-            let run = Run::new(
-                RunId::from_index(u32::try_from(run_index).unwrap()).unwrap(),
-                test_heap_id(),
-                map_for_class(class),
-                class,
-            )
-            .expect("test run");
+            let run = test_run(u32::try_from(run_index).unwrap(), class);
             let capacity = RUN_SIZE / class.size();
             let slack_offset = capacity * class.size();
             assert!(slack_offset < RUN_SIZE, "size={size}");
@@ -825,13 +804,7 @@ mod tests {
     #[test]
     fn claim_run_reports_duplicate_remote_free() {
         let class = class_id(64, 8);
-        let run = Run::new(
-            RunId::from_index(9).unwrap(),
-            test_heap_id(),
-            map_for_class(class),
-            class,
-        )
-        .expect("test run");
+        let run = test_run(9, class);
         let ptr = alloc_block(&run).unwrap();
 
         assert_eq!(run.claim(ptr), Ok(()));
@@ -841,13 +814,7 @@ mod tests {
     #[test]
     fn claim_run_completes_to_reusable() {
         let class = class_id(64, 8);
-        let run = Run::new(
-            RunId::from_index(11).unwrap(),
-            test_heap_id(),
-            map_for_class(class),
-            class,
-        )
-        .expect("test run");
+        let run = test_run(11, class);
         let ptr = alloc_block(&run).unwrap();
 
         assert_eq!(run.claim(ptr), Ok(()));
@@ -858,13 +825,7 @@ mod tests {
     #[test]
     fn accept_without_any_claim_is_a_noop() {
         let class = class_id(64, 8);
-        let run = Run::new(
-            RunId::from_index(16).unwrap(),
-            test_heap_id(),
-            map_for_class(class),
-            class,
-        )
-        .expect("test run");
+        let run = test_run(16, class);
         let ptr = alloc_block(&run).unwrap();
         assert!(!run.accept());
         // `ptr`'s block is still live (never claimed), so the next allocate is fresh.
@@ -875,13 +836,7 @@ mod tests {
     fn claim_accept_works_for_all_size_classes() {
         for (run_index, &size) in SizeClasses::SIZES.iter().enumerate() {
             let class = class_id(size, 8);
-            let run = Run::new(
-                RunId::from_index(u32::try_from(run_index).unwrap()).unwrap(),
-                test_heap_id(),
-                map_for_class(class),
-                class,
-            )
-            .expect("test run");
+            let run = test_run(u32::try_from(run_index).unwrap(), class);
             let ptr = alloc_block(&run).unwrap();
             assert_eq!(run.claim(ptr), Ok(()), "size={size}");
             assert!(!run.accept(), "size={size}");
@@ -892,13 +847,7 @@ mod tests {
     #[test]
     fn reusable_run_returns_aligned_blocks_for_alignment_sensitive_layout() {
         let class = class_id(17, 16);
-        let run = Run::new(
-            RunId::from_index(3).unwrap(),
-            test_heap_id(),
-            map_for_class(class),
-            class,
-        )
-        .expect("test run");
+        let run = test_run(3, class);
         let capacity = RUN_SIZE / class.size();
 
         for _ in 0..capacity {
@@ -910,19 +859,11 @@ mod tests {
     #[test]
     fn run_range_reports_payload_span() {
         let class = class_id(8, 8);
-        let mapping = map_for_class(class);
-        let base = mapping.base();
-        let run = Run::new(
-            RunId::from_index(5).unwrap(),
-            test_heap_id(),
-            mapping,
-            class,
-        )
-        .expect("test run");
+        let run = test_run(5, class);
+        let base = run.range().base();
 
         assert_eq!(run.range().base(), base);
         assert_eq!(run.range().len(), RUN_SIZE);
-        assert!(run.mapping().len().get() >= Run::mapping_len(class).unwrap());
     }
 
     #[test]
@@ -930,17 +871,11 @@ mod tests {
         use super::super::inbox::Inbox;
 
         let class = class_id(64, 8);
-        let run = Run::new(
-            RunId::from_index(17).unwrap(),
-            test_heap_id(),
-            map_for_class(class),
-            class,
-        )
-        .expect("test run");
+        let run = test_run(17, class);
         let a = alloc_block(&run).unwrap();
         let b = alloc_block(&run).unwrap();
         let inbox: Inbox<Run> = Inbox::new();
-        let run_ptr = NonNull::from(&run);
+        let run_ptr = NonNull::from(&*run);
 
         assert_eq!(run.claim(a), Ok(()));
         // First claim on an idle run wins the queue race and must push.
@@ -971,13 +906,7 @@ mod tests {
         use super::super::inbox::Inbox;
 
         let class = class_id(64, 8);
-        let run = Run::new(
-            RunId::from_index(20).unwrap(),
-            test_heap_id(),
-            map_for_class(class),
-            class,
-        )
-        .expect("test run");
+        let run = test_run(20, class);
         let capacity = RUN_SIZE / class.size();
         // Addresses, not `NonNull<u8>`: a raw-pointer `Vec` is not `Sync`, and this slice
         // only ever crosses the thread boundary by shared reference below.
@@ -986,14 +915,15 @@ mod tests {
             .collect();
         let inbox: Inbox<Run> = Inbox::new();
         let done = AtomicBool::new(false);
+        let run_ref: &Run = &run;
 
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                let run_ptr = NonNull::from(&run);
+                let run_ptr = NonNull::from(run_ref);
                 for &addr in &addrs {
                     // SAFETY: addr is one of this run's own blocks, allocated above.
                     let ptr = NonNull::new(addr as *mut u8).unwrap();
-                    run.claim(ptr).unwrap();
+                    run_ref.claim(ptr).unwrap();
                     let _ = inbox.push(run_ptr);
                 }
                 done.store(true, Ordering::Release);
@@ -1020,5 +950,54 @@ mod tests {
         });
 
         assert!(!run.is_live());
+    }
+
+    #[test]
+    fn discard_empty_run_resets_then_extend_reuses() {
+        let class = class_id(64, 8);
+        let run = test_run_discard(30, class);
+        let ptr = alloc_block(&run).unwrap();
+        assert_eq!(run.free(ptr), Ok(false));
+        assert!(!run.is_live());
+        assert!(run.allocate().is_none());
+        assert!(run.extend());
+        assert!(run.allocate().is_some());
+    }
+
+    #[test]
+    fn keep_empty_run_leaves_freelist() {
+        let class = class_id(64, 8);
+        let run = test_run(31, class);
+        let ptr = alloc_block(&run).unwrap();
+        assert_eq!(run.free(ptr), Ok(false));
+        assert_eq!(run.allocate(), Some(ptr));
+    }
+
+    #[test]
+    fn discard_after_accept_resets() {
+        let class = class_id(64, 8);
+        let run = test_run_discard(32, class);
+        let ptr = alloc_block(&run).unwrap();
+        assert_eq!(run.claim(ptr), Ok(()));
+        assert!(!run.accept());
+        assert!(!run.is_live());
+        assert!(run.allocate().is_none());
+        assert_eq!(run.claim(ptr), Err(RunError::DoubleFree));
+        assert!(run.extend());
+        assert!(run.allocate().is_some());
+    }
+
+    #[test]
+    fn discard_does_not_unmap_space() {
+        let class = class_id(64, 8);
+        let run = test_run_discard(33, class);
+        let base = run.range().base();
+        let ptr = alloc_block(&run).unwrap();
+        assert_eq!(run.free(ptr), Ok(false));
+        // SAFETY: space stays mapped; DONTNEED may zero the page.
+        unsafe {
+            base.as_ptr().write(0x11);
+            assert_eq!(base.as_ptr().read(), 0x11);
+        }
     }
 }

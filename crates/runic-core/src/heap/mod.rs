@@ -65,7 +65,7 @@ impl HeapInner {
     fn new(id: HeapId, config: AllocatorConfig) -> Self {
         Self {
             id,
-            runs: RunHeap::new(),
+            runs: RunHeap::new(config.run()),
             extents: ExtentHeap::new(config.extent()),
         }
     }

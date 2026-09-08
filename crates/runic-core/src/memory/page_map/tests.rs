@@ -476,6 +476,18 @@ fn page_map_many_single_page_extents_share_one_l2_table_without_exhaustion() {
 }
 
 #[test]
+fn page_map_publish_run_stamps_payload_not_claim_tail() {
+    let mapping = TestMapping::new(128 * 1024);
+    let map = PageMap::new();
+    let owner = owner_ptr(7);
+    let payload = crate::memory::AddressRange::new(mapping.base(), 64 * 1024);
+
+    map.publish_run(payload, owner).unwrap();
+    assert_eq!(map.get(mapping.base()), Some(PageOwner::Run(owner)));
+    assert!(map.get(mapping.ptr_at(64 * 1024)).is_none());
+}
+
+#[test]
 fn page_map_publish_extent_unpublish_extent_round_trip() {
     let mapping = TestMapping::new(PAGE_SIZE);
     let map = PageMap::new();

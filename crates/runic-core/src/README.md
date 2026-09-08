@@ -6,7 +6,7 @@ Allocator core organized around entities and invariants.
 
 - `allocator`: public core facade, abort, and `Allocator::ctx()` (`Process` is private mmap).
 - `arena`: mmap slab (`vacant` / `insert` / `remove`; slots never move). Sharing is the caller's lock, not interior atomics. Heap/run/extent metadata; each chunk owns a `Mapping`.
-- `config`: allocator and extent retention/reuse configuration.
+- `config`: `AllocatorConfig` and `Budget`. Run/extent policy live in `heap/run/config.rs` and `heap/extent/config.rs`.
 - `heap`: owner-local heaps, TLS current run, run/extent heaps, `Heaps`, and thread binding.
 - `layout`: normalized layout semantics and mapping sizing (`align` as `NonZeroUsize`; `mapping_len` uses `size + align - 1`).
 - `memory`: address ranges, mmap ownership, and page-indexed owner lookup.

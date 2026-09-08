@@ -1,8 +1,8 @@
 use core::ptr::NonNull;
 
 use crate::{
-    config::{ExtentConfig, ExtentPolicy},
     heap::Extent,
+    heap::extent::config::{ExtentConfig, ExtentPolicy},
 };
 
 /// Intrusive list of retained published extents.
@@ -93,7 +93,8 @@ mod tests {
     use core::{alloc::Layout, num::NonZeroU32};
 
     use crate::{
-        config::{Budget, ExtentConfig, ExtentPolicy},
+        config::Budget,
+        heap::extent::config::{ExtentConfig, ExtentPolicy},
         heap::{Extent, HeapId, extent::ExtentId},
         layout::LayoutSpec,
         memory::OsMemory,

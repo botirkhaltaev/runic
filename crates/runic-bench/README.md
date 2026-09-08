@@ -4,23 +4,17 @@ Internal allocator benchsuite. Not published.
 
 ## Criterion suites
 
+One `#[global_allocator]` binary per allocator. Cases are std collections plus
+real crate traffic (`serde_json`, `regex`, `bytes`).
+
 ```sh
-cargo bench -p runic-bench --bench micro
-cargo bench -p runic-bench --bench threaded
-cargo bench -p runic-bench --bench programs
 cargo bench -p runic-bench --bench global_runic
+cargo bench -p runic-bench --bench global_runic -- 'global/runic/json_api' --exact
 ```
 
-Filter by allocator and case (every suite includes all allocators except `global_*`):
-
-```sh
-cargo bench -p runic-bench --bench micro -- 'micro/owner_free/runic/64' --exact
-```
-
-- `micro`: owner-local phase isolation and size-class matrix through `GlobalAlloc`.
-- `threaded`: persistent workers plus one `lifecycle` bind/unbind path.
-- `programs`: real-world-shaped workloads (larson, xmalloc, cache, sh6bench, cfrac).
-- `global_*`: process-global allocator, std collections (`Vec`, `String`, `HashMap`, tree, word-count).
+- `global_{runic,system,mimalloc,jemalloc,snmalloc}`: process-global allocator.
+- Collections: `Vec`, `String`, `HashMap`, `Arc`, tree, word-count.
+- Libraries: JSON API roundtrip, regex log scan, `bytes` HTTP buffers.
 
 Default Criterion settings are developer-sized (`sample_size=10`, 1s, 2000 resamples, no plots, no Rayon). CLI flags (`--measurement-time`, `--sample-size`, `--profile-time`) override them. Rayon is off because Criterion analysis allocates through `#[global_allocator]`.
 
@@ -28,16 +22,12 @@ Default Criterion settings are developer-sized (`sample_size=10`, 1s, 2000 resam
 
 ```sh
 cargo run -p runic-bench --release --bin metrics
-cargo run -p runic-bench --release --bin metrics -- --cases sh6bench --targets runic,mimalloc
-cargo run -p runic-bench --release --bin metrics -- --syscalls --cases larson --targets runic
+cargo run -p runic-bench --release --bin metrics -- --cases json_api,tree --targets runic,snmalloc
+cargo run -p runic-bench --release --bin metrics -- --syscalls --cases http_buffers --targets runic
 ```
 
 Each allocator/case pair runs in a fresh subprocess so `VmHWM` is per case. Columns: peak RSS, plateau RSS after free, VMA count, minor faults, optional `mmap`/`madvise` syscall counts.
 
-Runic extent configs: `--targets runic:extent_drop,runic:extent_tight`.
-
-## Validation
-
-Workloads touch allocated memory, check alignment, and sample realloc prefix markers. Full correctness stays in the allocator test suite.
+Runic configs: `--targets runic:extent_drop,runic:extent_tight,runic:run_discard`.
 
 See `src/README.md` and `benches/README.md`.

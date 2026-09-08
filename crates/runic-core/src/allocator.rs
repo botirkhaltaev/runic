@@ -7,9 +7,7 @@ use core::{
 use crate::{
     config::AllocatorConfig,
     heap::extent::ExtentError,
-    heap::{
-        AllocatorCtx, ExtentInit, HeapError, Heaps, Run, RunError, THREAD_HEAP, ThreadFreeError,
-    },
+    heap::{AllocatorCtx, ExtentInit, HeapError, Heaps, RunError, THREAD_HEAP, ThreadFreeError},
     layout::LayoutSpec,
     memory::{OsMemory, PageMap, PageOwner},
     size_class::{SizeClass, SizeClasses},
@@ -93,20 +91,24 @@ impl Allocator {
     /// interior pointer, or an incompatible layout violates the allocator
     /// contract and may abort.
     #[inline]
-    pub unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+    pub unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         let Some(ptr) = NonNull::new(ptr) else {
             Self::abort();
         };
-        if let Some(run) = THREAD_HEAP.with(|tls| tls.cached_run(ptr)) {
-            // SAFETY: `cached_run` returns a live own-heap run.
-            match unsafe { run.as_ref().free(ptr) } {
-                Ok(false) => {}
-                Ok(true) => Self::push_available(run),
-                Err(_) => Self::abort(),
-            }
-            return;
+        let spec = LayoutSpec::from_layout(layout);
+        let Some(ctx) = Self::ctx() else {
+            Self::abort();
+        };
+        let result = THREAD_HEAP.with(|tls| match tls.lookup(ctx.pages, ptr, spec) {
+            Some(PageOwner::Run(run)) => Some(tls.free_run(run, ptr)),
+            Some(PageOwner::Extent(extent)) => Some(tls.free_extent(extent, ptr, &ctx)),
+            None => None,
+        });
+        match result {
+            Some(Ok(())) => {}
+            Some(Err(error)) => Self::free_fail(&ctx, ptr, error),
+            None => Self::dealloc_slow(ptr, spec),
         }
-        Self::dealloc_slow(ptr);
     }
 
     /// Changes the size of an allocation using allocate-copy-free semantics.
@@ -138,28 +140,26 @@ impl Allocator {
         };
         // SAFETY: `ptr` is non-null after the early return above.
         let old_ptr = unsafe { NonNull::new_unchecked(ptr) };
-        let Some(entry) = ctx.pages.get(old_ptr) else {
-            Self::abort();
-        };
-
         let Ok(new_layout) = Layout::from_size_align(new_size, old.align()) else {
             return null_mut();
         };
         let new_spec = LayoutSpec::from_layout(new_layout);
+        let old_spec = LayoutSpec::from_layout(old);
 
-        let resized = match entry {
-            PageOwner::Run(run) => {
-                // SAFETY: PageMap stores only pointers published from this allocator's live arena.
+        let resized = match THREAD_HEAP.with(|tls| tls.lookup(ctx.pages, old_ptr, old_spec)) {
+            Some(PageOwner::Run(run)) => {
+                // SAFETY: lookup returns a live arena run; resize still `locate`s.
                 unsafe { run.as_ref() }
                     .resize_in_place(old_ptr, new_spec)
                     .map_err(AllocatorError::from)
             }
-            PageOwner::Extent(mut extent) => {
-                // SAFETY: PageMap stores only pointers published from this allocator's live arena.
+            Some(PageOwner::Extent(mut extent)) => {
+                // SAFETY: lookup returns a live arena extent.
                 unsafe { extent.as_mut() }
                     .resize_in_place(old_ptr, new_spec)
                     .map_err(AllocatorError::from)
             }
+            None => Self::abort(),
         };
         match resized {
             Ok(true) => return ptr,
@@ -344,19 +344,13 @@ impl Allocator {
         unsafe { self.alloc(layout) }
     }
 
-    /// Available-list insert after a full run took a free. Off the free hit.
+    /// `PageMap` miss after `lookup` returned `None`.
     #[inline(never)]
-    fn push_available(run: NonNull<Run>) {
-        THREAD_HEAP.with(|tls| tls.push_available(run));
-    }
-
-    /// Page-cache miss / remote / extent after the TLS hit missed.
-    #[inline(never)]
-    fn dealloc_slow(ptr: NonNull<u8>) {
+    fn dealloc_slow(ptr: NonNull<u8>, spec: LayoutSpec) {
         let Some(ctx) = Self::ctx() else {
             Self::abort();
         };
-        match THREAD_HEAP.with(|tls| tls.free_slow(ptr, &ctx)) {
+        match THREAD_HEAP.with(|tls| tls.free_slow(ptr, spec, &ctx)) {
             Ok(()) => {}
             Err(error) => Self::free_fail(&ctx, ptr, error),
         }
@@ -603,16 +597,20 @@ mod tests {
         THREAD_HEAP.with(|tls| {
             let _id = tls.bind(&ctx).unwrap();
             let ptr = bind_alloc_small(tls, &ctx, layout);
-            assert!(tls.cached_run(ptr).is_none());
-            assert_eq!(tls.free_slow(ptr, &ctx), Ok(()));
+            let spec = LayoutSpec::from_layout(layout);
+            let Some(PageOwner::Run(run)) = tls.lookup(ctx.pages, ptr, spec) else {
+                panic!("alloc should publish a run");
+            };
+            assert_eq!(tls.free_slow(ptr, spec, &ctx), Ok(()));
             let again = bind_alloc_small(tls, &ctx, layout);
             assert_eq!(again, ptr);
-            let Some(run) = tls.cached_run(again) else {
-                panic!("run cache should hold the run after free_slow");
-            };
+            assert_eq!(
+                tls.lookup(ctx.pages, again, spec),
+                Some(PageOwner::Run(run))
+            );
             assert_eq!(tls.free_run(run, again), Ok(()));
             unbind(tls);
-            assert!(tls.cached_run(ptr).is_none());
+            assert_eq!(tls.lookup(ctx.pages, ptr, spec), Some(PageOwner::Run(run)));
         });
     }
 
@@ -1079,6 +1077,106 @@ mod tests {
         assert_eq!(unsafe { extent.as_ref() }.heap_id(), id);
 
         // SAFETY: grown was returned by realloc above for large.
+        unsafe { allocator.dealloc(grown, large) };
+    }
+
+    #[test]
+    fn dealloc_mixed_class_reverse_drop_uses_current_then_cache() {
+        let allocator = Allocator::new();
+        let eight = Layout::from_size_align(8, 8).unwrap();
+        let sixty_four = Layout::from_size_align(64, 8).unwrap();
+        // SAFETY: layouts are valid.
+        let a = unsafe { allocator.alloc(eight) };
+        let b = unsafe { allocator.alloc(sixty_four) };
+        assert!(!a.is_null() && !b.is_null());
+        // SAFETY: matching alloc/dealloc pairs.
+        unsafe { allocator.dealloc(b, sixty_four) };
+        unsafe { allocator.dealloc(a, eight) };
+    }
+
+    #[test]
+    fn dealloc_non_current_same_class_falls_back_to_pagemap() {
+        let allocator = Allocator::new();
+        let ctx = install(&allocator);
+        let pages = ctx.pages;
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        let (first0, rest, extra, run_a, run_b) = THREAD_HEAP.with(|tls| {
+            let _id = tls.bind(&ctx).unwrap();
+            let capacity = crate::heap::run::RUN_SIZE / 64;
+            let mut first = Vec::with_capacity(capacity);
+            for _ in 0..capacity {
+                first.push(bind_alloc_small(tls, &ctx, layout));
+            }
+            let extra = bind_alloc_small(tls, &ctx, layout);
+            let run_a = run_of(pages, first[0]);
+            let run_b = run_of(pages, extra);
+            assert_ne!(run_a, run_b);
+            let first0 = first[0];
+            let rest = first[1..].to_vec();
+            (first0, rest, extra, run_a, run_b)
+        });
+        // SAFETY: first0 is a live block on the non-current full run.
+        unsafe { allocator.dealloc(first0.as_ptr(), layout) };
+        THREAD_HEAP.with(|tls| {
+            assert_eq!(
+                tls.lookup(pages, first0, LayoutSpec::from_layout(layout)),
+                Some(PageOwner::Run(run_a))
+            );
+            assert_eq!(tls.free_run(run_b, extra), Ok(()));
+            assert_eq!(free_all(tls, pages, &rest), Ok(()));
+            unbind(tls);
+        });
+    }
+
+    #[test]
+    fn realloc_in_class_stays_on_current_run() {
+        let allocator = Allocator::new();
+        let old = Layout::from_size_align(16, 8).unwrap();
+        let new = Layout::from_size_align(24, 8).unwrap();
+        // SAFETY: old is a valid layout.
+        let ptr = unsafe { allocator.alloc(old) };
+        assert!(!ptr.is_null());
+        // SAFETY: ptr was returned for old.
+        unsafe { ptr.write(0x5a) };
+        // SAFETY: matching realloc/dealloc.
+        let grown = unsafe { allocator.realloc(ptr, old, new.size()) };
+        assert!(!grown.is_null());
+        assert_eq!(unsafe { grown.read() }, 0x5a);
+        unsafe { allocator.dealloc(grown, new) };
+    }
+
+    #[test]
+    fn realloc_repeated_in_class_hits_lookup() {
+        let allocator = Allocator::new();
+        let layout = Layout::from_size_align(32, 8).unwrap();
+        // SAFETY: valid layout.
+        let mut ptr = unsafe { allocator.alloc(layout) };
+        assert!(!ptr.is_null());
+        for _ in 0..8 {
+            // SAFETY: ptr is the live allocation from the previous step.
+            let next = unsafe { allocator.realloc(ptr, layout, layout.size()) };
+            assert_eq!(next, ptr);
+            ptr = next;
+        }
+        // SAFETY: final pointer is still live for layout.
+        unsafe { allocator.dealloc(ptr, layout) };
+    }
+
+    #[test]
+    fn realloc_to_extent_uses_pagemap() {
+        let allocator = Allocator::new();
+        let small = Layout::from_size_align(64, 8).unwrap();
+        let large = Layout::from_size_align(128 * 1024, 8).unwrap();
+        // SAFETY: valid layouts.
+        let ptr = unsafe { allocator.alloc(small) };
+        assert!(!ptr.is_null());
+        let grown = unsafe { allocator.realloc(ptr, small, large.size()) };
+        assert!(!grown.is_null());
+        let pages = Allocator::ctx().expect("allocator ctx").pages;
+        assert!(matches!(
+            pages.get(NonNull::new(grown).unwrap()),
+            Some(PageOwner::Extent(_))
+        ));
         unsafe { allocator.dealloc(grown, large) };
     }
 }

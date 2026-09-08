@@ -5,6 +5,7 @@ Extent metadata owns dedicated large allocations.
 ## Files
 
 - `mod.rs`: `Extent`, `ExtentId`, exact-pointer checks, reuse, and resize-in-place rules.
+- `config.rs`: `ExtentConfig` / `ExtentPolicy::{Drop, Keep}` and `Budget`.
 - `cache.rs`: intrusive `head` list of published Free extents (`ExtentPolicy::{Drop, Keep}`, exact-length reuse only).
 - `heap.rs`: dedicated allocation via `ExtentInit`, `Arena<Extent>`, page-map publication, and `cache_or_unmap` / `unmap`.
 

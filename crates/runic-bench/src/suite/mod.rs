@@ -3,9 +3,6 @@ use std::time::Duration;
 use criterion::Criterion;
 
 pub mod collections;
-pub mod micro;
-pub mod programs;
-pub mod threaded;
 
 /// Default Criterion config. The `criterion_group!` macro applies `configure_from_args`
 /// so `--measurement-time` / `--sample-size` / `--profile-time` override these defaults.

@@ -7,7 +7,7 @@ use core::{
 
 use crate::{
     heap::{Extent, Run},
-    memory::{Mapping, OsMemory, PAGE_SIZE},
+    memory::{AddressRange, Mapping, OsMemory, PAGE_SIZE},
 };
 
 mod entry;
@@ -71,10 +71,11 @@ impl PageMap {
 
     pub(crate) fn publish_run(
         &self,
-        mapping: &Mapping,
+        range: AddressRange,
         run: NonNull<Run>,
     ) -> Result<(), PageMapError> {
-        let range = PageRange::from_mapping(mapping).ok_or(PageMapError::InvalidRange)?;
+        let range =
+            PageRange::from_aligned(range.base(), range.len()).ok_or(PageMapError::InvalidRange)?;
         self.insert(range, PageOwner::Run(run))
     }
 

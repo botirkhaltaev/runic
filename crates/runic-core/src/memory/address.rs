@@ -2,9 +2,9 @@ use core::ptr::NonNull;
 
 /// Ownership-free byte geometry: a `(base, len)` view with no mmap lifecycle.
 ///
-/// Used for extent user sub-ranges and other non-owning spans. mmap ownership
-/// lives on [`crate::memory::Mapping`]; page-map publish takes `&Mapping`, not
-/// a raw `AddressRange`.
+/// Used for run payload spans, extent user sub-ranges, and other non-owning
+/// views. mmap ownership lives on [`crate::memory::Mapping`]. Run publish takes
+/// the 64 KiB payload [`AddressRange`]; extent publish still takes `&Mapping`.
 #[derive(Clone, Copy)]
 pub(crate) struct AddressRange {
     base: NonNull<u8>,

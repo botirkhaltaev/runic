@@ -3,13 +3,22 @@ use core::ptr::NonNull;
 use crate::{
     arena::Arena,
     heap::{HeapError, HeapId, Run, RunId},
-    memory::{OsMemory, PageMap},
+    memory::{Mapping, OsMemory, PageMap},
     size_class::{SizeClass, SizeClasses},
+};
+
+use super::{
+    MAP_RUNS, MAP_SIZE, RUN_SIZE, RUN_SPACE,
+    config::{RunConfig, RunPolicy},
 };
 
 pub(crate) struct RunHeap {
     runs: Arena<Run>,
+    maps: Arena<Mapping>,
+    map_index: Option<u32>,
+    used: usize,
     available: [Option<NonNull<Run>>; SizeClasses::COUNT],
+    policy: RunPolicy,
 }
 
 // SAFETY: RunHeap owns run metadata and available-list pointers into its own
@@ -18,14 +27,18 @@ pub(crate) struct RunHeap {
 unsafe impl Send for RunHeap {}
 
 impl RunHeap {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(config: RunConfig) -> Self {
         Self {
             runs: Arena::new(),
+            maps: Arena::new(),
+            map_index: None,
+            used: 0,
             available: [None; SizeClasses::COUNT],
+            policy: config.policy(),
         }
     }
 
-    /// Checkout a run for `class`: available list or cold mmap.
+    /// Checkout a run for `class`: available list or a new range in a heap map.
     pub(crate) fn acquire(
         &mut self,
         class: SizeClass,
@@ -33,21 +46,46 @@ impl RunHeap {
         pages: &PageMap,
     ) -> Option<NonNull<Run>> {
         self.take_available(class)
-            .or_else(|| self.map_run(class, heap_id, pages))
+            .or_else(|| self.new_run(class, heap_id, pages))
     }
 
     #[cold]
-    fn map_run(
+    fn new_run(
         &mut self,
         class: SizeClass,
         heap_id: HeapId,
         pages: &PageMap,
     ) -> Option<NonNull<Run>> {
-        let mapping = OsMemory::map_aligned(Run::mapping_len(class)?, super::RUN_SIZE)?;
+        let base = self.take()?;
         let index = self.runs.vacant()?;
         let id = RunId::from_index(index)?;
-        let run = Run::new(id, heap_id, mapping, class)?;
-        self.insert_run(index, id, run, pages)
+        let run = Run::new(id, heap_id, base, class, self.policy)?;
+        let run = self.insert_run(index, id, run, pages)?;
+        self.used += 1;
+        Some(run)
+    }
+
+    fn take(&mut self) -> Option<NonNull<u8>> {
+        if let Some(index) = self.map_index
+            && self.used < MAP_RUNS
+            && let Some(mapping) = self.maps.get(index)
+        {
+            let base = mapping
+                .base()
+                .as_ptr()
+                .wrapping_byte_add(self.used * RUN_SPACE);
+            return NonNull::new(base);
+        }
+        self.map()
+    }
+
+    fn map(&mut self) -> Option<NonNull<u8>> {
+        let index = self.maps.vacant()?;
+        let mapping = OsMemory::map_aligned(MAP_SIZE, RUN_SIZE)?;
+        let inserted = self.maps.insert(index, mapping)?;
+        self.map_index = Some(index);
+        self.used = 0;
+        Some(inserted.base())
     }
 
     /// Owner: drain every claimed bit on `run` and publish the freed blocks.
@@ -126,8 +164,7 @@ impl RunHeap {
         debug_assert_eq!(inserted_run.id(), id);
         let run_ptr = NonNull::from(&mut *inserted_run);
 
-        debug_assert_eq!(inserted_run.range().base(), inserted_run.mapping().base());
-        if pages.publish_run(inserted_run.mapping(), run_ptr).is_err() {
+        if pages.publish_run(inserted_run.range(), run_ptr).is_err() {
             let _removed = self.runs.remove(id.index());
             return None;
         }
@@ -147,7 +184,7 @@ mod tests {
         size_class::SizeClasses,
     };
 
-    use super::super::RUN_SIZE;
+    use super::super::{MAP_RUNS, RUN_SIZE, RUN_SPACE, config::RunConfig};
     use super::*;
 
     fn class_id(size: usize, align: usize) -> SizeClass {
@@ -155,14 +192,6 @@ mod tests {
             Layout::from_size_align(size, align).unwrap(),
         ))
         .unwrap()
-    }
-
-    fn reusable_run(id: RunId) -> Run {
-        let class = class_id(64, 8);
-        let mapping = OsMemory::map_aligned(Run::mapping_len(class).unwrap(), RUN_SIZE).unwrap();
-        let heap = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
-
-        Run::new(id, heap, mapping, class).expect("reusable test run")
     }
 
     fn available_run_id(heap: &RunHeap, class_index: usize) -> Option<RunId> {
@@ -194,7 +223,7 @@ mod tests {
 
     #[test]
     fn run_heap_relinks_previously_full_run_after_free() {
-        let mut heap = RunHeap::new();
+        let mut heap = RunHeap::new(RunConfig::new());
         let pages = PageMap::new();
         let class = class_id(64, 8);
         let class_index = class.index();
@@ -223,26 +252,28 @@ mod tests {
     }
 
     #[test]
-    fn failed_run_page_publication_removes_map_entry() {
-        let mut heap = RunHeap::new();
+    fn failed_run_page_publication_leaves_range_reusable() {
+        let mut heap = RunHeap::new(RunConfig::new());
         let pages = PageMap::new();
+        let class = class_id(64, 8);
+        let heap_id = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
+        let mapping = OsMemory::map_aligned(RUN_SPACE, RUN_SIZE).unwrap();
+        let existing = NonNull::dangling();
+        let range = crate::memory::AddressRange::new(mapping.base(), RUN_SIZE);
+        pages.publish_run(range, existing).unwrap();
+
         let index = heap.runs.vacant().unwrap();
         let id = RunId::from_index(index).unwrap();
-        assert_eq!(id.index(), index);
-        let run = reusable_run(id);
-        let existing = NonNull::dangling();
-        let base = run.range().base();
-
-        pages.publish_run(run.mapping(), existing).unwrap();
-
+        let run =
+            Run::new(id, heap_id, mapping.base(), class, RunPolicy::Keep).expect("conflict run");
         assert_eq!(heap.insert_run(index, id, run, &pages), None);
         assert!(heap.runs.get_mut(index).is_none());
-        assert_eq!(pages.get(base), Some(PageOwner::Run(existing)));
+        assert_eq!(pages.get(mapping.base()), Some(PageOwner::Run(existing)));
     }
 
     #[test]
     fn rebind_rebinds_runs_off_the_available_list() {
-        let mut heap = RunHeap::new();
+        let mut heap = RunHeap::new(RunConfig::new());
         let pages = PageMap::new();
         let class = class_id(64, 8);
         let old = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
@@ -261,7 +292,7 @@ mod tests {
 
     #[test]
     fn push_available_is_idempotent_and_keeps_tail() {
-        let mut heap = RunHeap::new();
+        let mut heap = RunHeap::new(RunConfig::new());
         let pages = PageMap::new();
         let class = class_id(64, 8);
         let class_index = class.index();
@@ -288,7 +319,7 @@ mod tests {
 
     #[test]
     fn push_available_returns_stranded_current() {
-        let mut heap = RunHeap::new();
+        let mut heap = RunHeap::new(RunConfig::new());
         let pages = PageMap::new();
         let class = class_id(64, 8);
         let class_index = class.index();
@@ -313,5 +344,33 @@ mod tests {
 
         let (_run, reused) = alloc_block(&mut heap, class, &pages).unwrap();
         assert_eq!(reused, ptr);
+    }
+
+    #[test]
+    fn publish_run_covers_payload_not_claim_tail() {
+        let mut heap = RunHeap::new(RunConfig::new());
+        let pages = PageMap::new();
+        let class = class_id(64, 8);
+        let heap_id = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
+        let run = heap.acquire(class, heap_id, &pages).unwrap();
+        // SAFETY: live arena run.
+        let base = unsafe { run.as_ref() }.range().base();
+        assert!(pages.get(base).is_some());
+        let tail = NonNull::new(base.as_ptr().wrapping_byte_add(RUN_SIZE)).unwrap();
+        assert!(pages.get(tail).is_none());
+    }
+
+    #[test]
+    fn sixteen_runs_share_one_map() {
+        let mut heap = RunHeap::new(RunConfig::new());
+        let pages = PageMap::new();
+        let class = class_id(64, 8);
+        let heap_id = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
+        for _ in 0..MAP_RUNS {
+            assert!(heap.acquire(class, heap_id, &pages).is_some());
+        }
+        assert_eq!(heap.maps.iter().count(), 1);
+        assert!(heap.acquire(class, heap_id, &pages).is_some());
+        assert_eq!(heap.maps.iter().count(), 2);
     }
 }

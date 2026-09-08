@@ -4,13 +4,14 @@ Run metadata owns small size-class allocations.
 
 ## Files
 
-- `mod.rs`: `Run`, `RunId`, pointer freelist + `extend`, and a private claim bitmap in the mapping tail.
+- `mod.rs`: `Run`, `RunId`, pointer freelist + `extend`, and a private claim bitmap in the space tail.
+- `config.rs`: `RunConfig` / `RunPolicy::{Keep,Discard}`.
 - `cache.rs`: `RunCache` — one-entry TLS payload-range probe (`hit` / `store` / `clear`). Not heap retention.
-- `heap.rs`: `RunHeap` with `Arena<Run>`, available-run lists, page-map publication, and arena-wide `HeapId` rebind.
+- `heap.rs`: `RunHeap` with `Arena<Run>` then `Arena<Mapping>`, available-run lists, payload-only page-map publication, and arena-wide `HeapId` rebind.
 
 ## Invariants
 
-- A run owns one mapping and one size class. The mapping base is `RUN_SIZE`-aligned (`OsMemory::map_aligned`). Payload is `RUN_SIZE` bytes, pad to 8-byte alignment, then `AtomicU64` claim words; `Run::range` is the payload span only.
+- A run owns one size class and one range in a heap-owned map (not its own `Mapping`). The base is `RUN_SIZE`-aligned. Payload is `RUN_SIZE` bytes, pad to 8-byte alignment, then `AtomicU64` claim words; `Run::range` is the payload span only. `PageMap::publish_run` stamps that payload. A map holds `MAP_RUNS` spaces (`RUN_SPACE` each).
 - Returned blocks must be valid block boundaries inside the payload span.
 - `Run` packs `span` / `recip` / `stride` next to `RunState`. `locate` is offset from the run base. `RunCache` is a `RUN_SIZE` range probe.
 - Owner Free/Live **authority** is freelist membership + `live` (+ bump). `allocate` is pop only. Empty freelist → `extend` threads one page of fresh blocks (at least 32, or remaining) and advances `issued` once. `free` is `locate` → `live--` → pointer push. Owner double-free is undefined.
@@ -21,6 +22,6 @@ Run metadata owns small size-class allocations.
 - Interior / foreign pointers fail closed via `locate` / `PageMap`. Never-issued remote claims are rejected via `issued`.
 - `Run::free` returns `Result<bool, RunError>` (`Ok(true)` when the run was full; `InvalidPointer` only on the owner path). `accept` returns `bool` (needs re-push). `RunHeap` calls `push_available` from that flag.
 - `RunHeap` available-list pointers must refer to live `Arena<Run>` entries. A run is on the list at most once (`RunState.on_available`); `push_available` is idempotent. The current run may be on the list. `unbind` returns non-full current runs to the list.
-- Alloc miss checks out a run from `available[]` (or OS), `extend`s if needed, and sets TLS `current`. Reincarnation rebinds every occupied arena run.
+- Alloc miss checks out a run from `available[]` (or take/map), `extend`s if needed, and sets TLS `current`. Reincarnation rebinds every occupied arena run.
 - Live small ownership for reclaim is `Run::is_live` (allocated or remote-claimed), aggregated by `RunHeap::has_live` over occupied arena runs.
-- Runs stay published and arena-resident for the heap lifetime (no empty-run OS release).
+- Runs stay published and arena-resident for the heap lifetime. `RunPolicy::Discard` drops empty-run payload pages via `madvise`; the heap map stays. `Keep` leaves pages resident.

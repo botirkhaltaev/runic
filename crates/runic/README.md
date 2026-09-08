@@ -25,14 +25,13 @@ budgets allow it, `Drop` retains nothing. Allocation-side lookup always reuses a
 retained mapping by exact length. Slot and byte budgets are enforced exactly.
 
 ```rust
-use runic::{Budget, ExtentPolicy, RunicAlloc};
+use runic::{Budget, ExtentPolicy, RunPolicy, RunicAlloc};
 
 #[global_allocator]
 static GLOBAL: RunicAlloc = RunicAlloc::builder()
-    .extent()
-    .policy(ExtentPolicy::Keep)
-    .budget(Budget::new(64, 64 * 1024 * 1024))
-    .done()
+    .extent_policy(ExtentPolicy::Keep)
+    .extent_budget(Budget::new(64, 64 * 1024 * 1024))
+    .run_policy(RunPolicy::Keep)
     .build();
 ```
 

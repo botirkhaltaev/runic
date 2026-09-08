@@ -40,10 +40,27 @@ impl ThreadHeap {
         }
     }
 
-    /// `PageMap` lookup with a one-entry TLS run-range cache (own-heap runs only).
-    fn lookup(&self, pages: &PageMap, ptr: NonNull<u8>) -> Option<PageOwner> {
+    /// Owner-local then `PageMap`: `RunCache` → `current[class]` → pages.
+    pub(crate) fn lookup(
+        &self,
+        pages: &PageMap,
+        ptr: NonNull<u8>,
+        spec: LayoutSpec,
+    ) -> Option<PageOwner> {
         if let Some(run) = self.cache.hit(ptr) {
             return Some(PageOwner::Run(run));
+        }
+        if let Some(class) = SizeClasses::class_for(spec)
+            && let Some(run) = NonNull::new(self.current(class).get())
+        {
+            // SAFETY: `current` stores only live arena run pointers while bound.
+            let run_ref = unsafe { run.as_ref() };
+            if self.heap_id.get() == Some(run_ref.heap_id())
+                && run_ref.range().offset_of(ptr).is_some()
+            {
+                self.cache.store(run);
+                return Some(PageOwner::Run(run));
+            }
         }
         let owner = pages.get(ptr)?;
         if let PageOwner::Run(run) = owner {
@@ -151,12 +168,6 @@ impl ThreadHeap {
         heap.flush(&mut inner, ctx)
     }
 
-    /// [`RunCache`] hit for `ptr`.
-    #[inline]
-    pub(crate) fn cached_run(&self, ptr: NonNull<u8>) -> Option<NonNull<Run>> {
-        self.cache.hit(ptr)
-    }
-
     /// Available-list insert after a full run took a free. Off the free hit.
     #[inline(never)]
     pub(crate) fn push_available(&self, run: NonNull<Run>) {
@@ -248,9 +259,10 @@ impl ThreadHeap {
     pub(crate) fn free_slow(
         &self,
         ptr: NonNull<u8>,
+        spec: LayoutSpec,
         ctx: &AllocatorCtx<'_>,
     ) -> Result<(), ThreadFreeError> {
-        let Some(owner) = self.lookup(ctx.pages, ptr) else {
+        let Some(owner) = self.lookup(ctx.pages, ptr, spec) else {
             return Err(ThreadFreeError::Heap(HeapError::InvalidRunPointer));
         };
         match owner {
