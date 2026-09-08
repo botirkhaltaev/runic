@@ -4,7 +4,7 @@ Allocator core organized around entities and invariants.
 
 ## Modules
 
-- `allocator`: public core facade and abort boundary used by the global wrapper.
+- `allocator`: public core facade, abort, and `Allocator::ctx()` (`Process` is private mmap).
 - `arena`: mmap slab (`vacant` / `insert` / `remove`; slots never move). Sharing is the caller's lock, not interior atomics. Heap/run/extent metadata; each chunk owns a `Mapping`.
 - `config`: allocator and extent retention/reuse configuration.
 - `heap`: owner-local heaps, TLS current run, run/extent heaps, `Heaps`, and thread binding.

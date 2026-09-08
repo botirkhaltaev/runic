@@ -11,19 +11,19 @@
 ## Conventions
 
 - Prefer `NonZero*` / `NonNull` / named fields. No useless helpers — especially free (module-level) one-liners / cast wrappers / pass-throughs. Put behavior on the owning type; helpers only for real reuse, a clearer ownership boundary, or a **profiled** cold-path factor.
-- **One handle** — never the same object as both `NonNull<T>` and `&T`. Project fields once at the boundary; do not thread `&AllocatorInner` with `&PageMap` / `&Heaps`.
-- Small hit: `ThreadHeap::{alloc,cached_run}` take `*mut AllocatorInner` (`matches` is pointer equality; null fails it). `&PageMap` on miss. Cold unbound: `Allocator::{bind_alloc,free_remote}`.
+- **One handle** — never the same object as both `NonNull<T>` and `&T`. Project fields once at the boundary; `Allocator::ctx()` is `AllocatorCtx` — do not thread `&PageMap` / `&Heaps` separately.
+- Small hit: `ThreadHeap::{alloc,cached_run}` take no ctx. Miss / bind / unbind take `&AllocatorCtx`. Cold unbound: `Allocator::{bind_alloc,free_remote}`.
 - Naming: short, clear, domain words only — same term means the same thing everywhere. No long compound jargon, invented synonyms, or parallel names for one concept. Frontend `alloc`, domain block/extent `allocate`, checkout `acquire`, current-run `extend`. Free protocol: `free` / `claim` / `accept`. Prefer existing vocabulary (`run`, `extent`, `heap`, `inbox`, `flush`, `bind`, `current`, `extend`) over new coinages.
 - Indices: `Arena` / `HeapId` / `RunId` / `ExtentId` use `u32`; convert to `usize` only when indexing Rust arrays or doing pointer/byte math — no free cast-wrapper helpers.
 - Remote free: claim → `Heap::enqueue` (Active; lease before new `try_queue`) or `Heaps::{enqueue,free,flush}` (Draining). Coalesce by owner (`Inbox`), never a freer TLS batch.
-- Flush policy: current-run empty = `extend`; inbox flush if nonempty; then local/OS `acquire_run`. Unbound = `alloc_after_bind` / `alloc_extent_after_bind` (flush then alloc); hit = current pop / `RunCache` `Run::free` (`push_available` only on `was_full`). Inbox `flush` is remote `accept` only.
+- Flush policy: current-run empty = `extend`; inbox flush if nonempty; then local/OS `acquire_run`. Unbound = `bind` then `flush` then alloc; hit = current pop / `RunCache` `Run::free` (`push_available` only on `was_full`). Inbox `flush` is remote `accept` only.
 - `Layout` only at the public boundary → `LayoutSpec` inward once.
-- No root/shared ownership heap; every run/extent has `HeapId`. Capabilities: shared `&Heap` = atomics only (`enqueue` / mode); Active exclusive = `ThreadHeap` + `try_inner` + `HeapCtx { pages }`; Draining = `Heaps::{enqueue,free,flush}` + `HeapsCtx`. No `Heap::state()` projection; no `*_fresh` dual alloc APIs.
+- No root/shared ownership heap; every run/extent has `HeapId`. Shared `&Heap` = atomics only (`enqueue` / mode). Active exclusive = `ThreadHeap` + `try_inner` + `AllocatorCtx`. Draining = `Heaps::{enqueue,free,flush}` + `AllocatorCtx`. No `Heap::state()` projection; no `*_fresh` dual alloc APIs.
 - One abort sink: `Allocator::abort`. Preserve abort kinds through `HeapError` (`InvalidRunPointer` / `InvalidExtentPointer` / `MissingExtent`). `HeapError::DoubleFree` is remote `claim` / interior-foreign only — not owner DF. Never hold the heaps arena mutex across flush / accept / user-memory copies.
 - No allocator-internal `Vec` / `Box` / `HashMap` / `String` / formatting / panic unless recursion risk is addressed.
 - `#![deny(unsafe_op_in_unsafe_fn)]`. No test-only methods on production `impl` blocks.
 - No backward compatibility for public or internal APIs — reshape in place; delete dual paths, aliases, and parallel old names. Best architecture and code always win.
-- Nested `AGENTS.md`: subtree rules only; closest wins; shorter than root; no root duplication; <60 lines (cap 100). Update the matching `README.md` when APIs change. Skill: `.agents/skills/agents-md`.
+- Nested `AGENTS.md`: subtree rules only; closest wins; shorter than root; no root duplication; <60 lines (cap 100). Update the matching `README.md` when APIs change.
 
 ## Commands
 
@@ -51,4 +51,4 @@
 
 - v0.6 in: Linux x86_64, Rust stable, `GlobalAlloc`, owner-local heaps, TLS current run, run/extent retention, remote-free, `realloc` / `alloc_zeroed`, tests, benches.
 - v0.6 out: quarantine, canaries, hugepages, NUMA, C ABI, ML placement, dashboards, background purge.
-- Next: leftover vs snmalloc is churn (30.2 vs 28.3) and freelist after the owner-free hit diet. Do not retry identity, batch take, O(1) TLS steal, or `#135` RSEQ on single-thread churn. Do not port snmalloc.
+- Next: leftover is remote-free and freelist. Do not compact `CLASS_FOR_SIZE`, retry first-fit extent reuse, lock-free `Heaps::get`, identity, batch take, O(1) TLS steal, `#135` RSEQ, or a locate-offset dual free. Do not port snmalloc.

@@ -4,9 +4,8 @@ use super::{RUN_SIZE, Run};
 
 /// One-entry TLS payload-range cache. Own-heap runs only; extents never stored.
 ///
-/// Empty is `base == usize::MAX`. Then `ptr.wrapping_sub(MAX) == ptr + 1`, which
-/// is `< RUN_SIZE` only for addresses in the first 64 KiB — never a published
-/// mapping.
+/// Empty is `base == usize::MAX`. `ptr & !(RUN_SIZE-1)` is always a multiple of
+/// `RUN_SIZE`, never `MAX`, so an empty cache cannot hit.
 pub(crate) struct RunCache {
     base: Cell<usize>,
     run: Cell<*mut Run>,
@@ -20,10 +19,10 @@ impl RunCache {
         }
     }
 
-    /// Payload-range hit. No run-null test.
+    /// Payload-range hit. No run-null test. Bases are `RUN_SIZE`-aligned.
     #[inline]
     pub(crate) fn hit(&self, ptr: NonNull<u8>) -> Option<NonNull<Run>> {
-        if ptr.as_ptr().addr().wrapping_sub(self.base.get()) >= RUN_SIZE {
+        if ptr.as_ptr().addr() & !(RUN_SIZE - 1) != self.base.get() {
             return None;
         }
         // SAFETY: a matching range is stored only with a live own-heap run.

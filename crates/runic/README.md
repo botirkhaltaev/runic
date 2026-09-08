@@ -22,8 +22,7 @@ static GLOBAL: RunicAlloc = RunicAlloc::new();
 Use the const builder for explicit retention policy experiments. Extent policy
 controls free-side retention: `Keep` retains a freed mapping while slot and byte
 budgets allow it, `Drop` retains nothing. Allocation-side lookup always reuses a
-retained mapping by exact length. Cache storage is fixed-size internally, so
-configured slot budgets above the implementation cap are clamped.
+retained mapping by exact length. Slot and byte budgets are enforced exactly.
 
 ```rust
 use runic::{Budget, ExtentPolicy, RunicAlloc};
@@ -32,10 +31,12 @@ use runic::{Budget, ExtentPolicy, RunicAlloc};
 static GLOBAL: RunicAlloc = RunicAlloc::builder()
     .extent()
     .policy(ExtentPolicy::Keep)
-    .budget(Budget::new(32, 16 * 1024 * 1024))
+    .budget(Budget::new(64, 64 * 1024 * 1024))
     .done()
     .build();
 ```
+
+`dealloc` requires a live pointer this allocator returned. Null is forbidden (`GlobalAlloc` contract) and aborts; it is not a no-op.
 
 ## Crate Shape
 

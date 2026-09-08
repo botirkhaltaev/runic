@@ -94,7 +94,7 @@ impl Extent {
     ) -> Option<Self> {
         let user_addr = spec.align_addr(mapping.base().as_ptr().addr())?;
         let user_ptr = NonNull::new(core::ptr::with_exposed_provenance_mut(user_addr))?;
-        let range = AddressRange::new(user_ptr, spec.size());
+        let range = AddressRange::new(user_ptr, spec.size().max(1));
 
         if mapping.range().contains(range) {
             Some(Self {
@@ -168,7 +168,7 @@ impl Extent {
             return Ok(false);
         }
 
-        let requested = AddressRange::new(ptr, spec.size());
+        let requested = AddressRange::new(ptr, spec.size().max(1));
         if !self.mapping.range().contains(requested) {
             return Ok(false);
         }
@@ -241,7 +241,7 @@ impl Extent {
 
         let user_addr = spec.align_addr(self.mapping.base().as_ptr().addr())?;
         let user_ptr = NonNull::new(core::ptr::with_exposed_provenance_mut(user_addr))?;
-        let range = AddressRange::new(user_ptr, spec.size());
+        let range = AddressRange::new(user_ptr, spec.size().max(1));
         if !self.mapping.range().contains(range) {
             return None;
         }

@@ -203,6 +203,8 @@ struct RunState {
     available_next: Option<NonNull<Run>>,
     /// `FREE_END` or a payload address of a free block.
     free: usize,
+    /// On this class's `RunHeap` available list. `push_available` is a no-op when set.
+    on_available: bool,
 }
 
 impl Run {
@@ -222,6 +224,9 @@ impl Run {
         let claim_offset = ClaimBits::mapping_offset()?;
         let need = claim_offset.checked_add(claim_bytes)?;
         if mapping.len().get() < need {
+            return None;
+        }
+        if mapping.base().as_ptr().addr() & (RUN_SIZE - 1) != 0 {
             return None;
         }
 
@@ -279,14 +284,27 @@ impl Run {
         unsafe { &*self.state.get() }.live != 0
     }
 
-    pub(crate) fn set_available_next(&self, next: Option<NonNull<Run>>) {
+    pub(crate) fn is_available(&self) -> bool {
         // SAFETY: owner-local methods are called only by the owning heap.
-        unsafe { &mut *self.state.get() }.available_next = next;
+        unsafe { &*self.state.get() }.on_available
     }
 
-    pub(crate) fn take_available_next(&self) -> Option<NonNull<Run>> {
+    /// Link onto the available list. Caller already checked `!is_available()`.
+    pub(crate) fn link_available(&self, next: Option<NonNull<Run>>) {
         // SAFETY: owner-local methods are called only by the owning heap.
-        unsafe { &mut *self.state.get() }.available_next.take()
+        let state = unsafe { &mut *self.state.get() };
+        debug_assert!(!state.on_available);
+        state.available_next = next;
+        state.on_available = true;
+    }
+
+    /// Unlink from the available list. Returns the previous successor.
+    pub(crate) fn unlink_available(&self) -> Option<NonNull<Run>> {
+        // SAFETY: owner-local methods are called only by the owning heap.
+        let state = unsafe { &mut *self.state.get() };
+        debug_assert!(state.on_available);
+        state.on_available = false;
+        state.available_next.take()
     }
 
     pub(crate) fn mapping(&self) -> &Mapping {
@@ -419,7 +437,6 @@ impl Run {
 
     #[inline]
     pub(crate) fn locate(&self, ptr: NonNull<u8>) -> Option<Block> {
-        // Out-of-span (incl. below base) wraps to a large offset ≥ `span`.
         let offset = u64::try_from(ptr.as_ptr().addr().wrapping_sub(self.base.as_ptr().addr()))
             .unwrap_or(u64::MAX);
         if offset >= u64::from(self.span) {
@@ -493,6 +510,7 @@ impl RunState {
             bump: 0,
             available_next: None,
             free: FREE_END,
+            on_available: false,
         }
     }
 }
@@ -525,7 +543,7 @@ mod tests {
     }
 
     fn map_for_class(class: SizeClass) -> Mapping {
-        OsMemory::map(Run::mapping_len(class).unwrap()).unwrap()
+        OsMemory::map_aligned(Run::mapping_len(class).unwrap(), RUN_SIZE).unwrap()
     }
 
     #[test]
@@ -742,6 +760,45 @@ mod tests {
             assert!(run.free(ptr).is_ok(), "size={size}");
             assert_eq!(run.allocate(), Some(ptr), "size={size}");
         }
+    }
+
+    #[test]
+    fn reusable_run_rejects_claim_tail() {
+        let class = class_id(64, 8);
+        let run = Run::new(
+            RunId::from_index(3).unwrap(),
+            test_heap_id(),
+            map_for_class(class),
+            class,
+        )
+        .expect("test run");
+        let claim_tail =
+            unsafe { NonNull::new_unchecked(run.range().base().as_ptr().add(RUN_SIZE)) };
+
+        assert!(run.locate(claim_tail).is_none());
+    }
+
+    #[test]
+    fn reusable_run_rejects_foreign_run_same_offset() {
+        let class = class_id(64, 8);
+        let run_a = Run::new(
+            RunId::from_index(4).unwrap(),
+            test_heap_id(),
+            map_for_class(class),
+            class,
+        )
+        .expect("test run a");
+        let run_b = Run::new(
+            RunId::from_index(5).unwrap(),
+            test_heap_id(),
+            map_for_class(class),
+            class,
+        )
+        .expect("test run b");
+        let ptr = alloc_block(&run_b).unwrap();
+
+        assert!(run_b.locate(ptr).is_some());
+        assert!(run_a.locate(ptr).is_none());
     }
 
     #[test]

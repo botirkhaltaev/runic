@@ -7,15 +7,10 @@ use core::{
 
 use spin::RwLock;
 
-use crate::{
-    arena::Arena,
-    config::AllocatorConfig,
-    heap::HeapError,
-    memory::{PageMap, PageOwner},
-};
+use crate::{arena::Arena, config::AllocatorConfig, heap::HeapError, memory::PageOwner};
 
 use super::state::HeapMode;
-use super::{Heap, HeapCtx, HeapId, HeapInner, HeapsCtx};
+use super::{AllocatorCtx, Heap, HeapId, HeapInner};
 
 const FREE_END: u32 = u32::MAX;
 
@@ -125,25 +120,15 @@ impl Heaps {
     /// Try to return a Draining heap to the Free list. No inbox accept.
     pub(crate) fn reclaim(&self, id: HeapId) -> Result<(), HeapError> {
         let (heap, inner) = self.admit(id)?;
-        let pages = PageMap::new();
-        let ctx = HeapsCtx {
-            heaps: self,
-            pages: &pages,
-        };
-        heap.reclaim(&inner, &ctx, id.index());
+        heap.reclaim(&inner, self, id.index());
         Ok(())
     }
 
     /// Inbox push while Draining (no Active lease). Then reclaim.
     pub(crate) fn enqueue(&self, id: HeapId, owner: PageOwner) -> Result<(), HeapError> {
         let (heap, inner) = self.admit(id)?;
-        let pages = PageMap::new();
-        let ctx = HeapsCtx {
-            heaps: self,
-            pages: &pages,
-        };
         heap.drain_enqueue(owner);
-        heap.reclaim(&inner, &ctx, id.index());
+        heap.reclaim(&inner, self, id.index());
         Ok(())
     }
 
@@ -153,21 +138,19 @@ impl Heaps {
         id: HeapId,
         owner: PageOwner,
         ptr: NonNull<u8>,
-        pages: &PageMap,
+        ctx: &AllocatorCtx<'_>,
     ) -> Result<(), HeapError> {
         let (heap, mut inner) = self.admit(id)?;
-        let ctx = HeapsCtx { heaps: self, pages };
-        heap.free(&mut inner, owner, ptr, &HeapCtx { pages: ctx.pages })?;
-        heap.reclaim(&inner, &ctx, id.index());
+        heap.free(&mut inner, owner, ptr, ctx)?;
+        heap.reclaim(&inner, self, id.index());
         Ok(())
     }
 
     /// Accept inboxes while Draining. Then reclaim.
-    pub(crate) fn flush(&self, id: HeapId, pages: &PageMap) -> Result<(), HeapError> {
+    pub(crate) fn flush(&self, id: HeapId, ctx: &AllocatorCtx<'_>) -> Result<(), HeapError> {
         let (heap, mut inner) = self.admit(id)?;
-        let ctx = HeapsCtx { heaps: self, pages };
-        heap.flush(&mut inner, &HeapCtx { pages: ctx.pages })?;
-        heap.reclaim(&inner, &ctx, id.index());
+        heap.flush(&mut inner, ctx)?;
+        heap.reclaim(&inner, self, id.index());
         Ok(())
     }
 
@@ -184,7 +167,7 @@ impl Heaps {
     }
 
     /// Owner thread gives up the heap: close Active, wait leases, reclaim, flush.
-    pub(crate) fn retire(&self, id: HeapId, pages: &PageMap) -> Result<(), HeapError> {
+    pub(crate) fn retire(&self, id: HeapId, ctx: &AllocatorCtx<'_>) -> Result<(), HeapError> {
         {
             let Some(heap) = self.get(id) else {
                 return Ok(());
@@ -200,7 +183,7 @@ impl Heaps {
             Err(error) => return Err(error),
         }
 
-        match self.flush(id, pages) {
+        match self.flush(id, ctx) {
             Ok(()) | Err(HeapError::InvalidHeap) => Ok(()),
             Err(error) => Err(error),
         }
@@ -231,13 +214,25 @@ mod tests {
     use std::thread;
 
     use super::*;
+    use crate::memory::PageMap;
+
+    fn retire(heaps: &Heaps, id: HeapId) -> Result<(), HeapError> {
+        let pages = PageMap::new();
+        heaps.retire(
+            id,
+            &AllocatorCtx {
+                pages: &pages,
+                heaps,
+            },
+        )
+    }
 
     #[test]
     fn acquire_retire_reactivate_bumps_generation() {
         let heaps = Heaps::new(AllocatorConfig::new());
         let (first, _) = heaps.acquire().unwrap();
         assert_eq!(first.generation().get(), 1);
-        assert_eq!(heaps.retire(first, &PageMap::new()), Ok(()));
+        assert_eq!(retire(&heaps, first), Ok(()));
         assert!(heaps.get(first).is_none());
 
         let (second, _) = heaps.acquire().unwrap();
@@ -251,7 +246,7 @@ mod tests {
     fn stale_heap_id_rejected_after_reclaim() {
         let heaps = Heaps::new(AllocatorConfig::new());
         let (id, _) = heaps.acquire().unwrap();
-        assert_eq!(heaps.retire(id, &PageMap::new()), Ok(()));
+        assert_eq!(retire(&heaps, id), Ok(()));
         assert!(heaps.get(id).is_none());
     }
 
@@ -291,7 +286,7 @@ mod tests {
         thread::scope(|scope| {
             scope.spawn(|| {
                 start.wait();
-                assert_eq!(heaps.retire(id, &PageMap::new()), Ok(()));
+                assert_eq!(retire(&heaps, id), Ok(()));
                 done_tx.send(()).unwrap();
             });
 
@@ -334,7 +329,7 @@ mod tests {
             assert_eq!(indexes.len(), unique);
 
             for id in ids {
-                assert_eq!(heaps.retire(id, &PageMap::new()), Ok(()));
+                assert_eq!(retire(heaps, id), Ok(()));
             }
         });
 

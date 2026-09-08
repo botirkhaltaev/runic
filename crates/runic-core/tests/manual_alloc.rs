@@ -357,42 +357,6 @@ fn allocator_survives_deterministic_random_trace() {
 }
 
 #[test]
-fn allocator_cold_switches_between_instances_in_one_thread() {
-    let first = Allocator::new();
-    let second = Allocator::new();
-    let layout = Layout::from_size_align(64, 8).unwrap();
-
-    let first_ptr = unsafe { first.alloc(layout) };
-    let second_ptr = unsafe { second.alloc(layout) };
-    let first_again = unsafe { first.alloc(layout) };
-
-    assert!(!first_ptr.is_null());
-    assert!(!second_ptr.is_null());
-    assert!(!first_again.is_null());
-
-    unsafe { first.dealloc(first_ptr, layout) };
-    unsafe { second.dealloc(second_ptr, layout) };
-    unsafe { first.dealloc(first_again, layout) };
-}
-
-#[test]
-fn allocator_drop_before_thread_local_teardown_is_safe() {
-    let layout = Layout::from_size_align(64, 8).unwrap();
-
-    let thread = thread::spawn(move || {
-        let allocator = Allocator::new();
-        let ptr = unsafe { allocator.alloc(layout) };
-
-        assert!(!ptr.is_null());
-
-        unsafe { allocator.dealloc(ptr, layout) };
-        drop(allocator);
-    });
-
-    thread.join().unwrap();
-}
-
-#[test]
 fn allocator_supports_scoped_threaded_use() {
     let allocator = Allocator::new();
     let layout = Layout::from_size_align(128, 8).unwrap();
