@@ -8,7 +8,7 @@
 # Evidence model (Cost → Where → Why → Causal):
 #   Cost   — metrics.txt from perf stat + Criterion thrpt; --compare
 #   Where  — perf report / annotate / samply / flamegraph on perf.data
-#   Why    — counter groups in perf-stat.txt; threaded phase filters
+#   Why    — counter groups in perf-stat.txt; collection / library filters
 #   Causal — temporary A/B after reading Where; re-measure Cost
 #
 # Default: bootstrap → build → perf stat → perf record → reports → summary
@@ -25,8 +25,8 @@ Usage: scripts/profile.sh [options] <bench-target> <criterion-filter>
        scripts/profile.sh --preflight
 
 Positional:
-  bench-target       Criterion bench binary (micro, threaded, programs, ...)
-  criterion-filter   Exact Criterion filter (e.g. micro/single_size_churn/runic/64)
+  bench-target       Criterion bench binary (global_runic, global_snmalloc, ...)
+  criterion-filter   Exact Criterion filter (e.g. global/runic/tree)
 
 Options:
   -t, --time SEC         Criterion --profile-time seconds (default: 30)
@@ -40,7 +40,7 @@ Options:
   --with LIST            Extra tools, comma-separated:
                            flamegraph (default on)
                            samply
-                           callgrind  (owner-local phases; requires valgrind)
+                           callgrind  (single-thread collection cases; requires valgrind)
                            none       disable extras
   --skip LIST            Skip stages, comma-separated:
                            build,stat,record,report,flamegraph,samply,callgrind,annotate,summary
@@ -68,11 +68,10 @@ User-space tools (auto-installed when selected, or via --install-tools):
 
 Examples:
   scripts/profile.sh --preflight
-  scripts/profile.sh micro 'micro/single_size_churn/runic/64'
-  scripts/profile.sh -l baseline -t 20 \
-    threaded 'threaded/remote_fan_in/runic/4/live:256'
+  scripts/profile.sh global_runic 'global/runic/tree'
+  scripts/profile.sh -l baseline global_runic 'global/runic/json_api'
   scripts/profile.sh --with flamegraph,samply,callgrind \
-    micro 'micro/owner_free/runic/64'
+    global_runic 'global/runic/http_buffers'
   scripts/profile.sh --compare \
     target/runic-profiles/foo-before target/runic-profiles/foo-after
 
@@ -485,8 +484,6 @@ ALLOWED_CPUS=$(awk '/^Cpus_allowed_list:/ { print $2 }' /proc/self/status)
 [[ -n $ALLOWED_CPUS ]] || die "cannot determine profiling CPU affinity"
 if [[ -n ${RUNIC_PROFILE_CPUS:-} ]]; then
   PROFILE_CPUS=$RUNIC_PROFILE_CPUS
-elif [[ $BENCH_TARGET == *threaded* || $BENCH_TARGET == *programs* ]]; then
-  PROFILE_CPUS=$ALLOWED_CPUS
 else
   PROFILE_CPUS=${ALLOWED_CPUS%%,*}
   PROFILE_CPUS=${PROFILE_CPUS%%-*}
@@ -497,14 +494,6 @@ if git diff --quiet --ignore-submodules -- 2>/dev/null && git diff --cached --qu
   GIT_DIRTY=no
 else
   GIT_DIRTY=yes
-fi
-
-if [[ $CRITERION_FILTER == *lifecycle* ]]; then
-  warn "lifecycle filters intentionally include spawn/join/unbind noise"
-fi
-
-if want_tool callgrind && [[ $BENCH_TARGET == *threaded* || $CRITERION_FILTER == *remote* || $CRITERION_FILTER == *fan_in* || $CRITERION_FILTER == *free_ring* ]]; then
-  warn "Callgrind is for owner-local phases only; concurrent/remote filters are not meaningful under simulation"
 fi
 
 timestamp=$(date +%Y%m%d-%H%M%S)
@@ -632,7 +621,7 @@ write_callgrind() {
   }
 
   {
-    printf '# callgrind (owner-local deterministic instruction counts)\n'
+    printf '# callgrind (deterministic instruction counts)\n'
     printf '# command: '
     print_command valgrind --tool=callgrind --callgrind-out-file="$OUT_DIR/callgrind.out" \
       --branch-sim=yes --cache-sim=yes -- "$@"
@@ -645,6 +634,47 @@ write_callgrind() {
   else
     warn "callgrind failed; see $log"
   fi
+}
+
+write_script_report() {
+  local perf_data=$1
+  local out=$2
+  if ! have_cmd perf || ! have_cmd python3; then
+    warn "cannot write perf-script fallback"
+    return 0
+  fi
+  if ! perf script -i "$perf_data" --no-inline 2>/dev/null | python3 - "$out" <<'PY'
+import collections, re, sys
+
+out_path = sys.argv[1]
+leaf = collections.Counter()
+total = 0
+frames = []
+for line in sys.stdin:
+    if line.startswith("\t"):
+        m = re.match(r"[0-9a-f]+\s+(\S+)", line.strip())
+        if m:
+            frames.append(m.group(1).split("+")[0])
+        continue
+    if "cycles:u" in line and frames:
+        leaf[frames[0]] += 1
+        total += 1
+        frames = []
+if frames:
+    leaf[frames[0]] += 1
+    total += 1
+
+lines = [f"# leaf samples from perf script --no-inline (total={total})"]
+if total:
+    for sym, n in leaf.most_common(40):
+        lines.append(f"{100.0 * n / total:6.2f}%  {n:6d}  {sym}")
+open(out_path, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+PY
+  then
+    warn "perf script fallback failed"
+    return 0
+  fi
+  info "Wrote $out"
 }
 
 write_flamegraph() {
@@ -864,6 +894,10 @@ write_summary() {
         }
       ' "$OUT_DIR/perf-report-flat.txt"
       printf '\n'
+    elif [[ -f $OUT_DIR/perf-script-leaves.txt ]]; then
+      printf '%s\n' '--- Where: perf script leaves ---'
+      cat "$OUT_DIR/perf-script-leaves.txt"
+      printf '\n'
     fi
 
     printf '%s\n' 'Where next:'
@@ -878,6 +912,7 @@ write_summary() {
     for f in metadata.txt manifest.txt command.txt metrics.txt \
       perf-stat.txt perf.data \
       perf-report-flat.txt perf-report-self.txt perf-report-children.txt \
+      perf-script-leaves.txt \
       flamegraph.svg flamegraph.log samply.json samply.log callgrind.out callgrind.log \
       perf-annotate.txt summary.txt; do
       if [[ -e $OUT_DIR/$f ]]; then
@@ -995,12 +1030,16 @@ fi
 if want_stage report; then
   [[ -f $OUT_DIR/perf.data ]] || die "missing perf.data; cannot report (skip record?)"
   info "Generating perf reports..."
-  perf report --stdio --no-children --percent-limit 0.5 -i "$OUT_DIR/perf.data" --sort=dso,symbol \
-    >"$OUT_DIR/perf-report-self.txt"
-  perf report --stdio --children --percent-limit 0.5 -i "$OUT_DIR/perf.data" --sort=dso,symbol \
-    >"$OUT_DIR/perf-report-children.txt"
-  perf report --stdio --no-children -g none --percent-limit 0.3 -i "$OUT_DIR/perf.data" \
-    --sort=overhead,symbol >"$OUT_DIR/perf-report-flat.txt"
+  if ! perf report --stdio --no-children --percent-limit 0.5 -i "$OUT_DIR/perf.data" --sort=dso,symbol \
+    >"$OUT_DIR/perf-report-self.txt"; then
+    warn "perf report failed; keeping perf.data and writing script fallback"
+    write_script_report "$OUT_DIR/perf.data" "$OUT_DIR/perf-script-leaves.txt"
+  else
+    perf report --stdio --children --percent-limit 0.5 -i "$OUT_DIR/perf.data" --sort=dso,symbol \
+      >"$OUT_DIR/perf-report-children.txt" || warn "perf report --children failed"
+    perf report --stdio --no-children -g none --percent-limit 0.3 -i "$OUT_DIR/perf.data" \
+      --sort=overhead,symbol >"$OUT_DIR/perf-report-flat.txt" || warn "perf report --flat failed"
+  fi
 fi
 
 if want_stage flamegraph && want_tool flamegraph; then

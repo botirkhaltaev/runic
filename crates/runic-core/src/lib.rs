@@ -19,4 +19,6 @@ pub(crate) mod memory;
 pub(crate) mod size_class;
 
 pub use allocator::Allocator;
-pub use config::{AllocatorConfig, Budget, ExtentConfig, ExtentPolicy};
+pub use config::{AllocatorConfig, Budget};
+pub use heap::extent::config::{ExtentConfig, ExtentPolicy};
+pub use heap::run::config::{RunConfig, RunPolicy};

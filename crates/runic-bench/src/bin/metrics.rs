@@ -1,46 +1,126 @@
-use std::{env, process::Command};
-
-use runic::{Budget, ExtentPolicy, RunicAlloc};
-use runic_bench::{
-    metrics::{Report, Syscalls},
-    micro, programs,
-    target::{self, AllocatorTarget, TARGETS},
+use std::{
+    alloc::{GlobalAlloc, Layout, System},
+    env,
+    ffi::c_char,
+    process::Command,
+    sync::atomic::{AtomicU8, Ordering},
 };
 
+use mimalloc::MiMalloc;
+use runic::{Budget, ExtentPolicy, RunPolicy, RunicAlloc};
+use runic_bench::{
+    metrics::{Report, Syscalls},
+    target::{self, TARGETS},
+    workloads::{self, WORKLOADS},
+};
+use snmalloc_rs::SnMalloc;
+use tikv_jemallocator::Jemalloc;
+
+static RUNIC: RunicAlloc = RunicAlloc::new();
+static SYSTEM: System = System;
+static MIMALLOC: MiMalloc = MiMalloc;
+static JEMALLOC: Jemalloc = Jemalloc;
+static SNMALLOC: SnMalloc = SnMalloc;
 static EXTENT_DROP: RunicAlloc = RunicAlloc::builder()
-    .extent()
-    .policy(ExtentPolicy::Drop)
-    .budget(Budget::new(0, 0))
-    .done()
+    .extent_policy(ExtentPolicy::Drop)
+    .extent_budget(Budget::new(0, 0))
     .build();
 static EXTENT_TIGHT: RunicAlloc = RunicAlloc::builder()
-    .extent()
-    .policy(ExtentPolicy::Keep)
-    .budget(Budget::new(2, 512 * 1024))
-    .done()
+    .extent_policy(ExtentPolicy::Keep)
+    .extent_budget(Budget::new(2, 512 * 1024))
     .build();
+static RUN_DISCARD: RunicAlloc = RunicAlloc::builder().run_policy(RunPolicy::Discard).build();
 
-const EXTENT_TARGETS: &[AllocatorTarget] = &[
-    AllocatorTarget::new("runic:extent_drop", &EXTENT_DROP),
-    AllocatorTarget::new("runic:extent_tight", &EXTENT_TIGHT),
+const EXTRA_NAMES: &[&str] = &[
+    "runic:extent_drop",
+    "runic:extent_tight",
+    "runic:run_discard",
 ];
 
-const CASES: &[&str] = &[
-    "larson",
-    "xmalloc",
-    "cache_thrash",
-    "cache_scratch",
-    "sh6bench",
-    "cfrac",
-    "recycled_churn",
-    "small_biased_random",
-    "large_churn",
-];
+struct SelectedAlloc;
 
-const PROGRAM_OPS: usize = 8_192;
-const MICRO_OPS: usize = 10_000;
-const LARGE_OPS: usize = 1_000;
-const RANDOM_SEED: u64 = 0xf3ee_a110_c001_cafe;
+static KIND: AtomicU8 = AtomicU8::new(0);
+
+fn kind_of(name: &[u8]) -> Option<u8> {
+    Some(match name {
+        b"runic" => 0,
+        b"system" => 1,
+        b"mimalloc" => 2,
+        b"jemalloc" => 3,
+        b"snmalloc" => 4,
+        b"runic:extent_drop" => 5,
+        b"runic:extent_tight" => 6,
+        b"runic:run_discard" => 7,
+        _ => return None,
+    })
+}
+
+fn c_bytes(ptr: *const c_char) -> Option<&'static [u8]> {
+    if ptr.is_null() {
+        return None;
+    }
+    let mut len = 0_usize;
+    // SAFETY: `getenv` returns a NUL-terminated C string or null.
+    unsafe {
+        while *ptr.add(len) != 0 {
+            len = len.checked_add(1)?;
+        }
+        Some(core::slice::from_raw_parts(ptr.cast::<u8>(), len))
+    }
+}
+
+unsafe extern "C" fn select_from_env() {
+    // SAFETY: CRT has installed the environment; this runs before `main`.
+    let ptr = unsafe { libc::getenv(c"RUNIC_BENCH_ALLOC".as_ptr()) };
+    let Some(name) = c_bytes(ptr) else {
+        return;
+    };
+    if let Some(kind) = kind_of(name) {
+        KIND.store(kind, Ordering::Relaxed);
+    }
+}
+
+#[used]
+#[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
+static SELECT: unsafe extern "C" fn() = select_from_env;
+
+fn selected() -> &'static dyn GlobalAlloc {
+    match KIND.load(Ordering::Relaxed) {
+        1 => &SYSTEM,
+        2 => &MIMALLOC,
+        3 => &JEMALLOC,
+        4 => &SNMALLOC,
+        5 => &EXTENT_DROP,
+        6 => &EXTENT_TIGHT,
+        7 => &RUN_DISCARD,
+        _ => &RUNIC,
+    }
+}
+
+unsafe impl GlobalAlloc for SelectedAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: forwarded to a live `GlobalAlloc`.
+        unsafe { selected().alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: forwarded to a live `GlobalAlloc`.
+        unsafe { selected().alloc_zeroed(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: `ptr` came from `alloc` on the same selected allocator.
+        unsafe { selected().dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: `ptr` came from `alloc` on the same selected allocator.
+        unsafe { selected().realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static ALLOC: SelectedAlloc = SelectedAlloc;
 
 fn main() {
     let args = env::args().collect::<Vec<_>>();
@@ -48,10 +128,13 @@ fn main() {
         run_case(&args);
         return;
     }
+    if args.get(1).is_some_and(|arg| arg == "--smoke") {
+        smoke();
+        return;
+    }
 
     let mut selected_targets = Vec::new();
     let mut selected_cases = Vec::new();
-    let mut threads = 4_usize;
     let mut syscalls = false;
     let mut index = 1;
     while index < args.len() {
@@ -64,14 +147,6 @@ fn main() {
             "--cases" => {
                 let list = args.get(index + 1).expect("missing --cases value");
                 selected_cases = list.split(',').map(str::trim).map(str::to_string).collect();
-                index += 2;
-            }
-            "--threads" => {
-                threads = args
-                    .get(index + 1)
-                    .expect("missing --threads value")
-                    .parse()
-                    .expect("invalid --threads");
                 index += 2;
             }
             "--syscalls" => {
@@ -89,25 +164,41 @@ fn main() {
             .collect();
     }
     if selected_cases.is_empty() {
-        selected_cases = CASES.iter().map(|case| (*case).to_string()).collect();
+        selected_cases = WORKLOADS
+            .iter()
+            .map(|workload| workload.name().to_string())
+            .collect();
     }
 
     Report::print_csv_header();
     for target in &selected_targets {
         for case in &selected_cases {
-            run_subprocess(target, case, threads, syscalls);
+            run_subprocess(target, case, syscalls);
         }
     }
 }
 
-fn run_subprocess(allocator: &str, workload: &str, threads: usize, syscalls: bool) {
+fn smoke() {
+    let mut names: Vec<&str> = TARGETS.iter().map(|target| target.name()).collect();
+    names.extend(EXTRA_NAMES.iter().copied());
+    for name in names {
+        let status = Command::new(env::current_exe().unwrap())
+            .args(["--case", name, "vec_push_clear"])
+            .env("RUNIC_BENCH_ALLOC", name)
+            .status()
+            .unwrap();
+        assert!(status.success(), "smoke failed for {name}");
+    }
+}
+
+fn run_subprocess(allocator: &str, workload: &str, syscalls: bool) {
     let exe = env::current_exe().unwrap();
     let case_args = [
         "--case".to_string(),
         allocator.to_string(),
         workload.to_string(),
-        threads.to_string(),
     ];
+    let alloc_env = ("RUNIC_BENCH_ALLOC", allocator);
 
     let output = if syscalls {
         Command::new("perf")
@@ -119,9 +210,13 @@ fn run_subprocess(allocator: &str, workload: &str, threads: usize, syscalls: boo
             ])
             .arg(exe.as_os_str())
             .args(&case_args)
+            .env(alloc_env.0, alloc_env.1)
             .output()
     } else {
-        Command::new(exe).args(&case_args).output()
+        Command::new(exe)
+            .args(&case_args)
+            .env(alloc_env.0, alloc_env.1)
+            .output()
     };
 
     let output = match output {
@@ -130,6 +225,7 @@ fn run_subprocess(allocator: &str, workload: &str, threads: usize, syscalls: boo
             eprintln!("warning: perf stat unavailable ({err}); retrying without syscalls");
             Command::new(env::current_exe().unwrap())
                 .args(&case_args)
+                .env(alloc_env.0, alloc_env.1)
                 .output()
                 .unwrap()
         }
@@ -142,6 +238,7 @@ fn run_subprocess(allocator: &str, workload: &str, threads: usize, syscalls: boo
             eprintln!("warning: perf syscall tracepoints not permitted; retrying without syscalls");
             let retry = Command::new(env::current_exe().unwrap())
                 .args(&case_args)
+                .env(alloc_env.0, alloc_env.1)
                 .output()
                 .unwrap();
             assert!(
@@ -212,60 +309,47 @@ fn merge_syscalls(row: &str, counts: Syscalls) -> String {
     cols.join(",")
 }
 
-fn resolve_target(name: &str) -> AllocatorTarget {
-    target::by_name(name)
-        .or_else(|| {
-            EXTENT_TARGETS
-                .iter()
-                .copied()
-                .find(|target| target.name() == name)
-        })
-        .unwrap_or_else(|| panic!("unknown allocator: {name}"))
+fn known_allocator(name: &str) -> bool {
+    target::by_name(name).is_some() || EXTRA_NAMES.contains(&name)
 }
 
 fn run_case(args: &[String]) {
     let allocator = args.get(2).map(String::as_str).expect("missing allocator");
     let workload = args.get(3).map(String::as_str).expect("missing workload");
-    let threads = args
-        .get(4)
-        .map_or(1, |value| value.parse().expect("invalid threads"));
-    let target = resolve_target(allocator);
-
-    match workload {
-        "larson" => Report::measure(target.name(), "larson", threads, PROGRAM_OPS, || {
-            let _ = programs::larson(target, threads, PROGRAM_OPS);
-        }),
-        "xmalloc" => Report::measure(target.name(), "xmalloc", threads, PROGRAM_OPS, || {
-            let _ = programs::xmalloc(target, threads, PROGRAM_OPS);
-        }),
-        "cache_thrash" => {
-            Report::measure(target.name(), "cache_thrash", threads, PROGRAM_OPS, || {
-                let _ = programs::cache_thrash(target, threads, PROGRAM_OPS);
-            })
-        }
-        "cache_scratch" => {
-            Report::measure(target.name(), "cache_scratch", threads, PROGRAM_OPS, || {
-                let _ = programs::cache_scratch(target, threads, PROGRAM_OPS);
-            })
-        }
-        "sh6bench" => Report::measure(target.name(), "sh6bench", threads, PROGRAM_OPS, || {
-            let _ = programs::sh6bench(target, threads, PROGRAM_OPS);
-        }),
-        "cfrac" => Report::measure(target.name(), "cfrac", threads, PROGRAM_OPS, || {
-            let _ = programs::cfrac(target, threads, PROGRAM_OPS);
-        }),
-        "recycled_churn" => Report::measure(target.name(), "recycled_churn", 1, MICRO_OPS, || {
-            let _ = micro::recycled_churn(target, 64, MICRO_OPS, 256);
-        }),
-        "small_biased_random" => {
-            Report::measure(target.name(), "small_biased_random", 1, MICRO_OPS, || {
-                let _ = micro::small_biased_random(target, RANDOM_SEED, MICRO_OPS, 1024);
-            })
-        }
-        "large_churn" => Report::measure(target.name(), "large_churn", 1, LARGE_OPS, || {
-            let _ = micro::large_churn(target, 256 * 1024, LARGE_OPS);
-        }),
-        _ => panic!("unknown workload: {workload}"),
-    }
+    assert!(known_allocator(allocator), "unknown allocator: {allocator}");
+    let Some(case) = workloads::by_name(workload) else {
+        panic!("unknown workload: {workload}");
+    };
+    Report::measure(
+        allocator_name(allocator),
+        case.name(),
+        1,
+        case.elems(),
+        || {
+            let _ = case.run();
+        },
+    )
     .print_csv();
+}
+
+fn allocator_name(name: &str) -> &'static str {
+    TARGETS
+        .iter()
+        .map(|target| target.name())
+        .chain(EXTRA_NAMES.iter().copied())
+        .find(|&known| known == name)
+        .unwrap_or_else(|| panic!("unknown allocator: {name}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kind_of;
+
+    #[test]
+    fn kind_of_known_names() {
+        assert_eq!(kind_of(b"runic"), Some(0));
+        assert_eq!(kind_of(b"snmalloc"), Some(4));
+        assert_eq!(kind_of(b"runic:run_discard"), Some(7));
+        assert_eq!(kind_of(b"nope"), None);
+    }
 }

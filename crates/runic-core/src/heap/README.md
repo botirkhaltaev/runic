@@ -11,7 +11,7 @@ Owner-local heap frontend: runs for small size classes, extents for dedicated la
 - `state.rs`: `HeapMode`, `HeapState`, `Lease` (`store` is module-private to reactivate / bump).
 - `inbox.rs`: `Inbox` / `InboxLink`.
 - `thread.rs`: `ThreadHeap`.
-- `run/`: size-classed fixed-block runs (`Run`, `RunHeap` with `Arena<Run>`, `RunCache`).
+- `run/`: size-classed fixed-block runs (`Run`, heap-owned maps, `RunHeap` with `Arena<Run>`, `RunCache`).
 - `extent/`: dedicated mappings (`Extent`, `ExtentHeap` with `Arena<Extent>`, `ExtentCache`).
 
 ## Capabilities
@@ -28,7 +28,7 @@ Owner-local heap frontend: runs for small size classes, extents for dedicated la
 - Every `Run` and `Extent` stores a `HeapId`; there is no root/central ownership heap. `Heap` owns lifecycle, inboxes, and run/extent metadata (`RunHeap` / `ExtentHeap`).
 - Small allocations are owned by a heap's runs; large allocations by that heap's extents.
 - Cross-thread frees: `claim` → `Heap::enqueue` (Active: lease before a new `try_queue`) or `Heaps::{enqueue,free,flush}` (Draining). Coalescing is by owner. Owner `flush` drains via `accept`.
-- Run remote admission is a private claim bitmap in the mapping tail. Owner `Run::free` is locate + pointer push; owner DF is undefined. Extents use byte `Claimed`.
+- Run remote admission is a private claim bitmap in the space tail. Owner `Run::free` is locate + pointer push; owner DF is undefined. Extents use byte `Claimed`.
 - Inbox is a Treiber stack of run/extent nodes. `drain` is a single-pass walk.
 - Draining reclaim observes live ownership via `RunHeap` ∨ `ExtentHeap` (`has_live`). In-flight claim bits keep the heap live. `Heap::reclaim` returns a Free heap to the table freelist.
 - Never-bound freers enqueue each successful claim in `Allocator::free_remote`. Bound producers coalesce by run/extent. `ThreadFreeError::Remote` carries the `PageOwner` `free_slow` already looked up.
@@ -45,8 +45,8 @@ A small block is on exactly one of: user, run freelist, or remote-claimed.
 | Hit | Work | Not on the hit |
 |-----|------|----------------|
 | **alloc** | `class_for` → `current[class]` → `Run::allocate` (pop) | `extend`, claim bits, locks, atomics, acquire, flush |
-| **owner free** | `RunCache::hit` → `Run::free` (locate + push); `push_available` only on `was_full` | claim bits, `extend`, locks, atomics |
+| **owner free** | `RunCache` → `current[class]` payload range → `PageMap`; `Run::free` (locate + push); `push_available` only on `was_full` | claim bits, `extend`, locks, atomics |
 
 `current[class]` is a hint, not ownership. Available list is the reservoir; a run may be both current and listed. Frees never touch `current`. Interior pointers abort on `locate`. Owner DF is undefined.
 
-`lookup` + `RunCache` stay on owner free. The cache stores only runs whose `HeapId` matches this TLS. `ExtentCache` is heap-level mapping reuse, not a TLS free probe.
+Owner free / realloc use `lookup` (`RunCache` → `current[class]` → `PageMap`). The cache stores only runs whose `HeapId` matches this TLS. `ExtentCache` is heap-level mapping reuse, not a TLS free probe.

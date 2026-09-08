@@ -12,7 +12,7 @@
 
 - Prefer `NonZero*` / `NonNull` / named fields. No useless helpers — especially free (module-level) one-liners / cast wrappers / pass-throughs. Put behavior on the owning type; helpers only for real reuse, a clearer ownership boundary, or a **profiled** cold-path factor.
 - **One handle** — never the same object as both `NonNull<T>` and `&T`. Project fields once at the boundary; `Allocator::ctx()` is `AllocatorCtx` — do not thread `&PageMap` / `&Heaps` separately.
-- Small hit: `ThreadHeap::{alloc,cached_run}` take no ctx. Miss / bind / unbind take `&AllocatorCtx`. Cold unbound: `Allocator::{bind_alloc,free_remote}`.
+- Small hit: `ThreadHeap::alloc` takes no ctx. `lookup` is `RunCache` → `current[class]` → `PageMap`. Miss / bind / unbind take `&AllocatorCtx`. Cold unbound: `Allocator::{bind_alloc,free_remote}`.
 - Naming: short, clear, domain words only — same term means the same thing everywhere. No long compound jargon, invented synonyms, or parallel names for one concept. Frontend `alloc`, domain block/extent `allocate`, checkout `acquire`, current-run `extend`. Free protocol: `free` / `claim` / `accept`. Prefer existing vocabulary (`run`, `extent`, `heap`, `inbox`, `flush`, `bind`, `current`, `extend`) over new coinages.
 - Indices: `Arena` / `HeapId` / `RunId` / `ExtentId` use `u32`; convert to `usize` only when indexing Rust arrays or doing pointer/byte math — no free cast-wrapper helpers.
 - Remote free: claim → `Heap::enqueue` (Active; lease before new `try_queue`) or `Heaps::{enqueue,free,flush}` (Draining). Coalesce by owner (`Inbox`), never a freer TLS batch.
@@ -51,4 +51,4 @@
 
 - v0.6 in: Linux x86_64, Rust stable, `GlobalAlloc`, owner-local heaps, TLS current run, run/extent retention, remote-free, `realloc` / `alloc_zeroed`, tests, benches.
 - v0.6 out: quarantine, canaries, hugepages, NUMA, C ABI, ML placement, dashboards, background purge.
-- Next: leftover is remote-free and freelist. Do not compact `CLASS_FOR_SIZE`, retry first-fit extent reuse, lock-free `Heaps::get`, identity, batch take, O(1) TLS steal, `#135` RSEQ, or a locate-offset dual free. Do not port snmalloc.
+- Next: leftover is `global_*` collection Cost vs last same-host snmalloc (`vec_many_small` 1.71×, then `word_count` / `http_buffers` ~1.10×, `json_api` / `regex_search` ~1.07×, `tree`). Do not compact `CLASS_FOR_SIZE`, retry first-fit extent reuse, lock-free `Heaps::get`, identity, batch take, O(1) TLS steal, `#135` RSEQ, or a locate-offset dual free. Do not port snmalloc.

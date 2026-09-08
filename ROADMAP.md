@@ -31,11 +31,12 @@ hot paths require it. Architecture should stay simple until a new entity owns a
 real lifecycle, invariant, or policy.
 
 The owner-local current run is that entity for the small hit. Leftover vs
-snmalloc on this host is remote-free (fan-in / ring) and freelist allocate;
-owner_free and churn already beat last same-host Cost. Do not retry a magazine,
-RSEQ, or a locate-offset dual free. Owner DF is undefined; remote admission
-stays fail-closed. One process-wide payload; TLS identity is free. Out-of-line
-metadata stays until Where shows an in-page run header is a ≥5% lever.
+snmalloc on this host is `global_*` collection Cost (`vec_many_small` 1.71×,
+then `word_count` / `http_buffers` ~1.10×, `json_api` / `regex_search` ~1.07×,
+`tree`). Do not retry a magazine, RSEQ, or a locate-offset dual free. Owner
+DF is undefined; remote admission stays fail-closed. One process-wide payload;
+TLS identity is free. Out-of-line metadata stays until Where shows an in-page
+run header is a ≥5% lever.
 
 ## Current Status
 
@@ -94,7 +95,8 @@ churn/64        29.4         28.2    28.0      27.5         28.0
 Singleton drops TLS `matches`. Folds: `dealloc` forbids null; `CLASS_FOR_SIZE[0]`
 + raw `LayoutSpec` size; one-branch admission. Aligned runs keep `locate` on the
 run base. `large_churn/65536` 143.4 (Criterion: no change vs prior binary).
-owner_free and churn beat last same-host snmalloc Cost; leftover is freelist.
+owner_free and churn beat last same-host snmalloc Cost; leftover then was
+freelist (now `global_*` collection Cost).
 
 Available-list leak: `push_available` was not idempotent. A full current run
 pushed twice linked `A.next = A` and dropped the tail, so `acquire` mmapped
@@ -195,16 +197,16 @@ Linux x86_64
 Rust stable
 GlobalAlloc
 owner-local heaps via Heaps / ThreadHeap
-mmap-backed runs for size-classed allocations
+heap-owned 2 MiB run maps (16 spaces) for size-classed allocations
 mmap-backed extents for dedicated allocations (heap-local)
 out-of-line metadata
-page-indexed pointer lookup
+page-indexed pointer lookup (run publish is the 64 KiB payload only)
 per-size-class available run lists
 pointer freelist + extend on runs (owner DF undefined)
 private run claim-bitmap for remote admission (issued + try_set; no per-block Free byte)
 run/extent Inbox coalesced by owner (Treiber stack of runs/extents, not per-block nodes)
 configurable extent mapping retention and reuse
-runs retained for the heap lifetime (no empty-run OS release)
+runs retained for the heap lifetime; Discard is madvise on empty payload
 run block-boundary checks
 extent exact-pointer checks
 basic realloc
@@ -238,7 +240,7 @@ Do not retry #126 / #128 / #135 (per-CPU on single-thread churn) / O(1) TLS stea
 
 ```text
 Every returned pointer maps to exactly one page-map entry.
-Runs own one mapping and divide it into fixed-size reusable blocks from one size class.
+A run owns one size class and one range in a heap-owned map.
 Extents own one mapping dedicated to exactly one returned allocation.
 Every free must map back to a known entry.
 Run frees must be valid block boundaries.
@@ -320,7 +322,7 @@ crates/runic-test-support
   reusable test support; not published
 
 crates/runic-bench
-  Criterion suites (micro / threaded / programs / global_*), metrics binary; not published
+  Criterion `global_*` (collections + serde_json / regex / bytes), metrics binary; not published
 ```
 
 ## Current Test Shape
@@ -384,9 +386,13 @@ Runic wins on extent retention (Keep).
 threaded/4: local 46.3 vs snmalloc 29.2 (1.6×). fan-in 392 vs 349 (1.1×).
 ring 674 vs 576 (1.2×). Cross-allocator ratios are this-host Cost, not library drift.
 
-Owner-local hit is current-run pop / run-cache `Run::free` (locate + push).
-Leftover vs snmalloc is remote-free and freelist allocate. `#135` RSEQ is not
-the lever — see thesis.
+Owner-local hit is current-run pop / `lookup` then `Run::free` (locate + push).
+Leftover vs snmalloc is `global_*` collection Cost. Same-session maps reshape
+(`profile.sh` cycles/elem vs snmalloc): `vec_many_small` 64.8 / 37.9 (1.71×;
+Where is alloc/dealloc — `lookup`, TLS `with`, `Run::free`); `word_count`
+365 / 331 (1.10×; fmt/hash); `http_buffers` 232 / 211 (1.10×; `bytes`);
+`json_api` 6400 / 5984 (1.07×; btree); `regex_search` 1123 / 1047 (1.07×;
+teddy). `#135` RSEQ is not the lever — see thesis.
 
 Remote fan-in is close (run-coalesced Inbox). Use paired Runic cycles/op for
 self-gates; use this table as the competitor baseline.
@@ -394,8 +400,8 @@ self-gates; use this table as the competitor baseline.
 Dedicated extent churn is primarily controlled by mapping retention policy.
 Keep extent retention deterministic, bounded, and allocation-free.
 
-Empty-run OS release is not implemented: runs stay published and arena-resident
-for the heap lifetime. Extent retention policies are extent-only.
+Empty-run `Discard` is opt-in (`madvise` on the payload). Maps stay; runs stay
+published and arena-resident. Default is `Keep` until Cost says otherwise.
 ```
 
 ## Milestones

@@ -8,7 +8,7 @@ This crate is published for the public `runic-alloc` crate, but most modules are
 
 - Normalize allocation layouts.
 - Select size classes.
-- Manage mmap-backed runs and dedicated extents.
+- Manage heap-owned run maps and dedicated extents.
 - Store out-of-line metadata in run and extent arenas.
 - Map returned pointers back to page-map owner pointers.
 - Enforce run block-boundary checks and extent exact-pointer checks.

@@ -5,6 +5,7 @@ use core::{
 };
 
 mod cache;
+pub(crate) mod config;
 pub(crate) mod heap;
 
 use crate::{

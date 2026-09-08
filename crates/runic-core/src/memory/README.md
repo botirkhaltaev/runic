@@ -5,9 +5,9 @@ Memory modules own address ranges, OS mappings, and page-indexed pointer lookup.
 ## Files
 
 - `address.rs`: ownership-free `AddressRange` geometry and pointer offset checks.
-- `os.rs`: `OsMemory::map` / `map_aligned` and `Mapping` (mmap ownership; `Drop` munmaps).
+- `os.rs`: `OsMemory::map` / `map_aligned` / `discard` and `Mapping` (mmap ownership; `Drop` munmaps).
 - `page_map/`: page-indexed lookup from user pointers to `PageOwner` metadata pointers.
-  - `mod.rs`: `PageMap` API (`publish_run`, `publish_extent`/`unpublish_extent`, `get`) — publish takes `&Mapping`; stamps under `L1WriteGuard`; lock-free `get` walks hot `tables` only.
+  - `mod.rs`: `PageMap` API (`publish_run`, `publish_extent`/`unpublish_extent`, `get`) — run publish takes the payload `AddressRange`; extent publish takes `&Mapping`; stamps under `L1WriteGuard`; lock-free `get` walks hot `tables` only.
   - `entry.rs`: `MapEntry` / `AtomicMapEntry` tagged-pointer encoding (`load` / `store`).
   - `page.rs`: page/index arithmetic and per-L1-table range segmentation.
   - `table.rs`: `L1Table` (hot `tables` + cold `writes` + cold `mappings`), `L1WriteGuard`, `L2Table` (exactly `0x8000` page stamps) — install, RAII stamp lock, owner lookup, segment match/write.

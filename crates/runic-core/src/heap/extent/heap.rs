@@ -2,7 +2,7 @@ use core::ptr::{NonNull, write_bytes};
 
 use crate::{
     arena::Arena,
-    config::ExtentConfig,
+    heap::extent::config::ExtentConfig,
     heap::{Extent, HeapError, HeapId},
     layout::LayoutSpec,
     memory::{OsMemory, PageMap},
@@ -177,7 +177,7 @@ mod tests {
     use core::{alloc::Layout, num::NonZeroU32, ptr::write_bytes};
 
     use crate::{
-        config::{ExtentConfig, ExtentPolicy},
+        heap::extent::config::{ExtentConfig, ExtentPolicy},
         heap::{Extent, HeapId, extent::ExtentId},
         layout::LayoutSpec,
         memory::{OsMemory, PageMap, PageOwner},

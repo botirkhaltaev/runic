@@ -146,6 +146,16 @@ impl OsMemory {
         Some(Mapping::new(base, keep))
     }
 
+    /// Drop resident pages in `range` (`MADV_DONTNEED`). Failure is ignored.
+    pub(crate) fn discard(range: AddressRange) {
+        let len = range.len();
+        if len == 0 {
+            return;
+        }
+        // SAFETY: caller keeps the mapping; this only advises the kernel.
+        let _ = unsafe { libc::madvise(range.base().as_ptr().cast(), len, libc::MADV_DONTNEED) };
+    }
+
     pub(crate) fn round_to_page(len: usize) -> Option<usize> {
         if len == 0 {
             return None;
@@ -222,6 +232,29 @@ mod tests {
             mapping.base().as_ptr().add(PAGE_SIZE - 1).write(0xcd);
             assert_eq!(mapping.base().as_ptr().read(), 0xab);
             assert_eq!(mapping.base().as_ptr().add(PAGE_SIZE - 1).read(), 0xcd);
+        }
+    }
+
+    #[test]
+    fn os_memory_discard_dontneed_zeros_anonymous_page() {
+        let mapping = OsMemory::map(PAGE_SIZE).unwrap();
+        unsafe {
+            mapping.base().as_ptr().write(0xab);
+            assert_eq!(mapping.base().as_ptr().read(), 0xab);
+        }
+        OsMemory::discard(mapping.range());
+        unsafe {
+            assert_eq!(mapping.base().as_ptr().read(), 0);
+        }
+    }
+
+    #[test]
+    fn os_memory_discard_empty_range_is_noop() {
+        let mapping = OsMemory::map(PAGE_SIZE).unwrap();
+        OsMemory::discard(AddressRange::new(mapping.base(), 0));
+        unsafe {
+            mapping.base().as_ptr().write(0xcd);
+            assert_eq!(mapping.base().as_ptr().read(), 0xcd);
         }
     }
 }
