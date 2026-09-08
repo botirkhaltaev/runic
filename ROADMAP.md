@@ -30,14 +30,12 @@ idiomatic Rust, with `unsafe` only where ownership/OS boundaries or measured
 hot paths require it. Architecture should stay simple until a new entity owns a
 real lifecycle, invariant, or policy.
 
-The owner-local current run is that entity for the small hit. The leftover vs
-snmalloc / mimalloc on this host is instruction count on that hit (`locate` /
-pop), not a magazine and not RSEQ. A per-CPU hit is a superset of the TLS hit on
-pinned single-thread churn — `#135` Cost 70.1 → 69.3 → 65.3 vs the #129 TLS
-magazine at 43.6 (gate ≤41.4). RSEQ is a footprint / thread-count lever, not a
-hit lever. Do not retry per-CPU on single-thread churn. Owner DF is undefined;
-remote admission stays fail-closed. Out-of-line metadata stays until Where shows
-an in-page run header is a ≥5% lever.
+The owner-local current run is that entity for the small hit. Leftover vs
+snmalloc on this host is remote-free (fan-in / ring) and freelist allocate;
+owner_free and churn already beat last same-host Cost. Do not retry a magazine,
+RSEQ, or a locate-offset dual free. Owner DF is undefined; remote admission
+stays fail-closed. One process-wide payload; TLS identity is free. Out-of-line
+metadata stays until Where shows an in-page run header is a ≥5% lever.
 
 ## Current Status
 
@@ -50,11 +48,10 @@ page-map ownership. Heap lifecycle lives on `Heaps` / `Heap`
 (Heaps indexes each Heap; each `Heap` owns inboxes and `RunHeap`/`ExtentHeap`).
 
 Owner-local hit is a TLS current run per class (pop) plus a one-entry own-heap
-`RunCache` (`base == usize::MAX` empty; probe `ptr - base < RUN_SIZE`).
-`locate` is span + reciprocal divisibility (Lemire; one path, no jump table).
-`Run::allocate` is pop only; `Run::extend` threads one page (min 32) of fresh
-blocks on miss. Owner miss free is `Run::free` without Inner; `push_available`
-only on `was_full`.
+`RunCache`. `locate` is offset from the run base. Run mappings are
+`RUN_SIZE`-aligned. `Run::allocate` is pop only; `extend` on miss. Owner free
+is `Run::free`; `push_available` only on `was_full`. One process-wide payload;
+`Allocator::ctx()` is the handle.
 
 This pass owner-free hit diet vs post-#142 `82dd8b5` (same host, cycles/elem):
 
@@ -70,6 +67,76 @@ This diet owner_free is 11.1 vs snmalloc 11.5. Freelist still 1.08× snmalloc
 (cycles flat; insn 58.7 → 65.3 is IPC, not a target).
 `owner_free/4096` 30.7 cycles/elem; `recycled_churn/64/live:256` 57.2;
 `programs/sh6bench/runic/1` 9488 (no post142 pair).
+
+Small-hit instruction diet vs `7064ab6` same-session (this host, cycles/elem):
+
+```text
+                7064ab6     diet     snmalloc
+owner_free/64      12.5      11.9        11.5
+freelist/64        21.2      20.4        19.0
+churn/64           30.2      29.4        28.0
+```
+
+`class_for` default-align indexes by size (drop `size.max(align)`).
+`Allocator::push_available` hides TLS from the free hit. `locate` uses the run
+base; a locate-offset dual `free` / `free_at` is out of scope.
+Large 64 KiB same-session: 136.7 vs mi 133.3 (Keep).
+
+Hit reshape vs `7064ab6` diet (same host, cycles/elem; this branch):
+
+```text
+                diet    singleton    folds    aligned     snmalloc
+owner_free/64   11.9         11.0    10.4       9.4         11.5
+freelist/64     20.4         20.4    20.0        —          19.0
+churn/64        29.4         28.2    28.0      27.5         28.0
+```
+
+Singleton drops TLS `matches`. Folds: `dealloc` forbids null; `CLASS_FOR_SIZE[0]`
++ raw `LayoutSpec` size; one-branch admission. Aligned runs keep `locate` on the
+run base. `large_churn/65536` 143.4 (Criterion: no change vs prior binary).
+owner_free and churn beat last same-host snmalloc Cost; leftover is freelist.
+
+Available-list leak: `push_available` was not idempotent. A full current run
+pushed twice linked `A.next = A` and dropped the tail, so `acquire` mmapped
+forever (small_biased_random: 957k faults / 1.2 M/s vs snmalloc 363 / 10.1 M/s).
+`RunState.on_available` (after `free`, off the hit) + unbind returning current
+runs. Guard vs `*leakfix-fp*` / prior aligned: owner_free 9.41 (was 9.56),
+churn 27.5 (was 27.7), freelist 21.0 (was 20.0).
+
+Extent default budget 32 slots / 16 MiB → 64 / 64 MiB (exact-length reuse).
+First-fit `want <= have <= 2 * want` regressed sh6bench (32 K/s, 1.2M faults)
+and was not kept.
+
+Tier 2 Cost vs snmalloc after the leak fix (this host, cycles/elem; `profile.sh`
+`cycles:u` plus `page-faults` / bash `time` so kernel time cannot hide):
+
+```text
+phase                         runic      sn      ×sn   faults r/sn     elems/s r/sn    notes
+sh6bench/1                    5776    10066     0.57   303k / 330      409k / 372k     after 64/64 MiB budget
+size_boundary_sweep           47.9     49.1     0.97   —               79.5M / 77.1M   L1d 1.8% vs 6.3%
+small_biased_random            262      372     0.70   1343 / 359      14.4M / 10.1M   was 571 / 1.2M/s
+remote_fan_in/4/live:256      7619     4055     1.88   518 / 382       922k / 778k     noisy; r elems/s higher
+free_ring/4/live:256          2081     1613     1.29   428 / 348       689k / 721k     same shape
+```
+
+`profile.sh` is user-cycles only. Always pair it with `page-faults` + `time`
+sys on mixed/large benches. First-fit extent reuse and lock-free `Heaps::get`
+were measured and not taken.
+
+`CLASS_FOR_SIZE` is not the mixed-size lever: sweep is tied and runic L1 is
+*lower* there. Compact class tables are not the next change.
+
+Alloc hit (`RunicAlloc::alloc` objdump): default-align is `CLASS_FOR_SIZE` +
+TLS current pop + `live++`. No leftover fold. Freelist residual is 21.0 vs 19.0.
+
+Fan-in leaf split (`*where-runic*…fan_in*`, 711k samples): bench 50.9%;
+`free_fail` 16.5% (annotate: second `PageMap::get` — 54% `test` L1, then L2
+load); `free_remote` 16.5% (inlined `claim` `lock bts` 14%, `Heaps::get` /
+`locate` cmps); `Heap::enqueue` 2.2%; `flush` 2.8%; `free_slow` 2.3%.
+Kept `ThreadFreeError::Remote(PageOwner)` (drop the second get): fan-in
+5296 (−4.7%, +30% elems/s) vs ring 2088 (+2.6%). Fan-in is the named path.
+Owner-local guard vs `*aligned*`: churn +0.8%; owner_free +1.9% cycles /
++0.8% insn (`Remote` is not on that hit).
 
 Locate diet vs run-local `75bb578` (same host, cycles/elem):
 
@@ -93,8 +160,8 @@ large 64 KiB    120.9    1276.3     130.8     892.6    Runic best
 
 Locate diet owner_free was 16.9 vs mimalloc 13.6 (~1.24×).
 
-Criterion `compare_explicit` without `-C force-frame-pointers` (512-elem, ns/elem):
-churn 7.46 vs sn 6.64 / mi 7.79; owner_free 4.43 vs sn 3.09 / mi 2.83; freelist 4.22 vs sn 4.02 / mi 4.35.
+Criterion without `-C force-frame-pointers` (512-elem, ns/elem):
+churn 7.98 vs sn 6.66 / mi 8.95; owner_free 3.92 vs sn 3.11 / mi 3.55; freelist 4.49 vs sn 4.48 / mi 5.25.
 Profile Cost gates still include the ~3-instruction frame-pointer tax C allocators do not pay.
 
 #129 closeout was 1.6× / 4.6× / 2.7× on those 64-byte phases. #126/#128 skipped.
@@ -137,7 +204,7 @@ pointer freelist + extend on runs (owner DF undefined)
 private run claim-bitmap for remote admission (issued + try_set; no per-block Free byte)
 run/extent Inbox coalesced by owner (Treiber stack of runs/extents, not per-block nodes)
 configurable extent mapping retention and reuse
-runs retained for the heap lifetime (no empty-run OS release in v0.5)
+runs retained for the heap lifetime (no empty-run OS release)
 run block-boundary checks
 extent exact-pointer checks
 basic realloc
@@ -163,6 +230,8 @@ Next:
 
 ```text
 Do not retry #126 / #128 / #135 (per-CPU on single-thread churn) / O(1) TLS steal
+/ locate-offset dual free / TLS extent cache / first-fit extent reuse
+/ lock-free Heaps::get
 ```
 
 ## Core Invariants
@@ -189,8 +258,8 @@ Use this architecture first:
 ```text
 GlobalAlloc
   -> RunicAlloc
-      -> Allocator
-          -> AllocatorInner { refs, pages: PageMap, heaps: Heaps }
+      -> Allocator          // const handle; ctx() borrows Process
+          -> Process { pages: PageMap, heaps: Heaps }  // mmap; not returned
               -> Heaps { RwLock<Arena<Heap>>, free list, config }
                   -> ThreadHeap
               -> Heap { HeapState, Inbox, id, RunHeap, ExtentHeap }
@@ -207,21 +276,21 @@ GlobalAlloc
 only. Draining exclusivity is `Mutex<HeapInner>` via `Heaps::{enqueue,free,flush,reclaim}`
 (not the arena lock across flush).
 Shared `&Heap` is atomics-only; Active body mutation is `ThreadHeap` + `try_inner`;
-reclaim is `Heap::reclaim` through `HeapsCtx`.
-Same-thread small-run hits use TLS-owned heap metadata with no locks or atomics.
-`PageMap` stays outside heaps arena locks so dealloc lookup is not heaps-locked.
+reclaim is `Heap::reclaim` through `Heaps`. `Allocator::ctx()` is the only
+handle into the process payload. Same-thread small-run hits use TLS-owned heap
+metadata with no locks or atomics. `PageMap` stays outside heaps arena locks so
+dealloc lookup is not heaps-locked.
 
 ## Entity Responsibilities
 
 ```text
 RunicAlloc     owns the Rust GlobalAlloc boundary.
 Allocator      owns the core public allocator API, abort, and cold unbound routing.
-AllocatorInner owns the refcounted mmap instance: PageMap, Heaps, and self-hosting Mapping.
+AllocatorCtx   borrows PageMap + Heaps for miss / bind / unbind / body / Draining.
+Process        owns the process-wide mmap payload (PageMap + Heaps); not returned.
 Heaps           owns `RwLock<Arena<Heap>>`, Free-heap freelist, and Draining `enqueue` / `free` / `flush` / `reclaim`.
 Heap           owns HeapState, Inbox, and `Mutex<HeapInner>`; shared surface is atomics only (`enqueue` / mode).
 HeapInner      owns RunHeap / ExtentHeap (exclusive metadata).
-HeapCtx        borrows PageMap for Active body ops.
-HeapsCtx       borrows Heaps + PageMap for Draining reclaim.
 Arena          owns grow-on-demand mmap slab storage (`vacant` / `insert` / `remove`; slots never move).
 LayoutSpec     owns normalized layout semantics.
 SizeClasses    owns size-class selection.
@@ -261,7 +330,7 @@ Default tests should cover:
 ```text
 layout normalization and overflow checks
 size-class alignment invariants
-per-block AtomicU8 block-state behavior
+run freelist / claim-bitmap / locate behavior
 mmap mapping and writability
 run block uniqueness and boundary checks
 run arena reservation, insertion, mutation, removal
@@ -315,9 +384,8 @@ Runic wins on extent retention (Keep).
 threaded/4: local 46.3 vs snmalloc 29.2 (1.6×). fan-in 392 vs 349 (1.1×).
 ring 674 vs 576 (1.2×). Cross-allocator ratios are this-host Cost, not library drift.
 
-Owner-local hit is current-run pop / run-cache `Run::free` (`locate` + push).
-Leftover small-churn cost is that hit's instruction count (`locate` / pop).
-Isolated owner_free / freelist are the same path (no take). `#135` RSEQ is not
+Owner-local hit is current-run pop / run-cache `Run::free` (locate + push).
+Leftover vs snmalloc is remote-free and freelist allocate. `#135` RSEQ is not
 the lever — see thesis.
 
 Remote fan-in is close (run-coalesced Inbox). Use paired Runic cycles/op for
@@ -326,8 +394,8 @@ self-gates; use this table as the competitor baseline.
 Dedicated extent churn is primarily controlled by mapping retention policy.
 Keep extent retention deterministic, bounded, and allocation-free.
 
-Empty-run OS release is not implemented in v0.5: runs stay published and arena-
-resident for the heap lifetime. Extent retention policies are extent-only.
+Empty-run OS release is not implemented: runs stay published and arena-resident
+for the heap lifetime. Extent retention policies are extent-only.
 ```
 
 ## Milestones
@@ -473,7 +541,6 @@ Out:
 ```text
 retry #126 / #128 / RSEQ / O(1) TLS steal
 multi-entry page cache
-Allocator singleton
 in-page Run header without Where
 hardening / hugepages (later)
 ```

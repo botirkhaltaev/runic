@@ -145,7 +145,7 @@ impl SizeClasses {
     const ALIGNED_CLASS_BY_START: [[usize; Self::COUNT]; Self::ALIGN_POWER_COUNT] =
         Self::build_aligned_class_map();
     /// `CLASS_FOR_SIZE[n]` is the smallest class index with `SIZES[i] >= n`
-    /// for `n` in `1..=SMALL_MAX`. Index `0` is unused.
+    /// for `n` in `0..=SMALL_MAX`. Index `0` is class 0.
     const CLASS_FOR_SIZE: [u8; Self::SMALL_MAX + 1] = Self::build_class_for_size();
 
     const fn align_power_count() -> usize {
@@ -203,6 +203,7 @@ impl SizeClasses {
         const { assert!(SizeClasses::COUNT <= 255) };
 
         let mut table = [0u8; Self::SMALL_MAX + 1];
+        table[0] = 0;
         let mut class = 0;
         let mut prev = 0usize;
 
@@ -220,41 +221,46 @@ impl SizeClasses {
         table
     }
 
-    /// Map a normalized layout to a small size class, or `None` for large/over-aligned.
+    /// Map a layout to a small size class, or `None` for large/over-aligned.
     ///
-    /// Default-align (`align <= 8`) is the hot path: size bound + `CLASS_FOR_SIZE`
-    /// only — no `PAGE_SIZE` check (align 8 is always ≤ page). Higher alignments
-    /// take the align-remap table. Zero-size is already normalized by `LayoutSpec`.
+    /// Default-align (`align < 16`) and `size < SMALL_MAX` is one unsigned
+    /// test: `(size >> 15) | (align >> 4) == 0`. Indexes `CLASS_FOR_SIZE` by
+    /// raw size (`0` is class 0). `size == SMALL_MAX` takes the remap path
+    /// and still hits the last class. Higher alignments keep `size.max(align)`
+    /// and the align-remap table.
     #[inline]
     pub(crate) fn class_for(spec: LayoutSpec) -> Option<SizeClass> {
         let size = spec.size();
         let align = spec.align().get();
-        let required = size.max(align);
 
-        if required > Self::SMALL_MAX {
-            return None;
-        }
-
-        if align <= Self::MIN_ALIGNMENT {
-            // SAFETY: `required` is in `1..=SMALL_MAX`, so the table slot is
-            // initialized; every stored class index is `< COUNT`.
-            let index = usize::from(unsafe { *Self::CLASS_FOR_SIZE.get_unchecked(required) });
+        if (size >> Self::SMALL_MAX.trailing_zeros())
+            | (align >> (Self::MIN_ALIGNMENT.trailing_zeros() + 1))
+            == 0
+        {
+            // SAFETY: the test is `size < SMALL_MAX` and `align < 2 * MIN_ALIGNMENT`;
+            // table[0] is class 0; every stored class index is `< COUNT`.
+            let index = usize::from(unsafe { *Self::CLASS_FOR_SIZE.get_unchecked(size) });
             // SAFETY: `index` came from `CLASS_FOR_SIZE` and is `< COUNT`.
             return Some(unsafe { SizeClass::new_unchecked(index) });
+        }
+
+        let required = size.max(align);
+        if required > Self::SMALL_MAX {
+            return None;
         }
 
         if align > PAGE_SIZE {
             return None;
         }
 
-        // SAFETY: `required` is in `1..=SMALL_MAX`, so the table slot is initialized.
+        // SAFETY: `required` is in `0..=SMALL_MAX`, so the table slot is initialized.
         let lower_bound = usize::from(unsafe { *Self::CLASS_FOR_SIZE.get_unchecked(required) });
         Self::aligned_class_from(lower_bound, align)
     }
 
     #[cfg(test)]
     fn lower_bound_index(required: usize) -> Option<usize> {
-        if required == 0 || required > Self::SMALL_MAX {
+        if required > Self::SMALL_MAX {
             return None;
         }
 
@@ -326,7 +332,7 @@ mod tests {
 
     #[test]
     fn size_classes_match_linear_reference() {
-        for size in 1..=SizeClasses::SMALL_MAX {
+        for size in 0..=SizeClasses::SMALL_MAX {
             for align in [
                 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
             ] {
@@ -375,7 +381,7 @@ mod tests {
 
     #[test]
     fn size_class_lower_bounds_match_declared_sizes() {
-        for size in 1..=SizeClasses::SMALL_MAX {
+        for size in 0..=SizeClasses::SMALL_MAX {
             let index = SizeClasses::lower_bound_index(size).unwrap();
             let block_size = SizeClasses::SIZES.get(index).copied();
             let reference = SizeClasses::SIZES

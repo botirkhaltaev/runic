@@ -8,9 +8,9 @@ Extent metadata owns dedicated large allocations.
 - `cache.rs`: intrusive `head` list of published Free extents (`ExtentPolicy::{Drop, Keep}`, exact-length reuse only).
 - `heap.rs`: dedicated allocation via `ExtentInit`, `Arena<Extent>`, page-map publication, and `cache_or_unmap` / `unmap`.
 
-## Same-thread fast path
+## Same-thread path
 
-`ThreadHeap::alloc_extent` / `ThreadHeap::free_extent` call `Heap` on the bound heap without taking the heaps arena mutex. TLS `RunCache` is a free-path PageMap skip for small runs; large reuse is `ExtentCache` on `ExtentHeap` (exact mapping length). `Allocator::alloc` / `alloc_zeroed` try the TLS path first and fall back to `bind_alloc` when unbound; `dealloc` uses `free_remote` for cross-heap pointers.
+`ThreadHeap::alloc_extent` / `free_extent` call `Heap` on the bound heap. Large reuse is `ExtentCache` (exact mapping length). Unbound cold path is `Allocator::bind_alloc`.
 
 ## Invariants
 
@@ -20,4 +20,4 @@ Extent metadata owns dedicated large allocations.
 - **Published-while-cached:** Keep retention leaves the arena entry and page-map stamp in place; the cache is an intrusive `head` list of `NonNull<Extent>`. Cache-hit allocate calls `Extent::reuse` and does not re-publish the mapping. True release (Drop policy / over budget) calls `unmap`, which unpublishes before removing metadata.
 - Live large ownership for reclaim is `Extent::is_live` (Allocated/Claimed), aggregated by `ExtentHeap::has_live`; cached Free extents do not block reclaim.
 - `ExtentInit::Zeroed` memsets only on cache hits (size from `LayoutSpec`); fresh anonymous mappings skip that memset.
-- `ExtentCache` retention must stay within configured slot and byte budgets; `Keep` never evicts an already-retained extent to admit a new one, and reuse is always exact mapping length.
+- `ExtentCache` retention must stay within configured slot and byte budgets; `Keep` never evicts an already-retained extent to admit a new one, and reuse is always exact mapping length. Default budget is 64 slots / 64 MiB.

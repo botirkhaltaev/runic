@@ -6,8 +6,9 @@ pub(crate) const PAGE_SIZE: usize = 4096;
 
 /// Sole owner of one live anonymous mmap region.
 ///
-/// Constructed only by [`OsMemory::map`]. `Drop` munmaps the region. Length is
-/// always nonzero and a multiple of [`PAGE_SIZE`]; base is always page-aligned.
+/// Constructed only by [`OsMemory::map`] / [`OsMemory::map_aligned`]. `Drop`
+/// munmaps the region. Length is always nonzero and a multiple of
+/// [`PAGE_SIZE`]; base is always page-aligned.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Mapping {
     base: NonNull<u8>,
@@ -16,7 +17,8 @@ pub(crate) struct Mapping {
 
 impl Mapping {
     /// Private: every `Mapping` must describe a live mmap region owned uniquely
-    /// by that `Mapping`, so construction is confined to `OsMemory::map`.
+    /// by that `Mapping`, so construction is confined to `OsMemory::map` /
+    /// `map_aligned`.
     fn new(base: NonNull<u8>, len: NonZeroUsize) -> Self {
         debug_assert!(base.as_ptr().addr().is_multiple_of(PAGE_SIZE));
         debug_assert!(len.get().is_multiple_of(PAGE_SIZE));
@@ -80,6 +82,70 @@ impl OsMemory {
         NonNull::new(ptr.cast::<u8>()).map(|base| Mapping::new(base, rounded_len))
     }
 
+    /// Anonymous mmap whose base is aligned to `align` (power of two, ≥ page).
+    ///
+    /// Over-maps by `align`, then trims the head and tail so the kept region is
+    /// `len` (page-rounded) bytes at an aligned address. Extents stay on [`map`].
+    pub(crate) fn map_aligned(len: usize, align: usize) -> Option<Mapping> {
+        if len == 0 || align < PAGE_SIZE || !align.is_power_of_two() {
+            return None;
+        }
+
+        let keep = Self::round_to_page(len)?;
+        let keep = NonZeroUsize::new(keep)?;
+        let total = keep.get().checked_add(align)?;
+        // SAFETY: anonymous private mapping, page-rounded over-map length.
+        let ptr = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                total,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return None;
+        }
+
+        let raw = ptr.addr();
+        let aligned = (raw + align - 1) & !(align - 1);
+        let head = aligned - raw;
+        let Some(kept_end) = head.checked_add(keep.get()) else {
+            // SAFETY: this thread uniquely owns the failed over-map.
+            unsafe { libc::munmap(ptr, total) };
+            return None;
+        };
+        let Some(tail) = total.checked_sub(kept_end) else {
+            // SAFETY: this thread uniquely owns the failed over-map.
+            unsafe { libc::munmap(ptr, total) };
+            return None;
+        };
+        let Some(base) = NonNull::new(ptr.cast::<u8>().wrapping_byte_add(head)) else {
+            // SAFETY: this thread uniquely owns the failed over-map.
+            unsafe { libc::munmap(ptr, total) };
+            return None;
+        };
+        if !base.as_ptr().addr().is_multiple_of(align) {
+            // SAFETY: this thread uniquely owns the failed over-map.
+            unsafe { libc::munmap(ptr, total) };
+            return None;
+        }
+
+        // SAFETY: `head`/`tail` are in-range prefixes/suffixes of this mmap.
+        unsafe {
+            if head > 0 {
+                libc::munmap(ptr, head);
+            }
+            if tail > 0 {
+                libc::munmap(base.as_ptr().add(keep.get()).cast(), tail);
+            }
+        }
+
+        Some(Mapping::new(base, keep))
+    }
+
     pub(crate) fn round_to_page(len: usize) -> Option<usize> {
         if len == 0 {
             return None;
@@ -125,6 +191,24 @@ mod tests {
 
         assert_eq!(mapping.base().as_ptr() as usize % PAGE_SIZE, 0);
         assert_eq!(mapping.len().get(), PAGE_SIZE);
+
+        drop(mapping);
+    }
+
+    #[test]
+    fn os_memory_map_aligned_rejects_zero_and_small_align() {
+        assert!(OsMemory::map_aligned(0, PAGE_SIZE).is_none());
+        assert!(OsMemory::map_aligned(PAGE_SIZE, PAGE_SIZE / 2).is_none());
+        assert!(OsMemory::map_aligned(PAGE_SIZE, PAGE_SIZE + 1).is_none());
+    }
+
+    #[test]
+    fn os_memory_map_aligned_returns_aligned_mapping() {
+        let align = 64 * 1024;
+        let mapping = OsMemory::map_aligned(align + PAGE_SIZE, align).unwrap();
+
+        assert_eq!(mapping.base().as_ptr() as usize % align, 0);
+        assert_eq!(mapping.len().get(), align + PAGE_SIZE);
 
         drop(mapping);
     }

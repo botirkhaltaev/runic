@@ -54,15 +54,11 @@ pub(super) struct HeapInner {
     extents: ExtentHeap,
 }
 
-/// Parent bits Active body ops need from outside [`Heap`] (`PageMap`).
-pub(super) struct HeapCtx<'a> {
+/// Parent bag passed into heap children (`PageMap` + `Heaps`).
+#[derive(Clone, Copy)]
+pub(crate) struct AllocatorCtx<'a> {
     pub pages: &'a PageMap,
-}
-
-/// Parent bits Draining reclaim needs from the table (`Heaps` + `PageMap`).
-pub(super) struct HeapsCtx<'a> {
     pub heaps: &'a Heaps,
-    pub pages: &'a PageMap,
 }
 
 impl HeapInner {
@@ -185,7 +181,7 @@ impl Heap {
     }
 
     /// Mark Free and bump generation when Draining, empty, and leases == 0.
-    pub(super) fn reclaim(&self, inner: &HeapInner, ctx: &HeapsCtx<'_>, index: u32) -> bool {
+    pub(super) fn reclaim(&self, inner: &HeapInner, heaps: &Heaps, index: u32) -> bool {
         let snap = self.state.load();
         if snap.retired || snap.mode != HeapMode::Draining || snap.leases != 0 {
             return false;
@@ -202,13 +198,17 @@ impl Heap {
         }
         self.state.bump_or_retire();
         if !self.state.is_retired() {
-            ctx.heaps.push_free(self, index);
+            heaps.push_free(self, index);
         }
         true
     }
 
     /// Drain both inboxes into run/extent metadata (accept).
-    pub(super) fn flush(&self, inner: &mut HeapInner, ctx: &HeapCtx<'_>) -> Result<(), HeapError> {
+    pub(super) fn flush(
+        &self,
+        inner: &mut HeapInner,
+        ctx: &AllocatorCtx<'_>,
+    ) -> Result<(), HeapError> {
         while let Some(chain) = self.run_inbox.drain() {
             for run in chain {
                 // SAFETY: dequeued from this heap's run inbox; live arena run.
@@ -234,7 +234,7 @@ impl Heap {
         inner: &mut HeapInner,
         owner: PageOwner,
         ptr: NonNull<u8>,
-        ctx: &HeapCtx<'_>,
+        ctx: &AllocatorCtx<'_>,
     ) -> Result<(), HeapError> {
         match owner {
             PageOwner::Run(run) => {
@@ -265,7 +265,7 @@ impl Heap {
         inner: &mut HeapInner,
         spec: LayoutSpec,
         init: ExtentInit,
-        ctx: &HeapCtx<'_>,
+        ctx: &AllocatorCtx<'_>,
     ) -> Option<NonNull<u8>> {
         if !self.inboxes_empty() {
             self.flush(inner, ctx).ok()?;
@@ -279,7 +279,7 @@ impl Heap {
         &self,
         inner: &mut HeapInner,
         class: SizeClass,
-        ctx: &HeapCtx<'_>,
+        ctx: &AllocatorCtx<'_>,
     ) -> Option<NonNull<Run>> {
         inner.runs.acquire(class, inner.id, ctx.pages)
     }

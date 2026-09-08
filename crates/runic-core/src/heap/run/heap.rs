@@ -43,7 +43,7 @@ impl RunHeap {
         heap_id: HeapId,
         pages: &PageMap,
     ) -> Option<NonNull<Run>> {
-        let mapping = OsMemory::map(Run::mapping_len(class)?)?;
+        let mapping = OsMemory::map_aligned(Run::mapping_len(class)?, super::RUN_SIZE)?;
         let index = self.runs.vacant()?;
         let id = RunId::from_index(index)?;
         let run = Run::new(id, heap_id, mapping, class)?;
@@ -81,13 +81,16 @@ impl RunHeap {
     pub(crate) fn push_available(&mut self, mut run_ptr: NonNull<Run>) -> Result<(), HeapError> {
         // SAFETY: caller supplies a pointer derived from this allocator's live arena.
         let run = unsafe { run_ptr.as_mut() };
+        if run.is_available() {
+            return Ok(());
+        }
         if run.is_full() {
             return Err(HeapError::InvalidMetadata);
         }
         let Some(available) = self.available.get_mut(run.class().index()) else {
             return Err(HeapError::InvalidMetadata);
         };
-        run.set_available_next(*available);
+        run.link_available(*available);
         *available = Some(run_ptr);
         Ok(())
     }
@@ -99,7 +102,7 @@ impl RunHeap {
             let next = {
                 // SAFETY: available-list pointers are created only from live arena entries.
                 let run = unsafe { run_ptr.as_mut() };
-                run.take_available_next()
+                run.unlink_available()
             };
 
             let available = self.available.get_mut(class_index)?;
@@ -156,7 +159,7 @@ mod tests {
 
     fn reusable_run(id: RunId) -> Run {
         let class = class_id(64, 8);
-        let mapping = OsMemory::map(Run::mapping_len(class).unwrap()).unwrap();
+        let mapping = OsMemory::map_aligned(Run::mapping_len(class).unwrap(), RUN_SIZE).unwrap();
         let heap = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
 
         Run::new(id, heap, mapping, class).expect("reusable test run")
@@ -254,5 +257,61 @@ mod tests {
 
         // SAFETY: run remains a live arena entry after rebind.
         assert_eq!(unsafe { run.as_ref() }.heap_id(), new);
+    }
+
+    #[test]
+    fn push_available_is_idempotent_and_keeps_tail() {
+        let mut heap = RunHeap::new();
+        let pages = PageMap::new();
+        let class = class_id(64, 8);
+        let class_index = class.index();
+        let heap_id = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
+
+        let run_a = heap.acquire(class, heap_id, &pages).unwrap();
+        let run_b = heap.acquire(class, heap_id, &pages).unwrap();
+        // SAFETY: both from this heap's live arena.
+        let id_a = unsafe { run_a.as_ref().id() };
+        let id_b = unsafe { run_b.as_ref().id() };
+        assert_ne!(id_a, id_b);
+
+        assert_eq!(heap.push_available(run_a), Ok(()));
+        assert_eq!(heap.push_available(run_b), Ok(()));
+        assert_eq!(heap.push_available(run_a), Ok(()));
+
+        let first = heap.acquire(class, heap_id, &pages).unwrap();
+        let second = heap.acquire(class, heap_id, &pages).unwrap();
+        // SAFETY: just acquired from this heap.
+        assert_eq!(unsafe { first.as_ref().id() }, id_b);
+        assert_eq!(unsafe { second.as_ref().id() }, id_a);
+        assert_eq!(available_run_id(&heap, class_index), None);
+    }
+
+    #[test]
+    fn push_available_returns_stranded_current() {
+        let mut heap = RunHeap::new();
+        let pages = PageMap::new();
+        let class = class_id(64, 8);
+        let class_index = class.index();
+        let heap_id = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
+
+        let mut run = heap.acquire(class, heap_id, &pages).unwrap();
+        // SAFETY: live arena run, exclusive to this test.
+        let run_ref = unsafe { run.as_mut() };
+        let ptr = run_ref
+            .allocate()
+            .or_else(|| {
+                run_ref.extend();
+                run_ref.allocate()
+            })
+            .unwrap();
+        let id = run_ref.id();
+        assert_eq!(run_ref.free(ptr), Ok(false));
+        assert_eq!(available_run_id(&heap, class_index), None);
+
+        assert_eq!(heap.push_available(run), Ok(()));
+        assert_eq!(available_run_id(&heap, class_index), Some(id));
+
+        let (_run, reused) = alloc_block(&mut heap, class, &pages).unwrap();
+        assert_eq!(reused, ptr);
     }
 }

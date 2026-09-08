@@ -6,6 +6,17 @@ use crate::{config::AllocatorConfig, memory::PageMap};
 
 use state::MAX_LEASES;
 
+fn retire(heaps: &Heaps, id: HeapId) -> Result<(), HeapError> {
+    let pages = PageMap::new();
+    heaps.retire(
+        id,
+        &AllocatorCtx {
+            pages: &pages,
+            heaps,
+        },
+    )
+}
+
 #[test]
 fn lease_rejected_after_close() {
     let heaps = Heaps::new(AllocatorConfig::new());
@@ -13,7 +24,7 @@ fn lease_rejected_after_close() {
     let heap = heaps.get(id).unwrap();
     assert_eq!(heap.state.close(id), Ok(()));
     assert!(heap.state.acquire_lease(id).is_err());
-    assert_eq!(heaps.retire(id, &PageMap::new()), Ok(()));
+    assert_eq!(retire(&heaps, id), Ok(()));
 }
 
 #[test]
@@ -30,7 +41,7 @@ fn lease_count_overflow_fails_closed() {
     ));
     heap.state
         .store(id.generation(), HeapMode::Active, false, 0);
-    assert_eq!(heaps.retire(id, &PageMap::new()), Ok(()));
+    assert_eq!(retire(&heaps, id), Ok(()));
 }
 
 #[test]

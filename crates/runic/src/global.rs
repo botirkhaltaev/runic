@@ -12,6 +12,7 @@ impl RunicAlloc {
         Self::with_config(AllocatorConfig::new())
     }
 
+    /// First `init` in the process wins; later configs are ignored.
     #[must_use]
     pub const fn with_config(config: AllocatorConfig) -> Self {
         Self {

@@ -48,7 +48,7 @@ impl ExtentConfig {
     pub const fn new() -> Self {
         Self {
             policy: ExtentPolicy::Keep,
-            budget: Budget::new(32, 16 * 1024 * 1024),
+            budget: Budget::new(64, 64 * 1024 * 1024),
         }
     }
 

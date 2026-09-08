@@ -1,7 +1,8 @@
 use core::alloc::Layout;
 use core::num::NonZeroUsize;
 
-/// A normalized, non-zero-size view of a `Layout`.
+/// A view of a `Layout`. Size may be zero; [`Self::mapping_len`] uses
+/// `size.max(1)`.
 ///
 /// `align` is stored as `NonZeroUsize` so that alignment arithmetic below
 /// never has to defend against a zero alignment; `Layout` already guarantees
@@ -14,7 +15,7 @@ pub(crate) struct LayoutSpec {
 
 impl LayoutSpec {
     pub(crate) const fn from_layout(layout: Layout) -> Self {
-        let size = if layout.size() == 0 { 1 } else { layout.size() };
+        let size = layout.size();
         // SAFETY: `Layout::align()` is always a nonzero power of two.
         let align = unsafe { NonZeroUsize::new_unchecked(layout.align()) };
 
@@ -48,7 +49,7 @@ impl LayoutSpec {
     /// aligned address), so the mapping needs `size + align - 1` bytes before
     /// rounding up to `page_size`.
     pub(crate) fn mapping_len(self, page_size: usize) -> Option<usize> {
-        let size_with_align_headroom = self.size.checked_add(self.align.get() - 1)?;
+        let size_with_align_headroom = self.size.max(1).checked_add(self.align.get() - 1)?;
         let mask = page_size.checked_sub(1)?;
         size_with_align_headroom
             .checked_add(mask)
@@ -67,11 +68,12 @@ mod tests {
     }
 
     #[test]
-    fn layout_spec_normalizes_zero_size_to_one() {
+    fn layout_spec_preserves_zero_size() {
         let layout = Layout::from_size_align(0, 8).unwrap();
         let spec = LayoutSpec::from_layout(layout);
 
-        assert_eq!(spec.size(), 1);
+        assert_eq!(spec.size(), 0);
+        assert_eq!(spec.mapping_len(4096), Some(4096));
     }
 
     #[test]
