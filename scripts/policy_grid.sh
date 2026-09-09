@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Policy hillclimb: N repeats of metrics, median + spread, train/hold-out gates.
+# minflt vs snmalloc is skipped when the snmalloc median is 0 (no signal).
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -153,7 +154,8 @@ for a in candidates:
             continue
         if t["rss"] > 1.10 * s["rss"] + 1:
             guard_fail.append(f"{w} rss {t['rss']:.0f}/{s['rss']:.0f}")
-        if t["minflt"] > 1.10 * s["minflt"] + 1:
+        # snmalloc minflt is often 0 — no signal, not a universal veto.
+        if s["minflt"] > 0 and t["minflt"] > 1.10 * s["minflt"] + 1:
             guard_fail.append(f"{w} minflt {t['minflt']:.0f}/{s['minflt']:.0f}")
         r = ratio(t["elapsed"], i["elapsed"])
         if w in train:

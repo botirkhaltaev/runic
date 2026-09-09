@@ -117,15 +117,6 @@ impl HeapInner {
     ) -> Option<NonNull<Run>> {
         self.runs.acquire(class, self.id, pages)
     }
-
-    fn allocate_extent(
-        &mut self,
-        spec: LayoutSpec,
-        init: ExtentInit,
-        pages: &PageMap,
-    ) -> Option<NonNull<u8>> {
-        self.extents.allocate(spec, self.id, pages, init)
-    }
 }
 
 impl Heap {
@@ -285,7 +276,7 @@ impl Heap {
         if !self.inboxes_empty() {
             self.flush(inner, ctx).ok()?;
         }
-        inner.allocate_extent(spec, init, ctx.pages)
+        inner.extents.allocate(spec, inner.id, ctx.pages, init)
     }
 }
 

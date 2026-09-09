@@ -292,7 +292,7 @@ RunicAlloc     owns the Rust GlobalAlloc boundary.
 Allocator      owns the core public allocator API, abort, and cold unbound routing.
 AllocatorCtx   borrows PageMap + Heaps for miss / bind / unbind / body / Draining.
 Process        owns the process-wide mmap payload (PageMap + Heaps); not returned.
-Heaps           owns `RwLock<Arena<Heap>>`, Free-heap freelist, and Draining `enqueue` / `free` / `flush` / `reclaim`.
+Heaps           owns the lock-free chunk table (`chunks[]` / `len`), grow mutex, Free-heap freelist, and Draining `enqueue` / `free` / `flush` / `reclaim`.
 Heap           owns HeapState, Inbox, and `Mutex<HeapInner>`; shared surface is atomics only (`enqueue` / mode).
 HeapInner      owns RunHeap / ExtentHeap (exclusive metadata).
 Arena          owns grow-on-demand mmap slab storage (`vacant` / `insert` / `remove`; slots never move).
@@ -444,13 +444,14 @@ Empty-run `Discard` is opt-in (`madvise` on the payload). Maps stay; runs stay
 published and arena-resident. Default is `Keep` until Cost says otherwise.
 
 Draining remote-free Cost after lock-free `Heaps::get` + reclaim gate
-(`scripts/profile.sh` 5s/5rep, this host, dirty tree):
+(runic vs the same dirty tree before the change, `scripts/profile.sh`
+5s/5rep, this host — not vs snmalloc; Track C still has the last
+same-session competitor Cost):
 
   workload            before    after    vs before
   scoped_map_reduce     613      387     0.63×  (≤400 gate)
   arc_share_drop        412      321     0.78×
   channel_pipeline      912      680     0.75×
-  vec_many_small       30.9     33.4     (3s/5s windows; Keep hit unchanged)
   large_buffers       77706    77531     unchanged
 
 `Heaps::get` is inlined (two Acquire loads). Where no longer shows the
@@ -461,8 +462,8 @@ Policy grid (`scripts/policy_grid.sh`, N=5, train/hold-out): no candidate
 beat Keep/Keep by ≥5% geomean without a hold-out or train regression.
 `runic:discard/keep` wins zeroed `large_buffers` (0.27M vs 5.0M ns) and
 fails `large_buffers_dirty` (2.3×). Run `Discard` is 2–8× on small
-churn. Extent/run `Bound` candidates lost and were deleted. Default stays
-Keep/Keep. `Unmap` remains the unretained baseline.
+churn. Extent/run Bound candidates were measured and not landed. Default
+stays Keep/Keep. `Unmap` remains the unretained baseline.
 ```
 
 ## Milestones

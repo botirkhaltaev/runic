@@ -32,7 +32,7 @@ Owner-local heap frontend: runs for small size classes, extents for dedicated la
 - Inbox is a Treiber stack of run/extent nodes. `drain` is a single-pass walk.
 - Draining reclaim observes live ownership via `RunHeap` ∨ `ExtentHeap` (`has_live`). In-flight claim bits keep the heap live. `Heap::reclaim` returns a Free heap to the table freelist.
 - Never-bound freers enqueue each successful claim in `Allocator::free_remote`. Bound producers coalesce by run/extent. `ThreadFreeError::Remote` carries the `PageOwner` `free_slow` already looked up.
-- Owner free: `Run::free` (lock-free); `push_available` only on `was_full` (idempotent). `unbind` returns non-full current runs. Draining late free uses `Heap::free`. Domain ops are `free` / `claim` / `accept`. Failures after claim abort.
+- Owner free: `Run::free` (lock-free); `push_available` only on `was_full` (idempotent). `unbind` returns non-full current runs. Draining late free uses `HeapInner::free` via `Heaps::free`. Domain ops are `free` / `claim` / `accept`. Failures after claim abort.
 - Current-run empty: `extend`; accept inbox if nonempty; then local/OS `acquire_run`. Unbound: `bind` then `flush` then alloc. Hit: current pop / `Run::free`. Inbox `flush` is remote `accept`. `lookup` is miss / realloc.
 - `HeapState` packs generation, mode (`Free` / `Active` / `Draining`), retired, and in-flight lease count for Active enqueue admits. Inbox depth stays live via claim bits / `has_live`.
 - `Heaps` is an append-only chunk table. `get` is two Acquire loads (`len`, chunk pointer) then `state.matches`. `grow` mutex covers mapping ownership and bump insert only. Free heaps sit on an intrusive index freelist. Fail only when the OS will not map more, or the chunk table is full.
