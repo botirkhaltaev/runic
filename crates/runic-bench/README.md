@@ -29,6 +29,6 @@ cargo run -p runic-bench --release --bin metrics -- --syscalls --cases http_buff
 
 Each allocator/case pair runs in a fresh subprocess so `VmHWM` is per case. Columns: peak RSS, plateau RSS after free, VMA count, minor faults, optional `mmap`/`madvise` syscall counts.
 
-Runic configs: `--targets runic:extent_unmap,runic:extent_tight,runic:run_discard,runic:extent_discard`.
+Runic configs: `--targets runic:keep/keep,runic:discard/keep,runic:keep/discard,runic:discard/discard,runic:unmap/keep,runic:keep/keep:tight`.
 
 See `src/README.md` and `benches/README.md`.

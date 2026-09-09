@@ -1,60 +1,102 @@
 use core::{
     hint,
+    mem::size_of,
     num::NonZeroU32,
-    ptr::NonNull,
-    sync::atomic::{AtomicU32, Ordering},
+    ptr::{self, NonNull},
+    sync::atomic::{AtomicPtr, AtomicU32, Ordering},
 };
 
-use spin::RwLock;
+use spin::Mutex;
 
-use crate::{arena::Arena, config::AllocatorConfig, heap::HeapError, memory::PageOwner};
+use crate::{
+    config::AllocatorConfig,
+    heap::HeapError,
+    memory::{Mapping, OsMemory, PAGE_SIZE, PageOwner},
+};
 
 use super::state::HeapMode;
 use super::{AllocatorCtx, Heap, HeapId, HeapInner};
 
 const FREE_END: u32 = u32::MAX;
+const CHUNK_BYTES: usize = 256 * 1024;
+const MAX_CHUNKS: usize = 256;
 
-/// Indexes heaps. `RwLock` covers claim/reuse only — never flush/accept.
+/// Writer-owned chunk mappings and bump. Readers never touch this.
+struct Chunks {
+    mappings: [Option<Mapping>; MAX_CHUNKS],
+    bump: u32,
+}
+
+/// Indexes heaps. Reader atomics (`chunks`, `len`) are lock-free; `grow` serializes insert.
 pub(crate) struct Heaps {
-    arena: RwLock<Arena<Heap>>,
+    chunks: [AtomicPtr<Heap>; MAX_CHUNKS],
+    /// One past the highest initialized index.
+    len: AtomicU32,
     /// Intrusive Free-heap stack (`Heap::free_next`). Pushed from [`Heap::reclaim`].
     free_head: AtomicU32,
     config: AllocatorConfig,
+    grow: Mutex<Chunks>,
 }
 
-// SAFETY: `RwLock` serializes arena directory access; occupied slots never move; config is immutable.
+// SAFETY: reader atomics publish immovable Heap slots; grow mutex serializes mapping
+// ownership; config is immutable; free_head is atomic. Slots never move or unmap
+// for the Heaps lifetime.
 unsafe impl Send for Heaps {}
-// SAFETY: same as Send — `get` copies `&Heap` out of a read guard (immovable slots).
+// SAFETY: same as Send — `get` returns `&Heap` from a published slot.
 unsafe impl Sync for Heaps {}
 
 impl Heaps {
     pub(crate) fn new(config: AllocatorConfig) -> Self {
         Self {
-            arena: RwLock::new(Arena::new()),
+            chunks: core::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
+            len: AtomicU32::new(0),
             free_head: AtomicU32::new(FREE_END),
             config,
+            grow: Mutex::new(Chunks {
+                mappings: core::array::from_fn(|_| None),
+                bump: 0,
+            }),
         }
+    }
+
+    fn slots_per_chunk() -> u32 {
+        let slot = size_of::<Heap>().max(1);
+        debug_assert!(core::mem::align_of::<Heap>() <= PAGE_SIZE);
+        let n = (CHUNK_BYTES / slot).max(1);
+        u32::try_from(n).unwrap_or(u32::MAX)
+    }
+
+    fn slot(&self, index: u32) -> Option<&Heap> {
+        if index >= self.len.load(Ordering::Acquire) {
+            return None;
+        }
+        let per = Self::slots_per_chunk();
+        let chunk_index = index / per;
+        let offset = index % per;
+        let chunk_i = usize::try_from(chunk_index).ok()?;
+        let chunk = self.chunks.get(chunk_i)?.load(Ordering::Acquire);
+        if chunk.is_null() {
+            return None;
+        }
+        let offset = usize::try_from(offset).ok()?;
+        // SAFETY: `len` was published after this slot was `ptr::write` and the chunk
+        // pointer was stored. Occupied slots never move or unmap for the Heaps lifetime.
+        Some(unsafe { &*chunk.add(offset) })
     }
 
     /// Acquire a heap for TLS bind: pop a Free heap or claim a fresh one.
     pub(crate) fn acquire(&self) -> Option<(HeapId, NonNull<Heap>)> {
-        let mut arena = self.arena.write();
-        if let Some(acquired) = self.reuse(&arena) {
+        let mut grow = self.grow.lock();
+        if let Some(acquired) = self.reuse() {
             return Some(acquired);
         }
-
-        let index = arena.vacant()?;
-        let generation = NonZeroU32::MIN;
-        let id = HeapId::new(index, generation)?;
-        let heap = arena.insert(index, Heap::new(id, self.config))?;
-
-        Some((id, NonNull::from(heap)))
+        self.bump(&mut grow)
     }
 
-    fn reuse(&self, arena: &Arena<Heap>) -> Option<(HeapId, NonNull<Heap>)> {
+    fn reuse(&self) -> Option<(HeapId, NonNull<Heap>)> {
         loop {
-            let index = self.pop_free(arena)?;
-            let heap = arena.get(index)?;
+            let index = self.pop_free()?;
+            let heap = self.slot(index)?;
             if heap.state.is_retired() || !heap.state.is_free() {
                 continue;
             }
@@ -66,13 +108,13 @@ impl Heaps {
         }
     }
 
-    fn pop_free(&self, arena: &Arena<Heap>) -> Option<u32> {
+    fn pop_free(&self) -> Option<u32> {
         let mut index = self.free_head.load(Ordering::Acquire);
         loop {
             if index == FREE_END {
                 return None;
             }
-            let heap = arena.get(index)?;
+            let heap = self.slot(index)?;
             let next = heap.free_next.load(Ordering::Relaxed);
             match self.free_head.compare_exchange_weak(
                 index,
@@ -84,6 +126,46 @@ impl Heaps {
                 Err(current) => index = current,
             }
         }
+    }
+
+    fn bump(&self, grow: &mut Chunks) -> Option<(HeapId, NonNull<Heap>)> {
+        let index = grow.bump;
+        if index == u32::MAX {
+            return None;
+        }
+        let per = Self::slots_per_chunk();
+        let chunk_index = index / per;
+        let offset = index % per;
+        let chunk_i = usize::try_from(chunk_index).ok()?;
+        if chunk_i >= MAX_CHUNKS {
+            return None;
+        }
+
+        if offset == 0 {
+            let byte_len = usize::try_from(per).ok()?.checked_mul(size_of::<Heap>())?;
+            let mapping = OsMemory::map(byte_len)?;
+            let base = mapping.base().cast::<Heap>();
+            *grow.mappings.get_mut(chunk_i)? = Some(mapping);
+            if let Some(slot) = self.chunks.get(chunk_i) {
+                slot.store(base.as_ptr(), Ordering::Release);
+            }
+        }
+
+        let base = self.chunks.get(chunk_i)?.load(Ordering::Relaxed);
+        if base.is_null() {
+            return None;
+        }
+        let offset = usize::try_from(offset).ok()?;
+        // SAFETY: this offset is inside the just-published (or already mapped) chunk
+        // and has never been initialized.
+        let slot = unsafe { NonNull::new_unchecked(base.add(offset)) };
+        let generation = NonZeroU32::MIN;
+        let id = HeapId::new(index, generation)?;
+        // SAFETY: exclusive grow lock; slot is uninitialized mapped memory.
+        unsafe { slot.as_ptr().write(Heap::new(id, self.config)) };
+        grow.bump = index + 1;
+        self.len.store(grow.bump, Ordering::Release);
+        Some((id, slot))
     }
 
     /// Link a just-reclaimed Free heap. Caller holds Inner.
@@ -103,18 +185,10 @@ impl Heaps {
         }
     }
 
-    /// Generation-checked shared borrow. Read lock covers the index only.
+    /// Generation-checked shared borrow. Lock-free directory read.
     pub(crate) fn get(&self, id: HeapId) -> Option<&Heap> {
-        let arena = self.arena.read();
-        let heap = arena.get(id.index())?;
-        if !heap.state.matches(id) {
-            return None;
-        }
-        let heap = NonNull::from(heap);
-        drop(arena);
-        // SAFETY: occupied slots never move for the Arena lifetime (chunked append).
-        // The read guard only indexes the directory; Heap bytes live in a stable mmap slot.
-        Some(unsafe { heap.as_ref() })
+        let heap = self.slot(id.index())?;
+        heap.state.matches(id).then_some(heap)
     }
 
     /// Try to return a Draining heap to the Free list. No inbox accept.
@@ -132,7 +206,7 @@ impl Heaps {
         Ok(())
     }
 
-    /// Late free while Draining. Then reclaim.
+    /// Late free while Draining. Then reclaim if this owner emptied.
     pub(crate) fn free(
         &self,
         id: HeapId,
@@ -141,8 +215,10 @@ impl Heaps {
         ctx: &AllocatorCtx<'_>,
     ) -> Result<(), HeapError> {
         let (heap, mut inner) = self.admit(id)?;
-        heap.free(&mut inner, owner, ptr, ctx)?;
-        heap.reclaim(&inner, self, id.index());
+        let emptied = inner.free(owner, ptr, ctx)?;
+        if emptied {
+            heap.reclaim(&inner, self, id.index());
+        }
         Ok(())
     }
 
@@ -208,6 +284,19 @@ impl Heaps {
     }
 }
 
+impl Drop for Heaps {
+    fn drop(&mut self) {
+        let n = self.len.load(Ordering::Relaxed);
+        for index in 0..n {
+            let Some(heap) = self.slot(index) else {
+                continue;
+            };
+            // SAFETY: exclusive Heaps drop; each slot was `ptr::write` exactly once.
+            unsafe { ptr::drop_in_place(ptr::from_ref(heap).cast_mut()) };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Barrier, mpsc};
@@ -256,20 +345,13 @@ mod tests {
         let (id, _) = heaps.acquire().unwrap();
         let index = id.index();
         let max_gen = NonZeroU32::new(u32::MAX).unwrap();
-        {
-            let arena = heaps.arena.write();
-            let heap = arena.get(index).unwrap();
-            // Drive route to terminal generation under Draining; flush reclaims.
-            heap.state.store(max_gen, HeapMode::Draining, false, 0);
-        }
+        let heap = heaps.get(id).unwrap();
+        heap.state.store(max_gen, HeapMode::Draining, false, 0);
         let id_max = HeapId::new(index, max_gen).unwrap();
         assert_eq!(heaps.reclaim(id_max), Ok(()));
         assert!(heaps.get(id).is_none());
         assert!(heaps.get(id_max).is_none());
-        {
-            let arena = heaps.arena.write();
-            assert!(arena.get(index).unwrap().state.is_retired());
-        }
+        assert!(heaps.slot(index).unwrap().state.is_retired());
         let (other, _) = heaps.acquire().unwrap();
         assert_ne!(other.index(), id.index());
     }
@@ -335,5 +417,29 @@ mod tests {
 
         let (reused, _) = heaps.acquire().unwrap();
         assert!(reused.index() < u32::try_from(LIVE).unwrap());
+    }
+
+    #[test]
+    fn get_sees_published_heaps_across_chunks() {
+        let heaps = Heaps::new(AllocatorConfig::new());
+        let n = usize::try_from(Heaps::slots_per_chunk()).unwrap() + 8;
+        let (tx, rx) = mpsc::channel();
+        thread::scope(|scope| {
+            let heaps = &heaps;
+            scope.spawn(move || {
+                for _ in 0..n {
+                    let (id, _) = heaps.acquire().unwrap();
+                    tx.send(id).unwrap();
+                }
+            });
+            let mut seen = 0usize;
+            for id in rx {
+                while heaps.get(id).is_none() {
+                    hint::spin_loop();
+                }
+                seen += 1;
+            }
+            assert_eq!(seen, n);
+        });
     }
 }

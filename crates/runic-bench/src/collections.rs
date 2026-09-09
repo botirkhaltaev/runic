@@ -164,6 +164,24 @@ pub fn word_count(rounds: usize, words: usize) -> usize {
     black_box(checksum)
 }
 
+/// Fill several runs of one class, drop them, refill. Stresses empty-run residency.
+#[must_use]
+pub fn run_churn_bursty(rounds: usize, runs: usize) -> usize {
+    const BLOCK: usize = 64;
+    const PER_RUN: usize = 64 * 1024 / BLOCK;
+    let mut checksum = 0_usize;
+    for round in 0..rounds {
+        let count = runs * PER_RUN;
+        let mut bufs = Vec::with_capacity(count);
+        for i in 0..count {
+            bufs.push(vec![byte(i ^ round); BLOCK]);
+        }
+        checksum ^= bufs.len() ^ usize::from(bufs[0][0]);
+        black_box(bufs);
+    }
+    black_box(checksum)
+}
+
 fn byte(value: usize) -> u8 {
     value.to_le_bytes()[0]
 }

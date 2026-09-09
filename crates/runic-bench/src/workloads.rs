@@ -100,6 +100,16 @@ pub const WORKLOADS: &[Workload] = &[
         elems: 4 * 16,
         run: || libraries::large_buffers(4, 16),
     },
+    Workload {
+        name: "large_buffers_dirty",
+        elems: 4 * 16,
+        run: || libraries::large_buffers_dirty(4, 16),
+    },
+    Workload {
+        name: "run_churn_bursty",
+        elems: 4 * 4 * 1_024,
+        run: || collections::run_churn_bursty(4, 4),
+    },
 ];
 
 #[must_use]

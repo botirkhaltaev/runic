@@ -24,6 +24,8 @@ Libraries:
 - `global/runic/regex_search`
 - `global/runic/http_buffers`
 - `global/runic/large_buffers`
+- `global/runic/large_buffers_dirty`
+- `global/runic/run_churn_bursty`
 
 Threaded (profile with `RUNIC_PROFILE_CPUS=0-3`):
 

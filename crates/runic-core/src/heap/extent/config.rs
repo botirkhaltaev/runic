@@ -65,7 +65,7 @@ pub enum ExtentPolicy {
 }
 
 impl ExtentPolicy {
-    /// `Keep` and `Discard` retain published mappings; `Unmap` does not.
+    /// `Unmap` does not retain; every other policy does.
     pub(crate) const fn retains(self) -> bool {
         !matches!(self, Self::Unmap)
     }

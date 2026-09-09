@@ -124,7 +124,7 @@ impl ThreadHeap {
         if !heap.inboxes_empty() {
             heap.flush(&mut inner, ctx).ok()?;
         }
-        if let Some(run) = heap.acquire_run(&mut inner, class, ctx) {
+        if let Some(run) = inner.acquire_run(class, ctx.pages) {
             return self.install_current(class, run);
         }
         None
@@ -195,7 +195,7 @@ impl ThreadHeap {
         let Some(mut inner) = heap.try_inner() else {
             Allocator::abort();
         };
-        if heap.push_available(&mut inner, run).is_err() {
+        if inner.push_available(run).is_err() {
             Allocator::abort();
         }
     }
@@ -243,7 +243,9 @@ impl ThreadHeap {
         let Some(mut inner) = heap.try_inner() else {
             Allocator::abort();
         };
-        heap.free(&mut inner, PageOwner::Extent(extent), ptr, ctx)
+        inner
+            .free(PageOwner::Extent(extent), ptr, ctx)
+            .map(|_| ())
             .map_err(ThreadFreeError::Heap)
     }
 
@@ -324,7 +326,7 @@ impl ThreadHeap {
                 if unsafe { run.as_ref() }.is_full() {
                     continue;
                 }
-                if heap.push_available(&mut inner, run).is_err() {
+                if inner.push_available(run).is_err() {
                     Allocator::abort();
                 }
             }

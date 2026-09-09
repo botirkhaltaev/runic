@@ -123,8 +123,8 @@ free_ring/4/live:256          2081     1613     1.29   428 / 348       689k / 72
 ```
 
 `profile.sh` is user-cycles only. Always pair it with `page-faults` + `time`
-sys on mixed/large benches. First-fit extent reuse and lock-free `Heaps::get`
-were measured and not taken.
+sys on mixed/large benches. First-fit extent reuse was measured and not taken.
+`Heaps::get` is a lock-free directory read (append-only chunk table).
 
 `CLASS_FOR_SIZE` is not the mixed-size lever: sweep is tied and runic L1 is
 *lower* there. Compact class tables are not the next change.
@@ -263,7 +263,7 @@ GlobalAlloc
   -> RunicAlloc
       -> Allocator          // const handle; ctx() borrows Process
           -> Process { pages: PageMap, heaps: Heaps }  // mmap; not returned
-              -> Heaps { RwLock<Arena<Heap>>, free list, config }
+              -> Heaps { chunks[], len, grow mutex, free list, config }
                   -> ThreadHeap
               -> Heap { HeapState, Inbox, id, RunHeap, ExtentHeap }
                   -> RunHeap { Arena<Run>, available[] }
@@ -273,11 +273,12 @@ GlobalAlloc
               -> OsMemory
 ```
 
-`Heaps::get` takes a short `RwLock` read to index `Arena<Heap>`, then returns
-`&Heap` (occupied slots never move). Active enqueue uses `HeapState` leases
-(lease before new `try_queue`). Write lock covers acquire / Free reactivation
-only. Draining exclusivity is `Mutex<HeapInner>` via `Heaps::{enqueue,free,flush,reclaim}`
-(not the arena lock across flush).
+`Heaps::get` is a lock-free directory read: `len` Acquire, chunk pointer
+Acquire, then `state.matches`. Occupied slots never move. Active enqueue uses
+`HeapState` leases (lease before new `try_queue`). The `grow` mutex covers
+mapping ownership and bump insert only. Draining exclusivity is
+`Mutex<HeapInner>` via `Heaps::{enqueue,free,flush,reclaim}`
+(not the grow lock across flush).
 Shared `&Heap` is atomics-only; Active body mutation is `ThreadHeap` + `try_inner`;
 reclaim is `Heap::reclaim` through `Heaps`. `Allocator::ctx()` is the only
 handle into the process payload. Same-thread small-run hits use TLS-owned heap
@@ -421,7 +422,7 @@ Keep vs Discard vs Unmap on `large_buffers` (metrics `--case`, 64 ops,
 Discard (retain mapping, `madvise`, skip memset when advise succeeds)
 matches snmalloc. Unmap is the same order. Keep and mimalloc pay the
 dirty memset. Medium size-classes are not the lever. Default stays
-Keep (dirty reuse). `runic:extent_discard` is the opt-in.
+Keep (dirty reuse). `runic:discard/keep` is the opt-in.
 
 RSS / minflt (`metrics` bin; syscall tracepoints not permitted on this host):
 
@@ -441,6 +442,27 @@ Keep extent retention deterministic, bounded, and allocation-free.
 
 Empty-run `Discard` is opt-in (`madvise` on the payload). Maps stay; runs stay
 published and arena-resident. Default is `Keep` until Cost says otherwise.
+
+Draining remote-free Cost after lock-free `Heaps::get` + reclaim gate
+(`scripts/profile.sh` 5s/5rep, this host, dirty tree):
+
+  workload            before    after    vs before
+  scoped_map_reduce     613      387     0.63×  (≤400 gate)
+  arc_share_drop        412      321     0.78×
+  channel_pipeline      912      680     0.75×
+  vec_many_small       30.9     33.4     (3s/5s windows; Keep hit unchanged)
+  large_buffers       77706    77531     unchanged
+
+`Heaps::get` is inlined (two Acquire loads). Where no longer shows the
+RwLock reader CAS. `Heap::reclaim` scans only when a Draining free emptied
+its owner. Double-get into `admit` was left in place.
+
+Policy grid (`scripts/policy_grid.sh`, N=5, train/hold-out): no candidate
+beat Keep/Keep by ≥5% geomean without a hold-out or train regression.
+`runic:discard/keep` wins zeroed `large_buffers` (0.27M vs 5.0M ns) and
+fails `large_buffers_dirty` (2.3×). Run `Discard` is 2–8× on small
+churn. Extent/run `Bound` candidates lost and were deleted. Default stays
+Keep/Keep. `Unmap` remains the unretained baseline.
 ```
 
 ## Milestones
