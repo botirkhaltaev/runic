@@ -124,7 +124,7 @@ free_ring/4/live:256          2081     1613     1.29   428 / 348       689k / 72
 
 `profile.sh` is user-cycles only. Always pair it with `page-faults` + `time`
 sys on mixed/large benches. First-fit extent reuse was measured and not taken.
-`Heaps::get` is a lock-free directory read (append-only chunk table).
+`Heaps::get` is a lock-free `Arena` read.
 
 `CLASS_FOR_SIZE` is not the mixed-size lever: sweep is tied and runic L1 is
 *lower* there. Compact class tables are not the next change.
@@ -263,9 +263,10 @@ GlobalAlloc
   -> RunicAlloc
       -> Allocator          // const handle; ctx() borrows Process
           -> Process { pages: PageMap, heaps: Heaps }  // mmap; not returned
-              -> Heaps { chunks[], len, grow mutex, free list, config }
+              -> Heaps { Arena<Heap>, free list, config }
                   -> ThreadHeap
-              -> Heap { HeapState, Inbox, id, RunHeap, ExtentHeap }
+              -> Heap { HeapState, Inbox, Mutex<HeapInner> }
+                  -> HeapInner { id, RunHeap, ExtentHeap }
                   -> RunHeap { Arena<Run>, available[] }
                   -> ExtentHeap { Arena<Extent>, cache }
               -> Run
@@ -273,12 +274,12 @@ GlobalAlloc
               -> OsMemory
 ```
 
-`Heaps::get` is a lock-free directory read: `len` Acquire, chunk pointer
+`Heaps::get` is a lock-free `Arena` read: `len` Acquire, chunk pointer
 Acquire, then `state.matches`. Occupied slots never move. Active enqueue uses
-`HeapState` leases (lease before new `try_queue`). The `grow` mutex covers
+`HeapState` leases (lease before new `try_queue`). Arena grow covers
 mapping ownership and bump insert only. Draining exclusivity is
 `Mutex<HeapInner>` via `Heaps::{enqueue,free,flush,reclaim}`
-(not the grow lock across flush).
+(not the arena grow lock across flush).
 Shared `&Heap` is atomics-only; Active body mutation is `ThreadHeap` + `try_inner`;
 reclaim is `Heap::reclaim` through `Heaps`. `Allocator::ctx()` is the only
 handle into the process payload. Same-thread small-run hits use TLS-owned heap
@@ -292,10 +293,10 @@ RunicAlloc     owns the Rust GlobalAlloc boundary.
 Allocator      owns the core public allocator API, abort, and cold unbound routing.
 AllocatorCtx   borrows PageMap + Heaps for miss / bind / unbind / body / Draining.
 Process        owns the process-wide mmap payload (PageMap + Heaps); not returned.
-Heaps           owns the lock-free chunk table (`chunks[]` / `len`), grow mutex, Free-heap freelist, and Draining `enqueue` / `free` / `flush` / `reclaim`.
+Heaps          owns `Arena<Heap>`, the Free-heap freelist, and Draining `enqueue` / `free` / `flush` / `reclaim`.
 Heap           owns HeapState, Inbox, and `Mutex<HeapInner>`; shared surface is atomics only (`enqueue` / mode).
 HeapInner      owns RunHeap / ExtentHeap (exclusive metadata).
-Arena          owns grow-on-demand mmap slab storage (`vacant` / `insert` / `remove`; slots never move).
+Arena          owns published immovable slots (`get` lock-free; `push` shared; `vacant` / `insert` / `remove` exclusive).
 LayoutSpec     owns normalized layout semantics.
 SizeClasses    owns size-class selection.
 OsMemory       maps anonymous pages; Mapping owns the mmap lifecycle (Drop munmaps).
@@ -456,7 +457,8 @@ same-session competitor Cost):
 
 `Heaps::get` is inlined (two Acquire loads). Where no longer shows the
 RwLock reader CAS. `Heap::reclaim` scans only when a Draining free emptied
-its owner. Double-get into `admit` was left in place.
+its owner. `admit` is one directory `get`, then a generation/mode recheck
+after the Inner lock.
 
 Policy grid (`scripts/policy_grid.sh`, N=5, train/hold-out): no candidate
 beat Keep/Keep by ≥5% geomean without a hold-out or train regression.

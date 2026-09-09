@@ -26,6 +26,11 @@ pub(crate) enum ExtentInit {
     Zeroed,
 }
 
+// SAFETY: ExtentHeap owns extent metadata and cache pointers into its own
+// arena. Moving the heap to another thread does not permit concurrent mutation;
+// exclusive access stays under HeapInner.
+unsafe impl Send for ExtentHeap {}
+
 impl ExtentHeap {
     pub(crate) fn new(config: ExtentConfig) -> Self {
         Self {

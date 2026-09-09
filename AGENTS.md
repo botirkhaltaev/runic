@@ -19,7 +19,7 @@
 - Flush policy: current-run empty = `extend`; inbox flush if nonempty; then local/OS `acquire_run`. Unbound = `bind` then `flush` then alloc; hit = current pop / `Run::free` (`push_available` only on `was_full`). Inbox `flush` is remote `accept` only. `lookup` is miss / realloc.
 - `Layout` only at the public boundary → `LayoutSpec` inward once.
 - No root/shared ownership heap; every run/extent has `HeapId`. Shared `&Heap` = atomics only (`enqueue` / mode). Active exclusive = `ThreadHeap` + `try_inner` + `AllocatorCtx`. Draining = `Heaps::{enqueue,free,flush}` + `AllocatorCtx`. No `Heap::state()` projection; no `*_fresh` dual alloc APIs.
-- One abort sink: `Allocator::abort`. Preserve abort kinds through `HeapError` (`InvalidRunPointer` / `InvalidExtentPointer` / `MissingExtent`). `HeapError::DoubleFree` is remote `claim` / interior-foreign only — not owner DF. Never hold the heaps grow mutex across flush / accept / user-memory copies.
+- One abort sink: `Allocator::abort`. Preserve abort kinds through `HeapError` (`InvalidRunPointer` / `InvalidExtentPointer` / `MissingExtent`). `HeapError::DoubleFree` is remote `claim` / interior-foreign only — not owner DF. Never hold the arena grow lock across flush / accept / user-memory copies.
 - No allocator-internal `Vec` / `Box` / `HashMap` / `String` / formatting / panic unless recursion risk is addressed.
 - `#![deny(unsafe_op_in_unsafe_fn)]`. No test-only methods on production `impl` blocks.
 - No backward compatibility for public or internal APIs — reshape in place; delete dual paths, aliases, and parallel old names. Best architecture and code always win.
@@ -52,4 +52,4 @@
 
 - v0.6 in: Linux x86_64, Rust nightly, `#[thread_local]` `THREAD_HEAP`, `GlobalAlloc`, owner-local heaps, TLS current run, run/extent retention, remote-free, `realloc` / `alloc_zeroed`, tests, benches.
 - v0.6 out: quarantine, canaries, hugepages, NUMA, C ABI, ML placement, dashboards, background purge.
-- Next: LTO `vec_many_small` ≤ 40 (30.7 vs sn 33.2). `large_buffers` leftover is default Keep memset; `ExtentPolicy::Discard` matches snmalloc — not a medium class. `Heaps::get` is a lock-free directory read (append-only chunk table). Do not compact `CLASS_FOR_SIZE`, retry first-fit extent reuse, identity, batch take, O(1) TLS steal, `#135` RSEQ, or a locate-offset dual free. Do not port snmalloc.
+- Next: LTO `vec_many_small` ≤ 40 (30.7 vs sn 33.2). `large_buffers` leftover is default Keep memset; `ExtentPolicy::Discard` matches snmalloc — not a medium class. `Heaps::get` is a lock-free `Arena` read. Do not compact `CLASS_FOR_SIZE`, retry first-fit extent reuse, identity, batch take, O(1) TLS steal, `#135` RSEQ, or a locate-offset dual free. Do not port snmalloc.

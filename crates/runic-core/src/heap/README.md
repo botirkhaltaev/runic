@@ -7,7 +7,7 @@ Owner-local heap frontend: runs for small size classes, extents for dedicated la
 - `error.rs`: `HeapError` at the heap edge (`InvalidRunPointer` / `InvalidExtentPointer` / `MissingExtent`, …) + `From<RunError>` / `From<ExtentError>`.
 - `id.rs`: `HeapId` (heap index + generation). Arena / `*Id` indices are `u32`; `usize` only at array/pointer edges.
 - `mod.rs`: `Heap`, `HeapInner`, `AllocatorCtx`, and re-exports.
-- `heaps.rs`: `Heaps` (lock-free chunk table + `grow` mutex + Free-heap freelist).
+- `heaps.rs`: `Heaps` (`Arena<Heap>` + Free-heap freelist).
 - `state.rs`: `HeapMode`, `HeapState`, `Lease` (`store` is module-private to reactivate / bump).
 - `inbox.rs`: `Inbox` / `InboxLink`.
 - `thread.rs`: `ThreadHeap`.
@@ -18,7 +18,7 @@ Owner-local heap frontend: runs for small size classes, extents for dedicated la
 
 | Entity | May do | Must not |
 |--------|--------|----------|
-| `Heaps` | `acquire` / `get` / `retire` / `enqueue` / `free` / `flush` / `reclaim` | hold grow lock across flush/accept |
+| `Heaps` | `acquire` / `get` / `retire` / `enqueue` / `free` / `flush` / `reclaim` | hold arena grow lock across flush/accept |
 | `&Heap` (shared) | `enqueue`, mode / active queries | body mutation, expose `&HeapState` |
 | `ThreadHeap` | sole Active body path (`try_inner` + `AllocatorCtx`) | be bypassed via `&Heap` from allocator / tests |
 | `AllocatorCtx` | pass `PageMap` + `Heaps` into Heap / ThreadHeap / Heaps methods | contain a mutex guard |
@@ -35,7 +35,7 @@ Owner-local heap frontend: runs for small size classes, extents for dedicated la
 - Owner free: `Run::free` (lock-free); `push_available` only on `was_full` (idempotent). `unbind` returns non-full current runs. Draining late free uses `HeapInner::free` via `Heaps::free`. Domain ops are `free` / `claim` / `accept`. Failures after claim abort.
 - Current-run empty: `extend`; accept inbox if nonempty; then local/OS `acquire_run`. Unbound: `bind` then `flush` then alloc. Hit: current pop / `Run::free`. Inbox `flush` is remote `accept`. `lookup` is miss / realloc.
 - `HeapState` packs generation, mode (`Free` / `Active` / `Draining`), retired, and in-flight lease count for Active enqueue admits. Inbox depth stays live via claim bits / `has_live`.
-- `Heaps` is an append-only chunk table. `get` is two Acquire loads (`len`, chunk pointer) then `state.matches`. `grow` mutex covers mapping ownership and bump insert only. Free heaps sit on an intrusive index freelist. Fail only when the OS will not map more, or the chunk table is full.
+- `Heaps` is `Arena<Heap>`. `get` is lock-free `Arena` then `state.matches`. Arena grow covers mapping ownership and bump insert only. Free heaps sit on an intrusive index freelist. Fail only when the OS will not map more, or the arena is full.
 - `THREAD_HEAP` is a `#[thread_local]` `!Drop` value (`%fs` load). `UnbindGuard` is the only `LocalKey` (touched in `bind`; `Drop` retires the heap).
 
 ## Current run (hit)
