@@ -70,7 +70,7 @@ impl Allocator {
     pub unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let spec = LayoutSpec::from_layout(layout);
         if let Some(class) = SizeClasses::class_for(spec) {
-            if let Some(ptr) = THREAD_HEAP.with(|tls| tls.alloc(class)) {
+            if let Some(ptr) = THREAD_HEAP.alloc(class) {
                 return ptr.as_ptr();
             }
             return self.alloc_miss(class, layout);
@@ -96,19 +96,12 @@ impl Allocator {
             Self::abort();
         };
         let spec = LayoutSpec::from_layout(layout);
-        let Some(ctx) = Self::ctx() else {
-            Self::abort();
-        };
-        let result = THREAD_HEAP.with(|tls| match tls.lookup(ctx.pages, ptr, spec) {
-            Some(PageOwner::Run(run)) => Some(tls.free_run(run, ptr)),
-            Some(PageOwner::Extent(extent)) => Some(tls.free_extent(extent, ptr, &ctx)),
-            None => None,
-        });
-        match result {
-            Some(Ok(())) => {}
-            Some(Err(error)) => Self::free_fail(&ctx, ptr, error),
-            None => Self::dealloc_slow(ptr, spec),
+        if let Some(class) = SizeClasses::class_for(spec)
+            && THREAD_HEAP.free(ptr, class).is_some()
+        {
+            return;
         }
+        Self::dealloc_slow(ptr, spec);
     }
 
     /// Changes the size of an allocation using allocate-copy-free semantics.
@@ -146,7 +139,7 @@ impl Allocator {
         let new_spec = LayoutSpec::from_layout(new_layout);
         let old_spec = LayoutSpec::from_layout(old);
 
-        let resized = match THREAD_HEAP.with(|tls| tls.lookup(ctx.pages, old_ptr, old_spec)) {
+        let resized = match THREAD_HEAP.lookup(ctx.pages, old_ptr, old_spec) {
             Some(PageOwner::Run(run)) => {
                 // SAFETY: lookup returns a live arena run; resize still `locate`s.
                 unsafe { run.as_ref() }
@@ -204,7 +197,7 @@ impl Allocator {
             return unsafe { self.alloc_zeroed(layout) };
         };
 
-        let ptr = if let Some(ptr) = THREAD_HEAP.with(|tls| tls.alloc(class)) {
+        let ptr = if let Some(ptr) = THREAD_HEAP.alloc(class) {
             ptr.as_ptr()
         } else {
             self.alloc_miss(class, layout)
@@ -261,16 +254,17 @@ impl Allocator {
     #[cold]
     #[inline(never)]
     fn bind_alloc(ctx: &AllocatorCtx<'_>, request: AllocKind) -> *mut u8 {
-        THREAD_HEAP
-            .with(|tls| {
-                tls.bind(ctx)?;
-                tls.flush(ctx).ok()?;
-                match request {
-                    AllocKind::Run(class) => tls.alloc_miss(class, ctx),
-                    AllocKind::Extent(spec, init) => tls.alloc_extent(spec, init, ctx),
-                }
-            })
-            .map_or(null_mut(), NonNull::as_ptr)
+        if THREAD_HEAP.bind(ctx).is_none() {
+            return null_mut();
+        }
+        if THREAD_HEAP.flush(ctx).is_err() {
+            return null_mut();
+        }
+        match request {
+            AllocKind::Run(class) => THREAD_HEAP.alloc_miss(class, ctx),
+            AllocKind::Extent(spec, init) => THREAD_HEAP.alloc_extent(spec, init, ctx),
+        }
+        .map_or(null_mut(), NonNull::as_ptr)
     }
 
     /// Cross-heap free: Active claim → enqueue, or `Heaps::free` under Draining.
@@ -344,13 +338,13 @@ impl Allocator {
         unsafe { self.alloc(layout) }
     }
 
-    /// `PageMap` miss after `lookup` returned `None`.
+    /// Current-run miss, large, or unbound: `lookup` then typed free.
     #[inline(never)]
     fn dealloc_slow(ptr: NonNull<u8>, spec: LayoutSpec) {
         let Some(ctx) = Self::ctx() else {
             Self::abort();
         };
-        match THREAD_HEAP.with(|tls| tls.free_slow(ptr, spec, &ctx)) {
+        match THREAD_HEAP.free_slow(ptr, spec, &ctx) {
             Ok(()) => {}
             Err(error) => Self::free_fail(&ctx, ptr, error),
         }
@@ -362,7 +356,7 @@ impl Allocator {
         let Some(ctx) = Self::ctx() else {
             return self.alloc_uninit(layout);
         };
-        if let Some(ptr) = THREAD_HEAP.with(|tls| tls.alloc_miss(class, &ctx)) {
+        if let Some(ptr) = THREAD_HEAP.alloc_miss(class, &ctx) {
             return ptr.as_ptr();
         }
         Self::bind_alloc(&ctx, AllocKind::Run(class))
@@ -371,7 +365,7 @@ impl Allocator {
     /// Bound-extent miss: TLS extent alloc, else bind.
     #[inline(never)]
     fn alloc_extent(ctx: &AllocatorCtx<'_>, spec: LayoutSpec, init: ExtentInit) -> *mut u8 {
-        if let Some(ptr) = THREAD_HEAP.with(|tls| tls.alloc_extent(spec, init, ctx)) {
+        if let Some(ptr) = THREAD_HEAP.alloc_extent(spec, init, ctx) {
             return ptr.as_ptr();
         }
         Self::bind_alloc(ctx, AllocKind::Extent(spec, init))
@@ -408,7 +402,7 @@ impl Default for Allocator {
 impl From<RunError> for AllocatorError {
     fn from(error: RunError) -> Self {
         match error {
-            RunError::InvalidPointer => Self::InvalidRunPointer,
+            RunError::InvalidPointer | RunError::OutOfRange => Self::InvalidRunPointer,
             RunError::DoubleFree => Self::DoubleFree,
         }
     }
@@ -508,12 +502,30 @@ mod tests {
     }
 
     #[test]
+    fn current_run_free_hits_without_lookup() {
+        let allocator = Allocator::new();
+        let ctx = install(&allocator);
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        let class = SizeClasses::class_for(LayoutSpec::from_layout(layout)).unwrap();
+        {
+            let tls = &THREAD_HEAP;
+            let _id = tls.bind(&ctx).unwrap();
+            let ptr = bind_alloc_small(tls, &ctx, layout);
+            assert_eq!(tls.free(ptr, class), Some(()));
+            assert_eq!(tls.alloc(class), Some(ptr));
+            assert_eq!(tls.free(ptr, class), Some(()));
+            unbind(tls);
+        };
+    }
+
+    #[test]
     fn owner_free_publishes_immediately() {
         let allocator = Allocator::new();
         let ctx = install(&allocator);
         let pages = ctx.pages;
         let layout = Layout::from_size_align(64, 8).unwrap();
-        THREAD_HEAP.with(|tls| {
+        {
+            let tls = &THREAD_HEAP;
             let _id = tls.bind(&ctx).unwrap();
             let ptr = bind_alloc_small(tls, &ctx, layout);
             let run = run_of(pages, ptr);
@@ -523,7 +535,7 @@ mod tests {
             assert_eq!(unsafe { run.as_ref() }.allocate(), Some(ptr));
             assert_eq!(tls.free_run(run, ptr), Ok(()));
             unbind(tls);
-        });
+        };
     }
 
     #[test]
@@ -532,7 +544,8 @@ mod tests {
         let ctx = install(&allocator);
         let pages = ctx.pages;
         let layout = Layout::from_size_align(64, 8).unwrap();
-        THREAD_HEAP.with(|tls| {
+        {
+            let tls = &THREAD_HEAP;
             let _id = tls.bind(&ctx).unwrap();
             let first = bind_alloc_small(tls, &ctx, layout);
             let run_a = run_of(pages, first);
@@ -550,7 +563,7 @@ mod tests {
             ptrs.push(extra);
             assert_eq!(free_all(tls, pages, &ptrs), Ok(()));
             unbind(tls);
-        });
+        };
     }
 
     #[test]
@@ -559,7 +572,8 @@ mod tests {
         let ctx = install(&allocator);
         let pages = ctx.pages;
         let layout = Layout::from_size_align(64, 8).unwrap();
-        THREAD_HEAP.with(|tls| {
+        {
+            let tls = &THREAD_HEAP;
             let _id = tls.bind(&ctx).unwrap();
             let capacity = crate::heap::run::RUN_SIZE / 64;
             let mut a_ptrs = Vec::with_capacity(capacity);
@@ -586,7 +600,7 @@ mod tests {
             assert_eq!(free_all(tls, pages, &a_ptrs[1..]), Ok(()));
             assert_eq!(free_all(tls, pages, &b_ptrs), Ok(()));
             unbind(tls);
-        });
+        };
     }
 
     #[test]
@@ -594,7 +608,8 @@ mod tests {
         let allocator = Allocator::new();
         let ctx = install(&allocator);
         let layout = Layout::from_size_align(64, 8).unwrap();
-        THREAD_HEAP.with(|tls| {
+        {
+            let tls = &THREAD_HEAP;
             let _id = tls.bind(&ctx).unwrap();
             let ptr = bind_alloc_small(tls, &ctx, layout);
             let spec = LayoutSpec::from_layout(layout);
@@ -611,7 +626,7 @@ mod tests {
             assert_eq!(tls.free_run(run, again), Ok(()));
             unbind(tls);
             assert_eq!(tls.lookup(ctx.pages, ptr, spec), Some(PageOwner::Run(run)));
-        });
+        };
     }
 
     #[test]
@@ -620,7 +635,8 @@ mod tests {
         let ctx = install(&allocator);
         let pages = ctx.pages;
         let layout = Layout::from_size_align(64, 8).unwrap();
-        let (id, ptr, run) = THREAD_HEAP.with(|tls| {
+        let (id, ptr, run) = {
+            let tls = &THREAD_HEAP;
             let id = tls.bind(&ctx).unwrap();
             let ptr = bind_alloc_small(tls, &ctx, layout);
             let run = run_of(pages, ptr);
@@ -628,7 +644,7 @@ mod tests {
             assert!(unsafe { run.as_ref() }.is_live());
             unbind(tls);
             (id, ptr, run)
-        });
+        };
         assert_eq!(ctx.heaps.get(id).map(Heap::mode), Some(HeapMode::Draining));
         // SAFETY: run stays arena-resident through Draining.
         assert!(unsafe { run.as_ref() }.is_live());
@@ -642,7 +658,8 @@ mod tests {
         let ctx = install(&allocator);
         let pages = ctx.pages;
         let layout = Layout::from_size_align(64, 8).unwrap();
-        THREAD_HEAP.with(|tls| {
+        {
+            let tls = &THREAD_HEAP;
             let _id = tls.bind(&ctx).unwrap();
             let ptr = bind_alloc_small(tls, &ctx, layout);
             let run = run_of(pages, ptr);
@@ -652,7 +669,7 @@ mod tests {
             assert_eq!(unsafe { run.as_ref() }.allocate(), Some(ptr));
             assert!(unsafe { run.as_ref() }.free(ptr).is_ok());
             unbind(tls);
-        });
+        };
     }
 
     #[test]
@@ -661,14 +678,15 @@ mod tests {
         let ctx = install(&allocator);
         let pages = ctx.pages;
         let layout = Layout::from_size_align(128 * 1024, 4096).unwrap();
-        THREAD_HEAP.with(|tls| {
+        {
+            let tls = &THREAD_HEAP;
             let _id = tls.bind(&ctx).unwrap();
             let ptr = bind_alloc_extent(tls, &ctx, layout, ExtentInit::Uninit);
             let extent = extent_of(pages, ptr);
             assert_eq!(tls.free_extent(extent, ptr, &ctx), Ok(()));
             assert_eq!(pages.get(ptr), Some(PageOwner::Extent(extent)));
             unbind(tls);
-        });
+        };
     }
 
     #[test]
@@ -677,7 +695,8 @@ mod tests {
         let ctx = install(&allocator);
         let pages = ctx.pages;
         let layout = Layout::from_size_align(64, 8).unwrap();
-        THREAD_HEAP.with(|tls| {
+        {
+            let tls = &THREAD_HEAP;
             let id = tls.bind(&ctx).unwrap();
             let ptr = bind_alloc_small(tls, &ctx, layout);
             let run = run_of(pages, ptr);
@@ -685,7 +704,7 @@ mod tests {
             assert_eq!(unsafe { run.as_ref() }.heap_id(), id);
             assert_eq!(tls.free_run(run, ptr), Ok(()));
             unbind(tls);
-        });
+        };
     }
 
     #[test]
@@ -694,7 +713,8 @@ mod tests {
         let ctx = install(&allocator);
         let pages = ctx.pages;
         let layout = Layout::from_size_align(128 * 1024, 4096).unwrap();
-        THREAD_HEAP.with(|tls| {
+        {
+            let tls = &THREAD_HEAP;
             let id = tls.bind(&ctx).unwrap();
             let ptr = bind_alloc_extent(tls, &ctx, layout, ExtentInit::Uninit);
             let extent = extent_of(pages, ptr);
@@ -702,7 +722,7 @@ mod tests {
             assert_eq!(unsafe { extent.as_ref() }.heap_id(), id);
             assert_eq!(tls.free_extent(extent, ptr, &ctx), Ok(()));
             unbind(tls);
-        });
+        };
     }
 
     #[test]
@@ -711,7 +731,8 @@ mod tests {
         let layout = Layout::from_size_align(64, 8).unwrap();
         let ctx = install(&allocator);
         let pages = ctx.pages;
-        THREAD_HEAP.with(|tls| {
+        {
+            let tls = &THREAD_HEAP;
             let _id = tls.bind(&ctx).unwrap();
             let ptr = bind_alloc_small(tls, &ctx, layout);
             let run = run_of(pages, ptr);
@@ -726,7 +747,7 @@ mod tests {
                 Err(AllocatorError::DoubleFree)
             );
             unbind(tls);
-        });
+        };
     }
 
     #[test]
@@ -735,7 +756,8 @@ mod tests {
         let ctx = install(&allocator);
         let pages = ctx.pages;
         let layout = Layout::from_size_align(64, 8).unwrap();
-        let (id, run, ptr) = THREAD_HEAP.with(|tls| {
+        let (id, run, ptr) = {
+            let tls = &THREAD_HEAP;
             let id = tls.bind(&ctx).unwrap();
             let ptr = bind_alloc_small(tls, &ctx, layout);
             let run = run_of(pages, ptr);
@@ -743,7 +765,7 @@ mod tests {
             assert_eq!(unsafe { run.as_ref() }.claim(ptr), Ok(()));
             unbind(tls);
             (id, run, ptr)
-        });
+        };
 
         assert_eq!(ctx.heaps.retire(id, &ctx), Ok(()));
         assert_eq!(ctx.heaps.get(id).map(Heap::mode), Some(HeapMode::Draining));
@@ -771,7 +793,8 @@ mod tests {
                 let start_a = start_a;
                 let ready_a = ready_a;
                 let done_a = done_a;
-                THREAD_HEAP.with(|tls| {
+                {
+                    let tls = &THREAD_HEAP;
                     let _id = tls.bind(&ctx).unwrap();
                     let live = alloc_live(tls, &ctx, layout, 8);
                     let run = run_of(pages, live[0]);
@@ -783,13 +806,14 @@ mod tests {
                     // SAFETY: run from this heap's arena.
                     done_a.send(unsafe { run.as_ref() }.is_live()).unwrap();
                     unbind(tls);
-                });
+                };
             });
             scope.spawn(move || {
                 let start_b = start_b;
                 let ready_b = ready_b;
                 let done_b = done_b;
-                THREAD_HEAP.with(|tls| {
+                {
+                    let tls = &THREAD_HEAP;
                     let _id = tls.bind(&ctx).unwrap();
                     let live = alloc_live(tls, &ctx, layout, 8);
                     let run = run_of(pages, live[0]);
@@ -801,7 +825,7 @@ mod tests {
                     // SAFETY: run from this heap's arena.
                     done_b.send(unsafe { run.as_ref() }.is_live()).unwrap();
                     unbind(tls);
-                });
+                };
             });
 
             let addrs_a = wait_a.recv().unwrap();
@@ -845,7 +869,8 @@ mod tests {
         ))
         .unwrap();
 
-        let (id, run_addr, addrs) = THREAD_HEAP.with(|tls| {
+        let (id, run_addr, addrs) = {
+            let tls = &THREAD_HEAP;
             let id = tls.bind(&ctx).unwrap();
             let mut addrs = Vec::with_capacity(THREADS * PER_THREAD);
             for _ in 0..THREADS * PER_THREAD {
@@ -858,7 +883,7 @@ mod tests {
             }
             let run = run_of(pages, NonNull::new(addrs[0] as *mut u8).unwrap());
             (id, run.as_ptr() as usize, addrs)
-        });
+        };
 
         let heap = ctx.heaps.get(id).unwrap();
         let addrs = &addrs[..];
@@ -882,13 +907,14 @@ mod tests {
         });
 
         assert_eq!(heap.leases(), 0);
-        THREAD_HEAP.with(|tls| {
+        {
+            let tls = &THREAD_HEAP;
             assert_eq!(tls.flush(&ctx), Ok(()));
             let run = NonNull::new(run_addr as *mut Run).unwrap();
             // SAFETY: same run pointer from this heap's live arena.
             assert!(!unsafe { run.as_ref() }.is_live());
             unbind(tls);
-        });
+        };
     }
 
     #[test]
@@ -897,7 +923,8 @@ mod tests {
         let ctx = install(&allocator);
         let pages = ctx.pages;
         let layout = Layout::from_size_align(64, 8).unwrap();
-        let id = THREAD_HEAP.with(|tls| {
+        let id = {
+            let tls = &THREAD_HEAP;
             let id = tls.bind(&ctx).unwrap();
             let live = alloc_live(tls, &ctx, layout, 8);
             let run = run_of(pages, live[0]);
@@ -909,13 +936,13 @@ mod tests {
             assert_eq!(heap.enqueue(id, PageOwner::Run(run)), Ok(()));
             assert_eq!(heap.close(id), Ok(()));
             id
-        });
+        };
 
         assert_eq!(ctx.heaps.reclaim(id), Ok(()));
         assert!(ctx.heaps.get(id).is_some());
         assert_eq!(ctx.heaps.flush(id, &ctx), Ok(()));
         assert!(ctx.heaps.get(id).is_none());
-        THREAD_HEAP.with(unbind);
+        unbind(&THREAD_HEAP);
     }
 
     #[test]
@@ -924,7 +951,8 @@ mod tests {
         let ctx = install(&allocator);
         let pages = ctx.pages;
         let layout = Layout::from_size_align(128 * 1024, 4096).unwrap();
-        let id = THREAD_HEAP.with(|tls| {
+        let id = {
+            let tls = &THREAD_HEAP;
             let id = tls.bind(&ctx).unwrap();
             let ptr = bind_alloc_extent(tls, &ctx, layout, ExtentInit::Uninit);
             let extent = extent_of(pages, ptr);
@@ -934,13 +962,13 @@ mod tests {
             assert_eq!(heap.enqueue(id, PageOwner::Extent(extent)), Ok(()));
             assert_eq!(heap.close(id), Ok(()));
             id
-        });
+        };
 
         assert_eq!(ctx.heaps.reclaim(id), Ok(()));
         assert!(ctx.heaps.get(id).is_some());
         assert_eq!(ctx.heaps.flush(id, &ctx), Ok(()));
         assert!(ctx.heaps.get(id).is_none());
-        THREAD_HEAP.with(unbind);
+        unbind(&THREAD_HEAP);
     }
 
     #[test]
@@ -949,7 +977,8 @@ mod tests {
         let ctx = install(&allocator);
         let pages = ctx.pages;
         let layout = Layout::from_size_align(64, 8).unwrap();
-        let (id, first, first_run, second, second_run) = THREAD_HEAP.with(|tls| {
+        let (id, first, first_run, second, second_run) = {
+            let tls = &THREAD_HEAP;
             let id = tls.bind(&ctx).unwrap();
             let first = bind_alloc_small(tls, &ctx, layout);
             let second = bind_alloc_small(tls, &ctx, layout);
@@ -957,7 +986,7 @@ mod tests {
             let second_run = run_of(pages, second);
             unbind(tls);
             (id, first, first_run, second, second_run)
-        });
+        };
 
         // unbind already retired; heap should be Draining with live blocks.
         assert_eq!(ctx.heaps.get(id).map(Heap::mode), Some(HeapMode::Draining));
@@ -979,23 +1008,25 @@ mod tests {
         let ctx = install(&allocator);
         let pages = ctx.pages;
         let layout = Layout::from_size_align(64, 8).unwrap();
-        let (heap, ptr, run) = THREAD_HEAP.with(|tls| {
+        let (heap, ptr, run) = {
+            let tls = &THREAD_HEAP;
             let heap = tls.bind(&ctx).unwrap();
             let ptr = bind_alloc_small(tls, &ctx, layout);
             let run = run_of(pages, ptr);
             unbind(tls);
             (heap, ptr, run)
-        });
+        };
 
         assert_eq!(ctx.heaps.free(heap, PageOwner::Run(run), ptr, &ctx), Ok(()));
         assert!(pages.get(ptr).is_some());
-        THREAD_HEAP.with(|tls| {
+        {
+            let tls = &THREAD_HEAP;
             let reused = tls.bind(&ctx).unwrap();
             if reused.index() == heap.index() {
                 assert_ne!(reused.generation(), heap.generation());
             }
             unbind(tls);
-        });
+        };
     }
 
     #[test]
@@ -1004,7 +1035,8 @@ mod tests {
         let ctx = install(&allocator);
         let pages = ctx.pages;
         let layout = Layout::from_size_align(64, 8).unwrap();
-        let (heap, ptr) = THREAD_HEAP.with(|tls| {
+        let (heap, ptr) = {
+            let tls = &THREAD_HEAP;
             let heap = tls.bind(&ctx).unwrap();
             let ptr = bind_alloc_small(tls, &ctx, layout);
             let run = run_of(pages, ptr);
@@ -1012,11 +1044,12 @@ mod tests {
             assert!(pages.get(ptr).is_some());
             unbind(tls);
             (heap, ptr)
-        });
+        };
 
         assert!(pages.get(ptr).is_some());
 
-        THREAD_HEAP.with(|tls| {
+        {
+            let tls = &THREAD_HEAP;
             let reused = tls.bind(&ctx).unwrap();
             if reused.index() == heap.index() {
                 assert_ne!(reused.generation(), heap.generation());
@@ -1027,7 +1060,7 @@ mod tests {
             let reused_run = run_of(pages, reused_ptr);
             assert_eq!(tls.free_run(reused_run, reused_ptr), Ok(()));
             unbind(tls);
-        });
+        };
     }
 
     #[test]
@@ -1036,7 +1069,8 @@ mod tests {
         let ctx = install(&allocator);
         let pages = ctx.pages;
         let layout = Layout::from_size_align(128 * 1024, 4096).unwrap();
-        THREAD_HEAP.with(|tls| {
+        {
+            let tls = &THREAD_HEAP;
             let id = tls.bind(&ctx).unwrap();
             let ptr = bind_alloc_extent(tls, &ctx, layout, ExtentInit::Zeroed);
             // SAFETY: ptr was just allocated zeroed for layout.
@@ -1050,7 +1084,7 @@ mod tests {
             assert_eq!(unsafe { extent.as_ref() }.heap_id(), id);
             assert_eq!(tls.free_extent(extent, ptr, &ctx), Ok(()));
             unbind(tls);
-        });
+        };
     }
 
     #[test]
@@ -1100,7 +1134,8 @@ mod tests {
         let ctx = install(&allocator);
         let pages = ctx.pages;
         let layout = Layout::from_size_align(64, 8).unwrap();
-        let (first0, rest, extra, run_a, run_b) = THREAD_HEAP.with(|tls| {
+        let (first0, rest, extra, run_a, run_b) = {
+            let tls = &THREAD_HEAP;
             let _id = tls.bind(&ctx).unwrap();
             let capacity = crate::heap::run::RUN_SIZE / 64;
             let mut first = Vec::with_capacity(capacity);
@@ -1114,10 +1149,13 @@ mod tests {
             let first0 = first[0];
             let rest = first[1..].to_vec();
             (first0, rest, extra, run_a, run_b)
-        });
+        };
+        let class = SizeClasses::class_for(LayoutSpec::from_layout(layout)).unwrap();
+        assert_eq!(THREAD_HEAP.free(first0, class), None);
         // SAFETY: first0 is a live block on the non-current full run.
         unsafe { allocator.dealloc(first0.as_ptr(), layout) };
-        THREAD_HEAP.with(|tls| {
+        {
+            let tls = &THREAD_HEAP;
             assert_eq!(
                 tls.lookup(pages, first0, LayoutSpec::from_layout(layout)),
                 Some(PageOwner::Run(run_a))
@@ -1125,7 +1163,7 @@ mod tests {
             assert_eq!(tls.free_run(run_b, extra), Ok(()));
             assert_eq!(free_all(tls, pages, &rest), Ok(()));
             unbind(tls);
-        });
+        };
     }
 
     #[test]

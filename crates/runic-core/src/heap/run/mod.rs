@@ -75,7 +75,7 @@ impl BlockIndex {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Block {
     index: BlockIndex,
     ptr: NonNull<u8>,
@@ -97,7 +97,10 @@ impl Block {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RunError {
+    /// In this run's block span but not a block boundary (interior).
     InvalidPointer,
+    /// Outside `span` (wrong run, tail slack, or claim tail).
+    OutOfRange,
     DoubleFree,
 }
 
@@ -172,15 +175,16 @@ impl ClaimBits {
 }
 
 pub(crate) struct Run {
-    /// Owner-local freelist / live / bump — field order prefers extend/flush locality under
-    /// `repr(Rust)` (not a layout guarantee; do not treat as ABI).
-    state: UnsafeCell<RunState>,
     /// Cached payload base (`RUN_SIZE` bytes) in a heap-owned map.
     base: NonNull<u8>,
     /// `capacity * stride` — payload bytes that are real blocks (≤ `RUN_SIZE`).
     span: u32,
     /// `ceil(2^32 / stride)` — exact `floor(offset / stride)` for `offset < 2^16`.
     recip: u32,
+    /// Owner-local freelist / live / bump. `free` / `live` / `capacity` sit on the
+    /// same line as `base` / `span` / `recip` so `Run::free` is one dependent line
+    /// after `current[class]` (`repr(Rust)` is not ABI).
+    state: UnsafeCell<RunState>,
     stride: usize,
     claims: ClaimBits,
     class: SizeClass,
@@ -208,12 +212,12 @@ impl InboxNode for Run {
 const FREE_END: usize = 0;
 
 struct RunState {
+    /// `FREE_END` or a payload address of a free block.
+    free: usize,
     live: usize,
     capacity: usize,
     bump: usize,
     available_next: Option<NonNull<Run>>,
-    /// `FREE_END` or a payload address of a free block.
-    free: usize,
     /// On this class's `RunHeap` available list. `push_available` is a no-op when set.
     on_available: bool,
 }
@@ -365,7 +369,7 @@ impl Run {
     /// Owner double-free is undefined. Remote admission is `claim` / `accept`.
     #[inline]
     pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<bool, RunError> {
-        let block = self.locate(ptr).ok_or(RunError::InvalidPointer)?;
+        let block = self.locate(ptr)?;
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
         let was_full = state.live == state.capacity;
@@ -380,7 +384,7 @@ impl Run {
 
     /// Freer: reserve remote admission before publish / payload reuse.
     pub(crate) fn claim(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
-        let block = self.locate(ptr).ok_or(RunError::InvalidPointer)?;
+        let block = self.locate(ptr)?;
         if block.index().get() >= self.issued.load(Ordering::Relaxed) {
             return Err(RunError::DoubleFree);
         }
@@ -422,6 +426,7 @@ impl Run {
         self.claims.any_set()
     }
 
+    #[cold]
     fn maybe_discard(&self, state: &mut RunState) {
         debug_assert_eq!(self.policy, RunPolicy::Discard);
         debug_assert_eq!(state.live, 0);
@@ -432,7 +437,7 @@ impl Run {
     }
 
     pub(crate) fn allocated(&self, ptr: NonNull<u8>) -> Result<Block, RunError> {
-        let block = self.locate(ptr).ok_or(RunError::InvalidPointer)?;
+        let block = self.locate(ptr)?;
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &*self.state.get() };
         if block.index().get() >= state.bump {
@@ -455,11 +460,11 @@ impl Run {
     }
 
     #[inline]
-    pub(crate) fn locate(&self, ptr: NonNull<u8>) -> Option<Block> {
+    pub(crate) fn locate(&self, ptr: NonNull<u8>) -> Result<Block, RunError> {
         let offset = u64::try_from(ptr.as_ptr().addr().wrapping_sub(self.base.as_ptr().addr()))
             .unwrap_or(u64::MAX);
         if offset >= u64::from(self.span) {
-            return None;
+            return Err(RunError::OutOfRange);
         }
         // `recip = ceil(2^32 / stride)` is exact for `offset < 2^16`, `stride ≤ 2^15`.
         // `stride | offset` iff the low 32 bits of `offset * recip` are `< recip`.
@@ -468,11 +473,11 @@ impl Run {
         #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
         let remainder = product as u32;
         if remainder >= self.recip {
-            return None;
+            return Err(RunError::InvalidPointer);
         }
         let index = product >> 32;
-        Some(Block::new(
-            BlockIndex::new(usize::try_from(index).ok()?),
+        Ok(Block::new(
+            BlockIndex::new(usize::try_from(index).map_err(|_| RunError::InvalidPointer)?),
             ptr,
         ))
     }
@@ -713,7 +718,7 @@ mod tests {
         let ptr = alloc_block(&run).unwrap();
         let interior = unsafe { NonNull::new_unchecked(ptr.as_ptr().add(1)) };
 
-        assert!(run.locate(interior).is_none());
+        assert_eq!(run.locate(interior), Err(RunError::InvalidPointer));
     }
 
     #[test]
@@ -724,10 +729,10 @@ mod tests {
             let capacity = RUN_SIZE / size;
 
             let first = alloc_block(&run).unwrap();
-            assert!(run.locate(first).is_some(), "size={size}");
-            assert!(
-                run.locate(unsafe { NonNull::new_unchecked(first.as_ptr().add(1)) })
-                    .is_none(),
+            assert!(run.locate(first).is_ok(), "size={size}");
+            assert_eq!(
+                run.locate(unsafe { NonNull::new_unchecked(first.as_ptr().add(1)) }),
+                Err(RunError::InvalidPointer),
                 "size={size}"
             );
 
@@ -736,7 +741,11 @@ mod tests {
                 let slack = unsafe {
                     NonNull::new_unchecked(run.range().base().as_ptr().add(slack_offset))
                 };
-                assert!(run.locate(slack).is_none(), "size={size} slack");
+                assert_eq!(
+                    run.locate(slack),
+                    Err(RunError::OutOfRange),
+                    "size={size} slack"
+                );
             }
         }
     }
@@ -748,8 +757,8 @@ mod tests {
         let ptr = alloc_block(&run).unwrap();
         let interior = unsafe { NonNull::new_unchecked(ptr.as_ptr().add(1)) };
 
-        assert!(run.locate(ptr).is_some());
-        assert!(run.locate(interior).is_none());
+        assert!(run.locate(ptr).is_ok());
+        assert_eq!(run.locate(interior), Err(RunError::InvalidPointer));
     }
 
     #[test]
@@ -759,7 +768,7 @@ mod tests {
             let run = test_run(u32::try_from(run_index).unwrap(), class);
             let ptr = alloc_block(&run).unwrap();
 
-            assert!(run.locate(ptr).is_some(), "size={size}");
+            assert!(run.locate(ptr).is_ok(), "size={size}");
             assert!(run.free(ptr).is_ok(), "size={size}");
             assert_eq!(run.allocate(), Some(ptr), "size={size}");
         }
@@ -772,7 +781,7 @@ mod tests {
         let claim_tail =
             unsafe { NonNull::new_unchecked(run.range().base().as_ptr().add(RUN_SIZE)) };
 
-        assert!(run.locate(claim_tail).is_none());
+        assert_eq!(run.locate(claim_tail), Err(RunError::OutOfRange));
     }
 
     #[test]
@@ -782,8 +791,8 @@ mod tests {
         let run_b = test_run(5, class);
         let ptr = alloc_block(&run_b).unwrap();
 
-        assert!(run_b.locate(ptr).is_some());
-        assert!(run_a.locate(ptr).is_none());
+        assert!(run_b.locate(ptr).is_ok());
+        assert_eq!(run_a.locate(ptr), Err(RunError::OutOfRange));
     }
 
     #[test]
@@ -797,7 +806,7 @@ mod tests {
             let slack =
                 unsafe { NonNull::new_unchecked(run.range().base().as_ptr().add(slack_offset)) };
 
-            assert!(run.locate(slack).is_none(), "size={size}");
+            assert_eq!(run.locate(slack), Err(RunError::OutOfRange), "size={size}");
         }
     }
 

@@ -18,8 +18,8 @@ pub(crate) struct ExtentHeap {
 /// How a newly allocated extent's bytes should be initialized.
 ///
 /// Fresh anonymous mappings are already kernel-zeroed. Cached extents may be
-/// dirty, so [`ExtentInit::Zeroed`] only memsets on cache hits (using
-/// [`LayoutSpec::size`]).
+/// dirty, so [`ExtentInit::Zeroed`] memsets on cache hits unless [`ExtentPolicy::Discard`]
+/// already dropped the pages (`LayoutSpec::size`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExtentInit {
     Uninit,
@@ -58,8 +58,9 @@ impl ExtentHeap {
         if let Some(mut extent_ptr) = self.cache.acquire(len) {
             // SAFETY: cache only stores live arena extents owned by this heap.
             let extent = unsafe { extent_ptr.as_mut() };
+            let skip_zero = extent.discarded();
             if let Some(ptr) = extent.reuse(heap_id, spec) {
-                if init == ExtentInit::Zeroed {
+                if init == ExtentInit::Zeroed && !skip_zero {
                     // SAFETY: ptr was just reused for spec and is valid for spec.size() bytes.
                     unsafe { write_bytes(ptr.as_ptr(), 0, spec.size()) };
                 }
@@ -113,18 +114,15 @@ impl ExtentHeap {
         self.cache_or_unmap(extent_ptr, pages)
     }
 
-    /// After free/accept: Keep retains published in cache; otherwise unpublish and drop.
+    /// After free/accept: Keep/Discard retain published in cache; Unmap / over-budget unpublish.
     fn cache_or_unmap(
         &mut self,
         extent_ptr: NonNull<Extent>,
         pages: &PageMap,
     ) -> Result<(), HeapError> {
         // SAFETY: PageMap stores only pointers published from this allocator's live arena.
-        let extent = unsafe { extent_ptr.as_ref() };
-        debug_assert!(!extent.is_live());
-        let len = extent.mapping().len().get();
-
-        if self.cache.will_retain(len) && self.cache.insert(extent_ptr).is_ok() {
+        debug_assert!(!unsafe { extent_ptr.as_ref() }.is_live());
+        if self.cache.insert(extent_ptr).is_ok() {
             return Ok(());
         }
 
@@ -256,8 +254,8 @@ mod tests {
     }
 
     #[test]
-    fn drop_policy_unpublishes_on_free() {
-        let mut heap = ExtentHeap::new(ExtentConfig::new().with_policy(ExtentPolicy::Drop));
+    fn unmap_policy_unpublishes_on_free() {
+        let mut heap = ExtentHeap::new(ExtentConfig::new().with_policy(ExtentPolicy::Unmap));
         let pages = PageMap::new();
         let spec = layout_spec(128 * 1024, 4096);
         let heap_id = HeapId::new(0, NonZeroU32::MIN).unwrap();
@@ -317,6 +315,43 @@ mod tests {
             .unwrap();
         assert_eq!(reused, first);
         // SAFETY: reused is valid for size bytes.
+        assert!(
+            unsafe { core::slice::from_raw_parts(reused.as_ptr(), size) }
+                .iter()
+                .all(|&byte| byte == 0)
+        );
+
+        let Some(PageOwner::Extent(extent)) = pages.get(reused) else {
+            panic!("expected extent owner");
+        };
+        heap.free(extent, reused, &pages).unwrap();
+    }
+
+    #[test]
+    fn discard_zeroed_allocate_is_clean_after_dirty_reuse() {
+        let mut heap = ExtentHeap::new(ExtentConfig::new().with_policy(ExtentPolicy::Discard));
+        let pages = PageMap::new();
+        let spec = layout_spec(128 * 1024, 4096);
+        let size = 128 * 1024;
+        let heap_id = HeapId::new(0, NonZeroU32::MIN).unwrap();
+
+        let first = heap
+            .allocate(spec, heap_id, &pages, ExtentInit::Zeroed)
+            .unwrap();
+        // SAFETY: first is valid for size bytes.
+        unsafe { write_bytes(first.as_ptr(), 0xab, size) };
+
+        let Some(PageOwner::Extent(extent)) = pages.get(first) else {
+            panic!("expected extent owner");
+        };
+        heap.free(extent, first, &pages).unwrap();
+        assert_eq!(pages.get(first), Some(PageOwner::Extent(extent)));
+
+        let reused = heap
+            .allocate(spec, heap_id, &pages, ExtentInit::Zeroed)
+            .unwrap();
+        assert_eq!(reused, first);
+        // SAFETY: reused is valid for size bytes; Discard must yield zeros without Keep memset.
         assert!(
             unsafe { core::slice::from_raw_parts(reused.as_ptr(), size) }
                 .iter()

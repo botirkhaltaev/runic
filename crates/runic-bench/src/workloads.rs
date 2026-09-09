@@ -1,4 +1,4 @@
-use crate::{collections, libraries};
+use crate::{collections, libraries, threaded};
 
 #[derive(Clone, Copy)]
 pub struct Workload {
@@ -79,6 +79,26 @@ pub const WORKLOADS: &[Workload] = &[
         name: "http_buffers",
         elems: 16 * 256,
         run: || libraries::http_buffers(16, 256),
+    },
+    Workload {
+        name: "channel_pipeline",
+        elems: 8 * 4 * 256,
+        run: || threaded::channel_pipeline(8, 256),
+    },
+    Workload {
+        name: "arc_share_drop",
+        elems: 8 * 1_024,
+        run: || threaded::arc_share_drop(8, 1_024),
+    },
+    Workload {
+        name: "scoped_map_reduce",
+        elems: 4 * 4 * 256,
+        run: || threaded::scoped_map_reduce(4, 256),
+    },
+    Workload {
+        name: "large_buffers",
+        elems: 4 * 16,
+        run: || libraries::large_buffers(4, 16),
     },
 ];
 

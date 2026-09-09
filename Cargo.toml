@@ -19,6 +19,8 @@ unsafe_op_in_unsafe_fn = "deny"
 
 [profile.bench]
 debug = "line-tables-only"
+lto = "fat"
+codegen-units = 1
 
 [workspace.lints.clippy]
 

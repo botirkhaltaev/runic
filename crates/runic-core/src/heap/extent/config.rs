@@ -51,11 +51,22 @@ impl Default for ExtentConfig {
 /// requested length; there is no size-bucket or best-fit reuse strategy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExtentPolicy {
-    /// Do not retain freed extent mappings. Useful for tests and benchmarks
-    /// that compare against unretained large-allocation churn.
-    Drop,
     /// Retain a freed mapping only while both slot and byte budget have free
-    /// capacity; otherwise the mapping is released back to the OS. Keep never
-    /// evicts a retained mapping to admit another.
+    /// capacity; otherwise the mapping is unmapped. Keep never evicts a
+    /// retained mapping to admit another. Reused pages stay dirty;
+    /// `alloc_zeroed` memsets on cache hit.
     Keep,
+    /// Like [`Self::Keep`], then `madvise(MADV_DONTNEED)` on the mapping.
+    /// Zeroed reuse skips memset when discard succeeded (kernel zeros on fault).
+    Discard,
+    /// Do not retain freed extent mappings; unmap immediately. Useful for tests
+    /// and benchmarks that compare against unretained large-allocation churn.
+    Unmap,
+}
+
+impl ExtentPolicy {
+    /// `Keep` and `Discard` retain published mappings; `Unmap` does not.
+    pub(crate) const fn retains(self) -> bool {
+        !matches!(self, Self::Unmap)
+    }
 }
