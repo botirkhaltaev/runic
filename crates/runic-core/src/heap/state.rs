@@ -60,7 +60,7 @@ pub(super) struct Snapshot {
 /// - Inbox link: head CAS in [`super::inbox::Inbox::link`] (after lease admit)
 /// - Active→Draining close: `close` `AcqRel` CAS (preserves lease count)
 /// - Lease release: `Release` `fetch_sub`; retire observes zero with `Acquire` loads
-/// - Free reactivation: `Release` store of Active after metadata rebind under the heaps arena lock
+/// - Free reactivation: `Release` store of Active after metadata rebind under Inner
 pub(crate) struct HeapState {
     word: AtomicU64,
 }

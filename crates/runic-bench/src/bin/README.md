@@ -2,7 +2,7 @@
 
 `metrics` runs each allocator/case in a fresh subprocess and prints RSS peak, plateau after free, VMA count, minor faults, and optional syscall counts.
 
-Cases are the same collection and library workloads as `global_*`. Runic configs (`runic:extent_unmap`, `runic:extent_tight`, `runic:run_discard`, `runic:extent_discard`) are targets here, not Criterion ids.
+Cases are the same collection and library workloads as `global_*`. Runic configs (`runic:<extent>/<run>[:tight]`) are targets here, not Criterion ids.
 
 ```sh
 cargo run -p runic-bench --release --bin metrics

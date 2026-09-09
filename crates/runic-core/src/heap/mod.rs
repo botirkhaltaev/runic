@@ -79,6 +79,44 @@ impl HeapInner {
     fn has_live(&self) -> bool {
         self.runs.has_live() || self.extents.has_live()
     }
+
+    /// Owner-local free. `Ok(true)` when this owner is no longer live.
+    ///
+    /// Caller owns inbox `flush`. A live owner means the heap is not reclaimable,
+    /// so Draining `Heaps::free` can skip the arena scan.
+    pub(super) fn free(
+        &mut self,
+        owner: PageOwner,
+        ptr: NonNull<u8>,
+        ctx: &AllocatorCtx<'_>,
+    ) -> Result<bool, HeapError> {
+        match owner {
+            PageOwner::Run(run) => {
+                // SAFETY: PageMap / inbox carry only live arena run pointers.
+                if unsafe { run.as_ref() }.free(ptr).map_err(HeapError::from)? {
+                    self.runs.push_available(run)?;
+                }
+                // SAFETY: same live arena run; `is_live` counts allocated and claimed.
+                Ok(!unsafe { run.as_ref() }.is_live())
+            }
+            PageOwner::Extent(extent) => {
+                self.extents.free(extent, ptr, ctx.pages)?;
+                Ok(true)
+            }
+        }
+    }
+
+    pub(super) fn push_available(&mut self, run: NonNull<Run>) -> Result<(), HeapError> {
+        self.runs.push_available(run)
+    }
+
+    pub(super) fn acquire_run(
+        &mut self,
+        class: SizeClass,
+        pages: &PageMap,
+    ) -> Option<NonNull<Run>> {
+        self.runs.acquire(class, self.id, pages)
+    }
 }
 
 impl Heap {
@@ -186,7 +224,7 @@ impl Heap {
         if snap.retired || snap.mode != HeapMode::Draining || snap.leases != 0 {
             return false;
         }
-        if inner.has_live() || !self.inboxes_empty() {
+        if !self.inboxes_empty() || inner.has_live() {
             return false;
         }
         let again = self.state.load();
@@ -227,38 +265,6 @@ impl Heap {
         Ok(())
     }
 
-    /// Owner-local free (Inner only). Caller owns inbox `flush`.
-    #[allow(clippy::unused_self)]
-    pub(super) fn free(
-        &self,
-        inner: &mut HeapInner,
-        owner: PageOwner,
-        ptr: NonNull<u8>,
-        ctx: &AllocatorCtx<'_>,
-    ) -> Result<(), HeapError> {
-        match owner {
-            PageOwner::Run(run) => {
-                // SAFETY: PageMap / inbox carry only live arena run pointers.
-                if unsafe { run.as_ref() }.free(ptr).map_err(HeapError::from)? {
-                    inner.runs.push_available(run)
-                } else {
-                    Ok(())
-                }
-            }
-            PageOwner::Extent(extent) => inner.extents.free(extent, ptr, ctx.pages),
-        }
-    }
-
-    /// Insert a run that just left full onto the available list. Not on the free hit.
-    #[allow(clippy::unused_self)]
-    pub(super) fn push_available(
-        &self,
-        inner: &mut HeapInner,
-        run: NonNull<Run>,
-    ) -> Result<(), HeapError> {
-        inner.runs.push_available(run)
-    }
-
     /// Flush inboxes if needed, then allocate one large block.
     pub(super) fn alloc_extent(
         &self,
@@ -271,17 +277,6 @@ impl Heap {
             self.flush(inner, ctx).ok()?;
         }
         inner.extents.allocate(spec, inner.id, ctx.pages, init)
-    }
-
-    /// Acquire a run without flushing the inbox (caller owns flush policy).
-    #[allow(clippy::unused_self)]
-    pub(super) fn acquire_run(
-        &self,
-        inner: &mut HeapInner,
-        class: SizeClass,
-        ctx: &AllocatorCtx<'_>,
-    ) -> Option<NonNull<Run>> {
-        inner.runs.acquire(class, inner.id, ctx.pages)
     }
 }
 

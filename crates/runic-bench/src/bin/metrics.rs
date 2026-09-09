@@ -21,23 +21,39 @@ static SYSTEM: System = System;
 static MIMALLOC: MiMalloc = MiMalloc;
 static JEMALLOC: Jemalloc = Jemalloc;
 static SNMALLOC: SnMalloc = SnMalloc;
-static EXTENT_UNMAP: RunicAlloc = RunicAlloc::builder()
-    .extent_policy(ExtentPolicy::Unmap)
-    .build();
-static EXTENT_TIGHT: RunicAlloc = RunicAlloc::builder()
+static KEEP_KEEP: RunicAlloc = RunicAlloc::builder()
     .extent_policy(ExtentPolicy::Keep)
-    .extent_budget(Budget::new(2, 512 * 1024))
+    .run_policy(RunPolicy::Keep)
     .build();
-static RUN_DISCARD: RunicAlloc = RunicAlloc::builder().run_policy(RunPolicy::Discard).build();
-static EXTENT_DISCARD: RunicAlloc = RunicAlloc::builder()
+static DISCARD_KEEP: RunicAlloc = RunicAlloc::builder()
     .extent_policy(ExtentPolicy::Discard)
+    .run_policy(RunPolicy::Keep)
+    .build();
+static KEEP_DISCARD: RunicAlloc = RunicAlloc::builder()
+    .extent_policy(ExtentPolicy::Keep)
+    .run_policy(RunPolicy::Discard)
+    .build();
+static DISCARD_DISCARD: RunicAlloc = RunicAlloc::builder()
+    .extent_policy(ExtentPolicy::Discard)
+    .run_policy(RunPolicy::Discard)
+    .build();
+static UNMAP_KEEP: RunicAlloc = RunicAlloc::builder()
+    .extent_policy(ExtentPolicy::Unmap)
+    .run_policy(RunPolicy::Keep)
+    .build();
+static KEEP_KEEP_TIGHT: RunicAlloc = RunicAlloc::builder()
+    .extent_policy(ExtentPolicy::Keep)
+    .run_policy(RunPolicy::Keep)
+    .extent_budget(Budget::new(2, 512 * 1024))
     .build();
 
 const EXTRA_NAMES: &[&str] = &[
-    "runic:extent_unmap",
-    "runic:extent_tight",
-    "runic:run_discard",
-    "runic:extent_discard",
+    "runic:keep/keep",
+    "runic:discard/keep",
+    "runic:keep/discard",
+    "runic:discard/discard",
+    "runic:unmap/keep",
+    "runic:keep/keep:tight",
 ];
 
 struct SelectedAlloc;
@@ -51,10 +67,12 @@ fn kind_of(name: &[u8]) -> Option<u8> {
         b"mimalloc" => 2,
         b"jemalloc" => 3,
         b"snmalloc" => 4,
-        b"runic:extent_unmap" => 5,
-        b"runic:extent_tight" => 6,
-        b"runic:run_discard" => 7,
-        b"runic:extent_discard" => 8,
+        b"runic:keep/keep" => 5,
+        b"runic:discard/keep" => 6,
+        b"runic:keep/discard" => 7,
+        b"runic:discard/discard" => 8,
+        b"runic:unmap/keep" => 9,
+        b"runic:keep/keep:tight" => 10,
         _ => return None,
     })
 }
@@ -94,10 +112,12 @@ fn selected() -> &'static dyn GlobalAlloc {
         2 => &MIMALLOC,
         3 => &JEMALLOC,
         4 => &SNMALLOC,
-        5 => &EXTENT_UNMAP,
-        6 => &EXTENT_TIGHT,
-        7 => &RUN_DISCARD,
-        8 => &EXTENT_DISCARD,
+        5 => &KEEP_KEEP,
+        6 => &DISCARD_KEEP,
+        7 => &KEEP_DISCARD,
+        8 => &DISCARD_DISCARD,
+        9 => &UNMAP_KEEP,
+        10 => &KEEP_KEEP_TIGHT,
         _ => &RUNIC,
     }
 }
@@ -357,8 +377,9 @@ mod tests {
     fn kind_of_known_names() {
         assert_eq!(kind_of(b"runic"), Some(0));
         assert_eq!(kind_of(b"snmalloc"), Some(4));
-        assert_eq!(kind_of(b"runic:run_discard"), Some(7));
-        assert_eq!(kind_of(b"runic:extent_discard"), Some(8));
+        assert_eq!(kind_of(b"runic:keep/discard"), Some(7));
+        assert_eq!(kind_of(b"runic:discard/keep"), Some(6));
+        assert_eq!(kind_of(b"runic:unmap/keep"), Some(9));
         assert_eq!(kind_of(b"nope"), None);
     }
 }
