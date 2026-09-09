@@ -30,13 +30,14 @@ idiomatic Rust, with `unsafe` only where ownership/OS boundaries or measured
 hot paths require it. Architecture should stay simple until a new entity owns a
 real lifecycle, invariant, or policy.
 
-The owner-local current run is that entity for the small hit. Leftover vs
-snmalloc on this host is `global_*` collection Cost (`vec_many_small` 1.71×,
-then `word_count` / `http_buffers` ~1.10×, `json_api` / `regex_search` ~1.07×,
-`tree`). Do not retry a magazine, RSEQ, or a locate-offset dual free. Owner
-DF is undefined; remote admission stays fail-closed. One process-wide payload;
-TLS identity is free. Out-of-line metadata stays until Where shows an in-page
-run header is a ≥5% lever.
+The owner-local current run is that entity for the small hit. LTO collection
+Cost on this host puts `vec_many_small` at 30.7 vs snmalloc 33.2 (0.93×).
+App-bound cases (`tree`, `http_buffers`, …) stay near parity. Substantial
+wins vs snmalloc live on remote-free, large buffers, and footprint — see
+Benchmark Policy. Do not retry a magazine, RSEQ, or a locate-offset dual
+free. Owner DF is undefined; remote admission stays fail-closed. One
+process-wide payload; TLS identity is free. Out-of-line metadata stays until
+Where shows an in-page run header is a ≥5% lever.
 
 ## Current Status
 
@@ -194,7 +195,7 @@ Build only:
 
 ```text
 Linux x86_64
-Rust stable
+Rust nightly (`#[thread_local]` `THREAD_HEAP`)
 GlobalAlloc
 owner-local heaps via Heaps / ThreadHeap
 heap-owned 2 MiB run maps (16 spaces) for size-classed allocations
@@ -370,32 +371,70 @@ allocation paths.
 Current benchmark interpretation:
 
 ```text
-#129 matrix (this host, aa3a83a, compare_explicit cycles/elem):
+Competitor crates (runic-bench defaults; no extra features):
+  snmalloc-rs 0.3.8  cmake Release -O3, initial-exec TLS, wait-on-address.
+                     native-cpu off (matches rustc x86-64, not -march=native).
+                     crate `lto` feature is a no-op on the Linux cmake path.
+  mimalloc 0.1.52    v3, MI_SECURE off, initial-exec TLS.
+  jemalloc 0.6.1     background_threads_runtime_support only (no background threads).
 
-phase/64        runic  snmalloc  mimalloc  jemalloc   vs best
-owner_free       62.4      15.4      13.6      34.2    4.6× mi
-freelist         44.6      16.3      22.5      30.0    2.7× sn
-churn            43.6      27.4      33.4      32.1    1.6× sn
+profile.sh Cost is the ordinary bench binary (no forced frame pointers).
+Where uses LBR. v0 symbol mangling stays on. Pair:
+  vec_many_small runic  fp 42.7 / no-fp 44.8 (fp fewer cycles, more insns).
+  Dropped the force so Cost matches `cargo bench` and C omit-fp.
 
-Runic churn is flat ~43–45 across 8/64/80/4096. owner_free 50.9 / 62.4 / 62.6 /
-77.7. freelist 41.9 / 44.6 / 43.2 / 102.5 (4096 pays take).
+[profile.bench] lto = "fat", codegen-units = 1 (adopted):
+  vec_many_small  runic 44.8 → 32.6 (−27%); snmalloc 39.4 → 33.2 (−16%).
 
-large_alloc_churn/65536: runic 110, mimalloc 133, jemalloc 883, snmalloc 1283.
-Runic wins on extent retention (Keep).
+After cold `maybe_discard` + Run hot-field pack (base/span/recip +
+free/live/capacity): vec_many_small 30.7. Gate ≤ 40. vs LTO snmalloc 33.2
+(0.93×). objdump: `__rust_alloc` has no callee-saved; `Allocator::dealloc`
+still pushes rbx/r14/r15 for was_full / Discard. `__rust_dealloc` is a jmp.
+Realloc and multi-entry RunCache skipped (no miss-rate / Cost lever).
 
-threaded/4: local 46.3 vs snmalloc 29.2 (1.6×). fan-in 392 vs 349 (1.1×).
-ring 674 vs 576 (1.2×). Cross-allocator ratios are this-host Cost, not library drift.
+#129 synthetic matrix stays the historical competitor baseline (aa3a83a).
+Collection leftover vs snmalloc is app work (`tree` / `http_buffers` ~1.01×
+pre-LTO).
 
-Owner-local hit is current-run pop / `lookup` then `Run::free` (locate + push).
-Leftover vs snmalloc is `global_*` collection Cost. Same-session maps reshape
-(`profile.sh` cycles/elem vs snmalloc): `vec_many_small` 64.8 / 37.9 (1.71×;
-Where is alloc/dealloc — `lookup`, TLS `with`, `Run::free`); `word_count`
-365 / 331 (1.10×; fmt/hash); `http_buffers` 232 / 211 (1.10×; `bytes`);
-`json_api` 6400 / 5984 (1.07×; btree); `regex_search` 1123 / 1047 (1.07×;
-teddy). `#135` RSEQ is not the lever — see thesis.
+Track C Cost (this host, LTO, `RUNIC_PROFILE_CPUS=0-3` for threaded):
 
-Remote fan-in is close (run-coalesced Inbox). Use paired Runic cycles/op for
-self-gates; use this table as the competitor baseline.
+  workload            runic     snmalloc   mimalloc    vs sn
+  channel_pipeline    1677        1462         —     1.15×
+  arc_share_drop       269         336         —     0.80×
+  scoped_map_reduce    703         577         —     1.22×
+  large_buffers      76423        4872     62846    15.7× (≈1.22× mi)
+
+`arc_share_drop` is the remote last-drop win. Mixed-size 64 KiB–1 MiB
+`large_buffers` under default Keep is memset on dirty reuse (15.7× sn),
+not a missing medium class.
+
+Keep vs Discard vs Unmap on `large_buffers` (metrics `--case`, 64 ops,
+`perf stat -r 5` cycles:u; same-host):
+
+  policy              cycles     minflt   rss_after
+  Keep (default)     7.60M       2186     21.5 MiB
+  Discard            1.64M        141     12.5 MiB
+  Unmap              1.69M        132     12.6 MiB
+  snmalloc           1.71M        121     12.4 MiB
+  mimalloc           6.28M          6     24.6 MiB
+
+Discard (retain mapping, `madvise`, skip memset when advise succeeds)
+matches snmalloc. Unmap is the same order. Keep and mimalloc pay the
+dirty memset. Medium size-classes are not the lever. Default stays
+Keep (dirty reuse). `runic:extent_discard` is the opt-in.
+
+RSS / minflt (`metrics` bin; syscall tracepoints not permitted on this host):
+
+  workload            runic peak/after/flt     snmalloc
+  vec_many_small      12.6 / 12.6 / 23         12.2 / 12.2 / 0
+  http_buffers        12.6 / 12.6 / 5          12.3 / 12.3 / 1
+  channel_pipeline    13.4 / 13.4 / 163        12.5 / 12.5 / 29
+  arc_share_drop      13.2 / 13.2 / 123        12.5 / 12.5 / 25
+  scoped_map_reduce   13.0 / 13.0 / 90         12.4 / 12.4 / 26
+  large_buffers       21.5 / 21.5 / 2188       12.7 / 12.4 / 121
+
+Runic `Keep` holds large mappings (rss_after_free == peak). That is policy,
+not a hack. jemalloc is smallest on `large_buffers` (9.9 / 9.0 / 120).
 
 Dedicated extent churn is primarily controlled by mapping retention policy.
 Keep extent retention deterministic, bounded, and allocation-free.
@@ -441,7 +480,7 @@ In scope:
 
 ```text
 AllocatorConfig and ExtentConfig
-ExtentPolicy::{Drop, Keep} with exact-length reuse
+ExtentPolicy::{Keep, Discard, Unmap} with exact-length reuse
 ExtentCache intrusive head list, exact slot and byte budgets
 policy_grid benchmark coverage
 page-map publication/removal invariants for cached mappings
@@ -499,7 +538,9 @@ Delivered (`#129` on this host, `aa3a83a`):
 
 ```text
 magazine hit (#133): churn 75.0 → 43.6 (−42% vs H0)
-#125 native TLS: skip (LocalKey % was inlined dealloc)
+#125 native TLS: skip then (LocalKey % was inlined dealloc); reopened as
+             #[thread_local] THREAD_HEAP after dealloc LocalKey::with showed as
+             the vec_many_small leaf
 #126 identity: skip (~4% of churn; PageMap::get ~0%)
 #128 batch take: skip (owner_free +53%, churn +29%)
 #129 matrix: 1.6× snmalloc on churn/64; 4.6× mimalloc on owner_free/64;
@@ -537,9 +578,9 @@ In:
 ```text
 ThreadHeap current[class] + own-heap-only page cache
 Run::allocate pop-only; Run::extend threads one page (min 32)
-unbind without take; UnbindGuard TLS; THREAD_HEAP no Drop
+unbind without take; UnbindGuard LocalKey; #[thread_local] THREAD_HEAP (#125)
 Allocator hit-only + #[inline] so RunicAlloc inlines
-#[cold] only abort / bind / map / remote / unbind
+#[cold] only abort / bind / map / remote / unbind / discard
 ```
 
 Out:

@@ -82,3 +82,22 @@ pub fn http_buffers(rounds: usize, chunks: usize) -> usize {
     }
     black_box(checksum)
 }
+
+/// Request-sized read/decode buffers, 64 KiB through 1 MiB.
+#[must_use]
+pub fn large_buffers(rounds: usize, requests: usize) -> usize {
+    const PAGE: usize = 64 * 1024;
+    let mut checksum = 0_usize;
+    for round in 0..rounds {
+        for i in 0..requests {
+            let pages = (i % 16) + 1;
+            let len = pages * PAGE;
+            let mut buf = vec![0_u8; len];
+            buf[0] = (i ^ round).to_le_bytes()[0];
+            buf[len - 1] = round.to_le_bytes()[0];
+            checksum ^= buf.len() ^ usize::from(buf[0]);
+            black_box(buf);
+        }
+    }
+    black_box(checksum)
+}

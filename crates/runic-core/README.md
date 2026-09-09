@@ -2,7 +2,7 @@
 
 `runic-core` contains Runic's allocator mechanics and global allocator state.
 
-This crate is published for the public `runic-alloc` crate, but most modules are internal. The main public entry point is `runic_core::Allocator`.
+This crate is published for the public `runic-alloc` crate, but most modules are internal. The main public entry point is `runic_core::Allocator`. It requires Rust nightly (`#![feature(thread_local)]`).
 
 ## Responsibilities
 

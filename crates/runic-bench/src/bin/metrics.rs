@@ -21,20 +21,23 @@ static SYSTEM: System = System;
 static MIMALLOC: MiMalloc = MiMalloc;
 static JEMALLOC: Jemalloc = Jemalloc;
 static SNMALLOC: SnMalloc = SnMalloc;
-static EXTENT_DROP: RunicAlloc = RunicAlloc::builder()
-    .extent_policy(ExtentPolicy::Drop)
-    .extent_budget(Budget::new(0, 0))
+static EXTENT_UNMAP: RunicAlloc = RunicAlloc::builder()
+    .extent_policy(ExtentPolicy::Unmap)
     .build();
 static EXTENT_TIGHT: RunicAlloc = RunicAlloc::builder()
     .extent_policy(ExtentPolicy::Keep)
     .extent_budget(Budget::new(2, 512 * 1024))
     .build();
 static RUN_DISCARD: RunicAlloc = RunicAlloc::builder().run_policy(RunPolicy::Discard).build();
+static EXTENT_DISCARD: RunicAlloc = RunicAlloc::builder()
+    .extent_policy(ExtentPolicy::Discard)
+    .build();
 
 const EXTRA_NAMES: &[&str] = &[
-    "runic:extent_drop",
+    "runic:extent_unmap",
     "runic:extent_tight",
     "runic:run_discard",
+    "runic:extent_discard",
 ];
 
 struct SelectedAlloc;
@@ -48,9 +51,10 @@ fn kind_of(name: &[u8]) -> Option<u8> {
         b"mimalloc" => 2,
         b"jemalloc" => 3,
         b"snmalloc" => 4,
-        b"runic:extent_drop" => 5,
+        b"runic:extent_unmap" => 5,
         b"runic:extent_tight" => 6,
         b"runic:run_discard" => 7,
+        b"runic:extent_discard" => 8,
         _ => return None,
     })
 }
@@ -90,9 +94,10 @@ fn selected() -> &'static dyn GlobalAlloc {
         2 => &MIMALLOC,
         3 => &JEMALLOC,
         4 => &SNMALLOC,
-        5 => &EXTENT_DROP,
+        5 => &EXTENT_UNMAP,
         6 => &EXTENT_TIGHT,
         7 => &RUN_DISCARD,
+        8 => &EXTENT_DISCARD,
         _ => &RUNIC,
     }
 }
@@ -234,7 +239,10 @@ fn run_subprocess(allocator: &str, workload: &str, syscalls: bool) {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if syscalls && (stderr.contains("not supported") || stderr.contains("Permission")) {
+        if syscalls
+            && (stderr.contains("not supported")
+                || stderr.to_ascii_lowercase().contains("permission"))
+        {
             eprintln!("warning: perf syscall tracepoints not permitted; retrying without syscalls");
             let retry = Command::new(env::current_exe().unwrap())
                 .args(&case_args)
@@ -350,6 +358,7 @@ mod tests {
         assert_eq!(kind_of(b"runic"), Some(0));
         assert_eq!(kind_of(b"snmalloc"), Some(4));
         assert_eq!(kind_of(b"runic:run_discard"), Some(7));
+        assert_eq!(kind_of(b"runic:extent_discard"), Some(8));
         assert_eq!(kind_of(b"nope"), None);
     }
 }

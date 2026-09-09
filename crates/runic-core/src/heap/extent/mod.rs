@@ -10,7 +10,7 @@ pub(crate) mod heap;
 
 use crate::{
     layout::LayoutSpec,
-    memory::{AddressRange, Mapping},
+    memory::{AddressRange, Mapping, OsMemory},
 };
 
 use super::{
@@ -78,6 +78,8 @@ pub(crate) struct Extent {
     link: InboxLink<Extent>,
     /// Rest of the cache list. Owner-exclusive; never set while inbox-linked.
     next: Option<NonNull<Extent>>,
+    /// Mapping pages were `MADV_DONTNEED`'d after the last free. Owner-exclusive.
+    discarded: bool,
 }
 
 impl InboxNode for Extent {
@@ -106,6 +108,7 @@ impl Extent {
                 state: AtomicU8::new(ExtentState::Allocated.raw()),
                 link: InboxLink::new(),
                 next: None,
+                discarded: false,
             })
         } else {
             None
@@ -130,6 +133,16 @@ impl Extent {
 
     pub(crate) fn set_next(&mut self, next: Option<NonNull<Extent>>) {
         self.next = next;
+    }
+
+    pub(crate) const fn discarded(&self) -> bool {
+        self.discarded
+    }
+
+    /// `MADV_DONTNEED` the mapping. Owner-exclusive; records whether advise succeeded.
+    #[cold]
+    pub(crate) fn discard(&mut self) {
+        self.discarded = OsMemory::discard(self.mapping.range());
     }
 
     /// Walk this extent then each [`Self::next`] link.
@@ -249,6 +262,7 @@ impl Extent {
 
         self.heap = heap_id;
         self.range = range;
+        self.discarded = false;
         self.state
             .store(ExtentState::Allocated.raw(), Ordering::Relaxed);
         Some(self.ptr())

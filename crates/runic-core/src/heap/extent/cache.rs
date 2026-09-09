@@ -9,8 +9,8 @@ use crate::{
 ///
 /// Links are [`Extent::next`] into the owning [`super::heap::ExtentHeap`] arena.
 /// Cached extents stay page-map published; reuse is exact mapping-length only.
-/// `ExtentPolicy::Keep` admits while slot and byte budgets allow and never evicts an
-/// already retained extent to make room; `ExtentPolicy::Drop` retains nothing.
+/// `ExtentPolicy::{Keep, Discard}` admit while slot and byte budgets allow and never
+/// evict an already retained extent to make room; `ExtentPolicy::Unmap` retains nothing.
 pub(crate) struct ExtentCache {
     head: Option<NonNull<Extent>>,
     count: usize,
@@ -55,8 +55,8 @@ impl ExtentCache {
         Some(extent)
     }
 
-    pub(crate) fn will_retain(&self, len: usize) -> bool {
-        if self.config.policy() == ExtentPolicy::Drop {
+    fn will_retain(&self, len: usize) -> bool {
+        if !self.config.policy().retains() {
             return false;
         }
 
@@ -84,6 +84,10 @@ impl ExtentCache {
         self.head = Some(extent);
         self.count += 1;
         self.retained_bytes = retained_bytes;
+        if self.config.policy() == ExtentPolicy::Discard {
+            // SAFETY: just cached; this heap is the exclusive owner.
+            unsafe { extent.as_mut() }.discard();
+        }
         Ok(())
     }
 }
@@ -189,10 +193,23 @@ mod tests {
     }
 
     #[test]
-    fn extent_cache_drop_policy_retains_nothing() {
+    fn extent_cache_discard_policy_retains_like_keep() {
         let mut cache = ExtentCache::new(
             ExtentConfig::new()
-                .with_policy(ExtentPolicy::Drop)
+                .with_policy(ExtentPolicy::Discard)
+                .with_budget(Budget::new(2, 1024 * 1024)),
+        );
+        let mut owned = OwnedExtents::new();
+
+        assert!(cache.insert(owned.free_extent(4096)).is_ok());
+        assert!(cache.acquire(4096).is_some());
+    }
+
+    #[test]
+    fn extent_cache_unmap_policy_retains_nothing() {
+        let mut cache = ExtentCache::new(
+            ExtentConfig::new()
+                .with_policy(ExtentPolicy::Unmap)
                 .with_budget(Budget::new(32, 1024 * 1024)),
         );
         let mut owned = OwnedExtents::new();

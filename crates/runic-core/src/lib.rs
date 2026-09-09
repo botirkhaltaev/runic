@@ -1,3 +1,4 @@
+#![feature(thread_local)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![cfg_attr(
     not(test),

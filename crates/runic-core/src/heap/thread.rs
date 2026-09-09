@@ -2,7 +2,7 @@ use core::{cell::Cell, ptr::NonNull};
 
 use crate::{
     allocator::Allocator,
-    heap::{Extent, ExtentInit, HeapError, HeapId, Run, RunCache},
+    heap::{Extent, ExtentInit, HeapError, HeapId, Run, RunCache, RunError},
     layout::LayoutSpec,
     memory::{PageMap, PageOwner},
     size_class::{SizeClass, SizeClasses},
@@ -21,8 +21,8 @@ pub(crate) enum ThreadFreeError {
 
 /// Thread-local frontend: bound heap and per-class current run.
 ///
-/// Hit is current-run pop / `RunCache` `Run::free`. Miss / bind / unbind take
-/// [`AllocatorCtx`].
+/// Hit is current-run pop / `Run::free`. Miss / bind / unbind take
+/// [`AllocatorCtx`]. `lookup` is miss / realloc.
 pub(crate) struct ThreadHeap {
     heap_id: Cell<Option<HeapId>>,
     heap: Cell<*mut Heap>,
@@ -80,6 +80,25 @@ impl ThreadHeap {
         let run = NonNull::new(self.current(class).get())?;
         // SAFETY: `current` stores only live arena run pointers while bound.
         unsafe { run.as_ref().allocate() }
+    }
+
+    /// Owner-local small free via the current run for `class`.
+    ///
+    /// Hit is `Run::free` (`locate` + push). `OutOfRange` / unbound → caller
+    /// `dealloc_slow`. Interior is `InvalidPointer` → abort.
+    #[inline]
+    pub(crate) fn free(&self, ptr: NonNull<u8>, class: SizeClass) -> Option<()> {
+        let run = NonNull::new(self.current(class).get())?;
+        // SAFETY: `current` stores only live arena run pointers while bound.
+        match unsafe { run.as_ref() }.free(ptr) {
+            Ok(false) => Some(()),
+            Ok(true) => {
+                self.push_available(run);
+                Some(())
+            }
+            Err(RunError::OutOfRange) => None,
+            Err(_) => Allocator::abort(),
+        }
     }
 
     /// Freelist empty: `extend`, accept inbox if needed, then local/OS `acquire_run`.
@@ -326,24 +345,24 @@ impl ThreadHeap {
     }
 }
 
-/// Drops after `THREAD_HEAP` is initialized so thread exit still retires the heap.
+/// `LocalKey` so `Drop` retires the heap. `THREAD_HEAP` is `!Drop` ELF TLS.
 struct UnbindGuard;
 
 impl Drop for UnbindGuard {
     fn drop(&mut self) {
-        THREAD_HEAP.with(|tls| {
-            let Some(ctx) = Allocator::ctx() else {
-                if !tls.is_empty() || tls.heap_id.get().is_some() {
-                    Allocator::abort();
-                }
-                return;
-            };
-            tls.unbind(&ctx);
-        });
+        let Some(ctx) = Allocator::ctx() else {
+            if !THREAD_HEAP.is_empty() || THREAD_HEAP.heap_id.get().is_some() {
+                Allocator::abort();
+            }
+            return;
+        };
+        THREAD_HEAP.unbind(&ctx);
     }
 }
 
+#[thread_local]
+pub(crate) static THREAD_HEAP: ThreadHeap = ThreadHeap::new();
+
 std::thread_local! {
-    pub(crate) static THREAD_HEAP: ThreadHeap = const { ThreadHeap::new() };
     static UNBIND_GUARD: UnbindGuard = const { UnbindGuard };
 }

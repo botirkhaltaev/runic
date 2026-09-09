@@ -6,17 +6,17 @@
 - Clean, idiomatic, readable Rust. No hacks at code or architecture level (no clever dual paths, kludges, or “temporary” shims that become permanent).
 - Safe Rust first; `unsafe` only for OS/ownership contracts or **measured** hot paths (narrow + SAFETY).
 - Explicit ownership entities, fail-closed remote admission and interior/foreign pointers, auditable invariants — not line-for-line ports. Owner double-free is undefined.
-- Composable APIs: behavior on the owning entity; no one-caller shims, pass-throughs, dual APIs, or `*_v2` / `*_nonlocal` names. `#[inline(never)]` outlines only (`alloc_miss` / `dealloc_slow` / `push_available`); `#[cold]` is abort / bind / map / remote / unbind.
+- Composable APIs: behavior on the owning entity; no one-caller shims, pass-throughs, dual APIs, or `*_v2` / `*_nonlocal` names. `#[inline(never)]` outlines only (`alloc_miss` / `dealloc_slow` / `push_available`); `#[cold]` is abort / bind / map / remote / unbind / discard.
 
 ## Conventions
 
 - Prefer `NonZero*` / `NonNull` / named fields. No useless helpers — especially free (module-level) one-liners / cast wrappers / pass-throughs. Put behavior on the owning type; helpers only for real reuse, a clearer ownership boundary, or a **profiled** cold-path factor.
 - **One handle** — never the same object as both `NonNull<T>` and `&T`. Project fields once at the boundary; `Allocator::ctx()` is `AllocatorCtx` — do not thread `&PageMap` / `&Heaps` separately.
-- Small hit: `ThreadHeap::alloc` takes no ctx. `lookup` is `RunCache` → `current[class]` → `PageMap`. Miss / bind / unbind take `&AllocatorCtx`. Cold unbound: `Allocator::{bind_alloc,free_remote}`.
+- Small hit: `ThreadHeap::{alloc,free}` take no inner. `&PageMap` on miss. Cold unbound: `Allocator::{bind_alloc,free_remote}`.
 - Naming: short, clear, domain words only — same term means the same thing everywhere. No long compound jargon, invented synonyms, or parallel names for one concept. Frontend `alloc`, domain block/extent `allocate`, checkout `acquire`, current-run `extend`. Free protocol: `free` / `claim` / `accept`. Prefer existing vocabulary (`run`, `extent`, `heap`, `inbox`, `flush`, `bind`, `current`, `extend`) over new coinages.
 - Indices: `Arena` / `HeapId` / `RunId` / `ExtentId` use `u32`; convert to `usize` only when indexing Rust arrays or doing pointer/byte math — no free cast-wrapper helpers.
 - Remote free: claim → `Heap::enqueue` (Active; lease before new `try_queue`) or `Heaps::{enqueue,free,flush}` (Draining). Coalesce by owner (`Inbox`), never a freer TLS batch.
-- Flush policy: current-run empty = `extend`; inbox flush if nonempty; then local/OS `acquire_run`. Unbound = `bind` then `flush` then alloc; hit = current pop / `RunCache` `Run::free` (`push_available` only on `was_full`). Inbox `flush` is remote `accept` only.
+- Flush policy: current-run empty = `extend`; inbox flush if nonempty; then local/OS `acquire_run`. Unbound = `bind` then `flush` then alloc; hit = current pop / `Run::free` (`push_available` only on `was_full`). Inbox `flush` is remote `accept` only. `lookup` is miss / realloc.
 - `Layout` only at the public boundary → `LayoutSpec` inward once.
 - No root/shared ownership heap; every run/extent has `HeapId`. Shared `&Heap` = atomics only (`enqueue` / mode). Active exclusive = `ThreadHeap` + `try_inner` + `AllocatorCtx`. Draining = `Heaps::{enqueue,free,flush}` + `AllocatorCtx`. No `Heap::state()` projection; no `*_fresh` dual alloc APIs.
 - One abort sink: `Allocator::abort`. Preserve abort kinds through `HeapError` (`InvalidRunPointer` / `InvalidExtentPointer` / `MissingExtent`). `HeapError::DoubleFree` is remote `claim` / interior-foreign only — not owner DF. Never hold the heaps arena mutex across flush / accept / user-memory copies.
@@ -49,6 +49,6 @@
 
 ## Scope
 
-- v0.6 in: Linux x86_64, Rust stable, `GlobalAlloc`, owner-local heaps, TLS current run, run/extent retention, remote-free, `realloc` / `alloc_zeroed`, tests, benches.
+- v0.6 in: Linux x86_64, Rust nightly, `#[thread_local]` `THREAD_HEAP`, `GlobalAlloc`, owner-local heaps, TLS current run, run/extent retention, remote-free, `realloc` / `alloc_zeroed`, tests, benches.
 - v0.6 out: quarantine, canaries, hugepages, NUMA, C ABI, ML placement, dashboards, background purge.
-- Next: leftover is `global_*` collection Cost vs last same-host snmalloc (`vec_many_small` 1.71×, then `word_count` / `http_buffers` ~1.10×, `json_api` / `regex_search` ~1.07×, `tree`). Do not compact `CLASS_FOR_SIZE`, retry first-fit extent reuse, lock-free `Heaps::get`, identity, batch take, O(1) TLS steal, `#135` RSEQ, or a locate-offset dual free. Do not port snmalloc.
+- Next: LTO `vec_many_small` ≤ 40 (30.7 vs sn 33.2). `large_buffers` leftover is default Keep memset; `ExtentPolicy::Discard` matches snmalloc — not a medium class. Do not compact `CLASS_FOR_SIZE`, retry first-fit extent reuse, lock-free `Heaps::get`, identity, batch take, O(1) TLS steal, `#135` RSEQ, or a locate-offset dual free. Do not port snmalloc.

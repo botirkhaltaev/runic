@@ -6,4 +6,5 @@ pub mod metrics;
 pub mod rng;
 pub mod suite;
 pub mod target;
+pub mod threaded;
 pub mod workloads;

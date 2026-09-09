@@ -51,12 +51,12 @@ Environment:
   RUNIC_PROFILE_FREQ           perf sample frequency (default: 997)
   RUNIC_PROFILE_STAT_REPEATS   perf stat -r (default: 5)
   RUNIC_PROFILE_STAT_SECONDS   Criterion window for perf stat (default: 5)
-  RUNIC_PROFILE_CPUS           taskset CPU list
+  RUNIC_PROFILE_CPUS           taskset CPU list (use 0-3 for threaded workloads)
   RUNIC_PROFILE_BIN            Bench ELF when using --skip build
   RUNIC_PROFILE_EVENT          Preferred record event (default: cycles:u)
   RUNIC_PROFILE_FALLBACK_EVENT Fallback record event (default: cpu-clock:u)
   CARGO_PROFILE_BENCH_DEBUG    Passed through (default: line-tables-only)
-  RUSTFLAGS                    Frame pointers and v0 symbols forced on if missing
+  RUSTFLAGS                    v0 symbols forced on if missing (no frame-pointer tax)
 
 Prerequisites (system; never auto-sudo):
   sudo pacman -S perf util-linux python
@@ -465,19 +465,16 @@ STAT_GROUPS=(
 )
 
 export CARGO_PROFILE_BENCH_DEBUG=${CARGO_PROFILE_BENCH_DEBUG:-line-tables-only}
-case " ${RUSTFLAGS:-} " in
-  *' -C force-frame-pointers=yes '*) ;;
-  *)
-    if [[ -n ${RUSTFLAGS:-} ]]; then
-      export RUSTFLAGS="$RUSTFLAGS -C force-frame-pointers=yes"
-    else
-      export RUSTFLAGS='-C force-frame-pointers=yes'
-    fi
-    ;;
-esac
+# Cost uses the ordinary bench binary (no forced frame pointers). Where uses LBR.
 case " ${RUSTFLAGS:-} " in
   *' -C symbol-mangling-version=v0 '*) ;;
-  *) export RUSTFLAGS="$RUSTFLAGS -C symbol-mangling-version=v0" ;;
+  *)
+    if [[ -n ${RUSTFLAGS:-} ]]; then
+      export RUSTFLAGS="$RUSTFLAGS -C symbol-mangling-version=v0"
+    else
+      export RUSTFLAGS='-C symbol-mangling-version=v0'
+    fi
+    ;;
 esac
 
 ALLOWED_CPUS=$(awk '/^Cpus_allowed_list:/ { print $2 }' /proc/self/status)
@@ -595,12 +592,12 @@ record_profile() {
     {
       printf '# perf record event=%s\n' "$event"
       printf '# command: '
-      print_command perf record -F "$SAMPLE_FREQ" -e "$event" -b -g --call-graph fp \
+      print_command perf record -F "$SAMPLE_FREQ" -e "$event" -g --call-graph lbr \
         -o "$output_file" -- "$@"
       printf '\n'
     } >>"$record_log"
 
-    if perf record -F "$SAMPLE_FREQ" -e "$event" -b -g --call-graph fp \
+    if perf record -F "$SAMPLE_FREQ" -e "$event" -g --call-graph lbr \
       -o "$output_file" -- "$@" >>"$record_log" 2>&1; then
       printf '%s\n' "$event" >"$event_file"
       return 0

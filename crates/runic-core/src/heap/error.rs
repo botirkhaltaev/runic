@@ -15,7 +15,7 @@ pub(crate) enum HeapError {
 impl From<RunError> for HeapError {
     fn from(error: RunError) -> Self {
         match error {
-            RunError::InvalidPointer => Self::InvalidRunPointer,
+            RunError::InvalidPointer | RunError::OutOfRange => Self::InvalidRunPointer,
             RunError::DoubleFree => Self::DoubleFree,
         }
     }

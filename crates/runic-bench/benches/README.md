@@ -23,6 +23,13 @@ Libraries:
 - `global/runic/json_api`
 - `global/runic/regex_search`
 - `global/runic/http_buffers`
+- `global/runic/large_buffers`
+
+Threaded (profile with `RUNIC_PROFILE_CPUS=0-3`):
+
+- `global/runic/channel_pipeline`
+- `global/runic/arc_share_drop`
+- `global/runic/scoped_map_reduce`
 
 ## Run
 

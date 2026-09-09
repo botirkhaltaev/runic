@@ -33,10 +33,10 @@ Owner-local heap frontend: runs for small size classes, extents for dedicated la
 - Draining reclaim observes live ownership via `RunHeap` ∨ `ExtentHeap` (`has_live`). In-flight claim bits keep the heap live. `Heap::reclaim` returns a Free heap to the table freelist.
 - Never-bound freers enqueue each successful claim in `Allocator::free_remote`. Bound producers coalesce by run/extent. `ThreadFreeError::Remote` carries the `PageOwner` `free_slow` already looked up.
 - Owner free: `Run::free` (lock-free); `push_available` only on `was_full` (idempotent). `unbind` returns non-full current runs. Draining late free uses `Heap::free`. Domain ops are `free` / `claim` / `accept`. Failures after claim abort.
-- Current-run empty: `extend`; accept inbox if nonempty; then local/OS `acquire_run`. Unbound: `bind` then `flush` then alloc. Hit: current pop / `RunCache` `Run::free`. Inbox `flush` is remote `accept`.
+- Current-run empty: `extend`; accept inbox if nonempty; then local/OS `acquire_run`. Unbound: `bind` then `flush` then alloc. Hit: current pop / `Run::free`. Inbox `flush` is remote `accept`. `lookup` is miss / realloc.
 - `HeapState` packs generation, mode (`Free` / `Active` / `Draining`), retired, and in-flight lease count for Active enqueue admits. Inbox depth stays live via claim bits / `has_live`.
 - `Heaps` is `RwLock<Arena<Heap>>`. `get` indexes then returns `&Heap` (occupied slots never move). Write lock covers acquire/reuse only. Free heaps sit on an intrusive index freelist. Fail only when the OS will not map more.
-- `THREAD_HEAP` has no destructor. `UnbindGuard` (touched in `bind`) retires the heap on thread exit.
+- `THREAD_HEAP` is a `#[thread_local]` `!Drop` value (`%fs` load). `UnbindGuard` is the only `LocalKey` (touched in `bind`; `Drop` retires the heap).
 
 ## Current run (hit)
 
@@ -45,8 +45,8 @@ A small block is on exactly one of: user, run freelist, or remote-claimed.
 | Hit | Work | Not on the hit |
 |-----|------|----------------|
 | **alloc** | `class_for` → `current[class]` → `Run::allocate` (pop) | `extend`, claim bits, locks, atomics, acquire, flush |
-| **owner free** | `RunCache` → `current[class]` payload range → `PageMap`; `Run::free` (locate + push); `push_available` only on `was_full` | claim bits, `extend`, locks, atomics |
+| **owner free** | `current[class]` → `Run::free` (one `locate` + push); `OutOfRange` is miss; `push_available` only on `was_full` | claim bits, `extend`, locks, atomics, `PageMap` |
 
 `current[class]` is a hint, not ownership. Available list is the reservoir; a run may be both current and listed. Frees never touch `current`. Interior pointers abort on `locate`. Owner DF is undefined.
 
-Owner free / realloc use `lookup` (`RunCache` → `current[class]` → `PageMap`). The cache stores only runs whose `HeapId` matches this TLS. `ExtentCache` is heap-level mapping reuse, not a TLS free probe.
+Miss / realloc use `lookup` (`RunCache` → `current[class]` → `PageMap`). The cache stores only runs whose `HeapId` matches this TLS. `ExtentCache` is heap-level mapping reuse, not a TLS free probe.
