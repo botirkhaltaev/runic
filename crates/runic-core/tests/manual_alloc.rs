@@ -271,6 +271,22 @@ fn allocator_realloc_large_to_small_preserves_prefix() {
 }
 
 #[test]
+fn allocator_realloc_extent_to_size_class_then_frees() {
+    let allocator = Allocator::new();
+    let old = Layout::from_size_align(40 * 1024, 8).unwrap();
+    let ptr = unsafe { allocator.alloc(old) };
+    assert!(!ptr.is_null());
+    unsafe { ptr.write(0x5a) };
+
+    let new_ptr = unsafe { allocator.realloc(ptr, old, 16) };
+    assert!(!new_ptr.is_null());
+    assert_eq!(unsafe { new_ptr.read() }, 0x5a);
+
+    let new = Layout::from_size_align(16, 8).unwrap();
+    unsafe { allocator.dealloc(new_ptr, new) };
+}
+
+#[test]
 fn allocator_zeroes_large_memory() {
     let allocator = Allocator::new();
     let layout = Layout::from_size_align(96 * 1024, 4096).unwrap();

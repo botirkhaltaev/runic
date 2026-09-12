@@ -11,6 +11,7 @@ pub(crate) mod heap;
 use crate::{
     layout::LayoutSpec,
     memory::{AddressRange, Mapping, OsMemory},
+    size_class::SizeClasses,
 };
 
 use super::{
@@ -176,6 +177,13 @@ impl Extent {
     ) -> Result<bool, ExtentError> {
         if !self.starts_at(ptr) {
             return Err(ExtentError::InvalidPointer);
+        }
+
+        // Small dealloc uses `Run::header_of`. An in-place shrink to a size class
+        // would leave a live extent behind a small layout and fault on the
+        // unmapped header page. Force allocate-copy-free instead.
+        if SizeClasses::class_for(spec).is_some() {
+            return Ok(false);
         }
 
         if !spec.is_addr_aligned(ptr.as_ptr().addr()) {
@@ -422,7 +430,7 @@ mod tests {
 
     #[test]
     fn extent_grows_in_place_when_page_range_does_not_change() {
-        let spec = layout_spec(4095, 8);
+        let spec = layout_spec(33 * 1024, 8);
         let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
         let mut extent = Extent::new(
             ExtentId::from_index(6).unwrap(),
@@ -431,9 +439,26 @@ mod tests {
             spec,
         )
         .unwrap();
-        let larger = layout_spec(4096, 8);
+        let larger = layout_spec(36 * 1024, 8);
 
         assert_eq!(extent.resize_in_place(extent.ptr(), larger), Ok(true));
-        assert_eq!(extent.range.len(), 4096);
+        assert_eq!(extent.range.len(), 36 * 1024);
+    }
+
+    #[test]
+    fn extent_does_not_resize_in_place_to_size_class() {
+        let spec = layout_spec(64 * 1024, 8);
+        let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
+        let mut extent = Extent::new(
+            ExtentId::from_index(7).unwrap(),
+            test_heap_id(),
+            mapping,
+            spec,
+        )
+        .unwrap();
+        let small = layout_spec(4096, 8);
+
+        assert_eq!(extent.resize_in_place(extent.ptr(), small), Ok(false));
+        assert_eq!(extent.range.len(), 64 * 1024);
     }
 }

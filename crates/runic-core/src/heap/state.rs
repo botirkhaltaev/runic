@@ -59,6 +59,7 @@ pub(super) struct Snapshot {
 /// - Active enqueue admit: successful `acquire_lease` `AcqRel` CAS
 /// - Inbox link: head CAS in [`super::inbox::Inbox::link`] (after lease admit)
 /// - Active→Draining close: `close` `AcqRel` CAS (preserves lease count)
+/// - Draining→Active adopt: `adopt` `AcqRel` CAS (preserves lease count)
 /// - Lease release: `Release` `fetch_sub`; retire observes zero with `Acquire` loads
 /// - Free reactivation: `Release` store of Active after metadata rebind under Inner
 pub(crate) struct HeapState {
@@ -196,6 +197,30 @@ impl HeapState {
                 }
                 HeapMode::Draining => return Ok(()),
                 HeapMode::Free => return Err(HeapError::InvalidHeap),
+            }
+        }
+    }
+
+    /// First remote freer takes Active ownership. Leases stay; loser sees Active.
+    pub(super) fn adopt(&self, id: HeapId) -> Result<(), HeapError> {
+        loop {
+            let word = self.word.load(Ordering::Acquire);
+            let snap = Self::decode(word);
+            if snap.retired || snap.generation != id.generation() {
+                return Err(HeapError::InvalidHeap);
+            }
+            match snap.mode {
+                HeapMode::Draining => {
+                    let next = Self::pack(snap.generation, HeapMode::Active, false, snap.leases);
+                    if self
+                        .word
+                        .compare_exchange_weak(word, next, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        return Ok(());
+                    }
+                }
+                HeapMode::Active | HeapMode::Free => return Err(HeapError::InvalidHeap),
             }
         }
     }

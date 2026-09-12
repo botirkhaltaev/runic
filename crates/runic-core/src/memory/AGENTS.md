@@ -3,7 +3,7 @@
 Scope: `crates/runic-core/src/memory/`.
 
 - Every `Mapping` from `OsMemory::map` / `map_aligned` only. `Mapping` Drop munmaps; do not munmap by hand. `OsMemory::discard` is `madvise(MADV_DONTNEED)` and returns whether it succeeded.
-- `PageMap::get` lock-free via hot `tables` only; never touches cold `writes` / `mappings`.
+- `PageMap::get` lock-free via hot `tables` only; never touches cold `writes` / `mappings`. Small free is `Run::header_of`; this map is miss / extent / fallback.
 - Checked `Page::split` on untrusted pointers (fail closed outside 48-bit geometry).
 - One in-memory encoding per published range — no layered span fallback beside per-page stamps.
 - No dead `unpublish_run` until empty-run reclaim has a real caller.

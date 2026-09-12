@@ -10,6 +10,9 @@ use crate::{
 
 use super::{ExtentId, cache::ExtentCache};
 
+/// Zeroed Keep reuse at or above this size discards instead of memset.
+const LAZY_ZERO: usize = 256 * 1024;
+
 pub(crate) struct ExtentHeap {
     extents: Arena<Extent>,
     cache: ExtentCache,
@@ -18,8 +21,9 @@ pub(crate) struct ExtentHeap {
 /// How a newly allocated extent's bytes should be initialized.
 ///
 /// Fresh anonymous mappings are already kernel-zeroed. Cached extents may be
-/// dirty, so [`ExtentInit::Zeroed`] memsets on cache hits unless [`ExtentPolicy::Discard`]
-/// already dropped the pages (`LayoutSpec::size`).
+/// dirty, so [`ExtentInit::Zeroed`] zeros on cache hits: Discard-insert already
+/// dropped the pages, else Keep discards when `size ≥ 256 KiB` or memsets.
+/// Allocate-time Keep discard does not set the cache-clean flag.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExtentInit {
     Uninit,
@@ -63,11 +67,15 @@ impl ExtentHeap {
         if let Some(mut extent_ptr) = self.cache.acquire(len) {
             // SAFETY: cache only stores live arena extents owned by this heap.
             let extent = unsafe { extent_ptr.as_mut() };
-            let skip_zero = extent.discarded();
+            let cache_clean = extent.discarded();
             if let Some(ptr) = extent.reuse(heap_id, spec) {
-                if init == ExtentInit::Zeroed && !skip_zero {
-                    // SAFETY: ptr was just reused for spec and is valid for spec.size() bytes.
-                    unsafe { write_bytes(ptr.as_ptr(), 0, spec.size()) };
+                if init == ExtentInit::Zeroed && !cache_clean {
+                    let zeroed =
+                        spec.size() >= LAZY_ZERO && OsMemory::discard(extent.mapping().range());
+                    if !zeroed {
+                        // SAFETY: ptr was just reused for spec and is valid for spec.size() bytes.
+                        unsafe { write_bytes(ptr.as_ptr(), 0, spec.size()) };
+                    }
                 }
                 return Some(ptr);
             }
@@ -330,6 +338,50 @@ mod tests {
             panic!("expected extent owner");
         };
         heap.free(extent, reused, &pages).unwrap();
+    }
+
+    #[test]
+    fn keep_lazy_zero_second_reuse_is_clean() {
+        let mut heap = ExtentHeap::new(ExtentConfig::new());
+        let pages = PageMap::new();
+        let spec = layout_spec(LAZY_ZERO, 4096);
+        let heap_id = HeapId::new(0, NonZeroU32::MIN).unwrap();
+
+        let first = heap
+            .allocate(spec, heap_id, &pages, ExtentInit::Zeroed)
+            .unwrap();
+        // SAFETY: first is valid for LAZY_ZERO bytes.
+        unsafe { write_bytes(first.as_ptr(), 0xab, LAZY_ZERO) };
+        let Some(PageOwner::Extent(extent)) = pages.get(first) else {
+            panic!("expected extent owner");
+        };
+        heap.free(extent, first, &pages).unwrap();
+
+        let second = heap
+            .allocate(spec, heap_id, &pages, ExtentInit::Zeroed)
+            .unwrap();
+        assert_eq!(second, first);
+        // SAFETY: second is a Zeroed reuse of the same mapping.
+        assert!(
+            unsafe { core::slice::from_raw_parts(second.as_ptr(), LAZY_ZERO) }
+                .iter()
+                .all(|&byte| byte == 0)
+        );
+        // SAFETY: dirty the mapping again so a stale skip_zero would leak.
+        unsafe { write_bytes(second.as_ptr(), 0xcd, LAZY_ZERO) };
+        heap.free(extent, second, &pages).unwrap();
+
+        let third = heap
+            .allocate(spec, heap_id, &pages, ExtentInit::Zeroed)
+            .unwrap();
+        assert_eq!(third, first);
+        // SAFETY: third must be zero even after a prior Keep lazy-zero discard.
+        assert!(
+            unsafe { core::slice::from_raw_parts(third.as_ptr(), LAZY_ZERO) }
+                .iter()
+                .all(|&byte| byte == 0)
+        );
+        heap.free(extent, third, &pages).unwrap();
     }
 
     #[test]

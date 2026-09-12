@@ -20,7 +20,7 @@ fn retire(heaps: &Heaps, id: HeapId) -> Result<(), HeapError> {
 #[test]
 fn lease_rejected_after_close() {
     let heaps = Heaps::new(AllocatorConfig::new());
-    let (id, _) = heaps.acquire().unwrap();
+    let id = heaps.acquire().unwrap().id();
     let heap = heaps.get(id).unwrap();
     assert_eq!(heap.state.close(id), Ok(()));
     assert!(heap.state.acquire_lease(id).is_err());
@@ -30,7 +30,7 @@ fn lease_rejected_after_close() {
 #[test]
 fn lease_count_overflow_fails_closed() {
     let heaps = Heaps::new(AllocatorConfig::new());
-    let (id, _) = heaps.acquire().unwrap();
+    let id = heaps.acquire().unwrap().id();
     let heap = heaps.get(id).unwrap();
     // Forge the packed lease ceiling — acquiring `(1<<29)-1` real leases is not practical.
     heap.state
@@ -45,9 +45,22 @@ fn lease_count_overflow_fails_closed() {
 }
 
 #[test]
+fn adopt_promotes_draining_to_active() {
+    let heaps = Heaps::new(AllocatorConfig::new());
+    let id = heaps.acquire().unwrap().id();
+    let heap = heaps.get(id).unwrap();
+    assert_eq!(heap.close(id), Ok(()));
+    assert_eq!(heap.mode(), HeapMode::Draining);
+    assert_eq!(heap.adopt(id), Ok(()));
+    assert_eq!(heap.mode(), HeapMode::Active);
+    assert_eq!(heap.adopt(id), Err(HeapError::InvalidHeap));
+    assert_eq!(retire(&heaps, id), Ok(()));
+}
+
+#[test]
 fn reclaim_rejects_nonzero_leases() {
     let heaps = Heaps::new(AllocatorConfig::new());
-    let (id, _) = heaps.acquire().unwrap();
+    let id = heaps.acquire().unwrap().id();
     let heap = heaps.get(id).unwrap();
     let lease = heap.state.acquire_lease(id).unwrap();
     assert_eq!(heap.state.close(id), Ok(()));

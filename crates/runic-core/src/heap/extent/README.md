@@ -20,5 +20,6 @@ Extent metadata owns dedicated large allocations.
 - Remote frees `claim` then enqueue; the owning heap completes with `accept` (`Claimed → Free`) before shared `cache_or_unmap`.
 - **Published-while-cached:** Keep and Discard leave the arena entry and page-map stamp in place; the cache is an intrusive `head` list of `NonNull<Extent>`. Cache-hit allocate calls `Extent::reuse` and does not re-publish the mapping. True release (Unmap policy / over budget) calls `unmap`, which unpublishes before removing metadata. Discard then `madvise(MADV_DONTNEED)`s the mapping.
 - Live large ownership for reclaim is `Extent::is_live` (Allocated/Claimed), aggregated by `ExtentHeap::has_live`; cached Free extents do not block reclaim.
-- `ExtentInit::Zeroed` memsets on dirty cache hits (size from `LayoutSpec`); fresh maps and successful Discard reuse skip that memset.
+- `resize_in_place` stays an extent layout (`class_for` is `None`). A size-class spec returns false so later small dealloc uses `Run::header_of` only on runs.
+- `ExtentInit::Zeroed` on dirty Keep reuse: `MADV_DONTNEED` when size ≥ 256 KiB, else memset. That allocate-time discard does not set `discarded` (that flag is Discard-insert only). Fresh maps and Discard-insert hits skip the memset. Uninit never discards.
 - `ExtentCache` retention must stay within configured slot and byte budgets; `Keep` never evicts an already-retained extent to admit a new one, and reuse is always exact mapping length. Default budget is 64 slots / 64 MiB.

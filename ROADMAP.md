@@ -36,8 +36,8 @@ App-bound cases (`tree`, `http_buffers`, …) stay near parity. Substantial
 wins vs snmalloc live on remote-free, large buffers, and footprint — see
 Benchmark Policy. Do not retry a magazine, RSEQ, or a locate-offset dual
 free. Owner DF is undefined; remote admission stays fail-closed. One
-process-wide payload; TLS identity is free. Out-of-line metadata stays until
-Where shows an in-page run header is a ≥5% lever.
+process-wide payload; TLS identity is free. The `Run` header lives in the
+run space (`base + RUN_SIZE`); small free is `header_of` (mask + `base` check).
 
 ## Current Status
 
@@ -49,11 +49,12 @@ extents stamped with `HeapId`, private run claim-bitmap remote admission, run/ex
 page-map ownership. Heap lifecycle lives on `Heaps` / `Heap`
 (Heaps indexes each Heap; each `Heap` owns inboxes and `RunHeap`/`ExtentHeap`).
 
-Owner-local hit is a TLS current run per class (pop) plus a one-entry own-heap
-`RunCache`. `locate` is offset from the run base. Run mappings are
-`RUN_SIZE`-aligned. `Run::allocate` is pop only; `extend` on miss. Owner free
-is `Run::free`; `push_available` only on `was_full`. One process-wide payload;
-`Allocator::ctx()` is the handle.
+Owner-local hit is a TLS current run per class (pop). Small miss/realloc uses
+`Run::header_of`. `locate` is offset from the run base. Run mappings are
+`RUN_SIZE`-aligned; the header and claim tail sit after the payload. `Run::allocate`
+is pop only; `extend` on miss. Owner free is `Run::free`; `push_available` only
+on `was_full`. One process-wide payload; `Allocator::ctx()` is the handle.
+A Draining heap may be `adopt`ed by the first remote freer (`Draining` → `Active`).
 
 This pass owner-free hit diet vs post-#142 `82dd8b5` (same host, cycles/elem):
 
@@ -280,7 +281,7 @@ Acquire, then `state.matches`. Occupied slots never move. Active enqueue uses
 mapping ownership and bump insert only. Draining exclusivity is
 `Mutex<HeapInner>` via `Heaps::{enqueue,free,flush,reclaim}`
 (not the arena grow lock across flush).
-Shared `&Heap` is atomics-only; Active body mutation is `ThreadHeap` + `try_inner`;
+Shared `&Heap` is atomics-only; Active body mutation is `ThreadHeap` + `require_inner`;
 reclaim is `Heap::reclaim` through `Heaps`. `Allocator::ctx()` is the only
 handle into the process payload. Same-thread small-run hits use TLS-owned heap
 metadata with no locks or atomics. `PageMap` stays outside heaps arena locks so
@@ -301,12 +302,12 @@ LayoutSpec     owns normalized layout semantics.
 SizeClasses    owns size-class selection.
 OsMemory       maps anonymous pages; Mapping owns the mmap lifecycle (Drop munmaps).
 PageMap        owns page-indexed owner-pointer lookup.
-RunHeap        owns Arena<Run>, run checkout (acquire), and available run lists.
-Run            owns pointer freelist + extend + live, claim bitmap, and embedded InboxLink. Owner DF undefined.
+RunHeap        owns Arena<NonNull<Run>> (in-space headers), run checkout (acquire), and available run lists.
+Run            owns in-page header, pointer freelist + extend + live, claim bitmap, and embedded InboxLink. Owner DF undefined.
 ExtentHeap     owns Arena<Extent>, dedicated allocation policy, and mapping reuse.
 ExtentCache    owns an intrusive head list of retained extents and exact-budget reuse.
 Extent         owns dedicated allocation metadata, embedded InboxLink, and Claimed byte state.
-ThreadHeap     owns TLS bind, current[class], RunCache, and the sole Active body path.
+ThreadHeap     owns TLS bind, current[class], at most one adopted heap, and the sole Active body path.
 ```
 
 Prefer direct methods on the entity that owns the state. Do not add passive
@@ -392,23 +393,31 @@ After cold `maybe_discard` + Run hot-field pack (base/span/recip +
 free/live/capacity): vec_many_small 30.7. Gate ≤ 40. vs LTO snmalloc 33.2
 (0.93×). objdump: `__rust_alloc` has no callee-saved; `Allocator::dealloc`
 still pushes rbx/r14/r15 for was_full / Discard. `__rust_dealloc` is a jmp.
-Realloc and multi-entry RunCache skipped (no miss-rate / Cost lever).
+Realloc multi-entry cache skipped. One-entry `RunCache` deleted; small
+miss/realloc is `Run::header_of`.
 
 #129 synthetic matrix stays the historical competitor baseline (aa3a83a).
 Collection leftover vs snmalloc is app work (`tree` / `http_buffers` ~1.01×
 pre-LTO).
 
-Track C Cost (this host, LTO, `RUNIC_PROFILE_CPUS=0-3` for threaded):
+Track C Cost (this host, LTO, `RUNIC_PROFILE_CPUS=0-3` for threaded;
+same-session after adopt + in-page header + lazy-zero ≥256 KiB):
 
   workload            runic     snmalloc   mimalloc    vs sn
-  channel_pipeline    1677        1462         —     1.15×
-  arc_share_drop       269         336         —     0.80×
-  scoped_map_reduce    703         577         —     1.22×
-  large_buffers      76423        4872     62846    15.7× (≈1.22× mi)
+  vec_many_small      15.8        33.4      34.5     0.47×
+  json_api            4608        4762      4774     0.97×
+  channel_pipeline    1071        1469      1965     0.73×
+  arc_share_drop       260         313       402     0.83×
+  scoped_map_reduce    595         544       670     1.09×
+  large_buffers       3576        4921     67425     0.73×
 
-`arc_share_drop` is the remote last-drop win. Mixed-size 64 KiB–1 MiB
-`large_buffers` under default Keep is memset on dirty reuse (15.7× sn),
-not a missing medium class.
+`arc_share_drop` is the remote last-drop win. `channel_pipeline` is the
+adopt + mask-lookup win. Mixed-size 64 KiB–1 MiB `large_buffers` under
+default Keep now discards on Zeroed reuse ≥256 KiB (0.73× sn); dirty
+touch-every-page remains a memset/fault tax, not a missing medium class.
+Switch-on-second-heap adopt lost on `channel_pipeline` (sticky + empty
+reclaim kept). Bitmap `accept` was not tried (`flush`/`accept` <4% after
+adopt).
 
 Keep vs Discard vs Unmap on `large_buffers` (metrics `--case`, 64 ops,
 `perf stat -r 5` cycles:u; same-host):
@@ -605,7 +614,7 @@ ThreadHeap current[class] + own-heap-only page cache
 Run::allocate pop-only; Run::extend threads one page (min 32)
 unbind without take; UnbindGuard LocalKey; #[thread_local] THREAD_HEAP (#125)
 Allocator hit-only + #[inline] so RunicAlloc inlines
-#[cold] only abort / bind / map / remote / unbind / discard
+#[cold] only abort / bind / map / remote / unbind / discard / adopt
 ```
 
 Out:
@@ -613,7 +622,7 @@ Out:
 ```text
 retry #126 / #128 / RSEQ / O(1) TLS steal
 multi-entry page cache
-in-page Run header without Where
+switch-on-second-heap adopt (lost on channel_pipeline)
 hardening / hugepages (later)
 ```
 

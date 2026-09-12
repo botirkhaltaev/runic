@@ -2,7 +2,7 @@ use core::ptr::NonNull;
 
 use crate::{
     arena::Arena,
-    heap::{HeapError, HeapId, Run, RunId},
+    heap::{Heap, HeapError, HeapId, Run, RunId},
     memory::{Mapping, OsMemory, PageMap},
     size_class::{SizeClass, SizeClasses},
 };
@@ -13,7 +13,8 @@ use super::{
 };
 
 pub(crate) struct RunHeap {
-    runs: Arena<Run>,
+    /// In-space header pointers. The `Run` itself lives at `base + RUN_SIZE`.
+    runs: Arena<NonNull<Run>>,
     maps: Arena<Mapping>,
     map_index: Option<u32>,
     used: usize,
@@ -43,10 +44,11 @@ impl RunHeap {
         &mut self,
         class: SizeClass,
         heap_id: HeapId,
+        heap: Option<&Heap>,
         pages: &PageMap,
     ) -> Option<NonNull<Run>> {
         self.take_available(class)
-            .or_else(|| self.new_run(class, heap_id, pages))
+            .or_else(|| self.new_run(class, heap_id, heap, pages))
     }
 
     #[cold]
@@ -54,12 +56,16 @@ impl RunHeap {
         &mut self,
         class: SizeClass,
         heap_id: HeapId,
+        heap: Option<&Heap>,
         pages: &PageMap,
     ) -> Option<NonNull<Run>> {
         let base = self.take()?;
         let index = self.runs.vacant()?;
         let id = RunId::from_index(index)?;
-        let run = Run::new(id, heap_id, base, class, self.policy)?;
+        let mut run = Run::new(id, heap_id, base, class, self.policy)?;
+        if let Some(heap) = heap {
+            run.set_heap(heap);
+        }
         let run = self.insert_run(index, id, run, pages)?;
         self.used += 1;
         Some(run)
@@ -106,13 +112,17 @@ impl RunHeap {
 
     pub(crate) fn rebind(&mut self, heap_id: HeapId) {
         for run in self.runs.iter_mut() {
-            run.set_heap_id(heap_id);
+            // SAFETY: directory stores only in-space headers from this heap.
+            unsafe { run.as_mut() }.set_heap_id(heap_id);
         }
     }
 
     /// Any occupied run with outstanding allocated or claimed blocks.
     pub(crate) fn has_live(&self) -> bool {
-        self.runs.iter().any(Run::is_live)
+        self.runs.iter().any(|run| {
+            // SAFETY: directory stores only in-space headers from this heap.
+            unsafe { run.as_ref() }.is_live()
+        })
     }
 
     #[inline(never)]
@@ -160,16 +170,31 @@ impl RunHeap {
         run: Run,
         pages: &PageMap,
     ) -> Option<NonNull<Run>> {
-        let inserted_run = self.runs.insert(index, run)?;
-        debug_assert_eq!(inserted_run.id(), id);
-        let run_ptr = NonNull::from(&mut *inserted_run);
+        // SAFETY: payload base is `RUN_SIZE`-aligned in a mapped `RUN_SPACE`.
+        let header: NonNull<Run> = unsafe {
+            NonNull::new_unchecked(
+                run.range()
+                    .base()
+                    .as_ptr()
+                    .wrapping_byte_add(RUN_SIZE)
+                    .cast(),
+            )
+        };
+        // SAFETY: `header` is in this run's mapped tail; first write to this space.
+        unsafe { header.as_ptr().write(run) };
+        self.runs.insert(index, header)?;
+        // SAFETY: header was just written for this payload range.
+        let written = unsafe { header.as_ref() };
+        debug_assert_eq!(written.id(), id);
 
-        if pages.publish_run(inserted_run.range(), run_ptr).is_err() {
+        if pages.publish_run(written.range(), header).is_err() {
             let _removed = self.runs.remove(id.index());
+            // SAFETY: we just wrote `header`; exclusive, unpublished.
+            unsafe { header.as_ptr().drop_in_place() };
             return None;
         }
 
-        Some(run_ptr)
+        Some(header)
     }
 }
 
@@ -207,7 +232,7 @@ mod tests {
         pages: &PageMap,
     ) -> Option<(NonNull<Run>, NonNull<u8>)> {
         let heap_id = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
-        let mut run = heap.acquire(class, heap_id, pages)?;
+        let mut run = heap.acquire(class, heap_id, None, pages)?;
         // SAFETY: RunHeap returns pointers to live runs from its arena.
         let run_ref = unsafe { run.as_mut() };
         let ptr = run_ref.allocate().or_else(|| {
@@ -279,7 +304,7 @@ mod tests {
         let old = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
         let new = HeapId::new(0, core::num::NonZeroU32::new(2).unwrap()).unwrap();
 
-        let run = heap.acquire(class, old, &pages).unwrap();
+        let run = heap.acquire(class, old, None, &pages).unwrap();
         // Leave the run checked out (not on available): reincarnation still rebinds it.
         // SAFETY: run came from this heap's live arena.
         assert_eq!(unsafe { run.as_ref() }.heap_id(), old);
@@ -298,8 +323,8 @@ mod tests {
         let class_index = class.index();
         let heap_id = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
 
-        let run_a = heap.acquire(class, heap_id, &pages).unwrap();
-        let run_b = heap.acquire(class, heap_id, &pages).unwrap();
+        let run_a = heap.acquire(class, heap_id, None, &pages).unwrap();
+        let run_b = heap.acquire(class, heap_id, None, &pages).unwrap();
         // SAFETY: both from this heap's live arena.
         let id_a = unsafe { run_a.as_ref().id() };
         let id_b = unsafe { run_b.as_ref().id() };
@@ -309,8 +334,8 @@ mod tests {
         assert_eq!(heap.push_available(run_b), Ok(()));
         assert_eq!(heap.push_available(run_a), Ok(()));
 
-        let first = heap.acquire(class, heap_id, &pages).unwrap();
-        let second = heap.acquire(class, heap_id, &pages).unwrap();
+        let first = heap.acquire(class, heap_id, None, &pages).unwrap();
+        let second = heap.acquire(class, heap_id, None, &pages).unwrap();
         // SAFETY: just acquired from this heap.
         assert_eq!(unsafe { first.as_ref().id() }, id_b);
         assert_eq!(unsafe { second.as_ref().id() }, id_a);
@@ -325,7 +350,7 @@ mod tests {
         let class_index = class.index();
         let heap_id = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
 
-        let mut run = heap.acquire(class, heap_id, &pages).unwrap();
+        let mut run = heap.acquire(class, heap_id, None, &pages).unwrap();
         // SAFETY: live arena run, exclusive to this test.
         let run_ref = unsafe { run.as_mut() };
         let ptr = run_ref
@@ -352,7 +377,7 @@ mod tests {
         let pages = PageMap::new();
         let class = class_id(64, 8);
         let heap_id = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
-        let run = heap.acquire(class, heap_id, &pages).unwrap();
+        let run = heap.acquire(class, heap_id, None, &pages).unwrap();
         // SAFETY: live arena run.
         let base = unsafe { run.as_ref() }.range().base();
         assert!(pages.get(base).is_some());
@@ -367,10 +392,10 @@ mod tests {
         let class = class_id(64, 8);
         let heap_id = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
         for _ in 0..MAP_RUNS {
-            assert!(heap.acquire(class, heap_id, &pages).is_some());
+            assert!(heap.acquire(class, heap_id, None, &pages).is_some());
         }
         assert_eq!(heap.maps.iter().count(), 1);
-        assert!(heap.acquire(class, heap_id, &pages).is_some());
+        assert!(heap.acquire(class, heap_id, None, &pages).is_some());
         assert_eq!(heap.maps.iter().count(), 2);
     }
 }
