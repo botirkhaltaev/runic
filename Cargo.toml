@@ -4,6 +4,7 @@ members = [
   "crates/runic-core",
   "crates/runic-test-support",
   "crates/runic-bench",
+  "crates/rseq-rs",
 ]
 resolver = "3"
 
