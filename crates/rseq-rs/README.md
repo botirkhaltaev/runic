@@ -19,6 +19,20 @@ assert!(rseq.fence(cpu));
 the kernel, glibc, or RSEQ membarrier is unavailable — use a different type
 later (`LockedStacks`), do not expect a hidden lock here.
 
-Still to land: `LockedStacks`, `Stacks`, `Quiesced`, stress, benches.
+## Portable stacks (landed)
+
+```rust
+use rseq_rs::{CpuId, LockedStacks};
+
+let stacks = LockedStacks::<u8>::new(2, 32)?;
+let cpu = CpuId::new(0)?;
+stacks.push_cpu(cpu, p)?;
+let p = stacks.pop_cpu(cpu)?;
+```
+
+`LockedStacks` is a distinct type (TAS per CPU). The RSEQ hit will never
+call it.
+
+Still to land: `Stacks`, `Quiesced`, stress, benches.
 
 See [ROADMAP.md](ROADMAP.md). `publish = false`.

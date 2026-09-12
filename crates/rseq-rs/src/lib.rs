@@ -2,13 +2,16 @@
 
 //! Safe Linux restartable-sequence primitives.
 //!
-//! Registration only in this slice: [`Rseq`], [`Thread`], [`CpuId`].
+//! [`Rseq`] registration and portable [`LockedStacks`].
 
 mod abi;
 mod cpus;
+mod layout;
+mod locked;
 mod membarrier;
 mod rseq;
 mod thread;
 
+pub use locked::{CpuStacks, Full, LockedStacks};
 pub use rseq::Rseq;
 pub use thread::{CpuId, Thread};
