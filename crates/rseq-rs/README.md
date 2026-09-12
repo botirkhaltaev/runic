@@ -20,6 +20,18 @@ assert!(rseq.fence(cpu));
 the kernel or glibc rseq is unavailable — use `AtomicUsize`, not a hidden
 lock here. `fence` is optional and registers membarrier itself.
 
-Still to land: `Word` / `Words`, `Thread` word ops, stress, benches.
+## Words region (landed)
+
+```rust
+use rseq_rs::Words;
+
+let words = Words::new(2)?;
+let w = words.get(cpu)?;
+```
+
+`get` is address math, not a critical section. `unsafe Word::from_raw` for a
+field in a caller-owned per-CPU struct.
+
+Still to land: `Thread` word ops, stress, benches.
 
 See [ROADMAP.md](ROADMAP.md). `publish = false`.
