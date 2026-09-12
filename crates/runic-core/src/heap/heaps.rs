@@ -121,7 +121,7 @@ impl Heaps {
         ctx: &AllocatorCtx<'_>,
     ) -> Result<(), HeapError> {
         let (heap, mut inner) = self.admit(id)?;
-        let emptied = inner.free(owner, ptr, ctx)?;
+        let emptied = inner.free(owner, ptr, ctx, heap)?;
         if emptied {
             heap.reclaim(&inner, self);
         }
