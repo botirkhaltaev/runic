@@ -18,8 +18,8 @@ pub struct Rseq {
 }
 
 impl Rseq {
-    /// glibc-registered area, CPU count, and RSEQ membarrier.
-    /// `None` if rseq or membarrier is unavailable. `#[cold]`; call once.
+    /// glibc-registered area and CPU count.
+    /// `None` if rseq is unavailable. `#[cold]`; call once.
     #[cold]
     #[must_use]
     pub fn try_new() -> Option<Self> {
@@ -40,6 +40,7 @@ impl Rseq {
     }
 
     /// Expedited RSEQ membarrier targeted at `cpu`.
+    /// Registers the command on first use.
     #[must_use]
     pub fn fence(self, cpu: CpuId) -> bool {
         membarrier::fence(cpu.get())
@@ -68,9 +69,6 @@ fn init() -> Option<Rseq> {
         let offset = unsafe { __rseq_offset };
         let cpus = cpus()?;
         if cpus == 0 {
-            return None;
-        }
-        if !membarrier::register() {
             return None;
         }
         Some(Rseq { offset, cpus })

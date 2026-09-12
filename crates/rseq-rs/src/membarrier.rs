@@ -1,14 +1,21 @@
-//! `membarrier(2)` for the RSEQ expedited command.
+//! `membarrier(2)` for the RSEQ expedited command. Used by `fence` only.
+
+use std::sync::OnceLock;
 
 const PRIVATE_EXPEDITED_RSEQ: libc::c_int = 1 << 7;
 const REGISTER_PRIVATE_EXPEDITED_RSEQ: libc::c_int = 1 << 8;
 const FLAG_CPU: libc::c_int = 1 << 0;
 
-pub(crate) fn register() -> bool {
+static READY: OnceLock<bool> = OnceLock::new();
+
+fn register() -> bool {
     membarrier(REGISTER_PRIVATE_EXPEDITED_RSEQ, 0, 0) == 0
 }
 
 pub(crate) fn fence(cpu: u32) -> bool {
+    if !*READY.get_or_init(register) {
+        return false;
+    }
     let Ok(cpu) = libc::c_int::try_from(cpu) else {
         return false;
     };
