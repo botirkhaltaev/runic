@@ -1,7 +1,11 @@
-use core::{marker::PhantomData, ptr::NonNull};
+use core::{
+    marker::PhantomData,
+    ptr::{NonNull, addr_of_mut},
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use crate::{
-    layout::{self, Header, Region},
+    layout::{self, Region},
     locked::{CpuStacks, Full},
     quiesce::Quiesced,
     rseq::Rseq,
@@ -104,7 +108,7 @@ impl<T> Stacks<T> {
         self.rseq
     }
 
-    /// Possible CPU slabs.
+    /// CPU slabs.
     #[must_use]
     pub const fn cpus(&self) -> u32 {
         self.cpus
@@ -162,24 +166,22 @@ impl<T> Stacks<T> {
         if id >= self.cpus {
             return None;
         }
-        #[allow(clippy::cast_ptr_alignment)]
-        let header = layout::block(self.memory.base(), id, self.shift).cast::<Header>();
-        // SAFETY: `header` is our slab; capacity 0 is the stop flag.
-        #[allow(clippy::cast_ptr_alignment)]
+        // SAFETY: `id` is in range for this mapping.
+        let header = unsafe { layout::header(self.memory.base(), id, self.shift) };
+        // Stop first. Snapshot `current` only after hitters abort or finish.
         unsafe {
-            (*header).capacity = 0;
+            AtomicU32::from_ptr(addr_of_mut!((*header.as_ptr()).capacity))
+                .store(0, Ordering::Release);
         }
         if !self.rseq.fence(cpu) {
-            #[allow(clippy::cast_ptr_alignment)]
             unsafe {
-                (*header).capacity = self.cap;
+                AtomicU32::from_ptr(addr_of_mut!((*header.as_ptr()).capacity))
+                    .store(self.cap, Ordering::Release);
             }
             return None;
         }
-        // SAFETY: fence completed; hitters on this CPU have aborted or finished.
-        #[allow(clippy::cast_ptr_alignment)]
-        let current = unsafe { (*header).current };
-        // SAFETY: exclusive drain of this slab until `Quiesced` drops.
+        // SAFETY: fence completed; this slab is exclusive until `Quiesced` drops.
+        let current = unsafe { header.as_ref().current };
         Some(unsafe { Quiesced::new(header, self.cap, current, None) })
     }
 

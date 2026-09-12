@@ -12,10 +12,12 @@ pub struct Quiesced<'a, T> {
     cap: u32,
     current: u32,
     unlock: Option<&'a AtomicBool>,
-    _t: PhantomData<&'a T>,
+    _t: PhantomData<(&'a T, *const ())>,
 }
 
 impl<'a, T> Quiesced<'a, T> {
+    /// # Safety
+    /// Exclusive mutator of this slab until drop. `current` is the live length.
     pub(crate) unsafe fn new(
         header: *mut Header,
         cap: u32,
@@ -52,6 +54,19 @@ impl<'a, T> Quiesced<'a, T> {
     /// Drain remaining pointers.
     pub fn drain(&mut self) -> impl Iterator<Item = NonNull<T>> + '_ {
         core::iter::from_fn(move || self.pop())
+    }
+}
+
+impl<T> Iterator for Quiesced<'_, T> {
+    type Item = NonNull<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.pop()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.current as usize;
+        (n, Some(n))
     }
 }
 
