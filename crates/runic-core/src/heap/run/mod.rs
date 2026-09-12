@@ -1,12 +1,11 @@
 use core::{
     cell::UnsafeCell,
-    mem::{align_of, size_of},
+    mem::{align_of, offset_of, size_of},
     num::NonZeroU32,
     ptr::NonNull,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
-pub(crate) mod cache;
 pub(crate) mod config;
 pub(crate) mod heap;
 
@@ -17,13 +16,12 @@ use crate::{
 };
 
 use super::{
-    HeapId,
+    Heap, HeapId,
     inbox::{InboxLink, InboxNode},
 };
 
 use config::RunPolicy;
 
-pub(crate) use cache::RunCache;
 pub(crate) use heap::RunHeap;
 
 pub(crate) const RUN_SIZE: usize = 64 * 1024;
@@ -33,7 +31,6 @@ pub(crate) const RUN_SPACE: usize = RUN_SIZE * 2;
 pub(crate) const MAP_RUNS: usize = 16;
 pub(crate) const MAP_SIZE: usize = MAP_RUNS * RUN_SPACE;
 
-const _: () = assert!(RUN_SPACE >= RUN_SIZE + (RUN_SIZE / 8).div_ceil(64) * 8);
 const _: () = assert!(MAP_SIZE == 2 * 1024 * 1024);
 /// Bits per claim-bitmap word (`AtomicU64`).
 const CLAIM_WORD_BITS: usize = 64;
@@ -121,9 +118,11 @@ impl ClaimBits {
         words.checked_mul(size_of::<u64>())
     }
 
-    /// Byte offset of the claim span from the space base (`RUN_SIZE`, 8-aligned).
+    /// Byte offset of the claim span from the space base (after the in-page header).
     fn space_offset() -> Option<usize> {
-        RUN_SIZE.checked_next_multiple_of(size_of::<u64>())
+        RUN_SIZE
+            .checked_add(size_of::<Run>())?
+            .checked_next_multiple_of(align_of::<AtomicU64>())
     }
 
     fn word_count(capacity: usize) -> usize {
@@ -174,6 +173,10 @@ impl ClaimBits {
     }
 }
 
+/// In-page header at `base + RUN_SIZE`. Owner hit packs `base`/`span`/`recip`
+/// next to `RunState` (`free`/`live` first). Remote `link`/`claims` start on
+/// the next 64-byte line.
+#[repr(C, align(64))]
 pub(crate) struct Run {
     /// Cached payload base (`RUN_SIZE` bytes) in a heap-owned map.
     base: NonNull<u8>,
@@ -181,20 +184,23 @@ pub(crate) struct Run {
     span: u32,
     /// `ceil(2^32 / stride)` — exact `floor(offset / stride)` for `offset < 2^16`.
     recip: u32,
-    /// Owner-local freelist / live / bump. `free` / `live` / `capacity` sit on the
-    /// same line as `base` / `span` / `recip` so `Run::free` is one dependent line
-    /// after `current[class]` (`repr(Rust)` is not ABI).
     state: UnsafeCell<RunState>,
     stride: usize,
-    claims: ClaimBits,
     class: SizeClass,
     id: RunId,
     heap: HeapId,
     policy: RunPolicy,
-    /// Mirror of `RunState.bump` for remote `claim`. Cold.
+    /// Owning `Heap`; never moves. Null in unit tests that construct a stack `Run`.
+    heap_ptr: *mut Heap,
+    /// Mirror of `RunState.bump` for remote `claim`.
     issued: AtomicUsize,
-    /// Coalesced-by-run inbox membership (see `heap::inbox`). Cold.
+    remote: RemoteLine,
+}
+
+#[repr(C, align(64))]
+struct RemoteLine {
     link: InboxLink<Run>,
+    claims: ClaimBits,
 }
 
 // SAFETY: owner-local methods are called only by the owning heap. Remote methods only touch
@@ -202,9 +208,13 @@ pub(crate) struct Run {
 // (except `accept`, itself an owner-local method called only through the owning heap's flush).
 unsafe impl Sync for Run {}
 
+const _: () = assert!(offset_of!(Run, state) == 16);
+const _: () = assert!(offset_of!(Run, remote) % 64 == 0);
+const _: () = assert!(RUN_SPACE >= RUN_SIZE + size_of::<Run>() + (RUN_SIZE / 8).div_ceil(64) * 8);
+
 impl InboxNode for Run {
     fn link(&self) -> &InboxLink<Self> {
-        &self.link
+        &self.remote.link
     }
 }
 
@@ -246,18 +256,21 @@ impl Run {
         debug_assert!(stride >= size_of::<usize>());
         let span = u32::try_from(capacity.checked_mul(stride)?).ok()?;
         Some(Self {
-            state: UnsafeCell::new(RunState::new(capacity)),
             base,
             span,
             recip: Self::recip(u32::try_from(stride).ok()?)?,
+            state: UnsafeCell::new(RunState::new(capacity)),
             stride,
-            claims,
             class,
             id,
             heap,
             policy,
+            heap_ptr: core::ptr::null_mut(),
             issued: AtomicUsize::new(0),
-            link: InboxLink::new(),
+            remote: RemoteLine {
+                link: InboxLink::new(),
+                claims,
+            },
         })
     }
 
@@ -272,6 +285,32 @@ impl Run {
 
     pub(crate) fn set_heap_id(&mut self, heap: HeapId) {
         self.heap = heap;
+    }
+
+    pub(crate) fn set_heap(&mut self, heap: &Heap) {
+        self.heap_ptr = core::ptr::from_ref(heap).cast_mut();
+    }
+
+    /// Owning heap when `heap_ptr` is set and the generation still matches.
+    pub(crate) fn heap(&self) -> Option<&Heap> {
+        // SAFETY: `heap_ptr` is the immovable arena slot when published.
+        let heap = unsafe { NonNull::new(self.heap_ptr)?.as_ref() };
+        heap.matches(self.heap).then_some(heap)
+    }
+
+    /// In-page header at `(ptr & !(RUN_SIZE-1)) + RUN_SIZE`. Self-check `base`.
+    #[inline]
+    pub(crate) fn header_of(ptr: NonNull<u8>) -> Option<NonNull<Self>> {
+        let masked = ptr.as_ptr().addr() & !(RUN_SIZE - 1);
+        let header = masked.wrapping_add(RUN_SIZE);
+        // SAFETY: run spaces map this address. Extents never carry a size-class
+        // layout (`resize_in_place` refuses). Unmapped foreign small pointers
+        // SIGSEGV (accepted). Mapped-but-foreign fails the base check.
+        let run = unsafe { &*core::ptr::with_exposed_provenance::<Self>(header) };
+        if run.base.as_ptr().addr() != masked {
+            return None;
+        }
+        Some(NonNull::from(run))
     }
 
     pub(crate) const fn heap_id(&self) -> HeapId {
@@ -389,7 +428,7 @@ impl Run {
             return Err(RunError::DoubleFree);
         }
 
-        if !self.claims.try_set(block.index()) {
+        if !self.remote.claims.try_set(block.index()) {
             return Err(RunError::DoubleFree);
         }
         Ok(())
@@ -402,12 +441,12 @@ impl Run {
     /// claim bits remain after the scan — the caller must `Inbox::push` again (or a racer
     /// already did). Exactly one of those pushes keeps the run queued when work remains.
     pub(crate) fn accept(&self) -> bool {
-        self.link.clear_queued();
+        self.remote.link.clear_queued();
 
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
-        for word in 0..self.claims.word_count {
-            let mut bits = self.claims.drain_word(word);
+        for word in 0..self.remote.claims.word_count {
+            let mut bits = self.remote.claims.drain_word(word);
             while bits != 0 {
                 // `trailing_zeros` of a nonzero `u64` is always < 64, so this never truncates.
                 let bit = usize::try_from(bits.trailing_zeros()).unwrap();
@@ -423,7 +462,7 @@ impl Run {
         if state.live == 0 && self.policy == RunPolicy::Discard {
             self.maybe_discard(state);
         }
-        self.claims.any_set()
+        self.remote.claims.any_set()
     }
 
     #[cold]
@@ -443,7 +482,7 @@ impl Run {
         if block.index().get() >= state.bump {
             return Err(RunError::DoubleFree);
         }
-        if self.claims.is_set(block.index()) {
+        if self.remote.claims.is_set(block.index()) {
             return Err(RunError::DoubleFree);
         }
         Ok(block)
@@ -949,7 +988,7 @@ mod tests {
                         }
                     }
                 }
-                if finished && inbox.is_empty() && !run.claims.any_set() {
+                if finished && inbox.is_empty() && !run.remote.claims.any_set() {
                     break;
                 }
                 spins += 1;

@@ -6,7 +6,7 @@
 - Clean, idiomatic, readable Rust. No hacks at code or architecture level (no clever dual paths, kludges, or “temporary” shims that become permanent).
 - Safe Rust first; `unsafe` only for OS/ownership contracts or **measured** hot paths (narrow + SAFETY).
 - Explicit ownership entities, fail-closed remote admission and interior/foreign pointers, auditable invariants — not line-for-line ports. Owner double-free is undefined.
-- Composable APIs: behavior on the owning entity; no one-caller shims, pass-throughs, dual APIs, or `*_v2` / `*_nonlocal` names. `#[inline(never)]` outlines only (`alloc_miss` / `dealloc_slow` / `push_available`); `#[cold]` is abort / bind / map / remote / unbind / discard.
+- Composable APIs: behavior on the owning entity; no one-caller shims, pass-throughs, dual APIs, or `*_v2` / `*_nonlocal` names. `#[inline(never)]` outlines only (`alloc_miss` / `dealloc_slow` / `push_available`); `#[cold]` is abort / bind / map / remote / unbind / discard / adopt.
 
 ## Conventions
 
@@ -15,10 +15,10 @@
 - Small hit: `ThreadHeap::{alloc,free}` take no inner. `&PageMap` on miss. Cold unbound: `Allocator::{bind_alloc,free_remote}`.
 - Naming: short, clear, domain words only — same term means the same thing everywhere. No long compound jargon, invented synonyms, or parallel names for one concept. Frontend `alloc`, domain block/extent `allocate`, checkout `acquire`, current-run `extend`. Free protocol: `free` / `claim` / `accept`. Prefer existing vocabulary (`run`, `extent`, `heap`, `inbox`, `flush`, `bind`, `current`, `extend`) over new coinages.
 - Indices: `Arena` / `HeapId` / `RunId` / `ExtentId` use `u32`; convert to `usize` only when indexing Rust arrays or doing pointer/byte math — no free cast-wrapper helpers.
-- Remote free: claim → `Heap::enqueue` (Active; lease before new `try_queue`) or `Heaps::{enqueue,free,flush}` (Draining). Coalesce by owner (`Inbox`), never a freer TLS batch.
+- Remote free: claim → `adopt` a Draining heap (then owner `free`) or `Heap::enqueue` (Active; lease before new `try_queue`) or `Heaps::{enqueue,free,flush}` (Draining). Coalesce by owner (`Inbox`), never a freer TLS batch.
 - Flush policy: current-run empty = `extend`; inbox flush if nonempty; then local/OS `acquire_run`. Unbound = `bind` then `flush` then alloc; hit = current pop / `Run::free` (`push_available` only on `was_full`). Inbox `flush` is remote `accept` only. `lookup` is miss / realloc.
 - `Layout` only at the public boundary → `LayoutSpec` inward once.
-- No root/shared ownership heap; every run/extent has `HeapId`. Shared `&Heap` = atomics only (`enqueue` / mode). Active exclusive = `ThreadHeap` + `try_inner` + `AllocatorCtx`. Draining = `Heaps::{enqueue,free,flush}` + `AllocatorCtx`. No `Heap::state()` projection; no `*_fresh` dual alloc APIs.
+- No root/shared ownership heap; every run/extent has `HeapId`. Shared `&Heap` = atomics only (`id` / `enqueue` / mode). Active exclusive = `ThreadHeap` + `require_inner` + `AllocatorCtx`. Draining = `Heaps::{enqueue,free,flush}` + `AllocatorCtx`. No `Heap::state()` projection; no `*_fresh` dual alloc APIs.
 - One abort sink: `Allocator::abort`. Preserve abort kinds through `HeapError` (`InvalidRunPointer` / `InvalidExtentPointer` / `MissingExtent`). `HeapError::DoubleFree` is remote `claim` / interior-foreign only — not owner DF. Never hold the arena grow lock across flush / accept / user-memory copies.
 - No allocator-internal `Vec` / `Box` / `HashMap` / `String` / formatting / panic unless recursion risk is addressed.
 - `#![deny(unsafe_op_in_unsafe_fn)]`. No test-only methods on production `impl` blocks.
@@ -52,4 +52,4 @@
 
 - v0.6 in: Linux x86_64, Rust nightly, `#[thread_local]` `THREAD_HEAP`, `GlobalAlloc`, owner-local heaps, TLS current run, run/extent retention, remote-free, `realloc` / `alloc_zeroed`, tests, benches.
 - v0.6 out: quarantine, canaries, hugepages, NUMA, C ABI, ML placement, dashboards, background purge.
-- Next: LTO `vec_many_small` ≤ 40 (30.7 vs sn 33.2). `large_buffers` leftover is default Keep memset; `ExtentPolicy::Discard` matches snmalloc — not a medium class. `Heaps::get` is a lock-free `Arena` read. Do not compact `CLASS_FOR_SIZE`, retry first-fit extent reuse, identity, batch take, O(1) TLS steal, `#135` RSEQ, or a locate-offset dual free. Do not port snmalloc.
+- Next: LTO `vec_many_small` 15.8 vs sn 33.4. Zeroed Keep reuse ≥256 KiB discards pages without the Discard-insert clean flag; below that, memset. `ExtentPolicy::Discard` matches snmalloc — not a medium class. `Heaps::get` is a lock-free `Arena` read. Remote-free may `adopt` a Draining heap; `unbind` retires bound and adopted. Do not compact `CLASS_FOR_SIZE`, retry first-fit extent reuse, identity, batch take, O(1) TLS steal, `#135` RSEQ, or a locate-offset dual free. Do not port snmalloc.

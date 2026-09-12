@@ -6,7 +6,7 @@ use core::{
 };
 
 use crate::{
-    heap::{Extent, Run},
+    heap::{Extent, HeapId, Run},
     memory::{AddressRange, Mapping, OsMemory, PAGE_SIZE},
 };
 
@@ -41,6 +41,21 @@ pub(crate) enum PageOwner {
     Run(NonNull<Run>),
     // Pointers must refer to live arena entries until their page-map range is removed.
     Extent(NonNull<Extent>),
+}
+
+impl PageOwner {
+    pub(crate) fn heap_id(self) -> HeapId {
+        match self {
+            Self::Run(run) => {
+                // SAFETY: PageMap / header_of store only live arena pointers.
+                unsafe { run.as_ref() }.heap_id()
+            }
+            Self::Extent(extent) => {
+                // SAFETY: PageMap stores only live arena pointers.
+                unsafe { extent.as_ref() }.heap_id()
+            }
+        }
+    }
 }
 
 pub(crate) struct PageMap {

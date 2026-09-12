@@ -7,7 +7,10 @@ use core::{
 use crate::{
     config::AllocatorConfig,
     heap::extent::ExtentError,
-    heap::{AllocatorCtx, ExtentInit, HeapError, Heaps, RunError, THREAD_HEAP, ThreadFreeError},
+    heap::{
+        AllocatorCtx, ExtentInit, HeapError, Heaps, RunError, THREAD_HEAP, ThreadFreeError,
+        ThreadHeap,
+    },
     layout::LayoutSpec,
     memory::{OsMemory, PageMap, PageOwner},
     size_class::{SizeClass, SizeClasses},
@@ -139,7 +142,7 @@ impl Allocator {
         let new_spec = LayoutSpec::from_layout(new_layout);
         let old_spec = LayoutSpec::from_layout(old);
 
-        let resized = match THREAD_HEAP.lookup(ctx.pages, old_ptr, old_spec) {
+        let resized = match ThreadHeap::lookup(ctx.pages, old_ptr, old_spec) {
             Some(PageOwner::Run(run)) => {
                 // SAFETY: lookup returns a live arena run; resize still `locate`s.
                 unsafe { run.as_ref() }
@@ -267,7 +270,8 @@ impl Allocator {
         .map_or(null_mut(), NonNull::as_ptr)
     }
 
-    /// Cross-heap free: Active claim → enqueue, or `Heaps::free` under Draining.
+    /// Cross-heap free: adopt a Draining heap, else Active claim → enqueue,
+    /// else `Heaps::free` under Draining.
     ///
     /// Coalescing is by owner inbox. `Remote` callers only — heap-domain errors abort
     /// in `dealloc` before this runs.
@@ -278,26 +282,33 @@ impl Allocator {
         owner: PageOwner,
         ptr: NonNull<u8>,
     ) -> Result<(), AllocatorError> {
-        let heap_id = match owner {
-            PageOwner::Run(run) => {
-                // SAFETY: PageMap stores only pointers published from this allocator's live arenas.
-                unsafe { run.as_ref() }.heap_id()
-            }
-            PageOwner::Extent(extent) => {
-                // SAFETY: PageMap stores only pointers published from this allocator's live arenas.
-                unsafe { extent.as_ref() }.heap_id()
-            }
-        };
-        let heap = ctx
-            .heaps
-            .get(heap_id)
-            .ok_or(AllocatorError::InvalidMetadata)?;
+        let heap_id = owner.heap_id();
+        let heap = match owner {
+            // SAFETY: PageMap / header_of store only live arena run pointers.
+            PageOwner::Run(run) => unsafe { run.as_ref() }.heap(),
+            PageOwner::Extent(_) => None,
+        }
+        .or_else(|| ctx.heaps.get(heap_id))
+        .ok_or(AllocatorError::InvalidMetadata)?;
 
         if !heap.is_active() {
-            return ctx
-                .heaps
-                .free(heap_id, owner, ptr, ctx)
-                .map_err(AllocatorError::from);
+            if THREAD_HEAP.adopt(heap, heap_id, ctx) {
+                return THREAD_HEAP
+                    .free_owner(owner, ptr, ctx)
+                    .map_err(|error| match error {
+                        ThreadFreeError::Heap(error) => AllocatorError::from(error),
+                        ThreadFreeError::Remote(_) => AllocatorError::InvalidMetadata,
+                    });
+            }
+            match ctx.heaps.free(heap_id, owner, ptr, ctx) {
+                Ok(()) => return Ok(()),
+                // Another thread won `adopt`; heap is now Active.
+                Err(HeapError::InvalidHeap) => {}
+                Err(error) => return Err(AllocatorError::from(error)),
+            }
+            if !heap.is_active() {
+                return Err(AllocatorError::InvalidMetadata);
+            }
         }
 
         match owner {
@@ -434,7 +445,7 @@ mod tests {
     use super::*;
     use crate::heap::thread::ThreadHeap;
     use crate::heap::{Extent, Heap, HeapMode, Run};
-    use std::sync::mpsc;
+    use std::sync::{Barrier, mpsc};
     use std::thread;
 
     fn install(allocator: &Allocator) -> AllocatorCtx<'static> {
@@ -604,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn run_cache_hits_after_free_slow_and_clears_on_unbind() {
+    fn header_of_finds_in_page_run_after_free() {
         let allocator = Allocator::new();
         let ctx = install(&allocator);
         let layout = Layout::from_size_align(64, 8).unwrap();
@@ -613,19 +624,20 @@ mod tests {
             let _id = tls.bind(&ctx).unwrap();
             let ptr = bind_alloc_small(tls, &ctx, layout);
             let spec = LayoutSpec::from_layout(layout);
-            let Some(PageOwner::Run(run)) = tls.lookup(ctx.pages, ptr, spec) else {
+            let Some(PageOwner::Run(run)) = ThreadHeap::lookup(ctx.pages, ptr, spec) else {
                 panic!("alloc should publish a run");
             };
+            assert_eq!(Run::header_of(ptr), Some(run));
             assert_eq!(tls.free_slow(ptr, spec, &ctx), Ok(()));
             let again = bind_alloc_small(tls, &ctx, layout);
             assert_eq!(again, ptr);
-            assert_eq!(
-                tls.lookup(ctx.pages, again, spec),
-                Some(PageOwner::Run(run))
-            );
+            assert_eq!(Run::header_of(again), Some(run));
             assert_eq!(tls.free_run(run, again), Ok(()));
             unbind(tls);
-            assert_eq!(tls.lookup(ctx.pages, ptr, spec), Some(PageOwner::Run(run)));
+            assert_eq!(
+                ThreadHeap::lookup(ctx.pages, ptr, spec),
+                Some(PageOwner::Run(run))
+            );
         };
     }
 
@@ -1115,7 +1127,7 @@ mod tests {
     }
 
     #[test]
-    fn dealloc_mixed_class_reverse_drop_uses_current_then_cache() {
+    fn dealloc_mixed_class_reverse_drop_uses_current() {
         let allocator = Allocator::new();
         let eight = Layout::from_size_align(8, 8).unwrap();
         let sixty_four = Layout::from_size_align(64, 8).unwrap();
@@ -1157,7 +1169,7 @@ mod tests {
         {
             let tls = &THREAD_HEAP;
             assert_eq!(
-                tls.lookup(pages, first0, LayoutSpec::from_layout(layout)),
+                ThreadHeap::lookup(pages, first0, LayoutSpec::from_layout(layout)),
                 Some(PageOwner::Run(run_a))
             );
             assert_eq!(tls.free_run(run_b, extra), Ok(()));
@@ -1216,5 +1228,116 @@ mod tests {
             Some(PageOwner::Extent(_))
         ));
         unsafe { allocator.dealloc(grown, large) };
+    }
+
+    #[test]
+    fn adopt_then_owner_local_free() {
+        let allocator = Allocator::new();
+        let ctx = install(&allocator);
+        let pages = ctx.pages;
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        let (id, first, second, run) = {
+            let tls = &THREAD_HEAP;
+            let id = tls.bind(&ctx).unwrap();
+            let first = bind_alloc_small(tls, &ctx, layout);
+            let second = bind_alloc_small(tls, &ctx, layout);
+            let run = run_of(pages, first);
+            unbind(tls);
+            (id, first, second, run)
+        };
+
+        assert_eq!(ctx.heaps.get(id).map(Heap::mode), Some(HeapMode::Draining));
+        assert_eq!(
+            Allocator::free_remote(&ctx, PageOwner::Run(run), first),
+            Ok(())
+        );
+        assert_eq!(ctx.heaps.get(id).map(Heap::mode), Some(HeapMode::Active));
+        assert_eq!(THREAD_HEAP.free_run(run, second), Ok(()));
+        THREAD_HEAP.retire_adopted(&ctx);
+        assert!(ctx.heaps.get(id).is_none());
+    }
+
+    #[test]
+    fn adopt_race_one_winner() {
+        let allocator = Allocator::new();
+        let ctx = install(&allocator);
+        let pages = ctx.pages;
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        let (id, addrs, run_addr) = {
+            let tls = &THREAD_HEAP;
+            let id = tls.bind(&ctx).unwrap();
+            let live = alloc_live(tls, &ctx, layout, 2);
+            let run = run_of(pages, live[0]);
+            let addrs: Vec<usize> = live.iter().map(|p| p.as_ptr() as usize).collect();
+            unbind(tls);
+            (id, addrs, run.as_ptr() as usize)
+        };
+
+        assert_eq!(ctx.heaps.get(id).map(Heap::mode), Some(HeapMode::Draining));
+        let (tx, rx) = mpsc::channel();
+        let hold = Barrier::new(2);
+        thread::scope(|scope| {
+            for addr in addrs {
+                let tx = tx.clone();
+                let hold = &hold;
+                scope.spawn(move || {
+                    let run = NonNull::new(run_addr as *mut Run).unwrap();
+                    let ptr = NonNull::new(addr as *mut u8).unwrap();
+                    assert_eq!(
+                        Allocator::free_remote(&ctx, PageOwner::Run(run), ptr),
+                        Ok(())
+                    );
+                    tx.send(THREAD_HEAP.adopted_id_for_test()).unwrap();
+                    hold.wait();
+                    unbind(&THREAD_HEAP);
+                });
+            }
+            drop(tx);
+            let winners: Vec<_> = rx.iter().flatten().collect();
+            assert_eq!(winners.len(), 1);
+        });
+        assert!(
+            ctx.heaps.get(id).is_none()
+                || ctx.heaps.get(id).map(Heap::mode) == Some(HeapMode::Draining)
+        );
+    }
+
+    #[test]
+    fn adopter_exit_retires_adopted_heap() {
+        let allocator = Allocator::new();
+        let ctx = install(&allocator);
+        let pages = ctx.pages;
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        let (id, first, second, run) = {
+            let tls = &THREAD_HEAP;
+            let id = tls.bind(&ctx).unwrap();
+            let first = bind_alloc_small(tls, &ctx, layout);
+            let second = bind_alloc_small(tls, &ctx, layout);
+            let run = run_of(pages, first);
+            unbind(tls);
+            (id, first, second, run)
+        };
+
+        let run_addr = run.as_ptr() as usize;
+        let first_addr = first.as_ptr() as usize;
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let run = NonNull::new(run_addr as *mut Run).unwrap();
+                let first = NonNull::new(first_addr as *mut u8).unwrap();
+                assert_eq!(
+                    Allocator::free_remote(&ctx, PageOwner::Run(run), first),
+                    Ok(())
+                );
+                assert_eq!(ctx.heaps.get(id).map(Heap::mode), Some(HeapMode::Active));
+                unbind(&THREAD_HEAP);
+            });
+        });
+
+        assert_eq!(ctx.heaps.get(id).map(Heap::mode), Some(HeapMode::Draining));
+        assert_eq!(
+            ctx.heaps.free(id, PageOwner::Run(run), second, &ctx),
+            Ok(())
+        );
+        assert!(ctx.heaps.get(id).is_none());
     }
 }

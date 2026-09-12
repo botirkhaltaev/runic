@@ -23,6 +23,15 @@ impl HeapId {
         self.generation
     }
 
+    pub(crate) const fn slot(self) -> NonZeroU32 {
+        self.slot
+    }
+
+    /// Slot already published by [`Self::new`].
+    pub(crate) const fn from_slot(slot: NonZeroU32, generation: NonZeroU32) -> Self {
+        Self { slot, generation }
+    }
+
     /// One-word identity: `slot | generation << 32`.
     #[inline]
     fn word(self) -> u64 {

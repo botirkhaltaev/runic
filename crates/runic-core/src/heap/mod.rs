@@ -7,12 +7,14 @@ pub(crate) mod run;
 mod state;
 pub(crate) mod thread;
 
+use core::num::NonZeroU32;
 use core::ptr::NonNull;
 use core::sync::atomic::AtomicU32;
 
 use spin::Mutex;
 
 use crate::{
+    allocator::Allocator,
     config::AllocatorConfig,
     layout::LayoutSpec,
     memory::{PageMap, PageOwner},
@@ -27,19 +29,22 @@ pub(crate) use extent::Extent;
 pub(crate) use extent::heap::{ExtentHeap, ExtentInit};
 pub(crate) use heaps::Heaps;
 pub(crate) use id::HeapId;
-pub(crate) use run::{Run, RunCache, RunError, RunHeap, RunId};
+pub(crate) use run::{Run, RunError, RunHeap, RunId};
 pub(crate) use state::HeapMode;
-pub(crate) use thread::{THREAD_HEAP, ThreadFreeError};
+pub(crate) use thread::{THREAD_HEAP, ThreadFreeError, ThreadHeap};
 
 /// Indexed heap entry: lifecycle, remote-free inboxes, and owner-local run/extent metadata.
 ///
-/// Shared (`get`): atomics only — `enqueue`, mode queries.
-/// Active exclusive metadata: [`ThreadHeap`](thread::ThreadHeap) via [`Heap::try_inner`].
+/// Shared (`get`): atomics only — `id`, `enqueue`, mode queries.
+/// Active exclusive metadata: [`ThreadHeap`](thread::ThreadHeap) via [`Heap::require_inner`]
+/// (bound owner or the remote freer that [`Heap::adopt`]ed a Draining heap).
 /// Draining exclusive metadata: [`Heaps::{enqueue,free,flush}`](Heaps).
 pub(crate) struct Heap {
     /// Lifecycle word — `pub(super)` so `Heaps` can close / wait / reactivate without a
     /// public `&HeapState` projection.
     pub(super) state: HeapState,
+    /// Published arena slot (`HeapId` 1-based). Generation is in [`HeapState`].
+    slot: NonZeroU32,
     run_inbox: RunInbox,
     extent_inbox: ExtentInbox,
     inner: Mutex<HeapInner>,
@@ -49,7 +54,6 @@ pub(crate) struct Heap {
 
 /// Exclusive run/extent metadata. Caller holds `MutexGuard<HeapInner>`.
 pub(super) struct HeapInner {
-    id: HeapId,
     runs: RunHeap,
     extents: ExtentHeap,
 }
@@ -62,21 +66,19 @@ pub(crate) struct AllocatorCtx<'a> {
 }
 
 impl HeapInner {
-    fn new(id: HeapId, config: AllocatorConfig) -> Self {
+    fn new(config: AllocatorConfig) -> Self {
         Self {
-            id,
             runs: RunHeap::new(config.run()),
             extents: ExtentHeap::new(config.extent()),
         }
     }
 
     fn rebind(&mut self, id: HeapId) {
-        self.id = id;
         self.runs.rebind(id);
         self.extents.rebind(id);
     }
 
-    fn has_live(&self) -> bool {
+    pub(super) fn has_live(&self) -> bool {
         self.runs.has_live() || self.extents.has_live()
     }
 
@@ -114,8 +116,9 @@ impl HeapInner {
         &mut self,
         class: SizeClass,
         pages: &PageMap,
+        heap: &Heap,
     ) -> Option<NonNull<Run>> {
-        self.runs.acquire(class, self.id, pages)
+        self.runs.acquire(class, heap.id(), Some(heap), pages)
     }
 }
 
@@ -123,11 +126,17 @@ impl Heap {
     pub(crate) fn new(id: HeapId, config: AllocatorConfig) -> Self {
         Self {
             state: HeapState::new(id.generation(), HeapMode::Active),
+            slot: id.slot(),
             run_inbox: RunInbox::new(),
             extent_inbox: ExtentInbox::new(),
-            inner: Mutex::new(HeapInner::new(id, config)),
+            inner: Mutex::new(HeapInner::new(config)),
             free_next: AtomicU32::new(u32::MAX),
         }
+    }
+
+    /// Arena slot plus the current generation.
+    pub(crate) fn id(&self) -> HeapId {
+        HeapId::from_slot(self.slot, self.state.generation())
     }
 
     /// Push-or-coalesce `owner` onto its inbox. Active freers only.
@@ -192,6 +201,10 @@ impl Heap {
         self.state.is_active()
     }
 
+    pub(crate) fn matches(&self, id: HeapId) -> bool {
+        self.state.matches(id)
+    }
+
     pub(crate) fn mode(&self) -> HeapMode {
         self.state.mode()
     }
@@ -204,8 +217,22 @@ impl Heap {
         self.state.close(id)
     }
 
+    /// Draining → Active. First remote freer wins; loser sees Active.
+    #[cold]
+    pub(crate) fn adopt(&self, id: HeapId) -> Result<(), HeapError> {
+        self.state.adopt(id)
+    }
+
     pub(super) fn try_inner(&self) -> Option<spin::MutexGuard<'_, HeapInner>> {
         self.inner.try_lock()
+    }
+
+    /// Active exclusive. Fail → abort.
+    pub(super) fn require_inner(&self) -> spin::MutexGuard<'_, HeapInner> {
+        let Some(inner) = self.try_inner() else {
+            Allocator::abort();
+        };
+        inner
     }
 
     pub(super) fn lock_inner(&self) -> spin::MutexGuard<'_, HeapInner> {
@@ -219,7 +246,7 @@ impl Heap {
     }
 
     /// Mark Free and bump generation when Draining, empty, and leases == 0.
-    pub(super) fn reclaim(&self, inner: &HeapInner, heaps: &Heaps, index: u32) -> bool {
+    pub(super) fn reclaim(&self, inner: &HeapInner, heaps: &Heaps) -> bool {
         let snap = self.state.load();
         if snap.retired || snap.mode != HeapMode::Draining || snap.leases != 0 {
             return false;
@@ -236,7 +263,7 @@ impl Heap {
         }
         self.state.bump_or_retire();
         if !self.state.is_retired() {
-            heaps.push_free(self, index);
+            heaps.push_free(self, self.id().index());
         }
         true
     }
@@ -276,7 +303,7 @@ impl Heap {
         if !self.inboxes_empty() {
             self.flush(inner, ctx).ok()?;
         }
-        inner.extents.allocate(spec, inner.id, ctx.pages, init)
+        inner.extents.allocate(spec, self.id(), ctx.pages, init)
     }
 }
 

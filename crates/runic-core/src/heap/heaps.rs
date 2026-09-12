@@ -31,30 +31,26 @@ impl Heaps {
     }
 
     /// Acquire a heap for TLS bind: pop a Free heap or claim a fresh one.
-    pub(crate) fn acquire(&self) -> Option<(HeapId, NonNull<Heap>)> {
-        if let Some(acquired) = self.reuse() {
-            return Some(acquired);
+    pub(crate) fn acquire(&self) -> Option<&Heap> {
+        if let Some(heap) = self.reuse() {
+            return Some(heap);
         }
-        let (index, heap) = self.arena.push(|index| {
+        let (_, heap) = self.arena.push(|index| {
             let id = HeapId::new(index, NonZeroU32::MIN)?;
             Some(Heap::new(id, self.config))
         })?;
-        let id = HeapId::new(index, heap.state.generation())?;
-        Some((id, NonNull::from(heap)))
+        Some(heap)
     }
 
-    fn reuse(&self) -> Option<(HeapId, NonNull<Heap>)> {
+    fn reuse(&self) -> Option<&Heap> {
         loop {
             let index = self.pop_free()?;
             let heap = self.arena.get(index)?;
             if heap.state.is_retired() || !heap.state.is_free() {
                 continue;
             }
-
-            let generation = heap.state.generation();
-            let id = HeapId::new(index, generation)?;
-            heap.reactivate(id);
-            return Some((id, NonNull::from(heap)));
+            heap.reactivate(heap.id());
+            return Some(heap);
         }
     }
 
@@ -104,7 +100,7 @@ impl Heaps {
     /// Try to return a Draining heap to the Free list. No inbox accept.
     pub(crate) fn reclaim(&self, id: HeapId) -> Result<(), HeapError> {
         let (heap, inner) = self.admit(id)?;
-        heap.reclaim(&inner, self, id.index());
+        heap.reclaim(&inner, self);
         Ok(())
     }
 
@@ -112,7 +108,7 @@ impl Heaps {
     pub(crate) fn enqueue(&self, id: HeapId, owner: PageOwner) -> Result<(), HeapError> {
         let (heap, inner) = self.admit(id)?;
         heap.drain_enqueue(owner);
-        heap.reclaim(&inner, self, id.index());
+        heap.reclaim(&inner, self);
         Ok(())
     }
 
@@ -127,7 +123,7 @@ impl Heaps {
         let (heap, mut inner) = self.admit(id)?;
         let emptied = inner.free(owner, ptr, ctx)?;
         if emptied {
-            heap.reclaim(&inner, self, id.index());
+            heap.reclaim(&inner, self);
         }
         Ok(())
     }
@@ -136,7 +132,7 @@ impl Heaps {
     pub(crate) fn flush(&self, id: HeapId, ctx: &AllocatorCtx<'_>) -> Result<(), HeapError> {
         let (heap, mut inner) = self.admit(id)?;
         heap.flush(&mut inner, ctx)?;
-        heap.reclaim(&inner, self, id.index());
+        heap.reclaim(&inner, self);
         Ok(())
     }
 
@@ -216,12 +212,12 @@ mod tests {
     #[test]
     fn acquire_retire_reactivate_bumps_generation() {
         let heaps = Heaps::new(AllocatorConfig::new());
-        let (first, _) = heaps.acquire().unwrap();
+        let first = heaps.acquire().unwrap().id();
         assert_eq!(first.generation().get(), 1);
         assert_eq!(retire(&heaps, first), Ok(()));
         assert!(heaps.get(first).is_none());
 
-        let (second, _) = heaps.acquire().unwrap();
+        let second = heaps.acquire().unwrap().id();
         assert_eq!(second.index(), first.index());
         assert_eq!(second.generation().get(), 2);
         assert!(heaps.get(second).is_some());
@@ -231,7 +227,7 @@ mod tests {
     #[test]
     fn stale_heap_id_rejected_after_reclaim() {
         let heaps = Heaps::new(AllocatorConfig::new());
-        let (id, _) = heaps.acquire().unwrap();
+        let id = heaps.acquire().unwrap().id();
         assert_eq!(retire(&heaps, id), Ok(()));
         assert!(heaps.get(id).is_none());
     }
@@ -239,7 +235,7 @@ mod tests {
     #[test]
     fn generation_exhaustion_permanently_retires_heap() {
         let heaps = Heaps::new(AllocatorConfig::new());
-        let (id, _) = heaps.acquire().unwrap();
+        let id = heaps.acquire().unwrap().id();
         let index = id.index();
         let max_gen = NonZeroU32::new(u32::MAX).unwrap();
         let heap = heaps.get(id).unwrap();
@@ -249,14 +245,14 @@ mod tests {
         assert!(heaps.get(id).is_none());
         assert!(heaps.get(id_max).is_none());
         assert!(heaps.arena.get(index).unwrap().state.is_retired());
-        let (other, _) = heaps.acquire().unwrap();
+        let other = heaps.acquire().unwrap().id();
         assert_ne!(other.index(), id.index());
     }
 
     #[test]
     fn retire_waits_for_in_flight_lease() {
         let heaps = Heaps::new(AllocatorConfig::new());
-        let (id, _) = heaps.acquire().unwrap();
+        let id = heaps.acquire().unwrap().id();
         let heap = heaps.get(id).unwrap();
         let lease = heap.state.acquire_lease(id).unwrap();
         let start = Barrier::new(2);
@@ -293,7 +289,7 @@ mod tests {
             for _ in 0..LIVE {
                 let tx = tx.clone();
                 scope.spawn(move || {
-                    let (id, _) = heaps.acquire().unwrap();
+                    let id = heaps.acquire().unwrap().id();
                     tx.send(id).unwrap();
                 });
             }
@@ -312,7 +308,7 @@ mod tests {
             }
         });
 
-        let (reused, _) = heaps.acquire().unwrap();
+        let reused = heaps.acquire().unwrap().id();
         assert!(reused.index() < u32::try_from(LIVE).unwrap());
     }
 
@@ -325,7 +321,7 @@ mod tests {
             let heaps = &heaps;
             scope.spawn(move || {
                 for _ in 0..n {
-                    let (id, _) = heaps.acquire().unwrap();
+                    let id = heaps.acquire().unwrap().id();
                     tx.send(id).unwrap();
                 }
             });

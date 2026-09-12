@@ -19,6 +19,7 @@ Memory modules own address ranges, OS mappings, and page-indexed pointer lookup.
 - Every `Mapping` is constructed only by `OsMemory::map` / `map_aligned`: nonzero page-multiple length, page-aligned base, uniquely owned until `Drop`. `map_aligned` over-maps and trims so the kept base matches the requested alignment.
 - `AddressRange` does not own mmap lifecycle; it is copyable geometry only.
 - Every returned pointer maps to exactly one `PageOwner` while allocated.
+- Small free / realloc probe `Run::header_of` first (in-page header at `base + RUN_SIZE`). `PageMap::get` is miss, extent, and self-check fallback. `publish_run` still stamps payload pages only.
 - `PageOwner` pointers must refer to live arena entries until their page-map range is removed.
 - Page-map insertion rejects overlapping ownership (validate under `L1WriteGuard`, then store; Drop unlocks).
 - Page-map removal validates the expected owner under `L1WriteGuard` before clearing; failed remove leaves the map unchanged.
