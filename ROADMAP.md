@@ -31,7 +31,8 @@ hot paths require it. Architecture should stay simple until a new entity owns a
 real lifecycle, invariant, or policy.
 
 The owner-local current run is that entity for the small hit. LTO collection
-Cost on this host puts `vec_many_small` at 30.7 vs snmalloc 33.2 (0.93×).
+Cost on this host puts `vec_many_small` at 31.0–32.7 (prior pack 30.7 vs
+snmalloc 33.2).
 App-bound cases (`tree`, `http_buffers`, …) stay near parity. Substantial
 wins vs snmalloc live on remote-free, large buffers, and footprint — see
 Benchmark Policy. Do not retry a magazine, RSEQ, or a locate-offset dual
@@ -52,8 +53,9 @@ page-map ownership. Heap lifecycle lives on `Heaps` / `Heap`
 Owner-local hit is a TLS current run per class (pop). Small miss/realloc uses
 `Run::header_of`. `locate` is offset from the run base. Run mappings are
 `RUN_SIZE`-aligned; the header and claim tail sit after the payload. `Run::allocate`
-is pop only; `extend` on miss. Owner free is `Run::free`; `push_available` only
-on `was_full`. One process-wide payload; `Allocator::ctx()` is the handle.
+is pop only; `extend` on miss. Owner free hit is `Run::release`;
+`push_available` is miss / slow / unbind. One process-wide payload;
+`Allocator::ctx()` is the handle.
 A Draining heap may be `adopt`ed by the first remote freer (`Draining` → `Active`).
 
 This pass owner-free hit diet vs post-#142 `82dd8b5` (same host, cycles/elem):
@@ -475,6 +477,42 @@ beat Keep/Keep by ≥5% geomean without a hold-out or train regression.
 fails `large_buffers_dirty` (2.3×). Run `Discard` is 2–8× on small
 churn. Extent/run Bound candidates were measured and not landed. Default
 stays Keep/Keep. `Unmap` remains the unretained baseline.
+
+Beyond-parity campaign (runic-only Cost, 5s×5, LTO, this host;
+`RUNIC_PROFILE_CPUS=0-3` for threaded). Gates are vs runic p0, not
+competitors.
+
+  p0 cycles/elem:
+  vec_push_clear            3.352
+  vec_many_small           31.792
+  string_building          37.953
+  hashmap_insert_remove    71.529
+  arc_clone_drop           42.992
+  mixed_collections        88.336
+  tree                    383.668
+  word_count              268.698
+  json_api               4571.556
+  regex_search           1143.047
+  http_buffers            169.719
+  large_buffers          4888.862
+  large_buffers_dirty   77034.772
+  run_churn_bursty         44.639
+  channel_pipeline       1279.049
+  arc_share_drop          270.810
+  scoped_map_reduce       560.804
+
+  gate                    p0       p2 (+D)     p2b (−D)
+  vec_many_small        31.792    31.029      32.704
+  run_churn_bursty      44.639    43.941         —
+  channel_pipeline      1279      1508        1273
+  arc_share_drop         270.8     267.0         —
+  scoped_map_reduce      560.8     549.9       585
+
+  Landed: Track A (`Run::release`; `__rust_dealloc` has no callee-saved),
+  B1 (`issued` on `RemoteLine`), C (`Heap::{run_live,extent_live}` /
+  `has_live`). Reverted: D (N=4 adopted slots; +18% `channel_pipeline`).
+  Not tried: B2 remote-only line split (no HITM), freelist prefetch
+  (next-link load 0.43%).
 ```
 
 ## Milestones
@@ -623,6 +661,7 @@ Out:
 retry #126 / #128 / RSEQ / O(1) TLS steal
 multi-entry page cache
 switch-on-second-heap adopt (lost on channel_pipeline)
+multi-slot adopt (lost on channel_pipeline)
 hardening / hugepages (later)
 ```
 

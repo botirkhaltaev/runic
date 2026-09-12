@@ -174,8 +174,8 @@ impl ClaimBits {
 }
 
 /// In-page header at `base + RUN_SIZE`. Owner hit packs `base`/`span`/`recip`
-/// next to `RunState` (`free`/`live` first). Remote `link`/`claims` start on
-/// the next 64-byte line.
+/// next to `RunState` (`free`/`live` first). Remote `issued`/`link`/`claims`
+/// start on the next 64-byte line.
 #[repr(C, align(64))]
 pub(crate) struct Run {
     /// Cached payload base (`RUN_SIZE` bytes) in a heap-owned map.
@@ -192,13 +192,13 @@ pub(crate) struct Run {
     policy: RunPolicy,
     /// Owning `Heap`; never moves. Null in unit tests that construct a stack `Run`.
     heap_ptr: *mut Heap,
-    /// Mirror of `RunState.bump` for remote `claim`.
-    issued: AtomicUsize,
     remote: RemoteLine,
 }
 
 #[repr(C, align(64))]
 struct RemoteLine {
+    /// Mirror of `RunState.bump` for remote `claim`. Off the owner hit line.
+    issued: AtomicUsize,
     link: InboxLink<Run>,
     claims: ClaimBits,
 }
@@ -266,8 +266,8 @@ impl Run {
             heap,
             policy,
             heap_ptr: core::ptr::null_mut(),
-            issued: AtomicUsize::new(0),
             remote: RemoteLine {
+                issued: AtomicUsize::new(0),
                 link: InboxLink::new(),
                 claims,
             },
@@ -369,6 +369,9 @@ impl Run {
         let state = unsafe { &mut *self.state.get() };
         let ptr = Self::pop_free(state)?;
         debug_assert!(state.live < state.capacity);
+        if state.live == 0 {
+            self.note_live(true);
+        }
         state.live += 1;
         Some(ptr)
     }
@@ -399,8 +402,17 @@ impl Run {
         Self::write_link(self.address(BlockIndex::new(end - 1)), state.free);
         state.free = self.address(BlockIndex::new(start)).as_ptr().addr();
         state.bump = end;
-        self.issued.store(end, Ordering::Relaxed);
+        self.remote.issued.store(end, Ordering::Relaxed);
         true
+    }
+
+    /// Hit: locate + push. Does not report `was_full` or discard.
+    ///
+    /// Available-list insert happens on the miss / slow / unbind path. Owner DF
+    /// is undefined.
+    #[inline]
+    pub(crate) fn release(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
+        self.take(ptr).map(|_| ())
     }
 
     /// Owner-local: live → pointer freelist. `Ok(true)` when the run was full.
@@ -408,6 +420,17 @@ impl Run {
     /// Owner double-free is undefined. Remote admission is `claim` / `accept`.
     #[inline]
     pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<bool, RunError> {
+        let was_full = self.take(ptr)?;
+        // SAFETY: owner-local methods are called only by the owning heap.
+        let state = unsafe { &mut *self.state.get() };
+        if state.live == 0 && self.policy == RunPolicy::Discard {
+            self.maybe_discard(state);
+        }
+        Ok(was_full)
+    }
+
+    #[inline]
+    fn take(&self, ptr: NonNull<u8>) -> Result<bool, RunError> {
         let block = self.locate(ptr)?;
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
@@ -415,8 +438,8 @@ impl Run {
         debug_assert!(state.live > 0);
         state.live -= 1;
         Self::push_free(state, block.ptr());
-        if state.live == 0 && self.policy == RunPolicy::Discard {
-            self.maybe_discard(state);
+        if state.live == 0 {
+            self.note_live(false);
         }
         Ok(was_full)
     }
@@ -424,7 +447,7 @@ impl Run {
     /// Freer: reserve remote admission before publish / payload reuse.
     pub(crate) fn claim(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
         let block = self.locate(ptr)?;
-        if block.index().get() >= self.issued.load(Ordering::Relaxed) {
+        if block.index().get() >= self.remote.issued.load(Ordering::Relaxed) {
             return Err(RunError::DoubleFree);
         }
 
@@ -445,6 +468,7 @@ impl Run {
 
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
+        let was_live = state.live != 0;
         for word in 0..self.remote.claims.word_count {
             let mut bits = self.remote.claims.drain_word(word);
             while bits != 0 {
@@ -459,10 +483,28 @@ impl Run {
             }
         }
 
+        if was_live && state.live == 0 {
+            self.note_live(false);
+        }
         if state.live == 0 && self.policy == RunPolicy::Discard {
             self.maybe_discard(state);
         }
         self.remote.claims.any_set()
+    }
+
+    /// Adjust [`Heap::run_live`] on the 0↔1 edge. No-op for stack test runs.
+    #[inline]
+    fn note_live(&self, add: bool) {
+        let Some(heap) = NonNull::new(self.heap_ptr) else {
+            return;
+        };
+        // SAFETY: published `heap_ptr` is the immovable arena slot.
+        let live = unsafe { &(*heap.as_ptr()).run_live };
+        if add {
+            live.fetch_add(1, Ordering::Release);
+        } else {
+            live.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
     #[cold]
@@ -471,7 +513,7 @@ impl Run {
         debug_assert_eq!(state.live, 0);
         state.bump = 0;
         state.free = FREE_END;
-        self.issued.store(0, Ordering::Relaxed);
+        self.remote.issued.store(0, Ordering::Relaxed);
         OsMemory::discard(self.range());
     }
 

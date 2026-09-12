@@ -9,7 +9,7 @@ pub(crate) mod thread;
 
 use core::num::NonZeroU32;
 use core::ptr::NonNull;
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use spin::Mutex;
 
@@ -50,6 +50,10 @@ pub(crate) struct Heap {
     inner: Mutex<HeapInner>,
     /// Next Free heap index for [`Heaps`] (`u32::MAX` = end).
     pub(super) free_next: AtomicU32,
+    /// Occupied runs with `live > 0`. Updated on the 0↔1 edge only.
+    pub(crate) run_live: AtomicUsize,
+    /// Allocated/claimed extents. Updated under exclusive metadata.
+    extent_live: AtomicUsize,
 }
 
 /// Exclusive run/extent metadata. Caller holds `MutexGuard<HeapInner>`.
@@ -91,6 +95,7 @@ impl HeapInner {
         owner: PageOwner,
         ptr: NonNull<u8>,
         ctx: &AllocatorCtx<'_>,
+        heap: &Heap,
     ) -> Result<bool, HeapError> {
         match owner {
             PageOwner::Run(run) => {
@@ -103,6 +108,7 @@ impl HeapInner {
             }
             PageOwner::Extent(extent) => {
                 self.extents.free(extent, ptr, ctx.pages)?;
+                heap.extent_live.fetch_sub(1, Ordering::AcqRel);
                 Ok(true)
             }
         }
@@ -131,7 +137,14 @@ impl Heap {
             extent_inbox: ExtentInbox::new(),
             inner: Mutex::new(HeapInner::new(config)),
             free_next: AtomicU32::new(u32::MAX),
+            run_live: AtomicUsize::new(0),
+            extent_live: AtomicUsize::new(0),
         }
+    }
+
+    /// Any run or extent with outstanding allocated or claimed blocks.
+    pub(crate) fn has_live(&self) -> bool {
+        self.run_live.load(Ordering::Acquire) != 0 || self.extent_live.load(Ordering::Acquire) != 0
     }
 
     /// Arena slot plus the current generation.
@@ -251,7 +264,7 @@ impl Heap {
         if snap.retired || snap.mode != HeapMode::Draining || snap.leases != 0 {
             return false;
         }
-        if !self.inboxes_empty() || inner.has_live() {
+        if !self.inboxes_empty() || self.has_live() || inner.has_live() {
             return false;
         }
         let again = self.state.load();
@@ -287,6 +300,7 @@ impl Heap {
                 // SAFETY: dequeued from this heap's extent inbox; live arena extent.
                 let ptr = unsafe { extent.as_ref() }.ptr();
                 inner.extents.accept(extent, ptr, ctx.pages)?;
+                self.extent_live.fetch_sub(1, Ordering::AcqRel);
             }
         }
         Ok(())
@@ -303,7 +317,9 @@ impl Heap {
         if !self.inboxes_empty() {
             self.flush(inner, ctx).ok()?;
         }
-        inner.extents.allocate(spec, self.id(), ctx.pages, init)
+        let ptr = inner.extents.allocate(spec, self.id(), ctx.pages, init)?;
+        self.extent_live.fetch_add(1, Ordering::Release);
+        Some(ptr)
     }
 }
 
