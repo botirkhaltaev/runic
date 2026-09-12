@@ -6,6 +6,6 @@ Scope: `crates/rseq-rs/`.
 - One committing store, last. No lock or CAS on the RSEQ hit.
 - `LockedStacks` is a distinct type, not a hidden fallback.
 - Hit takes `&Thread`. Do not reload `__rseq_offset` / `fs:0` per op.
-- No crate-internal `Vec` / `Box` / `HashMap` / `String` / panic / format.
+- This crate never uses the global allocator. `mmap` is the OS boundary. Cold `try_new` may use `OnceLock` and `File` into a stack buffer.
 - User Rust is not a critical section. Closures are miss / full / `Unavailable`.
 - Thesis: `crates/rseq-rs/ROADMAP.md`. API: `crates/rseq-rs/README.md`.

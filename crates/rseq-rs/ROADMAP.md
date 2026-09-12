@@ -123,8 +123,9 @@ Caller-owned Thread. Hit does not load __rseq_offset or fs:0.
 No per-op fence. No rseq_cs clear after commit (kernel clears on preempt).
 RSEQ path never locks or CASes. LockedStacks is a separate type.
 Quiesce is capacity = 0, then membarrier(PRIVATE_EXPEDITED_RSEQ, cpu).
-No crate-internal Vec / Box / HashMap / String / panic / format.
-#![no_std]. libc only. Workspace lints. unsafe_op_in_unsafe_fn deny.
+Never GlobalAlloc (no Vec / Box / String / HashMap). mmap is the OS boundary.
+Cold paths may use OnceLock and File into a stack buffer.
+Workspace lints. unsafe_op_in_unsafe_fn deny.
 ```
 
 Crate-owned `Stacks<T>` may `mmap` / `munmap`. That is the OS boundary, not
@@ -140,10 +141,10 @@ src/lib.rs         re-exports; cfg gate
 src/rseq.rs        Rseq::try_new / bind / fence
 src/thread.rs      Thread, CpuId
 src/stacks.rs      Stacks<T>, Full<T>, Quiesced, CpuStacks
-src/locked.rs      LockedStacks<T> (mutex per CPU, same trait)
+src/locked.rs      LockedStacks<T> (TAS per CPU in the mmap tail)
 src/layout.rs      header + slots; from_raw contract
 src/x86_64.rs      private inline asm! (not pub)
-src/cpus.rs        parse possible CPUs (no alloc)
+src/cpus.rs        parse possible CPUs (File, stack buffer)
 src/membarrier.rs  private syscalls
 src/abi.rs         private Area / Cs / SIG
 ```
