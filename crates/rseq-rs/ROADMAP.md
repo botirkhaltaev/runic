@@ -144,7 +144,7 @@ src/stacks.rs      Stacks<T>, Full<T>, Quiesced, CpuStacks
 src/locked.rs      LockedStacks<T> (TAS per CPU in the mmap tail)
 src/layout.rs      header + slots; from_raw contract
 src/x86_64.rs      private inline asm! (not pub)
-src/cpus.rs        parse possible CPUs (File, stack buffer)
+src/cpus.rs        CPU count (File, stack buffer)
 src/membarrier.rs  private syscalls
 src/abi.rs         private Area / Cs / SIG
 ```
