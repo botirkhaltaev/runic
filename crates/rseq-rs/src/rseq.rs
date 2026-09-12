@@ -1,7 +1,5 @@
-use core::{
-    ptr::NonNull,
-    sync::atomic::{AtomicIsize, AtomicU8, AtomicU32, Ordering},
-};
+use core::ptr::NonNull;
+use std::sync::OnceLock;
 
 use crate::{
     abi::{AREA_MIN, Area, CPU_UNINIT},
@@ -9,13 +7,7 @@ use crate::{
     thread::{CpuId, Thread},
 };
 
-const UNSET: u8 = 0;
-const READY: u8 = 1;
-const FAIL: u8 = 2;
-
-static STATE: AtomicU8 = AtomicU8::new(UNSET);
-static OFFSET: AtomicIsize = AtomicIsize::new(0);
-static CPUS: AtomicU32 = AtomicU32::new(0);
+static STATE: OnceLock<Option<Rseq>> = OnceLock::new();
 
 /// Process-wide rseq registration. `Copy`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,11 +22,7 @@ impl Rseq {
     #[cold]
     #[must_use]
     pub fn try_new() -> Option<Self> {
-        match STATE.load(Ordering::Acquire) {
-            READY => Some(Self::load()),
-            FAIL => None,
-            _ => init(),
-        }
+        *STATE.get_or_init(init)
     }
 
     /// Bind this thread's area. `#[cold]`; store the `Thread` in caller TLS.
@@ -60,31 +48,17 @@ impl Rseq {
     pub const fn cpus(self) -> u32 {
         self.cpus
     }
+}
 
-    fn load() -> Self {
-        Self {
-            offset: OFFSET.load(Ordering::Relaxed),
-            cpus: CPUS.load(Ordering::Relaxed),
-        }
+fn init() -> Option<Rseq> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        discover()
     }
-}
-
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn init() -> Option<Rseq> {
-    let Some(rseq) = discover() else {
-        STATE.store(FAIL, Ordering::Release);
-        return None;
-    };
-    OFFSET.store(rseq.offset, Ordering::Relaxed);
-    CPUS.store(rseq.cpus, Ordering::Relaxed);
-    STATE.store(READY, Ordering::Release);
-    Some(rseq)
-}
-
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-fn init() -> Option<Rseq> {
-    STATE.store(FAIL, Ordering::Release);
-    None
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        None
+    }
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
