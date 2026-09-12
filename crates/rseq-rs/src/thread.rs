@@ -34,6 +34,10 @@ impl Thread {
         Self { area: area.as_ptr() }
     }
 
+    pub(crate) const fn area(self) -> NonNull<Area> {
+        self.area
+    }
+
     /// Kernel `cpu_id`. `None` if unregistered or a sentinel.
     #[must_use]
     pub fn cpu_id(self) -> Option<CpuId> {

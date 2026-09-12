@@ -33,6 +33,16 @@ let p = stacks.pop_cpu(cpu)?;
 `LockedStacks` is a distinct type (TAS per CPU). The RSEQ hit will never
 call it.
 
-Still to land: `Stacks`, `Quiesced`, stress, benches.
+## RSEQ stacks (landed on Linux x86-64)
+
+```rust
+let rseq = Rseq::try_new()?;
+let t = rseq.bind()?;
+let stacks = rseq.stacks::<u8>(32)?;
+stacks.push(&t, p)?;
+let p = stacks.pop(&t)?;
+```
+
+Still to land: `Quiesced`, stress, benches.
 
 See [ROADMAP.md](ROADMAP.md). `publish = false`.

@@ -13,6 +13,10 @@ pub(crate) struct Area {
 /// Minimum glibc area (`cpu_id_start` .. `flags`).
 pub(crate) const AREA_MIN: usize = 20;
 pub(crate) const CPU_UNINIT: u32 = u32::MAX;
+/// glibc `RSEQ_SIG` on x86-64.
+pub(crate) const SIG: u32 = 0x5305_3053;
+pub(crate) const CPU_ID_OFF: usize = 4;
+pub(crate) const CS_OFF: usize = 8;
 
 #[cfg(test)]
 mod tests {
@@ -29,5 +33,8 @@ mod tests {
         assert_eq!(offset_of!(Area, mm_cid), 24);
         assert_eq!(align_of::<Area>(), 32);
         assert!(size_of::<Area>() >= AREA_MIN);
+        assert_eq!(SIG, 0x5305_3053);
+        assert_eq!(CPU_ID_OFF, 4);
+        assert_eq!(CS_OFF, 8);
     }
 }
