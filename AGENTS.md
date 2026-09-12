@@ -43,6 +43,7 @@
 | Need | File |
 |------|------|
 | Thesis, milestones, architecture | `ROADMAP.md` |
+| librseq-in-Rust word ops (not a runic hit) | `crates/rseq-rs/ROADMAP.md` |
 | Install / usage | `README.md` |
 | Core crate | `crates/runic-core/README.md` |
 | Public `GlobalAlloc` crate | `crates/runic/README.md` |

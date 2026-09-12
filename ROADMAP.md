@@ -170,7 +170,9 @@ Profile Cost gates still include the ~3-instruction frame-pointer tax C allocato
 
 #129 closeout was 1.6× / 4.6× / 2.7× on those 64-byte phases. #126/#128 skipped.
 
-`#135` RSEQ per-CPU: 65.3 vs 43.6 on churn/64, retired (not the lever).
+`#135` RSEQ per-CPU: 65.3 vs 43.6 on churn/64. Impl never reached the
+tcmalloc hit; the gate was single-thread churn. Retired as a runic hit.
+Primitive work: [crates/rseq-rs/ROADMAP.md](crates/rseq-rs/ROADMAP.md).
 O(1) TLS steal (this pass): freelist/64 18.5 → 22.9, gate missed; churn 37.4 → 31.3
 did not save the AND. Seeded `freelist_allocate_only` pays steal per sample. Reverted.
 
@@ -584,7 +586,8 @@ API audit: allocate_fresh → bump; no sticky / *_v2 leftovers
 ```
 
 Raw Cost lives under `target/runic-profiles/*id129*`. Watermark stays 32.
-`#135` RSEQ is retired (not the lever). This table stays the competitor baseline.
+`#135` RSEQ is retired as a runic hit on single-thread churn. This table
+stays the competitor baseline. See [crates/rseq-rs/ROADMAP.md](crates/rseq-rs/ROADMAP.md).
 
 Release artifacts:
 
@@ -601,7 +604,8 @@ Goal:
 Delete the per-class TLS magazine. The small hit is a current run per class
 plus a one-entry own-heap page cache. Diet the hit (TLS state byte, prologue,
 cross-crate inlining, `#[cold]` audit). Remote exact-once stays. Owner DF is
-undefined. Not a port of snmalloc. `#135` RSEQ is retired (not the lever).
+undefined. Not a port of snmalloc. `#135` RSEQ is retired as a runic hit
+on single-thread churn. Primitive: [crates/rseq-rs/ROADMAP.md](crates/rseq-rs/ROADMAP.md).
 ```
 
 Baseline: `c1ecdeb` on this host (churn/64 40.5, owner_free/64 74.0,
@@ -681,6 +685,13 @@ mimalloc-bench: workload and benchmark ideas
 ```
 
 Do not copy reference implementation code.
+
+## Related: rseq-rs
+
+Standalone librseq-in-Rust (`Thread` + `Word`, not a runic hit). Thesis
+and releases live in [crates/rseq-rs/ROADMAP.md](crates/rseq-rs/ROADMAP.md).
+v0.1 is in progress on `rseq/*` branches. Do not wire it into the allocator
+hit from this roadmap.
 
 ## Standing Rules
 
