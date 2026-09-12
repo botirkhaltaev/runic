@@ -17,6 +17,7 @@ pub(crate) enum Fast {
 }
 
 impl Fast {
+    #[inline]
     pub(crate) fn from_status(status: u64, obj: *mut u8) -> Self {
         match status {
             0 => Self::Ok(obj),
@@ -32,6 +33,7 @@ enum Memory {
 }
 
 impl Memory {
+    #[inline]
     fn base(&self) -> NonNull<u8> {
         match self {
             Self::Owned(region) => region.base(),
@@ -47,8 +49,12 @@ pub struct Stacks<T> {
     shift: u8,
     cap: u32,
     cpus: u32,
-    _t: PhantomData<NonNull<T>>,
+    _t: PhantomData<T>,
 }
+
+// SAFETY: `NonNull` is not `Send`/`Sync`; pop/push move `T` between threads.
+unsafe impl<T: Send> Send for Stacks<T> {}
+unsafe impl<T: Send> Sync for Stacks<T> {}
 
 impl<T> Stacks<T> {
     /// Crate-owned mapping sized for `rseq.cpus()` slabs.
@@ -107,6 +113,7 @@ impl<T> Stacks<T> {
     }
 
     /// Pop from the CPU in `thread`.
+    #[inline]
     #[must_use]
     pub fn pop(&self, thread: &Thread) -> Option<NonNull<T>> {
         match self.fast_pop(thread) {
@@ -120,6 +127,7 @@ impl<T> Stacks<T> {
     /// # Errors
     ///
     /// Returns [`Full`] when that slab is at capacity or rseq cannot commit.
+    #[inline]
     pub fn push(&self, thread: &Thread, item: NonNull<T>) -> Result<(), Full<T>> {
         match self.fast_push(thread, item) {
             Fast::Ok(_) => Ok(()),
@@ -154,6 +162,7 @@ impl<T> Stacks<T> {
         n
     }
 
+    #[inline]
     fn fast_pop(&self, thread: &Thread) -> Fast {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
@@ -174,6 +183,7 @@ impl<T> Stacks<T> {
         }
     }
 
+    #[inline]
     fn fast_push(&self, thread: &Thread, item: NonNull<T>) -> Fast {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {

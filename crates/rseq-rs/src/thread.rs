@@ -34,8 +34,10 @@ impl Thread {
         Self { area: area.as_ptr() }
     }
 
+    #[inline]
     pub(crate) const fn area(self) -> NonNull<Area> {
-        self.area
+        // SAFETY: constructed from `NonNull`.
+        unsafe { NonNull::new_unchecked(self.area) }
     }
 
     /// Kernel `cpu_id`. `None` if unregistered or a sentinel.

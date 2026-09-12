@@ -4,6 +4,8 @@ use core::ptr::NonNull;
 
 use crate::abi::{Area, CPU_ID_OFF, CS_OFF, SIG};
 
+/// # Safety
+/// `area` is this thread's rseq TLS and `base` is a live per-CPU region.
 #[inline]
 pub(crate) unsafe fn pop(
     area: NonNull<Area>,
@@ -76,6 +78,8 @@ pub(crate) unsafe fn pop(
     crate::stacks::Fast::from_status(status, obj)
 }
 
+/// # Safety
+/// `area` is this thread's rseq TLS and `base` is a live per-CPU region.
 #[inline]
 pub(crate) unsafe fn push(
     area: NonNull<Area>,
