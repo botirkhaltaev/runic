@@ -43,6 +43,8 @@ let prev = t.fetch_add(w, 1);
 Abort is retried. Compare-miss is `Err(current)`. CS aborts if this thread
 is no longer on `w.cpu`. No lock, no CAS.
 
-Still to land: stress, benches.
+Stress (ignored): `cargo test -p rseq-rs -- --ignored`.
+
+Isolated word-op bench: `taskset -c 0 cargo bench -p rseq-rs --bench words`.
 
 See [ROADMAP.md](ROADMAP.md). `publish = false`.

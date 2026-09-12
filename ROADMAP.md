@@ -690,8 +690,8 @@ Do not copy reference implementation code.
 
 Standalone librseq-in-Rust (`Thread` + `Word`, not a runic hit). Thesis
 and releases live in [crates/rseq-rs/ROADMAP.md](crates/rseq-rs/ROADMAP.md).
-v0.1 is in progress on `rseq/*` branches. Do not wire it into the allocator
-hit from this roadmap.
+v0.1 is on `rseq/05-measure`. Do not wire it into the allocator hit from
+this roadmap.
 
 ## Standing Rules
 
