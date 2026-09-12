@@ -29,9 +29,20 @@ let words = Words::new(2)?;
 let w = words.get(cpu)?;
 ```
 
-`get` is address math, not a critical section. `unsafe Word::from_raw` for a
-field in a caller-owned per-CPU struct.
+## Word ops (landed on Linux x86-64)
 
-Still to land: `Thread` word ops, stress, benches.
+```rust
+let rseq = Rseq::try_new()?;
+let t = rseq.bind()?;
+let cpu = t.cpu_id()?;
+let w = rseq.words()?.get(cpu)?;
+t.compare_exchange(w, 0, 7)?;
+let prev = t.fetch_add(w, 1);
+```
+
+Abort is retried. Compare-miss is `Err(current)`. CS aborts if this thread
+is no longer on `w.cpu`. No lock, no CAS.
+
+Still to land: stress, benches.
 
 See [ROADMAP.md](ROADMAP.md). `publish = false`.
