@@ -2,5 +2,13 @@
 
 //! Safe Linux restartable-sequence primitives.
 //!
-//! v0.1 is stacked: this crate is a compiling stub until later PRs land
-//! `Rseq`, `LockedStacks`, and `Stacks`.
+//! Registration only in this slice: [`Rseq`], [`Thread`], [`CpuId`].
+
+mod abi;
+mod cpus;
+mod membarrier;
+mod rseq;
+mod thread;
+
+pub use rseq::Rseq;
+pub use thread::{CpuId, Thread};
