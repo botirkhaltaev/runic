@@ -4,31 +4,29 @@ Standalone Linux restartable-sequence primitives for Rust. Zero runic
 dependency. Package `rseq-rs`, lib `rseq_rs`. The crate name `rseq` is taken
 (unrelated DSL).
 
-This is librseq in Rust: crate-owned word ops (`compare_exchange`,
-`fetch_add`), not a tcmalloc magazine. Crate stub is on the tree.
+This is librseq in Rust: crate-owned sequences on a caller-chosen word
+plus a CPU check. Not a tcmalloc magazine. Crate stub is on the tree.
 
 ## Thesis
 
 RSEQ lets a thread run a short sequence of ordinary stores that must look
 atomic with respect to preemption and migration. The kernel either lets the
 sequence finish on the same CPU or jumps to a signed abort IP. It does not
-roll stores back. The hit is ordinary stores — no lock, no CAS.
+roll stores back and does not save partial progress. The hit is ordinary
+stores — no lock, no CAS.
 
-The crate is a **safe, idiomatic Rust API** over that kernel contract.
-Callers see owning types, `Option` / `Result`. They do not see `asm!`,
-offsets, signatures, or `syscall`. `unsafe` exists only at OS and
-foreign-layout boundaries (`from_raw` for an embedder that already owns
-the region).
+The primitive is that sequence, not an array. librseq is
+`cmpeqv_storev(v, expect, new, cpu)`: the caller owns `v`. This crate
+owns the instruction range. The public handle is `Thread` plus `Word`
+(`NonNull<usize>` and `CpuId`). `Words` is an optional mmap of usizes.
 
 The critical section itself is **not** user Rust. A `Fn` / closure /
 proc-macro around safe code cannot be a restartable sequence: the compiler
 may spill, reorder, or split it, and the kernel needs an exact
 `[start_ip, start_ip + post_commit_offset)` range. The crate owns those
-sequences. The public methods are safe because they only run those
-sequences on memory the crate (or `from_raw`) already validated.
+sequences.
 
 Compare-miss is `Err(current)`. Abort is retried inside the crate.
-Closures belong on the miss path, not inside the CS.
 
 Runic integration is out until v0.1 benches exist and new thread-heavy gates
 are named. `#135` was not a fair test of RSEQ: the impl never reached the
@@ -40,31 +38,41 @@ win that by design).
 Behavior lives on the owning types. No free one-liner wrappers.
 
 ```rust
-let rseq = Rseq::try_new()?;          // None: kernel / glibc / membarrier
-let t = rseq.bind()?;                 // Thread; store in caller TLS
-let words = rseq.words()?;            // one usize per possible CPU
+let rseq = Rseq::try_new()?;       // None: kernel / glibc
+let t = rseq.bind()?;              // Thread; store in caller TLS
+let words = rseq.words()?;         // optional region
+let cpu = t.cpu_id()?;
+let w = words.get(cpu)?;           // Word { ptr, cpu }
 
-words.compare_exchange(&t, expect, new)?;  // cmpeqv_storev
-words.fetch_add(&t, 1);                    // addv
+t.compare_exchange(w, expect, new)?;  // cmpeqv_storev
+t.fetch_add(w, 1);                    // addv
 ```
 
 - `Rseq` — process registration. `Copy`. `try_new` is `#[cold]`, once.
-- `Thread` — this thread's `Area`. `Copy`. `bind` is `#[cold]`. Hit methods
-  take `&Thread` so they do not reload `__rseq_offset` / `fs:0`.
-- `Words` — crate-owned mmap of one `usize` per possible CPU. Index is
-  `thread.cpu_id()`. `compare_exchange` → `Result<usize, usize>` (miss is
-  `Err(current)`). `fetch_add` → previous `usize`. Abort is retried.
+  glibc area and CPU count. Not membarrier.
+- `Thread` — this thread's `Area`. `Copy`. `bind` is `#[cold]`. Owns
+  `compare_exchange` / `fetch_add`. Hit takes `&Thread` so it does not
+  reload `__rseq_offset` / `fs:0`.
+- `Word` — `Copy`. Pointer plus `CpuId`. librseq's `(v, cpu)`.
+- `Words` — optional mmap of one `usize` per possible CPU. `get` is
+  address math, not a CS.
 - `CpuId` — newtype `u32`. `Thread::cpu_id() -> Option<CpuId>`.
 
-Embedder path (runic later): `unsafe Words::from_raw(base, cpus)`. Safety:
-region is live, sized for `cpus` words, and exclusively used as this
-crate's per-CPU usizes. Default path does not need this.
+The CS loads `area.cpu_id` and aborts if it is not `word.cpu`. Then it
+stores through `word.ptr`.
 
-`try_new` is `None` → do not construct `Words` from `Rseq`. The fallback
+Embedder field in a larger per-CPU struct: `unsafe Word::from_raw(ptr, cpu)`.
+Safety: `ptr` is a live `usize`, used only as this word, and outlives the
+ops. Array embedder: `unsafe Words::from_raw(base, cpus)`.
+
+`try_new` is `None` → missing glibc rseq or a zero CPU count. The fallback
 is the caller's `AtomicUsize`, not a locked twin in this crate.
 
-Other targets: types exist; `try_new` / `words` return `None`. Dependents
-compile everywhere. Word type is `usize` (librseq `intptr_t`).
+`Rseq::fence` is optional. First call registers RSEQ membarrier; word ops
+never fence.
+
+Other targets: types exist; `try_new` returns `None`. Dependents compile
+everywhere. Word width is `usize` (librseq `intptr_t`).
 
 ## What #135 got wrong
 
@@ -103,6 +111,7 @@ Safe public API. unsafe only: from_raw, and the private asm.
 One committing store, last. Extra stores before it must be scratch.
 Static rseq_cs in __rseq_cs ("aw"), 32-byte aligned. Hit stores the pointer.
 Caller-owned Thread. Hit does not load __rseq_offset or fs:0.
+CS aborts if area.cpu_id != word.cpu. Store goes through word.ptr.
 No per-op fence. No rseq_cs clear after commit (kernel clears on preempt).
 RSEQ path never locks or CASes. No locked twin in this crate.
 Never GlobalAlloc (no Vec / Box / String / HashMap). mmap is the OS boundary.
@@ -120,33 +129,32 @@ Workspace member `crates/rseq-rs`. Full RSEQ impl on `linux + x86_64`.
 ```text
 src/lib.rs         re-exports
 src/rseq.rs        Rseq::try_new / bind / fence / words
-src/thread.rs      Thread, CpuId
-src/words.rs       Words, from_raw
+src/thread.rs      Thread, CpuId, compare_exchange / fetch_add
+src/words.rs       Word, Words, get, from_raw
 src/layout.rs      one usize per CPU; mmap region
 src/x86_64.rs      private inline asm! (not pub)
 src/cpus.rs        CPU count (File, stack buffer)
-src/membarrier.rs  private syscalls
+src/membarrier.rs  private syscalls (fence only)
 src/abi.rs         private Area / SIG
 ```
 
-Internal layout (not pub except via `from_raw` docs): word `cpu` at
-`base + cpu * size_of::<usize>()`. Zeros on crate `mmap`.
+`Words::get` is `base + cpu * size_of::<usize>()`. Zeros on crate `mmap`.
 
 `asm!` shape: `.pushsection __rseq_cs,"aw"` + local labels (PIE-safe; no
 `global_asm!` outline). `jmp entry; .long SIG; abort: entry:` then
-`lea cs(%rip)` into `area.rseq_cs`. Load `cpu_id`; abort if out of range.
-Compare-exchange or add. Committing store last. Abort retried in Rust.
-No `cpu_id_start` pre-read and recheck.
+`lea cs(%rip)` into `area.rseq_cs`. Load `cpu_id`; abort if not `word.cpu`.
+Compare-exchange or add through `word.ptr`. Committing store last. Abort
+retried in Rust. No `cpu_id_start` pre-read and recheck.
 
 ## Releases
 
 ### v0.1.0 — x86_64 word ops
 
 ```text
-Rseq / Thread / CpuId / Words
-compare_exchange / fetch_add; unsafe from_raw only
-tests: abi (private), smoke, words, stress (ignored)
-bench: TLS Cell vs Words vs AtomicUsize
+Rseq / Thread / CpuId / Word / Words
+Thread::compare_exchange / fetch_add; unsafe from_raw only
+tests: abi (private), smoke, words, ops, stress (ignored)
+bench: TLS Cell vs Thread word ops vs AtomicUsize
 README + AGENTS.md
 ```
 
@@ -183,8 +191,8 @@ v0.1 bench moves. API unchanged.
 
 ### Later — magazine
 
-Index stacks / `Quiesced` as a layer on these ops (or a dedicated CS if
-the index-stack sequence stays tighter than two word ops). Not v0.1.
+Index stacks as a layer on these ops (or a dedicated CS if the index-stack
+sequence stays tighter than two word ops). Not v0.1.
 
 ## Out
 
@@ -192,6 +200,7 @@ the index-stack sequence stays tighter than two word ops). Not v0.1.
 User Rust / closures / proc-macros as the critical section
 Silent lock or CAS on the RSEQ hit
 Locked / atomic twin in this crate
+Ops on Words
 Runic magazine / heap / PageMap
 Porting tcmalloc or snmalloc
 crates.io publish until v0.1 benches and stress are green
@@ -202,4 +211,4 @@ Runic integration before the isolated bench table exists
 
 Starts from the v0.1 bench table and new gates: threads > cores, thread
 spawn churn, RSS under thread count. Not churn/64. Not a retry of `#135`
-as written. Runic would call `from_raw` on arena memory or own `Words`.
+as written. Runic would call `Word::from_raw` on a field or own `Words`.

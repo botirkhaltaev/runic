@@ -3,4 +3,4 @@
 //! Safe Linux restartable-sequence primitives.
 //!
 //! v0.1 is stacked: this crate is a compiling stub until later PRs land
-//! `Rseq` and `Words`.
+//! `Rseq`, `Thread`, and `Word`.
