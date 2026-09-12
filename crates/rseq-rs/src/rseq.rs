@@ -3,7 +3,8 @@ use std::sync::OnceLock;
 
 use crate::{
     abi::{AREA_MIN, Area, CPU_UNINIT},
-    cpus, membarrier,
+    cpus::cpus,
+    membarrier,
     thread::{CpuId, Thread},
 };
 
@@ -17,7 +18,7 @@ pub struct Rseq {
 }
 
 impl Rseq {
-    /// glibc-registered area, possible CPU count, and RSEQ membarrier.
+    /// glibc-registered area, CPU count, and RSEQ membarrier.
     /// `None` if rseq or membarrier is unavailable. `#[cold]`; call once.
     #[cold]
     #[must_use]
@@ -44,6 +45,7 @@ impl Rseq {
         membarrier::fence(cpu.get())
     }
 
+    /// CPU count used to size per-CPU slabs.
     #[must_use]
     pub const fn cpus(self) -> u32 {
         self.cpus
@@ -51,50 +53,34 @@ impl Rseq {
 }
 
 fn init() -> Option<Rseq> {
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    {
-        discover()
-    }
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     {
-        None
-    }
-}
-
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn discover() -> Option<Rseq> {
-    let size = usize::try_from(unsafe { libc_rseq_size() }).ok()?;
-    if size < AREA_MIN {
         return None;
     }
-    // SAFETY: glibc publishes `__rseq_offset` for every thread.
-    let offset = unsafe { libc_rseq_offset() };
-    let cpus = cpus::possible()?;
-    if cpus == 0 {
-        return None;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        // SAFETY: glibc publishes `__rseq_size` (0 if rseq is off).
+        let size = usize::try_from(unsafe { __rseq_size }).ok()?;
+        if size < AREA_MIN {
+            return None;
+        }
+        // SAFETY: glibc publishes `__rseq_offset` for every thread.
+        let offset = unsafe { __rseq_offset };
+        let cpus = cpus()?;
+        if cpus == 0 {
+            return None;
+        }
+        if !membarrier::register() {
+            return None;
+        }
+        Some(Rseq { offset, cpus })
     }
-    if !membarrier::register() {
-        return None;
-    }
-    Some(Rseq { offset, cpus })
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 unsafe extern "C" {
     static __rseq_offset: libc::ptrdiff_t;
     static __rseq_size: libc::c_uint;
-}
-
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-unsafe fn libc_rseq_offset() -> libc::ptrdiff_t {
-    // SAFETY: glibc publishes `__rseq_offset` for every thread.
-    unsafe { __rseq_offset }
-}
-
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-unsafe fn libc_rseq_size() -> libc::c_uint {
-    // SAFETY: glibc publishes `__rseq_size` (0 if rseq is off).
-    unsafe { __rseq_size }
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

@@ -7,7 +7,9 @@ use crate::abi::{Area, CPU_UNINIT};
 pub struct CpuId(u32);
 
 impl CpuId {
-    pub(crate) const fn from_raw(id: u32) -> Option<Self> {
+    /// Rejects the kernel uninitialized sentinel.
+    #[must_use]
+    pub const fn new(id: u32) -> Option<Self> {
         if id == CPU_UNINIT {
             None
         } else {
@@ -41,6 +43,6 @@ impl Thread {
     pub fn cpu_id(self) -> Option<CpuId> {
         // SAFETY: `area` is this thread's registered rseq TLS.
         let id = unsafe { self.area.as_ref().cpu_id };
-        CpuId::from_raw(id)
+        CpuId::new(id)
     }
 }
