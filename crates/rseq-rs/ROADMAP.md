@@ -4,20 +4,21 @@ Standalone Linux restartable-sequence primitives for Rust. Zero runic
 dependency. Package `rseq-rs`, lib `rseq_rs`. The crate name `rseq` is taken
 (unrelated DSL).
 
-Crate stub is on the tree. This file is the thesis and release plan.
+This is librseq in Rust: crate-owned word ops (`compare_exchange`,
+`fetch_add`), not a tcmalloc magazine. Crate stub is on the tree.
 
 ## Thesis
 
 RSEQ lets a thread run a short sequence of ordinary stores that must look
 atomic with respect to preemption and migration. The kernel either lets the
 sequence finish on the same CPU or jumps to a signed abort IP. It does not
-roll stores back.
+roll stores back. The hit is ordinary stores — no lock, no CAS.
 
 The crate is a **safe, idiomatic Rust API** over that kernel contract.
-Callers see owning types, `Option` / `Result`, RAII, and generics. They do
-not see `asm!`, offsets, signatures, or `syscall`. `unsafe` exists only at
-OS and foreign-layout boundaries (`from_raw` for an embedder that already
-owns the region).
+Callers see owning types, `Option` / `Result`. They do not see `asm!`,
+offsets, signatures, or `syscall`. `unsafe` exists only at OS and
+foreign-layout boundaries (`from_raw` for an embedder that already owns
+the region).
 
 The critical section itself is **not** user Rust. A `Fn` / closure /
 proc-macro around safe code cannot be a restartable sequence: the compiler
@@ -26,8 +27,8 @@ may spill, reorder, or split it, and the kernel needs an exact
 sequences. The public methods are safe because they only run those
 sequences on memory the crate (or `from_raw`) already validated.
 
-Miss / full / unavailable are ordinary Rust: `Option`, `Result`,
-`unwrap_or_else`. Closures belong on that path, not inside the CS.
+Compare-miss is `Err(current)`. Abort is retried inside the crate.
+Closures belong on the miss path, not inside the CS.
 
 Runic integration is out until v0.1 benches exist and new thread-heavy gates
 are named. `#135` was not a fair test of RSEQ: the impl never reached the
@@ -39,49 +40,31 @@ win that by design).
 Behavior lives on the owning types. No free one-liner wrappers.
 
 ```rust
-let rseq = Rseq::try_new()?;              // None: kernel / glibc / membarrier
-let stacks = rseq.stacks::<T>(cap)?;      // crate-owned per-CPU region
-let t = rseq.bind()?;                     // Thread; store in caller TLS
+let rseq = Rseq::try_new()?;          // None: kernel / glibc / membarrier
+let t = rseq.bind()?;                 // Thread; store in caller TLS
+let words = rseq.words()?;            // one usize per possible CPU
 
-let p = stacks.pop(&t).ok_or_else(|| refill())?;
-stacks.push(&t, p).inspect_err(|_| overflow(p))?;
-
-let mut q = stacks.quiesce(cpu)?;         // stop + fence; Drop restores
-for p in q.drain() { /* exclusive */ }
+words.compare_exchange(&t, expect, new)?;  // cmpeqv_storev
+words.fetch_add(&t, 1);                    // addv
 ```
 
 - `Rseq` — process registration. `Copy`. `try_new` is `#[cold]`, once.
 - `Thread` — this thread's `Area`. `Copy`. `bind` is `#[cold]`. Hit methods
   take `&Thread` so they do not reload `__rseq_offset` / `fs:0`.
-- `Stacks<T>` — typed per-CPU index stacks the crate `mmap`s and `Drop`s.
-  `pop` → `Option<NonNull<T>>`, `push` → `Result<(), Full<T>>` (returns the
-  item), batch ops take `&mut [NonNull<T>]` and return `usize` committed.
-- `Quiesced<'_, T>` — RAII drain of one CPU. Exclusive `&mut` to `current`
-  and slots. `Drop` publishes `current` and restores `capacity` (release).
+- `Words` — crate-owned mmap of one `usize` per possible CPU. Index is
+  `thread.cpu_id()`. `compare_exchange` → `Result<usize, usize>` (miss is
+  `Err(current)`). `fetch_add` → previous `usize`. Abort is retried.
 - `CpuId` — newtype `u32`. `Thread::cpu_id() -> Option<CpuId>`.
 
-Embedder path (runic later): `unsafe Stacks::from_raw(layout)`. Safety:
-region is live, sized, and exclusively used as this crate's header+slots
-for `T`. Default path does not need this.
+Embedder path (runic later): `unsafe Words::from_raw(base, cpus)`. Safety:
+region is live, sized for `cpus` words, and exclusively used as this
+crate's per-CPU usizes. Default path does not need this.
 
-Other targets and failed `try_new`: types exist, constructors return
-`None` / `Err(Unavailable)`. Dependents compile everywhere.
+`try_new` is `None` → do not construct `Words` from `Rseq`. The fallback
+is the caller's `AtomicUsize`, not a locked twin in this crate.
 
-### Locked backend (opt-in type, not a hidden fallback)
-
-The RSEQ path never locks and never CASes. When `Rseq::try_new` fails, the
-caller constructs a **different type** with the same methods:
-
-```rust
-let stacks = LockedStacks::<T>::new(cpus, cap)?;
-let p = stacks.pop()?;
-stacks.push(p)?;
-```
-
-Same `pop` / `push` / `quiesce` names. A `CpuStacks<T>` trait (in the crate)
-lets a generic caller pick `Stacks<T>` or `LockedStacks<T>` at the type
-level. No runtime branch on the RSEQ hit. Covers gVisor, `rseq=0`, old
-kernels without lying about the fast path.
+Other targets: types exist; `try_new` / `words` return `None`. Dependents
+compile everywhere. Word type is `usize` (librseq `intptr_t`).
 
 ## What #135 got wrong
 
@@ -104,7 +87,7 @@ and one thesis bug:
 
 `toccata-core` and `rsmalloc` each reimplemented the same layer as raw
 asm + offsets. This crate keeps that CS shape and hides it behind safe
-types.
+types. v0.1 is the word ops, not another magazine.
 
 ## Host facts (this machine)
 
@@ -121,88 +104,66 @@ One committing store, last. Extra stores before it must be scratch.
 Static rseq_cs in __rseq_cs ("aw"), 32-byte aligned. Hit stores the pointer.
 Caller-owned Thread. Hit does not load __rseq_offset or fs:0.
 No per-op fence. No rseq_cs clear after commit (kernel clears on preempt).
-RSEQ path never locks or CASes. LockedStacks is a separate type.
-Quiesce is capacity = 0, then membarrier(PRIVATE_EXPEDITED_RSEQ, cpu).
+RSEQ path never locks or CASes. No locked twin in this crate.
 Never GlobalAlloc (no Vec / Box / String / HashMap). mmap is the OS boundary.
 Cold paths may use OnceLock and File into a stack buffer.
 Workspace lints. unsafe_op_in_unsafe_fn deny.
 ```
 
-Crate-owned `Stacks<T>` may `mmap` / `munmap`. That is the OS boundary, not
+Crate-owned `Words` may `mmap` / `munmap`. That is the OS boundary, not
 an allocator-internal heap.
 
 ## Layout (v0.1)
 
-Workspace member `crates/rseq-rs`. Full RSEQ impl on `linux + x86_64`;
-`LockedStacks` everywhere.
+Workspace member `crates/rseq-rs`. Full RSEQ impl on `linux + x86_64`.
 
 ```text
-src/lib.rs         re-exports; cfg gate
-src/rseq.rs        Rseq::try_new / bind / fence
+src/lib.rs         re-exports
+src/rseq.rs        Rseq::try_new / bind / fence / words
 src/thread.rs      Thread, CpuId
-src/stacks.rs      Stacks<T>, Full<T>, Quiesced, CpuStacks
-src/locked.rs      LockedStacks<T> (TAS per CPU in the mmap tail)
-src/layout.rs      header + slots; from_raw contract
+src/words.rs       Words, from_raw
+src/layout.rs      one usize per CPU; mmap region
 src/x86_64.rs      private inline asm! (not pub)
-src/cpus.rs        parse possible CPUs (File, stack buffer)
+src/cpus.rs        CPU count (File, stack buffer)
 src/membarrier.rs  private syscalls
-src/abi.rs         private Area / Cs / SIG
+src/abi.rs         private Area / SIG
 ```
 
-Internal layout (not pub except via `from_raw` docs): block =
-`base + (cpu << shift)`, `Header { current, capacity }`, slot `i` at
-`slots + i * size_of::<*mut T>()`. `capacity == 0` is stopped or empty
-init: pop misses, push is `Full`.
+Internal layout (not pub except via `from_raw` docs): word `cpu` at
+`base + cpu * size_of::<usize>()`. Zeros on crate `mmap`.
 
 `asm!` shape: `.pushsection __rseq_cs,"aw"` + local labels (PIE-safe; no
 `global_asm!` outline). `jmp entry; .long SIG; abort: entry:` then
-`lea cs(%rip)` into `area.rseq_cs`. No bounded-retry counter. No
-`cpu_id_start` pre-read and recheck.
-
-## Quiesce
-
-```text
-Drainer: capacity = 0
-Drainer: membarrier(PRIVATE_EXPEDITED_RSEQ, FLAG_CPU, cpu)
-Kernel:  if IP in CS, jump abort_ip
-Hitter:  restart, load header, capacity 0 → None / Full
-Drainer: drain slots under Quiesced
-Drop:    current = leftover, capacity = cap (release)
-```
-
-Caller serialises drainers per `(cpu, stacks)` if several exist.
+`lea cs(%rip)` into `area.rseq_cs`. Load `cpu_id`; abort if out of range.
+Compare-exchange or add. Committing store last. Abort retried in Rust.
+No `cpu_id_start` pre-read and recheck.
 
 ## Releases
 
-### v0.1.0 — x86_64, safe API
+### v0.1.0 — x86_64 word ops
 
 ```text
-Rseq / Thread / Stacks<T> / Quiesced / LockedStacks<T> / CpuStacks
-safe pop / push / batch; unsafe from_raw only
-tests: abi (private), smoke (skip when Unavailable), stacks, stress, quiesce
-bench: pinned cycles/pair, TLS Cell vs Stacks vs LockedStacks vs AtomicU32
+Rseq / Thread / CpuId / Words
+compare_exchange / fetch_add; unsafe from_raw only
+tests: abi (private), smoke, words, stress (ignored)
+bench: TLS Cell vs Words vs AtomicUsize
 README + AGENTS.md
 ```
 
-Stress: threads > cores, unique tokens, `sched_setaffinity` flap +
-`setitimer` SIGALRM storm. Assert no dup/loss. A signature bug is SIGSEGV.
+Stress: threads > cores, `sched_setaffinity` flap + `setitimer` SIGALRM.
+Unique add / no lost CAS. A signature bug is SIGSEGV.
 
-Bench is the number runic integration needs. `#135` never isolated it.
+Bench is the isolated number. `#135` never isolated it.
 
 ### v0.2.0 — aarch64
 
 Same safe API. `adrp`/`add` for `cs`, `mrs tpidr_el0`, aarch64 `SIG`.
 CI `cargo check --target aarch64-unknown-linux-gnu`.
 
-### v0.3.0 — word ops
-
-Safe methods on a crate-owned `PerCpu<T: Copy>` (or `from_raw` words),
-both arches. Names follow Rust, not librseq C:
+### v0.3.0 — more word ops
 
 ```text
-compare_exchange   // cmpeqv_storev
-fetch_add          // addv
-store_if            // cmpeqv_trystorev_storev
+store_if   // cmpeqv_trystorev_storev
 ```
 
 Still one committing store each. No user closure in the CS.
@@ -220,11 +181,17 @@ tcmalloc's cached block pointer overlaid on `cpu_id_start` so the hit is
 load+test instead of shift+add. Self-registration only. Ship only if the
 v0.1 bench moves. API unchanged.
 
+### Later — magazine
+
+Index stacks / `Quiesced` as a layer on these ops (or a dedicated CS if
+the index-stack sequence stays tighter than two word ops). Not v0.1.
+
 ## Out
 
 ```text
 User Rust / closures / proc-macros as the critical section
-Silent lock or CAS on the RSEQ hit (LockedStacks is a distinct type)
+Silent lock or CAS on the RSEQ hit
+Locked / atomic twin in this crate
 Runic magazine / heap / PageMap
 Porting tcmalloc or snmalloc
 crates.io publish until v0.1 benches and stress are green
@@ -235,4 +202,4 @@ Runic integration before the isolated bench table exists
 
 Starts from the v0.1 bench table and new gates: threads > cores, thread
 spawn churn, RSS under thread count. Not churn/64. Not a retry of `#135`
-as written. Runic would call `from_raw` on arena memory or own `Stacks<T>`.
+as written. Runic would call `from_raw` on arena memory or own `Words`.
