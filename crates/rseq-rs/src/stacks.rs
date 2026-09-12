@@ -1,10 +1,11 @@
 use core::{marker::PhantomData, ptr::NonNull};
 
 use crate::{
-    layout::{self, Region},
+    layout::{self, Header, Region},
     locked::{CpuStacks, Full},
+    quiesce::Quiesced,
     rseq::Rseq,
-    thread::Thread,
+    thread::{CpuId, Thread},
 };
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -97,16 +98,19 @@ impl<T> Stacks<T> {
         }
     }
 
+    /// Registration used to fence `quiesce`.
     #[must_use]
     pub const fn rseq(&self) -> Rseq {
         self.rseq
     }
 
+    /// Possible CPU slabs.
     #[must_use]
     pub const fn cpus(&self) -> u32 {
         self.cpus
     }
 
+    /// Slots per CPU.
     #[must_use]
     pub const fn cap(&self) -> u32 {
         self.cap
@@ -147,6 +151,36 @@ impl<T> Stacks<T> {
             n += 1;
         }
         n
+    }
+
+    /// Stop one CPU, fence, then drain exclusively.
+    ///
+    /// Caller serialises drainers for `(self, cpu)`.
+    #[must_use]
+    pub fn quiesce(&self, cpu: CpuId) -> Option<Quiesced<'_, T>> {
+        let id = cpu.get();
+        if id >= self.cpus {
+            return None;
+        }
+        #[allow(clippy::cast_ptr_alignment)]
+        let header = layout::block(self.memory.base(), id, self.shift).cast::<Header>();
+        // SAFETY: `header` is our slab; capacity 0 is the stop flag.
+        #[allow(clippy::cast_ptr_alignment)]
+        unsafe {
+            (*header).capacity = 0;
+        }
+        if !self.rseq.fence(cpu) {
+            #[allow(clippy::cast_ptr_alignment)]
+            unsafe {
+                (*header).capacity = self.cap;
+            }
+            return None;
+        }
+        // SAFETY: fence completed; hitters on this CPU have aborted or finished.
+        #[allow(clippy::cast_ptr_alignment)]
+        let current = unsafe { (*header).current };
+        // SAFETY: exclusive drain of this slab until `Quiesced` drops.
+        Some(unsafe { Quiesced::new(header, self.cap, current, None) })
     }
 
     /// Push a batch onto the CPU in `thread`.

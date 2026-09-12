@@ -9,6 +9,7 @@ mod cpus;
 mod layout;
 mod locked;
 mod membarrier;
+mod quiesce;
 mod rseq;
 mod stacks;
 mod thread;
@@ -17,6 +18,7 @@ mod thread;
 mod x86_64;
 
 pub use locked::{CpuStacks, Full, LockedStacks};
+pub use quiesce::Quiesced;
 pub use rseq::Rseq;
 pub use stacks::Stacks;
 pub use thread::{CpuId, Thread};

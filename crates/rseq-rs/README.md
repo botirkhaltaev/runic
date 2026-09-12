@@ -43,6 +43,26 @@ stacks.push(&t, p)?;
 let p = stacks.pop(&t)?;
 ```
 
-Still to land: `Quiesced`, stress, benches.
+## Quiesce
+
+```rust
+let mut q = stacks.quiesce(cpu)?;
+for p in q.drain() { /* exclusive */ }
+```
+
+Stress (ignored): `cargo test -p rseq-rs -- --ignored`.
+
+Isolated pair bench: `taskset -c 0 cargo bench -p rseq-rs --bench stack`.
+
+This host (`taskset -c 0`, Criterion 1s / 20 samples), ns/pair:
+
+```text
+tls_cell_pair      1.31
+rseq_pair          5.94
+locked_pair       12.57
+atomic_cas_pair   19.67
+```
+
+RSEQ is slower than a TLS `Cell` (expected: arm `rseq_cs` + CPU index) and faster than a TAS or CAS stack. That is the number for a later runic integration decision — not churn/64.
 
 See [ROADMAP.md](ROADMAP.md). `publish = false`.

@@ -4,7 +4,14 @@ Standalone Linux restartable-sequence primitives for Rust. Zero runic
 dependency. Package `rseq-rs`, lib `rseq_rs`. The crate name `rseq` is taken
 (unrelated DSL).
 
-Crate stub is on the tree. This file is the thesis and release plan.
+v0.1 is on `rseq/05-measure`. Isolated pair bench (this host, `taskset -c 0`):
+
+```text
+tls_cell_pair      1.31 ns
+rseq_pair          5.94 ns
+locked_pair       12.57 ns
+atomic_cas_pair   19.67 ns
+```
 
 ## Thesis
 

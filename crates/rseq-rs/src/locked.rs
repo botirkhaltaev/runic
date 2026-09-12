@@ -8,6 +8,7 @@ use core::{
 
 use crate::{
     layout::{self, Header, Region},
+    quiesce::Quiesced,
     thread::CpuId,
 };
 
@@ -194,6 +195,19 @@ impl<T> LockedStacks<T> {
         n
     }
 
+    /// Exclusive drain of one CPU. TAS is held until [`Quiesced`] drops.
+    #[must_use]
+    pub fn quiesce(&self, cpu: CpuId) -> Option<Quiesced<'_, T>> {
+        let id = self.index(cpu)?;
+        let flag = self.acquire(id);
+        let header = self.header(id);
+        // SAFETY: TAS held.
+        let current = unsafe { (*header).current };
+        unsafe { (*header).capacity = 0 };
+        // SAFETY: exclusive until drop unlocks.
+        Some(unsafe { Quiesced::new(header, self.cap, current, Some(flag)) })
+    }
+
     /// Push a batch onto a specific CPU slab.
     #[must_use]
     pub fn push_batch_cpu(&self, cpu: CpuId, items: &[NonNull<T>]) -> usize {
@@ -223,12 +237,16 @@ impl<T> LockedStacks<T> {
     }
 
     fn lock(&self, cpu: u32) -> Guard<'_> {
+        Guard(self.acquire(cpu))
+    }
+
+    fn acquire(&self, cpu: u32) -> &AtomicBool {
         // SAFETY: `cpu` < `cpus`; lock array is live for the region lifetime.
         let flag = unsafe { &*self.locks.as_ptr().add(cpu as usize) };
         while flag.swap(true, Ordering::Acquire) {
             spin_loop();
         }
-        Guard(flag)
+        flag
     }
 }
 
