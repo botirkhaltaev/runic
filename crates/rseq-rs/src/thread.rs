@@ -1,4 +1,4 @@
-use core::{marker::PhantomData, ptr::NonNull};
+use core::ptr::NonNull;
 
 use crate::abi::{Area, CPU_UNINIT};
 
@@ -23,26 +23,22 @@ impl CpuId {
     }
 }
 
-/// This thread's registered `struct rseq`. `Copy`. Not `Send`.
+/// This thread's registered `struct rseq`. `Copy`. `*mut` so it is not `Send`.
 #[derive(Clone, Copy, Debug)]
 pub struct Thread {
-    area: NonNull<Area>,
-    _not_send: PhantomData<*const ()>,
+    area: *mut Area,
 }
 
 impl Thread {
     pub(crate) const fn new(area: NonNull<Area>) -> Self {
-        Self {
-            area,
-            _not_send: PhantomData,
-        }
+        Self { area: area.as_ptr() }
     }
 
     /// Kernel `cpu_id`. `None` if unregistered or a sentinel.
     #[must_use]
     pub fn cpu_id(self) -> Option<CpuId> {
         // SAFETY: `area` is this thread's registered rseq TLS.
-        let id = unsafe { self.area.as_ref().cpu_id };
+        let id = unsafe { (*self.area).cpu_id };
         CpuId::new(id)
     }
 }
