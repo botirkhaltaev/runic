@@ -1,4 +1,8 @@
-use core::{num::NonZeroUsize, ptr::NonNull};
+use core::{
+    mem::size_of,
+    num::NonZeroUsize,
+    ptr::{self, NonNull},
+};
 
 pub(crate) const HEADER_SIZE: usize = 8;
 pub(crate) const SLOT_SIZE: usize = 8;
@@ -30,21 +34,46 @@ pub(crate) fn region_len(cpus: u32, shift: u8, extra: usize) -> Option<NonZeroUs
     NonZeroUsize::new(pages)
 }
 
-pub(crate) fn block(base: NonNull<u8>, cpu: u32, shift: u8) -> *mut u8 {
-    let off = (cpu as usize) << shift;
-    // SAFETY: caller keeps `cpu` in range and `base` a live region.
-    unsafe { base.as_ptr().add(off) }
+/// Header at `base + (cpu << shift)`. Address-based so alignment is not a cast.
+///
+/// # Safety
+/// `cpu` is in range and `base` is a live region with this `shift`.
+#[inline]
+pub(crate) unsafe fn header(base: NonNull<u8>, cpu: u32, shift: u8) -> NonNull<Header> {
+    let addr = base.as_ptr().addr().wrapping_add((cpu as usize) << shift);
+    let ptr: *mut Header = ptr::with_exposed_provenance_mut(addr);
+    // SAFETY: mmap + power-of-two stride is `Header`-aligned; `cpu` is in range.
+    unsafe { NonNull::new_unchecked(ptr) }
 }
 
+/// Slot `index` immediately after `hdr`. Address-based so alignment is not a cast.
+///
+/// # Safety
+/// `index` is in range for the slab at `hdr`.
+#[inline]
+pub(crate) unsafe fn slot<T>(hdr: NonNull<Header>, index: u32) -> NonNull<NonNull<T>> {
+    let addr = hdr
+        .as_ptr()
+        .addr()
+        .wrapping_add(size_of::<Header>())
+        .wrapping_add((index as usize).wrapping_mul(size_of::<NonNull<T>>()));
+    let ptr: *mut NonNull<T> = ptr::with_exposed_provenance_mut(addr);
+    // SAFETY: slots follow an 8-byte header; `index` is in range.
+    unsafe { NonNull::new_unchecked(ptr) }
+}
+
+/// # Safety
+/// `base` is a zeroed mapping with `cpus` blocks of `1 << shift` bytes.
 pub(crate) unsafe fn init_headers(base: NonNull<u8>, cpus: u32, shift: u8, cap: u32) {
     for cpu in 0..cpus {
-        // Block bases are `1 << shift` (>= 16) aligned.
-        #[allow(clippy::cast_ptr_alignment)]
-        let hdr = block(base, cpu, shift).cast::<Header>();
-        // SAFETY: each block is a zeroed mmap page we own; header is at offset 0.
+        // SAFETY: `cpu` is in `0..cpus`.
+        let hdr = unsafe { header(base, cpu, shift) };
+        // SAFETY: each block is a zeroed mmap we own; header is at offset 0.
         unsafe {
-            (*hdr).current = 0;
-            (*hdr).capacity = cap;
+            hdr.as_ptr().write(Header {
+                current: 0,
+                capacity: cap,
+            });
         }
     }
 }

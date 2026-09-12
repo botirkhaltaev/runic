@@ -58,8 +58,12 @@ pub struct LockedStacks<T> {
     shift: u8,
     cap: u32,
     cpus: u32,
-    _t: PhantomData<NonNull<T>>,
+    _t: PhantomData<T>,
 }
+
+// SAFETY: `NonNull` is not `Send`/`Sync`; the TAS and mmap are process-private. `T` is moved, not shared.
+unsafe impl<T: Send> Send for LockedStacks<T> {}
+unsafe impl<T: Send> Sync for LockedStacks<T> {}
 
 impl<T> LockedStacks<T> {
     /// Allocate per-CPU stacks. `None` if `cpus`/`cap` is zero or mmap fails.
@@ -213,8 +217,9 @@ impl<T> LockedStacks<T> {
         (id < self.cpus).then_some(id)
     }
 
-    fn header(&self, cpu: u32) -> *mut Header {
-        layout::block(self.region.base(), cpu, self.shift).cast()
+    fn header(&self, cpu: u32) -> NonNull<Header> {
+        // SAFETY: `cpu` is in range for this mapping.
+        unsafe { layout::header(self.region.base(), cpu, self.shift) }
     }
 
     fn lock(&self, cpu: u32) -> Guard<'_> {
@@ -271,37 +276,30 @@ fn current_cpu() -> Option<CpuId> {
     }
 }
 
-unsafe fn pop_unlocked<T>(hdr: *mut Header) -> Option<NonNull<T>> {
+/// # Safety
+/// Caller holds the CPU TAS and `hdr` is a live header.
+unsafe fn pop_unlocked<T>(hdr: NonNull<Header>) -> Option<NonNull<T>> {
     // SAFETY: caller holds the CPU TAS and `hdr` is a live header.
-    let header = unsafe { &mut *hdr };
+    let header = unsafe { &mut *hdr.as_ptr() };
     if header.capacity == 0 || header.current == 0 {
         return None;
     }
     header.current -= 1;
-    // SAFETY: slots follow an 8-byte-aligned `Header`; `current` is in range.
-    #[allow(clippy::cast_ptr_alignment)]
-    let slot = unsafe {
-        hdr.add(1)
-            .cast::<NonNull<T>>()
-            .add(header.current as usize)
-            .read()
-    };
-    Some(slot)
+    // SAFETY: `current` is in range.
+    Some(unsafe { layout::slot::<T>(hdr, header.current).as_ptr().read() })
 }
 
-unsafe fn push_unlocked<T>(hdr: *mut Header, item: NonNull<T>) -> Result<(), Full<T>> {
+/// # Safety
+/// Caller holds the CPU TAS and `hdr` is a live header.
+unsafe fn push_unlocked<T>(hdr: NonNull<Header>, item: NonNull<T>) -> Result<(), Full<T>> {
     // SAFETY: caller holds the CPU TAS and `hdr` is a live header.
-    let header = unsafe { &mut *hdr };
+    let header = unsafe { &mut *hdr.as_ptr() };
     if header.current >= header.capacity {
         return Err(Full::new(item));
     }
-    // SAFETY: slots follow an 8-byte-aligned `Header`; `current` is below capacity.
-    #[allow(clippy::cast_ptr_alignment)]
+    // SAFETY: `current` is below capacity.
     unsafe {
-        hdr.add(1)
-            .cast::<NonNull<T>>()
-            .add(header.current as usize)
-            .write(item);
+        layout::slot::<T>(hdr, header.current).as_ptr().write(item);
     }
     header.current += 1;
     Ok(())
