@@ -46,6 +46,13 @@ pub(crate) unsafe fn header(base: NonNull<u8>, cpu: u32, shift: u8) -> NonNull<H
     unsafe { NonNull::new_unchecked(ptr) }
 }
 
+/// Base of the slot array after `hdr`.
+#[inline]
+pub(crate) fn slots<T>(hdr: NonNull<Header>) -> *mut NonNull<T> {
+    let addr = hdr.as_ptr().addr().wrapping_add(size_of::<Header>());
+    ptr::with_exposed_provenance_mut(addr)
+}
+
 /// Slot `index` immediately after `hdr`. Address-based so alignment is not a cast.
 ///
 /// # Safety

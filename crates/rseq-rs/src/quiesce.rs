@@ -1,35 +1,35 @@
 use core::{
-    marker::PhantomData,
     ptr::{NonNull, addr_of_mut},
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
-use crate::layout::Header;
+use crate::layout::{self, Header};
 
 /// Exclusive drain of one CPU slab. `Drop` publishes `current` and restores capacity.
+/// `*mut` fields keep this `!Send`.
 pub struct Quiesced<'a, T> {
     header: *mut Header,
+    slots: *mut NonNull<T>,
     cap: u32,
     current: u32,
     unlock: Option<&'a AtomicBool>,
-    _t: PhantomData<(&'a T, *const ())>,
 }
 
 impl<'a, T> Quiesced<'a, T> {
     /// # Safety
     /// Exclusive mutator of this slab until drop. `current` is the live length.
     pub(crate) unsafe fn new(
-        header: *mut Header,
+        header: NonNull<Header>,
         cap: u32,
         current: u32,
         unlock: Option<&'a AtomicBool>,
     ) -> Self {
         Self {
-            header,
+            header: header.as_ptr(),
+            slots: layout::slots(header),
             cap,
             current,
             unlock,
-            _t: PhantomData,
         }
     }
 
@@ -40,15 +40,8 @@ impl<'a, T> Quiesced<'a, T> {
             return None;
         }
         self.current -= 1;
-        // SAFETY: we are the exclusive mutator; slots follow `Header`.
-        #[allow(clippy::cast_ptr_alignment)]
-        Some(unsafe {
-            self.header
-                .add(1)
-                .cast::<NonNull<T>>()
-                .add(self.current as usize)
-                .read()
-        })
+        // SAFETY: exclusive mutator; `current` is in range.
+        Some(unsafe { self.slots.add(self.current as usize).read() })
     }
 
     /// Drain remaining pointers.

@@ -202,8 +202,13 @@ impl<T> LockedStacks<T> {
         let flag = self.acquire(id);
         let header = self.header(id);
         // SAFETY: TAS held.
-        let current = unsafe { (*header).current };
-        unsafe { (*header).capacity = 0 };
+        let current = unsafe { header.as_ref().current };
+        unsafe {
+            header.as_ptr().write(Header {
+                current,
+                capacity: 0,
+            });
+        }
         // SAFETY: exclusive until drop unlocks.
         Some(unsafe { Quiesced::new(header, self.cap, current, Some(flag)) })
     }

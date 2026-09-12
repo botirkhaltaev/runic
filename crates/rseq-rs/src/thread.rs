@@ -31,7 +31,9 @@ pub struct Thread {
 
 impl Thread {
     pub(crate) const fn new(area: NonNull<Area>) -> Self {
-        Self { area: area.as_ptr() }
+        Self {
+            area: area.as_ptr(),
+        }
     }
 
     #[inline]
