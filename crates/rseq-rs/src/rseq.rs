@@ -45,7 +45,7 @@ impl Rseq {
         membarrier::fence(cpu.get())
     }
 
-    /// CPU count used to size per-CPU slabs.
+    /// CPU count used to size the per-CPU word region.
     #[must_use]
     pub const fn cpus(self) -> u32 {
         self.cpus
