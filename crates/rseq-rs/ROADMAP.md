@@ -5,8 +5,7 @@ dependency. Package `rseq-rs`, lib `rseq_rs`. The crate name `rseq` is taken
 (unrelated DSL).
 
 This is librseq in Rust: crate-owned sequences on a caller-chosen word
-plus a CPU check. Not a tcmalloc magazine. Registration, `Word`, and
-the x86_64 sequences are on the tree.
+plus a CPU check. Not a tcmalloc magazine. v0.1 is on `rseq/05-measure`.
 
 ## Thesis
 
