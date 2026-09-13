@@ -215,7 +215,8 @@ impl ThreadHeap {
 
         let heap = self.owned_heap(heap_id);
         let mut inner = heap.require_inner();
-        heap.free(&mut inner, PageOwner::Extent(extent), ptr, ctx)
+        inner
+            .free(PageOwner::Extent(extent), ptr, ctx.pages)
             .map(|_| ())
             .map_err(ThreadFreeError::Heap)
     }
@@ -294,11 +295,11 @@ impl ThreadHeap {
         let Some(heap) = self.adopted_heap() else {
             return;
         };
-        if !heap.inboxes_empty() || heap.has_live() {
+        if !heap.inboxes_empty() {
             return;
         }
         let inner = heap.require_inner();
-        let idle = !inner.has_live();
+        let idle = !inner.occupied() && !inner.has_live();
         drop(inner);
         if idle {
             self.retire_adopted(ctx);

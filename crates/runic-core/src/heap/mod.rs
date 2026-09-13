@@ -9,7 +9,7 @@ pub(crate) mod thread;
 
 use core::num::NonZeroU32;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::AtomicU32;
 
 use spin::Mutex;
 
@@ -50,10 +50,6 @@ pub(crate) struct Heap {
     inner: Mutex<HeapInner>,
     /// Next Free heap index for [`Heaps`] (`u32::MAX` = end).
     pub(super) free_next: AtomicU32,
-    /// Occupied runs with `live > 0`. Updated on the 0↔1 edge only.
-    run_live: AtomicUsize,
-    /// Allocated/claimed extents. Updated under exclusive metadata.
-    extent_live: AtomicUsize,
 }
 
 /// Exclusive run/extent metadata. Caller holds `MutexGuard<HeapInner>`.
@@ -82,6 +78,10 @@ impl HeapInner {
         self.extents.rebind(id);
     }
 
+    pub(super) fn occupied(&self) -> bool {
+        self.runs.occupied() || self.extents.occupied()
+    }
+
     pub(super) fn has_live(&self) -> bool {
         self.runs.has_live() || self.extents.has_live()
     }
@@ -98,6 +98,33 @@ impl HeapInner {
     ) -> Option<NonNull<Run>> {
         self.runs.acquire(class, heap.id(), Some(heap), pages)
     }
+
+    /// Owner-local free. `Ok(true)` when this owner is no longer live.
+    ///
+    /// Caller owns inbox `flush`. A live owner means the heap is not reclaimable,
+    /// so Draining `Heaps::free` can skip the arena scan.
+    pub(super) fn free(
+        &mut self,
+        owner: PageOwner,
+        ptr: NonNull<u8>,
+        pages: &PageMap,
+    ) -> Result<bool, HeapError> {
+        match owner {
+            PageOwner::Run(run) => {
+                // SAFETY: PageMap / inbox carry only live arena run pointers.
+                let run_ref = unsafe { run.as_ref() };
+                if run_ref.free(ptr).map_err(HeapError::from)? {
+                    self.runs.push_available(run)?;
+                }
+                run_ref.discard_empty();
+                Ok(!run_ref.is_live())
+            }
+            PageOwner::Extent(extent) => {
+                self.extents.free(extent, ptr, pages)?;
+                Ok(true)
+            }
+        }
+    }
 }
 
 impl Heap {
@@ -109,58 +136,6 @@ impl Heap {
             extent_inbox: ExtentInbox::new(),
             inner: Mutex::new(HeapInner::new(config)),
             free_next: AtomicU32::new(u32::MAX),
-            run_live: AtomicUsize::new(0),
-            extent_live: AtomicUsize::new(0),
-        }
-    }
-
-    /// Any run or extent with outstanding allocated or claimed blocks.
-    pub(crate) fn has_live(&self) -> bool {
-        self.run_live.load(Ordering::Acquire) != 0 || self.extent_live.load(Ordering::Acquire) != 0
-    }
-
-    fn add_run_live(&self) {
-        self.run_live.fetch_add(1, Ordering::Release);
-    }
-
-    fn sub_run_live(&self) {
-        self.run_live.fetch_sub(1, Ordering::AcqRel);
-    }
-
-    fn add_extent_live(&self) {
-        self.extent_live.fetch_add(1, Ordering::Release);
-    }
-
-    fn sub_extent_live(&self) {
-        self.extent_live.fetch_sub(1, Ordering::AcqRel);
-    }
-
-    /// Owner-local free. `Ok(true)` when this owner is no longer live.
-    ///
-    /// Caller owns inbox `flush`. A live owner means the heap is not reclaimable,
-    /// so Draining `Heaps::free` can skip the arena scan.
-    pub(super) fn free(
-        &self,
-        inner: &mut HeapInner,
-        owner: PageOwner,
-        ptr: NonNull<u8>,
-        ctx: &AllocatorCtx<'_>,
-    ) -> Result<bool, HeapError> {
-        match owner {
-            PageOwner::Run(run) => {
-                // SAFETY: PageMap / inbox carry only live arena run pointers.
-                let run_ref = unsafe { run.as_ref() };
-                if run_ref.free(ptr).map_err(HeapError::from)? {
-                    inner.runs.push_available(run)?;
-                }
-                run_ref.discard_empty();
-                Ok(!run_ref.is_live())
-            }
-            PageOwner::Extent(extent) => {
-                inner.extents.free(extent, ptr, ctx.pages)?;
-                self.sub_extent_live();
-                Ok(true)
-            }
         }
     }
 
@@ -281,7 +256,7 @@ impl Heap {
         if snap.retired || snap.mode != HeapMode::Draining || snap.leases != 0 {
             return false;
         }
-        if !self.inboxes_empty() || self.has_live() || inner.has_live() {
+        if !self.inboxes_empty() || inner.occupied() || inner.has_live() {
             return false;
         }
         let again = self.state.load();
@@ -317,7 +292,6 @@ impl Heap {
                 // SAFETY: dequeued from this heap's extent inbox; live arena extent.
                 let ptr = unsafe { extent.as_ref() }.ptr();
                 inner.extents.accept(extent, ptr, ctx.pages)?;
-                self.sub_extent_live();
             }
         }
         Ok(())
@@ -334,9 +308,7 @@ impl Heap {
         if !self.inboxes_empty() {
             self.flush(inner, ctx).ok()?;
         }
-        let ptr = inner.extents.allocate(spec, self.id(), ctx.pages, init)?;
-        self.add_extent_live();
-        Some(ptr)
+        inner.extents.allocate(spec, self.id(), ctx.pages, init)
     }
 }
 

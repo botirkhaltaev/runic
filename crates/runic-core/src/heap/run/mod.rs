@@ -192,6 +192,8 @@ pub(crate) struct Run {
     policy: RunPolicy,
     /// Owning `Heap`; never moves. Null in unit tests that construct a stack `Run`.
     heap_ptr: *mut Heap,
+    /// Owning [`RunHeap::live`]. Null in stack tests.
+    runs: *mut RunHeap,
     remote: RemoteLine,
 }
 
@@ -266,6 +268,7 @@ impl Run {
             heap,
             policy,
             heap_ptr: core::ptr::null_mut(),
+            runs: core::ptr::null_mut(),
             remote: RemoteLine {
                 issued: AtomicUsize::new(0),
                 link: InboxLink::new(),
@@ -287,8 +290,9 @@ impl Run {
         self.heap = heap;
     }
 
-    pub(crate) fn set_heap(&mut self, heap: &Heap) {
+    pub(crate) fn set_heap(&mut self, heap: &Heap, runs: &RunHeap) {
         self.heap_ptr = core::ptr::from_ref(heap).cast_mut();
+        self.runs = core::ptr::from_ref(runs).cast_mut();
     }
 
     /// Owning heap when `heap_ptr` is set and the generation still matches.
@@ -370,7 +374,7 @@ impl Run {
         let ptr = Self::pop_free(state)?;
         debug_assert!(state.live < state.capacity);
         if state.live == 0 {
-            self.add_run_live();
+            self.add_live();
         }
         state.live += 1;
         Some(ptr)
@@ -421,7 +425,7 @@ impl Run {
         state.live -= 1;
         Self::push_free(state, block.ptr());
         if state.live == 0 {
-            self.sub_run_live();
+            self.sub_live();
         }
         Ok(was_full)
     }
@@ -466,7 +470,7 @@ impl Run {
         }
 
         if was_live && state.live == 0 {
-            self.sub_run_live();
+            self.sub_live();
         }
         if state.live == 0 && self.policy == RunPolicy::Discard {
             self.maybe_discard(state);
@@ -474,16 +478,20 @@ impl Run {
         self.remote.claims.any_set()
     }
 
-    fn add_run_live(&self) {
-        if let Some(heap) = self.heap() {
-            heap.add_run_live();
-        }
+    fn add_live(&self) {
+        let Some(runs) = NonNull::new(self.runs) else {
+            return;
+        };
+        // SAFETY: `runs` is the immovable `RunHeap` in the owning `Heap`.
+        unsafe { runs.as_ref() }.add_live();
     }
 
-    fn sub_run_live(&self) {
-        if let Some(heap) = self.heap() {
-            heap.sub_run_live();
-        }
+    fn sub_live(&self) {
+        let Some(runs) = NonNull::new(self.runs) else {
+            return;
+        };
+        // SAFETY: `runs` is the immovable `RunHeap` in the owning `Heap`.
+        unsafe { runs.as_ref() }.sub_live();
     }
 
     /// `madvise` empty Discard payload. Keep is a no-op. Off the free hit.

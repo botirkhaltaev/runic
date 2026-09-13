@@ -510,7 +510,7 @@ competitors.
 
   Landed: Track A (hit `Run::free` without discard / `push_available`;
   `__rust_dealloc` has no callee-saved),
-  B1 (`issued` on `RemoteLine`), C (`Heap::{run_live,extent_live}` /
+  B1 (`issued` on `RemoteLine`), C (`RunHeap` / `ExtentHeap` live /
   `has_live`). Reverted: D (N=4 adopted slots; +18% `channel_pipeline`).
   Not tried: B2 remote-only line split (no HITM), freelist prefetch
   (next-link load 0.43%).

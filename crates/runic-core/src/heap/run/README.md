@@ -22,5 +22,5 @@ Run metadata owns small size-class allocations.
 - `Run::free` returns `Result<bool, RunError>` (`Ok(true)` when the run was full; `OutOfRange` is current-run miss; `InvalidPointer` is interior). `accept` returns `bool` (needs re-push). `RunHeap` calls `push_available` from that flag.
 - `RunHeap` available-list pointers must refer to live in-space headers. A run is on the list at most once (`RunState.on_available`); `push_available` is idempotent. The current run may be on the list. `unbind` returns non-full current runs to the list.
 - Alloc miss checks out a run from `available[]` (or take/map), `extend`s if needed, and sets TLS `current`. Reincarnation rebinds every occupied in-space header.
-- Live small ownership for reclaim is `Heap::run_live` (0↔1 edges on `allocate` / `free` / `accept`). `RunHeap::has_live` still scans for isolated tests.
+- Live small ownership for reclaim is `RunHeap` live (0↔1 edges on `allocate` / `free` / `accept`). `RunHeap::has_live` scans after `occupied`.
 - Runs stay published and arena-resident for the heap lifetime. `RunPolicy::Discard` drops empty-run payload pages via `madvise`; the heap map stays. `Keep` leaves pages resident.

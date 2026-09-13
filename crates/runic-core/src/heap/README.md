@@ -30,7 +30,7 @@ Owner-local heap frontend: runs for small size classes, extents for dedicated la
 - Cross-thread frees: `claim` → `Heap::enqueue` (Active: lease before a new `try_queue`) or `Heaps::{enqueue,free,flush}` (Draining). The first remote freer into a Draining heap may `adopt` it (`Draining` → `Active`); later frees from that thread are owner-local. One adopted heap besides the bound heap; a second Draining heap stays on `Heaps::free` until unbind (multi-slot adopt lost on `channel_pipeline`). `alloc` never uses it. Coalescing is by owner. Owner `flush` drains via `accept`.
 - Run remote admission is a private claim bitmap in the space tail. Owner `Run::free` is locate + pointer push; owner DF is undefined. Extents use byte `Claimed`.
 - Inbox is a Treiber stack of run/extent nodes. `drain` is a single-pass walk.
-- Draining reclaim observes live ownership via `Heap::has_live` (`run_live` / `extent_live`). In-flight claim bits keep the heap live. `Heap::reclaim` returns a Free heap to the table freelist.
+- Draining reclaim observes live ownership via `RunHeap` / `ExtentHeap` live counts, then a scan. In-flight claim bits keep the heap live. `Heap::reclaim` returns a Free heap to the table freelist.
 - Never-bound freers enqueue each successful claim in `Allocator::free_remote`. Bound producers coalesce by run/extent. `ThreadFreeError::Remote` carries the `PageOwner` `free_slow` already looked up.
 - Owner free hit: `Run::free` (lock-free locate + push). Hit ignores `was_full` and Discard. `push_available` / `discard_empty` are miss / slow / unbind. Miss / adopt-local is `ThreadHeap::free_run` after `lookup`. `unbind` / `retire_adopted` retire the adopted heap; `retire_if_idle` confirms `has_live` with an inner scan. Draining late free uses `Heap::free` via `Heaps::free` when adopt does not win. Domain ops are `free` / `claim` / `accept`. Failures after claim abort.
 - Current-run empty: `extend`; accept inbox if nonempty; then local/OS `acquire_run`. Unbound: `bind` then `flush` then alloc. Hit: current pop / `Run::free`. Inbox `flush` is remote `accept`. `lookup` is miss / realloc.
@@ -44,8 +44,8 @@ A small block is on exactly one of: user, run freelist, or remote-claimed.
 
 | Hit | Work | Not on the hit |
 |-----|------|----------------|
-| **alloc** | `class_for` → `current[class]` → `Run::allocate` (pop) | `extend`, claim bits, locks, acquire, flush. `run_live` only on 0→1 |
-| **owner free** | `current[class]` → `Run::free` (one `locate` + push); `OutOfRange` is miss | `push_available`, Discard, claim bits, `extend`, locks, `PageMap`. `run_live` only on 1→0 |
+| **alloc** | `class_for` → `current[class]` → `Run::allocate` (pop) | `extend`, claim bits, locks, acquire, flush. `RunHeap` live only on 0→1 |
+| **owner free** | `current[class]` → `Run::free` (one `locate` + push); `OutOfRange` is miss | `push_available`, Discard, claim bits, `extend`, locks, `PageMap`. `RunHeap` live only on 1→0 |
 
 `current[class]` is a hint, not ownership. Available list is the reservoir; a run may be both current and listed. Frees never touch `current`. Interior pointers abort on `locate`. Owner DF is undefined.
 

@@ -530,32 +530,6 @@ mod tests {
     }
 
     #[test]
-    fn has_live_tracks_run_and_extent() {
-        let allocator = Allocator::new();
-        let ctx = install(&allocator);
-        let small = Layout::from_size_align(64, 8).unwrap();
-        let large = Layout::from_size_align(64 * 1024, 8).unwrap();
-        let class = SizeClasses::class_for(LayoutSpec::from_layout(small)).unwrap();
-        {
-            let tls = &THREAD_HEAP;
-            let id = tls.bind(&ctx).unwrap();
-            let heap = ctx.heaps.get(id).unwrap();
-            let run_ptr = bind_alloc_small(tls, &ctx, small);
-            assert!(heap.has_live());
-            assert_eq!(tls.free(run_ptr, class), Some(()));
-            assert!(!heap.has_live());
-            let extent_ptr = bind_alloc_extent(tls, &ctx, large, ExtentInit::Uninit);
-            assert!(heap.has_live());
-            assert_eq!(
-                tls.free_extent(extent_of(ctx.pages, extent_ptr), extent_ptr, &ctx),
-                Ok(())
-            );
-            assert!(!heap.has_live());
-            unbind(tls);
-        };
-    }
-
-    #[test]
     fn owner_free_publishes_immediately() {
         let allocator = Allocator::new();
         let ctx = install(&allocator);
