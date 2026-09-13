@@ -172,7 +172,7 @@ Profile Cost gates still include the ~3-instruction frame-pointer tax C allocato
 
 `#135` RSEQ per-CPU: 65.3 vs 43.6 on churn/64. Impl never reached the
 tcmalloc hit; the gate was single-thread churn. Retired as a runic hit.
-Primitive work: [crates/rseq-rs/ROADMAP.md](crates/rseq-rs/ROADMAP.md).
+Primitive work: [rseq-rs](https://github.com/botirkhaltaev/rseq-rs).
 O(1) TLS steal (this pass): freelist/64 18.5 → 22.9, gate missed; churn 37.4 → 31.3
 did not save the AND. Seeded `freelist_allocate_only` pays steal per sample. Reverted.
 
@@ -587,7 +587,7 @@ API audit: allocate_fresh → bump; no sticky / *_v2 leftovers
 
 Raw Cost lives under `target/runic-profiles/*id129*`. Watermark stays 32.
 `#135` RSEQ is retired as a runic hit on single-thread churn. This table
-stays the competitor baseline. See [crates/rseq-rs/ROADMAP.md](crates/rseq-rs/ROADMAP.md).
+stays the competitor baseline. See [rseq-rs](https://github.com/botirkhaltaev/rseq-rs).
 
 Release artifacts:
 
@@ -605,7 +605,7 @@ Delete the per-class TLS magazine. The small hit is a current run per class
 plus a one-entry own-heap page cache. Diet the hit (TLS state byte, prologue,
 cross-crate inlining, `#[cold]` audit). Remote exact-once stays. Owner DF is
 undefined. Not a port of snmalloc. `#135` RSEQ is retired as a runic hit
-on single-thread churn. Primitive: [crates/rseq-rs/ROADMAP.md](crates/rseq-rs/ROADMAP.md).
+on single-thread churn. Primitive: [rseq-rs](https://github.com/botirkhaltaev/rseq-rs).
 ```
 
 Baseline: `c1ecdeb` on this host (churn/64 40.5, owner_free/64 74.0,
@@ -688,10 +688,9 @@ Do not copy reference implementation code.
 
 ## Related: rseq-rs
 
-Standalone librseq-in-Rust (`Thread` + `Word`, not a runic hit). Thesis
-and releases live in [crates/rseq-rs/ROADMAP.md](crates/rseq-rs/ROADMAP.md).
-v0.1 is the `rseq-rs` crate. Do not wire it into the allocator hit from
-this roadmap.
+Standalone librseq-in-Rust (`Thread` + `Word`, not a runic hit). Lives in
+[botirkhaltaev/rseq-rs](https://github.com/botirkhaltaev/rseq-rs) (`0.1.0`).
+Do not wire it into the allocator hit from this roadmap.
 
 ## Standing Rules
 
