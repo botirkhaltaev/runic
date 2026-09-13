@@ -13,7 +13,7 @@ let rseq = Rseq::try_new()?;
 let t = rseq.bind()?;
 let cpu = t.cpu_id()?;
 assert!(cpu.get() < rseq.cpus());
-assert!(rseq.fence(cpu));
+let _ = rseq.fence(cpu);
 ```
 
 `try_new` / `bind` are `#[cold]`. Store `Thread` in caller TLS. `None` means
@@ -29,7 +29,8 @@ let words = Words::new(2)?;
 let w = words.get(cpu)?;
 ```
 
-`get` borrows `words`. Embedder field: `unsafe Word::from_raw(ptr, cpu)`.
+`get` borrows `words` — keep the region alive. Embedder field:
+`unsafe Word::from_raw(ptr, cpu)`.
 
 ## Word ops (Linux x86-64)
 
@@ -38,9 +39,10 @@ use rseq_rs::{Error, Rseq};
 
 let rseq = Rseq::try_new()?;
 let t = rseq.bind()?;
+let words = rseq.words()?;
 loop {
     let cpu = t.cpu_id()?;
-    let w = rseq.words()?.get(cpu)?;
+    let w = words.get(cpu)?;
     match t.compare_exchange(w, 0, 7) {
         Ok(_) | Err(Error::Miss(_)) => break,
         Err(Error::Abort) => {}
@@ -49,11 +51,24 @@ loop {
 ```
 
 One attempt per call. Kernel preemption restarts inside the CS. CPU
-mismatch is `Err(Abort)` — re-read `cpu_id` and pick again. Compare-miss
-is `Err(Miss(current))`. No lock, no CAS.
+mismatch is `Err(Abort)` — re-read `cpu_id` and pick again. Do not retry
+the same `Word`. Compare-miss is `Err(Miss(current))`. No lock, no CAS.
+
+A bad abort signature is SIGSEGV, not `Error::Abort`.
 
 Stress (ignored): `cargo test -p rseq-rs -- --ignored`.
 
-Isolated word-op bench: `taskset -c 0 cargo bench -p rseq-rs --bench words`.
+Use-case benches (one file each). Isolated numbers: `taskset -c 0`.
+`counter` / `cached` report a bare-`Word` CS next to the retry-loop caller.
+
+```text
+cargo bench -p rseq-rs --bench counter    # librseq addv / per-CPU stats
+cargo bench -p rseq-rs --bench cached     # tcmalloc 1-deep cached object
+cargo bench -p rseq-rs --bench freelist   # librseq / mempool per-CPU stack
+cargo bench -p rseq-rs --bench drain      # tcmalloc FenceCpu + steal
+```
+
+Each file reports rseq next to a non-rseq pair (TLS `Cell` and/or `AtomicUsize`).
+Non-rseq benches still run if rseq is unavailable.
 
 See [ROADMAP.md](ROADMAP.md). `publish = false`.

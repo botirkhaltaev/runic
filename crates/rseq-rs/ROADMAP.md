@@ -18,7 +18,7 @@ stores — no lock, no CAS.
 The primitive is that sequence, not an array. librseq is
 `cmpeqv_storev(v, expect, new, cpu)`: the caller owns `v`. This crate
 owns the instruction range. The public handle is `Thread` plus `Word`
-(`NonNull<usize>` and `CpuId`). `Words` is an optional mmap of usizes.
+(`NonNull<AtomicUsize>` and `CpuId`). `Words` is an optional mmap of words.
 
 The critical section itself is **not** user Rust. A `Fn` / closure /
 proc-macro around safe code cannot be a restartable sequence: the compiler
@@ -55,10 +55,10 @@ t.fetch_add(w, 1)?;                   // abort
 - `Thread` — this thread's `Area`. `Copy`. `bind` is `#[cold]`. Owns
   `compare_exchange` / `fetch_add`. Hit takes `&Thread` so it does not
   reload `__rseq_offset` / `fs:0`.
-- `Word` — `Copy`. Pointer plus `CpuId`. librseq's `(v, cpu)`.
+- `Word` — `Copy`. `AtomicUsize` pointer plus `CpuId`. librseq's `(v, cpu)`.
   `Words::get` borrows the region. `from_raw` is `'static`.
-- `Words` — optional mmap of one `usize` per possible CPU. `get` is
-  address math, not a CS.
+- `Words` — optional mmap of one word per possible CPU. `get` is
+  address math, not a CS. `Rseq::words` maps a new region.
 - `CpuId` — newtype `u32`. `Thread::cpu_id() -> Option<CpuId>`.
 - `Error` — `Miss(usize)` or `Abort`.
 
@@ -67,7 +67,7 @@ stores through `word.ptr`. A CPU-mismatch abort does not retry inside
 the crate: the caller re-reads `cpu_id` and picks a new word.
 
 Embedder field in a larger per-CPU struct: `unsafe Word::from_raw(ptr, cpu)`.
-Safety: `ptr` is a live aligned `usize`, used only as this word, and
+Safety: `ptr` is a live aligned `AtomicUsize`, used only as this word, and
 outlives the ops. Array embedder: `unsafe Words::from_raw(base, cpus)`.
 
 `try_new` is `None` → missing glibc rseq or a zero CPU count. The fallback
@@ -109,6 +109,41 @@ types. v0.1 is the word ops, not another magazine.
 - glibc registers a 20-byte area (`node_id` / `mm_cid` not populated).
 - Self-register via `SYS_rseq` returns `EINVAL`. v0.1 reuses glibc's area.
 
+## ABI contract (v0.1)
+
+The kernel registers **one** per-thread `struct rseq` (`rseq(2)`). glibc
+(2.35+, and this host's 2.34 RHEL backport) owns that area. A second
+`SYS_rseq` is `EINVAL`. Libraries share glibc's TLS.
+
+User-space may write **`rseq_cs` only**. `cpu_id`, `cpu_id_start`,
+`node_id`, `mm_cid`, and feature `flags` are kernel-owned. Optimized
+RSEQ V2 SIGSEGVs writers of those fields. tcmalloc's cached-slab overlay
+on `cpu_id_start` is ABI-hostile and is out of this crate.
+
+`cpu_id_start` is a speculative in-range index. Side effects are legal
+only after `cpu_id` confirms it. This crate does not pre-read
+`cpu_id_start`. `Word.cpu` is the librseq confirmation: the CS compares
+`area.cpu_id == word.cpu`.
+
+Remote drain is `membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ)`
+(Linux 5.10+): abort siblings' CS on a CPU. That is `Rseq::fence`. Word
+ops never fence.
+
+An isolated pinned TLS increment beating the CS is not a bug. The extra
+cost is the `rseq_cs` install (`#135`). Per-CPU cannot beat TLS on
+single-thread pinned churn by design.
+
+```text
+cpu = TLS->rseq::cpu_id_start
+TLS->rseq::rseq_cs = rseq_cs
+[start_ip] if (cpu != TLS->rseq::cpu_id) goto abort_ip
+[last instruction = commit]
+[post_commit_ip]
+```
+
+Time-slice extension, `mm_cid` compact indexing, and V2 feature-size
+registration are later kernels. Not v0.1.
+
 ## Invariants
 
 ```text
@@ -141,9 +176,13 @@ src/x86_64.rs      private inline asm! (not pub)
 src/cpus.rs        CPU count (File, stack buffer)
 src/membarrier.rs  private syscalls (fence only)
 src/abi.rs         private Area / SIG
+benches/counter.rs librseq addv; retry-loop + bare Word
+benches/cached.rs  tcmalloc 1-deep; retry-loop + bare Word
+benches/freelist.rs librseq / mempool stack
+benches/drain.rs   tcmalloc FenceCpu + steal
 ```
 
-`Words::get` is `base + cpu * size_of::<usize>()`. Zeros on crate `mmap`.
+`Words::get` is `base + cpu * size_of::<AtomicUsize>()`. Zeros on crate `mmap`.
 
 `asm!` shape: `.pushsection __rseq_cs,"aw"` + local labels (PIE-safe; no
 `global_asm!` outline). `jmp entry; .long SIG; abort: entry:` then
@@ -160,14 +199,18 @@ No `cpu_id_start` pre-read and recheck.
 Rseq / Thread / CpuId / Word / Words / Error
 Thread::compare_exchange / fetch_add; unsafe from_raw only
 tests: abi (private), smoke, words, ops, stress (ignored)
-bench: TLS Cell vs Thread word ops vs AtomicUsize
+bench: counter (addv + bare Word), cached (take/put + bare Word),
+       freelist (librseq list), drain (FenceCpu)
 README + AGENTS.md
 ```
 
 Stress: threads > cores, `sched_setaffinity` flap + `setitimer` SIGALRM.
 Unique add / no lost CAS. A signature bug is SIGSEGV.
 
-Bench is the isolated number. `#135` never isolated it.
+Retry-loop benches are the real caller (`cpu_id` + `get` each iter).
+Pinned `*_word` benches reuse one `Word` so the CS number is visible.
+`#135` never isolated either. Do not chase `#[inline(always)]`,
+fall-through status, or `addq` vs `xadd` without a new isolated table.
 
 ### v0.2.0 — aarch64
 
@@ -189,11 +232,12 @@ per-thread 32-byte area, unregister on thread exit. `node_id` / `mm_cid`
 when the registered area is 32 bytes. Nightly only behind a cargo feature.
 `try_new` stays safe; this is still an `Unavailable` vs `Ok` split.
 
-### v0.5.0 — cached block overlay (experimental)
+### v0.5.0 — cached block overlay (likely never)
 
-tcmalloc's cached block pointer overlaid on `cpu_id_start` so the hit is
-load+test instead of shift+add. Self-registration only. Ship only if the
-v0.1 bench moves. API unchanged.
+tcmalloc overlays a cached block pointer on `cpu_id_start`. That is
+ABI-hostile: we do not write kernel-owned fields, and RSEQ V2 SIGSEGVs
+those writers. Not v0.1. Revisit only if a later kernel offers a
+documented user field.
 
 ### Later — magazine
 
@@ -207,6 +251,7 @@ User Rust / closures / proc-macros as the critical section
 Silent lock or CAS on the RSEQ hit
 Locked / atomic twin in this crate
 Ops on Words
+Overlay or write of cpu_id_start / other kernel-owned Area fields
 Runic magazine / heap / PageMap
 Porting tcmalloc or snmalloc
 crates.io publish until v0.1 benches and stress are green

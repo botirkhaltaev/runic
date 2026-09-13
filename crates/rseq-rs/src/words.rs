@@ -1,29 +1,29 @@
-use core::{marker::PhantomData, ptr::NonNull};
+use core::{marker::PhantomData, ptr::NonNull, sync::atomic::AtomicUsize};
 
 use crate::{
     layout::{self, Region},
     thread::CpuId,
 };
 
-/// One `usize` and the CPU it belongs to. librseq's `(v, cpu)`.
+/// One word and the CPU it belongs to. librseq's `(v, cpu)`.
 ///
 /// [`Words::get`] borrows the region. [`Word::from_raw`] is `'static`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Word<'a> {
-    ptr: NonNull<usize>,
+    ptr: NonNull<AtomicUsize>,
     cpu: CpuId,
-    _a: PhantomData<&'a usize>,
+    _a: PhantomData<&'a AtomicUsize>,
 }
 
 impl Word<'static> {
-    /// Caller-owned `usize` paired with `cpu`.
+    /// Caller-owned word paired with `cpu`.
     ///
     /// # Safety
     ///
-    /// `ptr` is a live aligned `usize`, used only as this word, and outlives
-    /// the ops.
+    /// `ptr` is a live aligned [`AtomicUsize`], used only as this word, and
+    /// outlives the ops.
     #[must_use]
-    pub const unsafe fn from_raw(ptr: NonNull<usize>, cpu: CpuId) -> Self {
+    pub const unsafe fn from_raw(ptr: NonNull<AtomicUsize>, cpu: CpuId) -> Self {
         Self {
             ptr,
             cpu,
@@ -39,12 +39,12 @@ impl Word<'_> {
     }
 
     #[must_use]
-    pub const fn as_ptr(self) -> NonNull<usize> {
+    pub const fn as_ptr(self) -> NonNull<AtomicUsize> {
         self.ptr
     }
 }
 
-/// Optional mmap of one `usize` per possible CPU.
+/// Optional mmap of one word per possible CPU.
 pub struct Words {
     backing: Backing,
     cpus: u32,
@@ -64,7 +64,8 @@ impl Backing {
     }
 }
 
-// SAFETY: `NonNull` is not `Send`/`Sync`; the words are process-private usizes.
+// SAFETY: the mapping is process-private `AtomicUsize`s. `NonNull<u8>` is
+// `!Send`/`!Sync`; the words are the atomics the CS and drain already share.
 unsafe impl Send for Words {}
 unsafe impl Sync for Words {}
 
@@ -86,10 +87,11 @@ impl Words {
     ///
     /// # Safety
     ///
-    /// `base` is live for `cpus` aligned `usize`s (`cpus > 0`), used only as
-    /// this crate's per-CPU words, and outlives `Self`.
+    /// `base` is live for `cpus` aligned [`AtomicUsize`]s (`cpus > 0`), used
+    /// only as this crate's per-CPU words, and outlives `Self`.
     #[must_use]
     pub unsafe fn from_raw(base: NonNull<u8>, cpus: u32) -> Self {
+        debug_assert!(cpus > 0);
         Self {
             backing: Backing::Raw(base),
             cpus,

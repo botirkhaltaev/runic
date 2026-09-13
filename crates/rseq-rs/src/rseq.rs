@@ -2,7 +2,7 @@ use core::ptr::NonNull;
 use std::sync::OnceLock;
 
 use crate::{
-    abi::{AREA_MIN, Area, CPU_UNINIT},
+    abi::{AREA_MIN, Area, CPU_REG_FAILED, CPU_UNINIT},
     cpus::cpus,
     membarrier,
     thread::{CpuId, Thread},
@@ -32,9 +32,8 @@ impl Rseq {
     #[must_use]
     pub fn bind(self) -> Option<Thread> {
         let area = thread_area(self.offset)?;
-        // SAFETY: `area` is the glibc-registered rseq TLS for this thread.
-        let id = unsafe { area.as_ref().cpu_id };
-        if id == CPU_UNINIT || id >= self.cpus {
+        let id = Thread::cpu_id_of(area);
+        if id == CPU_UNINIT || id == CPU_REG_FAILED {
             return None;
         }
         Some(Thread::new(area))
@@ -53,7 +52,7 @@ impl Rseq {
         self.cpus
     }
 
-    /// Allocate crate-owned per-CPU words.
+    /// Map a new per-CPU word region sized for [`Self::cpus`]. Caller owns it.
     #[must_use]
     pub fn words(self) -> Option<Words> {
         Words::new(self.cpus)

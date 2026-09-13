@@ -1,4 +1,4 @@
-use rseq_rs::{Error, Rseq};
+use rseq_rs::{CpuId, Error, Rseq};
 
 #[test]
 fn compare_exchange_and_add() {
@@ -27,24 +27,40 @@ fn isolated_cpus() {
         return;
     }
     let words = rseq.words().expect("words");
-    pin(0);
-    let t0 = rseq.bind().expect("bind 0");
-    let c0 = t0.cpu_id().expect("cpu 0");
-    let w0 = words.get(c0).expect("word 0");
-    assert_eq!(t0.compare_exchange(w0, 0, 11), Ok(0));
-    pin(1);
-    let t1 = rseq.bind().expect("bind 1");
-    let c1 = t1.cpu_id().expect("cpu 1");
-    let w1 = words.get(c1).expect("word 1");
-    assert_eq!(t1.compare_exchange(w1, 0, 22), Ok(0));
-    pin(0);
-    let t0 = rseq.bind().expect("rebind 0");
-    let w0 = words.get(t0.cpu_id().expect("cpu 0")).expect("word 0");
-    assert_eq!(t0.compare_exchange(w0, 11, 11), Ok(11));
-    pin(1);
-    let t1 = rseq.bind().expect("rebind 1");
-    let w1 = words.get(t1.cpu_id().expect("cpu 1")).expect("word 1");
-    assert_eq!(t1.compare_exchange(w1, 22, 22), Ok(22));
+    let thread = rseq.bind().expect("bind");
+    let a = thread.cpu_id().expect("cpu");
+    let b = (0..rseq.cpus())
+        .filter_map(CpuId::new)
+        .find(|id| *id != a)
+        .expect("other cpu");
+    if !pin(a.get()) {
+        eprintln!("skip: pin {a:?}");
+        return;
+    }
+    let t = rseq.bind().expect("bind a");
+    let wa = words.get(t.cpu_id().expect("cpu a")).expect("word a");
+    assert_eq!(t.compare_exchange(wa, 0, 11), Ok(0));
+    if !pin(b.get()) {
+        eprintln!("skip: pin {b:?}");
+        return;
+    }
+    let t = rseq.bind().expect("bind b");
+    let wb = words.get(t.cpu_id().expect("cpu b")).expect("word b");
+    assert_eq!(t.compare_exchange(wb, 0, 22), Ok(0));
+    if !pin(a.get()) {
+        eprintln!("skip: re-pin {a:?}");
+        return;
+    }
+    let t = rseq.bind().expect("rebind a");
+    let wa = words.get(t.cpu_id().expect("cpu a")).expect("word a");
+    assert_eq!(t.compare_exchange(wa, 11, 11), Ok(11));
+    if !pin(b.get()) {
+        eprintln!("skip: re-pin {b:?}");
+        return;
+    }
+    let t = rseq.bind().expect("rebind b");
+    let wb = words.get(t.cpu_id().expect("cpu b")).expect("word b");
+    assert_eq!(t.compare_exchange(wb, 22, 22), Ok(22));
 }
 
 #[test]
@@ -58,11 +74,16 @@ fn wrong_cpu_aborts() {
         return;
     }
     let words = rseq.words().expect("words");
-    pin(0);
     let thread = rseq.bind().expect("bind");
     let here = thread.cpu_id().expect("cpu");
+    if !pin(here.get()) {
+        eprintln!("skip: pin {here:?}");
+        return;
+    }
+    let thread = rseq.bind().expect("bind pinned");
+    let here = thread.cpu_id().expect("cpu");
     let other = (0..rseq.cpus())
-        .filter_map(rseq_rs::CpuId::new)
+        .filter_map(CpuId::new)
         .find(|id| *id != here)
         .expect("other cpu");
     let w = words.get(other).expect("other word");
@@ -70,11 +91,12 @@ fn wrong_cpu_aborts() {
     assert_eq!(thread.fetch_add(w, 1), Err(Error::Abort));
 }
 
-fn pin(cpu: usize) {
+fn pin(cpu: u32) -> bool {
+    let cpu = cpu as usize;
     unsafe {
         let mut set = std::mem::zeroed::<libc::cpu_set_t>();
         libc::CPU_ZERO(&mut set);
         libc::CPU_SET(cpu, &mut set);
-        libc::sched_setaffinity(0, core::mem::size_of::<libc::cpu_set_t>(), &raw const set);
+        libc::sched_setaffinity(0, core::mem::size_of::<libc::cpu_set_t>(), &raw const set) == 0
     }
 }

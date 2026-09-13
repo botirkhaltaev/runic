@@ -11,12 +11,12 @@ use std::time::{Duration, Instant};
 
 use rseq_rs::{Error, Rseq, Words};
 
-fn pin(cpu: usize) {
+fn pin(cpu: usize) -> bool {
     unsafe {
         let mut set = std::mem::zeroed::<libc::cpu_set_t>();
         libc::CPU_ZERO(&mut set);
         libc::CPU_SET(cpu, &mut set);
-        libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &raw const set);
+        libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &raw const set) == 0
     }
 }
 
