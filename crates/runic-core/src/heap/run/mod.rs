@@ -370,7 +370,7 @@ impl Run {
         let ptr = Self::pop_free(state)?;
         debug_assert!(state.live < state.capacity);
         if state.live == 0 {
-            self.note_live(true);
+            self.add_run_live();
         }
         state.live += 1;
         Some(ptr)
@@ -406,31 +406,13 @@ impl Run {
         true
     }
 
-    /// Hit: locate + push. Does not report `was_full` or discard.
-    ///
-    /// Available-list insert happens on the miss / slow / unbind path. Owner DF
-    /// is undefined.
-    #[inline]
-    pub(crate) fn release(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
-        self.take(ptr).map(|_| ())
-    }
-
     /// Owner-local: live → pointer freelist. `Ok(true)` when the run was full.
     ///
-    /// Owner double-free is undefined. Remote admission is `claim` / `accept`.
+    /// Hit ignores the flag and does not discard. Miss / slow / unbind call
+    /// [`Self::discard_empty`] and `push_available` from the flag. Owner DF is
+    /// undefined. Remote admission is `claim` / `accept`.
     #[inline]
     pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<bool, RunError> {
-        let was_full = self.take(ptr)?;
-        // SAFETY: owner-local methods are called only by the owning heap.
-        let state = unsafe { &mut *self.state.get() };
-        if state.live == 0 && self.policy == RunPolicy::Discard {
-            self.maybe_discard(state);
-        }
-        Ok(was_full)
-    }
-
-    #[inline]
-    fn take(&self, ptr: NonNull<u8>) -> Result<bool, RunError> {
         let block = self.locate(ptr)?;
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
@@ -439,7 +421,7 @@ impl Run {
         state.live -= 1;
         Self::push_free(state, block.ptr());
         if state.live == 0 {
-            self.note_live(false);
+            self.sub_run_live();
         }
         Ok(was_full)
     }
@@ -484,7 +466,7 @@ impl Run {
         }
 
         if was_live && state.live == 0 {
-            self.note_live(false);
+            self.sub_run_live();
         }
         if state.live == 0 && self.policy == RunPolicy::Discard {
             self.maybe_discard(state);
@@ -492,19 +474,27 @@ impl Run {
         self.remote.claims.any_set()
     }
 
-    /// Adjust [`Heap::run_live`] on the 0↔1 edge. No-op for stack test runs.
-    #[inline]
-    fn note_live(&self, add: bool) {
-        let Some(heap) = NonNull::new(self.heap_ptr) else {
-            return;
-        };
-        // SAFETY: published `heap_ptr` is the immovable arena slot.
-        let live = unsafe { &(*heap.as_ptr()).run_live };
-        if add {
-            live.fetch_add(1, Ordering::Release);
-        } else {
-            live.fetch_sub(1, Ordering::AcqRel);
+    fn add_run_live(&self) {
+        if let Some(heap) = self.heap() {
+            heap.add_run_live();
         }
+    }
+
+    fn sub_run_live(&self) {
+        if let Some(heap) = self.heap() {
+            heap.sub_run_live();
+        }
+    }
+
+    /// `madvise` empty Discard payload. Keep is a no-op. Off the free hit.
+    #[cold]
+    pub(crate) fn discard_empty(&self) {
+        if self.policy != RunPolicy::Discard || self.is_live() {
+            return;
+        }
+        // SAFETY: owner-local; `is_live` just observed empty.
+        let state = unsafe { &mut *self.state.get() };
+        self.maybe_discard(state);
     }
 
     #[cold]
@@ -1048,6 +1038,7 @@ mod tests {
         let run = test_run_discard(30, class);
         let ptr = alloc_block(&run).unwrap();
         assert_eq!(run.free(ptr), Ok(false));
+        run.discard_empty();
         assert!(!run.is_live());
         assert!(run.allocate().is_none());
         assert!(run.extend());
@@ -1084,6 +1075,7 @@ mod tests {
         let base = run.range().base();
         let ptr = alloc_block(&run).unwrap();
         assert_eq!(run.free(ptr), Ok(false));
+        run.discard_empty();
         // SAFETY: space stays mapped; DONTNEED may zero the page.
         unsafe {
             base.as_ptr().write(0x11);

@@ -21,7 +21,7 @@ pub(crate) enum ThreadFreeError {
 
 /// Thread-local frontend: bound heap, at most one adopted heap, per-class current run.
 ///
-/// Hit is current-run pop / `Run::release`. Miss / bind / unbind / adopt take
+/// Hit is current-run pop / `Run::free`. Miss / bind / unbind / adopt take
 /// [`AllocatorCtx`]. `lookup` is miss / realloc. `alloc` never uses the adopted heap.
 pub(crate) struct ThreadHeap {
     heap_id: Cell<Option<HeapId>>,
@@ -68,14 +68,15 @@ impl ThreadHeap {
 
     /// Owner-local small free via the current run for `class`.
     ///
-    /// Hit is `Run::release` (`locate` + push). `OutOfRange` / unbound → caller
-    /// `dealloc_slow`. Interior is `InvalidPointer` → abort.
+    /// Hit is `Run::free` (`locate` + push). Ignores `was_full` and Discard.
+    /// `OutOfRange` / unbound → caller `dealloc_slow`. Interior is
+    /// `InvalidPointer` → abort.
     #[inline]
     pub(crate) fn free(&self, ptr: NonNull<u8>, class: SizeClass) -> Option<()> {
         let run = NonNull::new(self.current(class).get())?;
         // SAFETY: `current` stores only live arena run pointers while bound.
-        match unsafe { run.as_ref() }.release(ptr) {
-            Ok(()) => Some(()),
+        match unsafe { run.as_ref() }.free(ptr) {
+            Ok(_) => Some(()),
             Err(RunError::OutOfRange) => None,
             Err(_) => Allocator::abort(),
         }
@@ -186,9 +187,13 @@ impl ThreadHeap {
             return Err(ThreadFreeError::Remote(PageOwner::Run(run)));
         }
         match run_ref.free(ptr) {
-            Ok(false) => Ok(()),
+            Ok(false) => {
+                run_ref.discard_empty();
+                Ok(())
+            }
             Ok(true) => {
                 self.push_available(run);
+                run_ref.discard_empty();
                 Ok(())
             }
             Err(_) => Allocator::abort(),
@@ -210,8 +215,7 @@ impl ThreadHeap {
 
         let heap = self.owned_heap(heap_id);
         let mut inner = heap.require_inner();
-        inner
-            .free(PageOwner::Extent(extent), ptr, ctx, heap)
+        heap.free(&mut inner, PageOwner::Extent(extent), ptr, ctx)
             .map(|_| ())
             .map_err(ThreadFreeError::Heap)
     }
@@ -290,7 +294,13 @@ impl ThreadHeap {
         let Some(heap) = self.adopted_heap() else {
             return;
         };
-        if heap.inboxes_empty() && !heap.has_live() {
+        if !heap.inboxes_empty() || heap.has_live() {
+            return;
+        }
+        let inner = heap.require_inner();
+        let idle = !inner.has_live();
+        drop(inner);
+        if idle {
             self.retire_adopted(ctx);
         }
     }

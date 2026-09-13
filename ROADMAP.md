@@ -53,7 +53,7 @@ page-map ownership. Heap lifecycle lives on `Heaps` / `Heap`
 Owner-local hit is a TLS current run per class (pop). Small miss/realloc uses
 `Run::header_of`. `locate` is offset from the run base. Run mappings are
 `RUN_SIZE`-aligned; the header and claim tail sit after the payload. `Run::allocate`
-is pop only; `extend` on miss. Owner free hit is `Run::release`;
+is pop only; `extend` on miss. Owner free hit is `Run::free`;
 `push_available` is miss / slow / unbind. One process-wide payload;
 `Allocator::ctx()` is the handle.
 A Draining heap may be `adopt`ed by the first remote freer (`Draining` → `Active`).
@@ -508,7 +508,8 @@ competitors.
   arc_share_drop         270.8     267.0         —
   scoped_map_reduce      560.8     549.9       585
 
-  Landed: Track A (`Run::release`; `__rust_dealloc` has no callee-saved),
+  Landed: Track A (hit `Run::free` without discard / `push_available`;
+  `__rust_dealloc` has no callee-saved),
   B1 (`issued` on `RemoteLine`), C (`Heap::{run_live,extent_live}` /
   `has_live`). Reverted: D (N=4 adopted slots; +18% `channel_pipeline`).
   Not tried: B2 remote-only line split (no HITM), freelist prefetch

@@ -51,7 +51,7 @@ pub(crate) struct Heap {
     /// Next Free heap index for [`Heaps`] (`u32::MAX` = end).
     pub(super) free_next: AtomicU32,
     /// Occupied runs with `live > 0`. Updated on the 0↔1 edge only.
-    pub(crate) run_live: AtomicUsize,
+    run_live: AtomicUsize,
     /// Allocated/claimed extents. Updated under exclusive metadata.
     extent_live: AtomicUsize,
 }
@@ -86,34 +86,6 @@ impl HeapInner {
         self.runs.has_live() || self.extents.has_live()
     }
 
-    /// Owner-local free. `Ok(true)` when this owner is no longer live.
-    ///
-    /// Caller owns inbox `flush`. A live owner means the heap is not reclaimable,
-    /// so Draining `Heaps::free` can skip the arena scan.
-    pub(super) fn free(
-        &mut self,
-        owner: PageOwner,
-        ptr: NonNull<u8>,
-        ctx: &AllocatorCtx<'_>,
-        heap: &Heap,
-    ) -> Result<bool, HeapError> {
-        match owner {
-            PageOwner::Run(run) => {
-                // SAFETY: PageMap / inbox carry only live arena run pointers.
-                if unsafe { run.as_ref() }.free(ptr).map_err(HeapError::from)? {
-                    self.runs.push_available(run)?;
-                }
-                // SAFETY: same live arena run; `is_live` counts allocated and claimed.
-                Ok(!unsafe { run.as_ref() }.is_live())
-            }
-            PageOwner::Extent(extent) => {
-                self.extents.free(extent, ptr, ctx.pages)?;
-                heap.extent_live.fetch_sub(1, Ordering::AcqRel);
-                Ok(true)
-            }
-        }
-    }
-
     pub(super) fn push_available(&mut self, run: NonNull<Run>) -> Result<(), HeapError> {
         self.runs.push_available(run)
     }
@@ -145,6 +117,51 @@ impl Heap {
     /// Any run or extent with outstanding allocated or claimed blocks.
     pub(crate) fn has_live(&self) -> bool {
         self.run_live.load(Ordering::Acquire) != 0 || self.extent_live.load(Ordering::Acquire) != 0
+    }
+
+    fn add_run_live(&self) {
+        self.run_live.fetch_add(1, Ordering::Release);
+    }
+
+    fn sub_run_live(&self) {
+        self.run_live.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn add_extent_live(&self) {
+        self.extent_live.fetch_add(1, Ordering::Release);
+    }
+
+    fn sub_extent_live(&self) {
+        self.extent_live.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Owner-local free. `Ok(true)` when this owner is no longer live.
+    ///
+    /// Caller owns inbox `flush`. A live owner means the heap is not reclaimable,
+    /// so Draining `Heaps::free` can skip the arena scan.
+    pub(super) fn free(
+        &self,
+        inner: &mut HeapInner,
+        owner: PageOwner,
+        ptr: NonNull<u8>,
+        ctx: &AllocatorCtx<'_>,
+    ) -> Result<bool, HeapError> {
+        match owner {
+            PageOwner::Run(run) => {
+                // SAFETY: PageMap / inbox carry only live arena run pointers.
+                let run_ref = unsafe { run.as_ref() };
+                if run_ref.free(ptr).map_err(HeapError::from)? {
+                    inner.runs.push_available(run)?;
+                }
+                run_ref.discard_empty();
+                Ok(!run_ref.is_live())
+            }
+            PageOwner::Extent(extent) => {
+                inner.extents.free(extent, ptr, ctx.pages)?;
+                self.sub_extent_live();
+                Ok(true)
+            }
+        }
     }
 
     /// Arena slot plus the current generation.
@@ -300,7 +317,7 @@ impl Heap {
                 // SAFETY: dequeued from this heap's extent inbox; live arena extent.
                 let ptr = unsafe { extent.as_ref() }.ptr();
                 inner.extents.accept(extent, ptr, ctx.pages)?;
-                self.extent_live.fetch_sub(1, Ordering::AcqRel);
+                self.sub_extent_live();
             }
         }
         Ok(())
@@ -318,7 +335,7 @@ impl Heap {
             self.flush(inner, ctx).ok()?;
         }
         let ptr = inner.extents.allocate(spec, self.id(), ctx.pages, init)?;
-        self.extent_live.fetch_add(1, Ordering::Release);
+        self.add_extent_live();
         Some(ptr)
     }
 }
