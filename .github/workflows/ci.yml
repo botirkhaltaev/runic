@@ -34,8 +34,13 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace
 
+      - name: rseq-rs abort stress
+        run: cargo test -p rseq-rs -- --ignored --test-threads=1
+
       - name: Lint workspace
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Build benchmarks
-        run: cargo bench -p runic-bench --no-run
+        run: |
+          cargo bench -p runic-bench --no-run
+          cargo bench -p rseq-rs --no-run
