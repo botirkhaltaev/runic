@@ -1,4 +1,7 @@
-use core::ptr::{NonNull, write_bytes};
+use core::{
+    ptr::{NonNull, write_bytes},
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use crate::{
     arena::Arena,
@@ -14,6 +17,8 @@ use super::{ExtentId, cache::ExtentCache};
 const LAZY_ZERO: usize = 256 * 1024;
 
 pub(crate) struct ExtentHeap {
+    /// Allocated/claimed extents. Cached Free extents are not live.
+    live: AtomicUsize,
     extents: Arena<Extent>,
     cache: ExtentCache,
 }
@@ -38,13 +43,27 @@ unsafe impl Send for ExtentHeap {}
 impl ExtentHeap {
     pub(crate) fn new(config: ExtentConfig) -> Self {
         Self {
+            live: AtomicUsize::new(0),
             extents: Arena::new(),
             cache: ExtentCache::new(config),
         }
     }
 
+    fn add_live(&self) {
+        self.live.fetch_add(1, Ordering::Release);
+    }
+
+    fn sub_live(&self) {
+        self.live.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn occupied(&self) -> bool {
+        self.live.load(Ordering::Acquire) != 0
+    }
+
     /// Any occupied extent that is still Allocated or Claimed.
     ///
+    /// Production reclaim uses [`Self::occupied`] then this scan.
     /// Cached Free extents stay in the arena while published but are not live.
     pub(crate) fn has_live(&self) -> bool {
         self.extents.iter().any(Extent::is_live)
@@ -77,6 +96,7 @@ impl ExtentHeap {
                         unsafe { write_bytes(ptr.as_ptr(), 0, spec.size()) };
                     }
                 }
+                self.add_live();
                 return Some(ptr);
             }
             // Cache keyed by mapping length; reuse failure is rare (align) — release and remap.
@@ -84,7 +104,9 @@ impl ExtentHeap {
         }
 
         let mapping = OsMemory::map(len)?;
-        self.allocate_mapping(spec, heap_id, mapping, pages)
+        let ptr = self.allocate_mapping(spec, heap_id, mapping, pages)?;
+        self.add_live();
+        Some(ptr)
     }
 
     fn allocate_mapping(
@@ -135,6 +157,7 @@ impl ExtentHeap {
     ) -> Result<(), HeapError> {
         // SAFETY: PageMap stores only pointers published from this allocator's live arena.
         debug_assert!(!unsafe { extent_ptr.as_ref() }.is_live());
+        self.sub_live();
         if self.cache.insert(extent_ptr).is_ok() {
             return Ok(());
         }

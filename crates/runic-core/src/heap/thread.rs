@@ -68,18 +68,15 @@ impl ThreadHeap {
 
     /// Owner-local small free via the current run for `class`.
     ///
-    /// Hit is `Run::free` (`locate` + push). `OutOfRange` / unbound → caller
-    /// `dealloc_slow`. Interior is `InvalidPointer` → abort.
+    /// Hit is `Run::free` (`locate` + push). Ignores `was_full` and Discard.
+    /// `OutOfRange` / unbound → caller `dealloc_slow`. Interior is
+    /// `InvalidPointer` → abort.
     #[inline]
     pub(crate) fn free(&self, ptr: NonNull<u8>, class: SizeClass) -> Option<()> {
         let run = NonNull::new(self.current(class).get())?;
         // SAFETY: `current` stores only live arena run pointers while bound.
         match unsafe { run.as_ref() }.free(ptr) {
-            Ok(false) => Some(()),
-            Ok(true) => {
-                self.push_available(run);
-                Some(())
-            }
+            Ok(_) => Some(()),
             Err(RunError::OutOfRange) => None,
             Err(_) => Allocator::abort(),
         }
@@ -190,9 +187,13 @@ impl ThreadHeap {
             return Err(ThreadFreeError::Remote(PageOwner::Run(run)));
         }
         match run_ref.free(ptr) {
-            Ok(false) => Ok(()),
+            Ok(false) => {
+                run_ref.discard_empty();
+                Ok(())
+            }
             Ok(true) => {
                 self.push_available(run);
+                run_ref.discard_empty();
                 Ok(())
             }
             Err(_) => Allocator::abort(),
@@ -215,7 +216,7 @@ impl ThreadHeap {
         let heap = self.owned_heap(heap_id);
         let mut inner = heap.require_inner();
         inner
-            .free(PageOwner::Extent(extent), ptr, ctx)
+            .free(PageOwner::Extent(extent), ptr, ctx.pages)
             .map(|_| ())
             .map_err(ThreadFreeError::Heap)
     }
@@ -294,8 +295,11 @@ impl ThreadHeap {
         let Some(heap) = self.adopted_heap() else {
             return;
         };
+        if !heap.inboxes_empty() {
+            return;
+        }
         let inner = heap.require_inner();
-        let idle = heap.inboxes_empty() && !inner.has_live();
+        let idle = !inner.occupied() && !inner.has_live();
         drop(inner);
         if idle {
             self.retire_adopted(ctx);

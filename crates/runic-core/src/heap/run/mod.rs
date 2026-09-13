@@ -174,8 +174,8 @@ impl ClaimBits {
 }
 
 /// In-page header at `base + RUN_SIZE`. Owner hit packs `base`/`span`/`recip`
-/// next to `RunState` (`free`/`live` first). Remote `link`/`claims` start on
-/// the next 64-byte line.
+/// next to `RunState` (`free`/`live` first). Remote `issued`/`link`/`claims`
+/// start on the next 64-byte line.
 #[repr(C, align(64))]
 pub(crate) struct Run {
     /// Cached payload base (`RUN_SIZE` bytes) in a heap-owned map.
@@ -192,13 +192,15 @@ pub(crate) struct Run {
     policy: RunPolicy,
     /// Owning `Heap`; never moves. Null in unit tests that construct a stack `Run`.
     heap_ptr: *mut Heap,
-    /// Mirror of `RunState.bump` for remote `claim`.
-    issued: AtomicUsize,
+    /// Owning [`RunHeap::live`]. Null in stack tests.
+    runs: *mut RunHeap,
     remote: RemoteLine,
 }
 
 #[repr(C, align(64))]
 struct RemoteLine {
+    /// Mirror of `RunState.bump` for remote `claim`. Off the owner hit line.
+    issued: AtomicUsize,
     link: InboxLink<Run>,
     claims: ClaimBits,
 }
@@ -266,8 +268,9 @@ impl Run {
             heap,
             policy,
             heap_ptr: core::ptr::null_mut(),
-            issued: AtomicUsize::new(0),
+            runs: core::ptr::null_mut(),
             remote: RemoteLine {
+                issued: AtomicUsize::new(0),
                 link: InboxLink::new(),
                 claims,
             },
@@ -287,8 +290,9 @@ impl Run {
         self.heap = heap;
     }
 
-    pub(crate) fn set_heap(&mut self, heap: &Heap) {
+    pub(crate) fn set_heap(&mut self, heap: &Heap, runs: &RunHeap) {
         self.heap_ptr = core::ptr::from_ref(heap).cast_mut();
+        self.runs = core::ptr::from_ref(runs).cast_mut();
     }
 
     /// Owning heap when `heap_ptr` is set and the generation still matches.
@@ -369,6 +373,9 @@ impl Run {
         let state = unsafe { &mut *self.state.get() };
         let ptr = Self::pop_free(state)?;
         debug_assert!(state.live < state.capacity);
+        if state.live == 0 {
+            self.add_live();
+        }
         state.live += 1;
         Some(ptr)
     }
@@ -399,13 +406,15 @@ impl Run {
         Self::write_link(self.address(BlockIndex::new(end - 1)), state.free);
         state.free = self.address(BlockIndex::new(start)).as_ptr().addr();
         state.bump = end;
-        self.issued.store(end, Ordering::Relaxed);
+        self.remote.issued.store(end, Ordering::Relaxed);
         true
     }
 
     /// Owner-local: live → pointer freelist. `Ok(true)` when the run was full.
     ///
-    /// Owner double-free is undefined. Remote admission is `claim` / `accept`.
+    /// Hit ignores the flag and does not discard. Miss / slow / unbind call
+    /// [`Self::discard_empty`] and `push_available` from the flag. Owner DF is
+    /// undefined. Remote admission is `claim` / `accept`.
     #[inline]
     pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<bool, RunError> {
         let block = self.locate(ptr)?;
@@ -415,8 +424,8 @@ impl Run {
         debug_assert!(state.live > 0);
         state.live -= 1;
         Self::push_free(state, block.ptr());
-        if state.live == 0 && self.policy == RunPolicy::Discard {
-            self.maybe_discard(state);
+        if state.live == 0 {
+            self.sub_live();
         }
         Ok(was_full)
     }
@@ -424,7 +433,7 @@ impl Run {
     /// Freer: reserve remote admission before publish / payload reuse.
     pub(crate) fn claim(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
         let block = self.locate(ptr)?;
-        if block.index().get() >= self.issued.load(Ordering::Relaxed) {
+        if block.index().get() >= self.remote.issued.load(Ordering::Relaxed) {
             return Err(RunError::DoubleFree);
         }
 
@@ -445,6 +454,7 @@ impl Run {
 
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
+        let was_live = state.live != 0;
         for word in 0..self.remote.claims.word_count {
             let mut bits = self.remote.claims.drain_word(word);
             while bits != 0 {
@@ -459,10 +469,40 @@ impl Run {
             }
         }
 
+        if was_live && state.live == 0 {
+            self.sub_live();
+        }
         if state.live == 0 && self.policy == RunPolicy::Discard {
             self.maybe_discard(state);
         }
         self.remote.claims.any_set()
+    }
+
+    fn add_live(&self) {
+        let Some(runs) = NonNull::new(self.runs) else {
+            return;
+        };
+        // SAFETY: `runs` is the immovable `RunHeap` in the owning `Heap`.
+        unsafe { runs.as_ref() }.add_live();
+    }
+
+    fn sub_live(&self) {
+        let Some(runs) = NonNull::new(self.runs) else {
+            return;
+        };
+        // SAFETY: `runs` is the immovable `RunHeap` in the owning `Heap`.
+        unsafe { runs.as_ref() }.sub_live();
+    }
+
+    /// `madvise` empty Discard payload. Keep is a no-op. Off the free hit.
+    #[cold]
+    pub(crate) fn discard_empty(&self) {
+        if self.policy != RunPolicy::Discard || self.is_live() {
+            return;
+        }
+        // SAFETY: owner-local; `is_live` just observed empty.
+        let state = unsafe { &mut *self.state.get() };
+        self.maybe_discard(state);
     }
 
     #[cold]
@@ -471,7 +511,7 @@ impl Run {
         debug_assert_eq!(state.live, 0);
         state.bump = 0;
         state.free = FREE_END;
-        self.issued.store(0, Ordering::Relaxed);
+        self.remote.issued.store(0, Ordering::Relaxed);
         OsMemory::discard(self.range());
     }
 
@@ -1006,6 +1046,7 @@ mod tests {
         let run = test_run_discard(30, class);
         let ptr = alloc_block(&run).unwrap();
         assert_eq!(run.free(ptr), Ok(false));
+        run.discard_empty();
         assert!(!run.is_live());
         assert!(run.allocate().is_none());
         assert!(run.extend());
@@ -1042,6 +1083,7 @@ mod tests {
         let base = run.range().base();
         let ptr = alloc_block(&run).unwrap();
         assert_eq!(run.free(ptr), Ok(false));
+        run.discard_empty();
         // SAFETY: space stays mapped; DONTNEED may zero the page.
         unsafe {
             base.as_ptr().write(0x11);

@@ -78,34 +78,12 @@ impl HeapInner {
         self.extents.rebind(id);
     }
 
-    pub(super) fn has_live(&self) -> bool {
-        self.runs.has_live() || self.extents.has_live()
+    pub(super) fn occupied(&self) -> bool {
+        self.runs.occupied() || self.extents.occupied()
     }
 
-    /// Owner-local free. `Ok(true)` when this owner is no longer live.
-    ///
-    /// Caller owns inbox `flush`. A live owner means the heap is not reclaimable,
-    /// so Draining `Heaps::free` can skip the arena scan.
-    pub(super) fn free(
-        &mut self,
-        owner: PageOwner,
-        ptr: NonNull<u8>,
-        ctx: &AllocatorCtx<'_>,
-    ) -> Result<bool, HeapError> {
-        match owner {
-            PageOwner::Run(run) => {
-                // SAFETY: PageMap / inbox carry only live arena run pointers.
-                if unsafe { run.as_ref() }.free(ptr).map_err(HeapError::from)? {
-                    self.runs.push_available(run)?;
-                }
-                // SAFETY: same live arena run; `is_live` counts allocated and claimed.
-                Ok(!unsafe { run.as_ref() }.is_live())
-            }
-            PageOwner::Extent(extent) => {
-                self.extents.free(extent, ptr, ctx.pages)?;
-                Ok(true)
-            }
-        }
+    pub(super) fn has_live(&self) -> bool {
+        self.runs.has_live() || self.extents.has_live()
     }
 
     pub(super) fn push_available(&mut self, run: NonNull<Run>) -> Result<(), HeapError> {
@@ -119,6 +97,33 @@ impl HeapInner {
         heap: &Heap,
     ) -> Option<NonNull<Run>> {
         self.runs.acquire(class, heap.id(), Some(heap), pages)
+    }
+
+    /// Owner-local free. `Ok(true)` when this owner is no longer live.
+    ///
+    /// Caller owns inbox `flush`. A live owner means the heap is not reclaimable,
+    /// so Draining `Heaps::free` can skip the arena scan.
+    pub(super) fn free(
+        &mut self,
+        owner: PageOwner,
+        ptr: NonNull<u8>,
+        pages: &PageMap,
+    ) -> Result<bool, HeapError> {
+        match owner {
+            PageOwner::Run(run) => {
+                // SAFETY: PageMap / inbox carry only live arena run pointers.
+                let run_ref = unsafe { run.as_ref() };
+                if run_ref.free(ptr).map_err(HeapError::from)? {
+                    self.runs.push_available(run)?;
+                }
+                run_ref.discard_empty();
+                Ok(!run_ref.is_live())
+            }
+            PageOwner::Extent(extent) => {
+                self.extents.free(extent, ptr, pages)?;
+                Ok(true)
+            }
+        }
     }
 }
 
@@ -251,7 +256,7 @@ impl Heap {
         if snap.retired || snap.mode != HeapMode::Draining || snap.leases != 0 {
             return false;
         }
-        if !self.inboxes_empty() || inner.has_live() {
+        if !self.inboxes_empty() || inner.occupied() || inner.has_live() {
             return false;
         }
         let again = self.state.load();

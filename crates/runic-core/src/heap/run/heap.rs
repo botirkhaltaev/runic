@@ -1,4 +1,7 @@
-use core::ptr::NonNull;
+use core::{
+    ptr::NonNull,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use crate::{
     arena::Arena,
@@ -13,6 +16,8 @@ use super::{
 };
 
 pub(crate) struct RunHeap {
+    /// Occupied runs with `live > 0`. Updated on the 0↔1 edge only.
+    live: AtomicUsize,
     /// In-space header pointers. The `Run` itself lives at `base + RUN_SIZE`.
     runs: Arena<NonNull<Run>>,
     maps: Arena<Mapping>,
@@ -30,6 +35,7 @@ unsafe impl Send for RunHeap {}
 impl RunHeap {
     pub(crate) fn new(config: RunConfig) -> Self {
         Self {
+            live: AtomicUsize::new(0),
             runs: Arena::new(),
             maps: Arena::new(),
             map_index: None,
@@ -64,7 +70,7 @@ impl RunHeap {
         let id = RunId::from_index(index)?;
         let mut run = Run::new(id, heap_id, base, class, self.policy)?;
         if let Some(heap) = heap {
-            run.set_heap(heap);
+            run.set_heap(heap, self);
         }
         let run = self.insert_run(index, id, run, pages)?;
         self.used += 1;
@@ -117,7 +123,21 @@ impl RunHeap {
         }
     }
 
+    pub(crate) fn add_live(&self) {
+        self.live.fetch_add(1, Ordering::Release);
+    }
+
+    pub(crate) fn sub_live(&self) {
+        self.live.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn occupied(&self) -> bool {
+        self.live.load(Ordering::Acquire) != 0
+    }
+
     /// Any occupied run with outstanding allocated or claimed blocks.
+    ///
+    /// Production reclaim uses [`Self::occupied`] then this scan.
     pub(crate) fn has_live(&self) -> bool {
         self.runs.iter().any(|run| {
             // SAFETY: directory stores only in-space headers from this heap.
