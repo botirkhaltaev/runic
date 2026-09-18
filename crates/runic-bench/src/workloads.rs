@@ -3,7 +3,9 @@ use crate::{collections, libraries, threaded};
 #[derive(Clone, Copy)]
 pub struct Workload {
     name: &'static str,
-    elems: usize,
+    /// Element count for throughput. A function because `oversubscribed`
+    /// scales with the host's core count.
+    elems: fn() -> usize,
     run: fn() -> usize,
 }
 
@@ -14,8 +16,8 @@ impl Workload {
     }
 
     #[must_use]
-    pub const fn elems(self) -> usize {
-        self.elems
+    pub fn elems(self) -> usize {
+        (self.elems)()
     }
 
     #[must_use]
@@ -27,87 +29,97 @@ impl Workload {
 pub const WORKLOADS: &[Workload] = &[
     Workload {
         name: "vec_push_clear",
-        elems: 32 * 1_024,
+        elems: || 32 * 1_024,
         run: || collections::vec_push_clear(32, 1_024),
     },
     Workload {
         name: "vec_many_small",
-        elems: 16 * 1_024,
+        elems: || 16 * 1_024,
         run: || collections::vec_many_small(16, 1_024),
     },
     Workload {
         name: "string_building",
-        elems: 32 * 1_024,
+        elems: || 32 * 1_024,
         run: || collections::string_building(32, 1_024),
     },
     Workload {
         name: "hashmap_insert_remove",
-        elems: 16 * 1_024,
+        elems: || 16 * 1_024,
         run: || collections::hashmap_insert_remove(16, 1_024),
     },
     Workload {
         name: "arc_clone_drop",
-        elems: 32 * 1_024,
+        elems: || 32 * 1_024,
         run: || collections::arc_clone_drop(32, 1_024),
     },
     Workload {
         name: "mixed_collections",
-        elems: 8 * 1_024,
+        elems: || 8 * 1_024,
         run: || collections::mixed_collections(8, 1_024),
     },
     Workload {
         name: "tree",
-        elems: 8 * 512,
+        elems: || 8 * 512,
         run: || collections::tree(8, 512),
     },
     Workload {
         name: "word_count",
-        elems: 4 * 4_096,
+        elems: || 4 * 4_096,
         run: || collections::word_count(4, 4_096),
     },
     Workload {
         name: "json_api",
-        elems: 8 * 128,
+        elems: || 8 * 128,
         run: || libraries::json_api(8, 128),
     },
     Workload {
         name: "regex_search",
-        elems: 8 * 1_024,
+        elems: || 8 * 1_024,
         run: || libraries::regex_search(8, 1_024),
     },
     Workload {
         name: "http_buffers",
-        elems: 16 * 256,
+        elems: || 16 * 256,
         run: || libraries::http_buffers(16, 256),
     },
     Workload {
         name: "channel_pipeline",
-        elems: 8 * 4 * 256,
+        elems: || 8 * 4 * 256,
         run: || threaded::channel_pipeline(8, 256),
     },
     Workload {
         name: "arc_share_drop",
-        elems: 8 * 1_024,
+        elems: || 8 * 1_024,
         run: || threaded::arc_share_drop(8, 1_024),
     },
     Workload {
         name: "scoped_map_reduce",
-        elems: 4 * 4 * 256,
+        elems: || 4 * 4 * 256,
         run: || threaded::scoped_map_reduce(4, 256),
     },
     Workload {
+        name: "spawn_churn",
+        elems: || 4 * 16 * threaded::SPAWN_CHURN_ALLOCS,
+        run: || threaded::spawn_churn(4, 16),
+    },
+    Workload {
+        name: "oversubscribed",
+        elems: || threaded::oversubscribed_threads() * 4_096,
+        run: || threaded::oversubscribed(4_096),
+    },
+    Workload {
         name: "large_buffers",
-        elems: 4 * 16,
+        elems: || 4 * 16,
         run: || libraries::large_buffers(4, 16),
     },
     Workload {
         name: "large_buffers_dirty",
-        elems: 4 * 16,
+        elems: || 4 * 16,
         run: || libraries::large_buffers_dirty(4, 16),
     },
     Workload {
         name: "run_churn_bursty",
-        elems: 4 * 4 * 1_024,
+        elems: || 4 * 4 * 1_024,
         run: || collections::run_churn_bursty(4, 4),
     },
 ];

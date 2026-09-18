@@ -16,6 +16,7 @@ cargo bench -p runic-bench --bench global_runic -- 'global/runic/json_api' --exa
 - Collections: `Vec`, `String`, `HashMap`, `Arc`, tree, word-count.
 - Libraries: JSON API roundtrip, regex log scan, `bytes` HTTP buffers, large read/decode buffers.
 - Threaded: channel pipeline, Arc last-drop, scoped map-reduce (profile with `RUNIC_PROFILE_CPUS=0-3`).
+- Lifecycle: `spawn_churn` (short-lived threads, live set dropped after exit), `oversubscribed` (4x cores threads churning 64 B rings; thread count follows the affinity mask, so `elems` is computed at run time).
 
 Default Criterion settings are developer-sized (`sample_size=10`, 1s, 2000 resamples, no plots, no Rayon). CLI flags (`--measurement-time`, `--sample-size`, `--profile-time`) override them. Rayon is off because Criterion analysis allocates through `#[global_allocator]`.
 

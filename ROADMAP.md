@@ -178,6 +178,31 @@ Primitive work: [rseq-rs](https://github.com/botirkhaltaev/rseq-rs).
 O(1) TLS steal (this pass): freelist/64 18.5 → 22.9, gate missed; churn 37.4 → 31.3
 did not save the AND. Seeded `freelist_allocate_only` pays steal per sample. Reverted.
 
+Per-CPU heaps on rseq-rs 0.8 (Phase 0, measured and declined). Gate fixed before
+measuring: proceed only if runic loses > 2× to the best competitor on `spawn_churn`
+Cost or peak RSS, or heap lifecycle (bind / adopt / Draining / retire / reclaim) is
+> 10% of `spawn_churn` user cycles. `CPUS=0-7`, cycles:u/elem, 5 s × 5; RSS from
+`metrics` (this host, 96 CPUs unpinned):
+
+```text
+                    runic   system  mimalloc  snmalloc  jemalloc
+spawn_churn          379      482      668       604      1126
+oversubscribed      27.5     55.1     40.6      38.2      50.9
+peak RSS MiB
+  spawn_churn       14.9     10.3     14.1      12.1      55.6
+  oversubscribed    19.7     15.5     19.6      17.5    1037.1
+minflt spawn_churn   726      130       91        89       734
+```
+
+runic wins Cost on both; RSS is ≤ 1.44× system. Lifecycle self cycles on
+`spawn_churn`: `retire_if_idle` 4.6, `adopt` 3.0, `free_remote` 2.8, `free_slow` 3.9,
+`Heaps::retire` 1.6, `flush` 1.5, `free_owner` 1.3, `reclaim` 1.3 → 16–21% of user
+cycles, but user cycles are ~6% of wall (1.39 G cycles/s over 8 CPUs; thread
+creation dominates), so removing all of it is ≤ 7% wall. Elems/s is within 6% of
+system on both. Not worth a rewrite of ownership. Open Where: runic takes 5–8× the
+minor faults of the C allocators on `spawn_churn` with every `RunPolicy` /
+`ExtentPolicy` (801–1557); find the source before touching architecture.
+
 Run-local `#140` vs `c1ecdeb` (this host):
 
 ```text
@@ -238,8 +263,8 @@ Next:
 
 ```text
 Do not retry #126 / #128 / #135 (per-CPU on single-thread churn) / O(1) TLS steal
-/ locate-offset dual free / TLS extent cache / first-fit extent reuse
-/ lock-free Heaps::get
+/ per-CPU heaps on rseq (Phase 0 declined) / locate-offset dual free
+/ TLS extent cache / first-fit extent reuse / lock-free Heaps::get
 ```
 
 ## Core Invariants
@@ -729,8 +754,9 @@ Do not copy reference implementation code.
 ## Related: rseq-rs
 
 Standalone librseq-in-Rust (`Thread` + `Word`, not a runic hit). Lives in
-[botirkhaltaev/rseq-rs](https://github.com/botirkhaltaev/rseq-rs) (`0.1.0`).
-Do not wire it into the allocator hit from this roadmap.
+[botirkhaltaev/rseq-rs](https://github.com/botirkhaltaev/rseq-rs) (`0.8`, GitHub
+only). Do not wire it into the allocator hit from this roadmap; per-CPU heaps on
+it were measured and declined (Current Status).
 
 ## Standing Rules
 

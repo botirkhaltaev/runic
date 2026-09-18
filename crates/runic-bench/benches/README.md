@@ -33,6 +33,11 @@ Threaded (profile with `RUNIC_PROFILE_CPUS=0-3`):
 - `global/runic/arc_share_drop`
 - `global/runic/scoped_map_reduce`
 
+Lifecycle (profile with `RUNIC_PROFILE_CPUS=0-7`; thread counts follow the mask):
+
+- `global/runic/spawn_churn`
+- `global/runic/oversubscribed`
+
 ## Run
 
 ```sh

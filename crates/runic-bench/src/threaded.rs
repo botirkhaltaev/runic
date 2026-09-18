@@ -1,11 +1,91 @@
 use std::{
     collections::HashMap,
     hint::black_box,
+    num::NonZero,
     sync::{Arc, mpsc},
     thread,
 };
 
 const THREADS: usize = 4;
+
+/// Short-lived threads: each allocates, frees most, and hands a small live set
+/// back to the joiner, which drops it after the thread has exited.
+///
+/// Allocations per thread: `SPAWN_SMALL` 64 B, `SPAWN_LARGE` 1 KiB, `SPAWN_LIVE` kept.
+#[must_use]
+pub fn spawn_churn(rounds: usize, threads: usize) -> usize {
+    const SPAWN_SMALL: usize = 64;
+    const SPAWN_LARGE: usize = 8;
+    const SPAWN_LIVE: usize = 4;
+    let mut checksum = 0_usize;
+    for round in 0..rounds {
+        let joins: Vec<_> = (0..threads)
+            .map(|worker| {
+                thread::spawn(move || {
+                    let mut small: Vec<Vec<u8>> = (0..SPAWN_SMALL)
+                        .map(|i| vec![(i ^ round ^ worker).to_le_bytes()[0]; 64])
+                        .collect();
+                    let large: Vec<Vec<u8>> = (0..SPAWN_LARGE)
+                        .map(|i| vec![(i ^ round).to_le_bytes()[0]; 1024])
+                        .collect();
+                    let local = small.iter().chain(&large).map(Vec::len).sum::<usize>();
+                    small.truncate(SPAWN_LIVE);
+                    black_box(large);
+                    (local, small)
+                })
+            })
+            .collect();
+        for (local, live) in joins.into_iter().filter_map(|join| join.join().ok()) {
+            checksum ^= local ^ live.len();
+            black_box(live);
+        }
+    }
+    black_box(checksum)
+}
+
+/// Allocations per `spawn_churn` thread.
+pub const SPAWN_CHURN_ALLOCS: usize = 64 + 8;
+
+/// Threads outnumber cores 4:1. Each thread churns a ring of 64 B blocks so
+/// frees hit the freelist in FIFO order, not LIFO.
+#[must_use]
+pub fn oversubscribed(ops: usize) -> usize {
+    const RING: usize = 64;
+    let threads = oversubscribed_threads();
+    let mut checksum = 0_usize;
+    thread::scope(|scope| {
+        let joins: Vec<_> = (0..threads)
+            .map(|worker| {
+                scope.spawn(move || {
+                    let mut ring: Vec<Vec<u8>> = (0..RING)
+                        .map(|i| vec![(i ^ worker).to_le_bytes()[0]; 64])
+                        .collect();
+                    let mut local = 0_usize;
+                    for i in 0..ops {
+                        let slot = i % RING;
+                        local ^= usize::from(ring[slot][0]);
+                        ring[slot] = vec![(i ^ worker).to_le_bytes()[0]; 64];
+                    }
+                    black_box(ring);
+                    local
+                })
+            })
+            .collect();
+        for local in joins.into_iter().filter_map(|join| join.join().ok()) {
+            checksum ^= local;
+        }
+    });
+    black_box(checksum)
+}
+
+/// `4 * available_parallelism`, at least 8.
+#[must_use]
+pub fn oversubscribed_threads() -> usize {
+    thread::available_parallelism()
+        .map_or(2, NonZero::get)
+        .saturating_mul(4)
+        .max(8)
+}
 
 /// Producers allocate `Vec<u8>` / `String` messages; the consumer drops them.
 #[must_use]
