@@ -101,6 +101,18 @@ pub(crate) enum RunError {
     DoubleFree,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RunFree {
+    Unchanged,
+    Available,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Accept {
+    Done,
+    Requeue,
+}
+
 /// Run-owned remote-admission bitmap.
 ///
 /// Remote `claim` is `issued` + `try_set`. A second claim on the same bit is
@@ -188,12 +200,11 @@ pub(crate) struct Run {
     stride: usize,
     class: SizeClass,
     id: RunId,
-    heap: HeapId,
+    heap: &'static Heap,
+    /// Owning `RunHeap`; initialized only after the process-lifetime `Heap` is
+    /// immovable in `Heaps::arena`.
+    runs: NonNull<RunHeap>,
     policy: RunPolicy,
-    /// Owning `Heap`; never moves. Null in unit tests that construct a stack `Run`.
-    heap_ptr: *mut Heap,
-    /// Owning [`RunHeap::live`]. Null in stack tests.
-    runs: *mut RunHeap,
     remote: RemoteLine,
 }
 
@@ -237,7 +248,8 @@ struct RunState {
 impl Run {
     pub(crate) fn new(
         id: RunId,
-        heap: HeapId,
+        heap: &'static Heap,
+        runs: NonNull<RunHeap>,
         base: NonNull<u8>,
         class: SizeClass,
         policy: RunPolicy,
@@ -266,9 +278,8 @@ impl Run {
             class,
             id,
             heap,
+            runs,
             policy,
-            heap_ptr: core::ptr::null_mut(),
-            runs: core::ptr::null_mut(),
             remote: RemoteLine {
                 issued: AtomicUsize::new(0),
                 link: InboxLink::new(),
@@ -286,20 +297,8 @@ impl Run {
         self.id
     }
 
-    pub(crate) fn set_heap_id(&mut self, heap: HeapId) {
-        self.heap = heap;
-    }
-
-    pub(crate) fn set_heap(&mut self, heap: &Heap, runs: &RunHeap) {
-        self.heap_ptr = core::ptr::from_ref(heap).cast_mut();
-        self.runs = core::ptr::from_ref(runs).cast_mut();
-    }
-
-    /// Owning heap when `heap_ptr` is set and the generation still matches.
-    pub(crate) fn heap(&self) -> Option<&Heap> {
-        // SAFETY: `heap_ptr` is the immovable arena slot when published.
-        let heap = unsafe { NonNull::new(self.heap_ptr)?.as_ref() };
-        heap.matches(self.heap).then_some(heap)
+    pub(crate) const fn heap(&self) -> &'static Heap {
+        self.heap
     }
 
     /// In-page header at `(ptr & !(RUN_SIZE-1)) + RUN_SIZE`. Self-check `base`.
@@ -318,8 +317,8 @@ impl Run {
         Some(unsafe { NonNull::new_unchecked(base_ptr.cast_mut().cast()) })
     }
 
-    pub(crate) const fn heap_id(&self) -> HeapId {
-        self.heap
+    pub(crate) fn heap_id(&self) -> HeapId {
+        self.heap.id()
     }
 
     pub(crate) const fn class(&self) -> SizeClass {
@@ -411,13 +410,13 @@ impl Run {
         true
     }
 
-    /// Owner-local: live → pointer freelist. `Ok(true)` when the run was full.
+    /// Owner-local: live → pointer freelist. `Available` when the run was full.
     ///
     /// Hit ignores the flag and does not discard. Miss / slow / unbind call
     /// [`Self::discard_empty`] and `push_available` from the flag. Owner DF is
     /// undefined. Remote admission is `claim` / `accept`.
     #[inline]
-    pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<bool, RunError> {
+    pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<RunFree, RunError> {
         let block = self.locate(ptr)?;
         // SAFETY: owner-local methods are called only by the owning heap.
         let state = unsafe { &mut *self.state.get() };
@@ -428,7 +427,11 @@ impl Run {
         if state.live == 0 {
             self.sub_live();
         }
-        Ok(was_full)
+        Ok(if was_full {
+            RunFree::Available
+        } else {
+            RunFree::Unchanged
+        })
     }
 
     /// Freer: reserve remote admission before publish / payload reuse.
@@ -447,10 +450,10 @@ impl Run {
     /// Owner: clear inbox queued, drain every claimed bit, publish blocks to the freelist.
     ///
     /// Wakeup proof (idle-first + recheck): clears queued *before* scanning, so a racing
-    /// `claim` + `Inbox::push` may re-queue the run once it is dequeued. Returns `true` when
+    /// `claim` + `Inbox::push` may re-queue the run once it is dequeued. Returns `Requeue` when
     /// claim bits remain after the scan — the caller must `Inbox::push` again (or a racer
     /// already did). Exactly one of those pushes keeps the run queued when work remains.
-    pub(crate) fn accept(&self) -> bool {
+    pub(crate) fn accept(&self) -> Accept {
         self.remote.link.clear_queued();
 
         // SAFETY: owner-local methods are called only by the owning heap.
@@ -476,23 +479,22 @@ impl Run {
         if state.live == 0 && self.policy == RunPolicy::Discard {
             self.maybe_discard(state);
         }
-        self.remote.claims.any_set()
+        if self.remote.claims.any_set() {
+            Accept::Requeue
+        } else {
+            Accept::Done
+        }
     }
 
     fn add_live(&self) {
-        let Some(runs) = NonNull::new(self.runs) else {
-            return;
-        };
-        // SAFETY: `runs` is the immovable `RunHeap` in the owning `Heap`.
-        unsafe { runs.as_ref() }.add_live();
+        // SAFETY: `runs` points to the immovable `RunHeap` that constructed
+        // this run; the heap outlives every in-space run header.
+        unsafe { self.runs.as_ref() }.add_live();
     }
 
     fn sub_live(&self) {
-        let Some(runs) = NonNull::new(self.runs) else {
-            return;
-        };
-        // SAFETY: `runs` is the immovable `RunHeap` in the owning `Heap`.
-        unsafe { runs.as_ref() }.sub_live();
+        // SAFETY: same owner edge as `add_live`.
+        unsafe { self.runs.as_ref() }.sub_live();
     }
 
     /// `madvise` empty Discard payload. Keep is a no-op. Off the free hit.
@@ -626,6 +628,7 @@ mod tests {
     use core::ops::Deref;
 
     use crate::{
+        config::AllocatorConfig,
         layout::LayoutSpec,
         memory::{Mapping, OsMemory},
         size_class::SizeClasses,
@@ -637,6 +640,7 @@ mod tests {
 
     struct TestRun {
         run: Run,
+        _runs: Box<RunHeap>,
         _map: Mapping,
     }
 
@@ -663,10 +667,6 @@ mod tests {
         })
     }
 
-    fn test_heap_id() -> HeapId {
-        HeapId::new(0, NonZeroU32::MIN).unwrap()
-    }
-
     fn test_run(index: u32, class: SizeClass) -> TestRun {
         test_run_with(index, class, RunPolicy::Keep)
     }
@@ -677,15 +677,25 @@ mod tests {
 
     fn test_run_with(index: u32, class: SizeClass, policy: RunPolicy) -> TestRun {
         let map = OsMemory::map_aligned(RUN_SPACE, RUN_SIZE).unwrap();
+        let heap = Box::leak(Box::new(Heap::new(
+            HeapId::new(0, NonZeroU32::MIN).unwrap(),
+            AllocatorConfig::new(),
+        )));
+        let runs = Box::new(RunHeap::new(config::RunConfig::new()));
         let run = Run::new(
             RunId::from_index(index).unwrap(),
-            test_heap_id(),
+            heap,
+            NonNull::from(runs.as_ref()),
             map.base(),
             class,
             policy,
         )
         .expect("test run");
-        TestRun { run, _map: map }
+        TestRun {
+            run,
+            _runs: runs,
+            _map: map,
+        }
     }
 
     #[test]
@@ -916,7 +926,7 @@ mod tests {
         let ptr = alloc_block(&run).unwrap();
 
         assert_eq!(run.claim(ptr), Ok(()));
-        assert!(!run.accept());
+        assert_eq!(run.accept(), Accept::Done);
         assert_eq!(run.allocate(), Some(ptr));
     }
 
@@ -925,7 +935,7 @@ mod tests {
         let class = class_id(64, 8);
         let run = test_run(16, class);
         let ptr = alloc_block(&run).unwrap();
-        assert!(!run.accept());
+        assert_eq!(run.accept(), Accept::Done);
         // `ptr`'s block is still live (never claimed), so the next allocate is fresh.
         assert_ne!(alloc_block(&run).unwrap(), ptr);
     }
@@ -937,7 +947,7 @@ mod tests {
             let run = test_run(u32::try_from(run_index).unwrap(), class);
             let ptr = alloc_block(&run).unwrap();
             assert_eq!(run.claim(ptr), Ok(()), "size={size}");
-            assert!(!run.accept(), "size={size}");
+            assert_eq!(run.accept(), Accept::Done, "size={size}");
             assert_eq!(run.allocate(), Some(ptr), "size={size}");
         }
     }
@@ -985,7 +995,7 @@ mod tests {
 
         // accept coalesces both claims from the single queued entry.
         let _ = inbox.drain();
-        assert!(!run.accept());
+        assert_eq!(run.accept(), Accept::Done);
         assert_eq!(run.allocate(), Some(b));
         assert_eq!(run.allocate(), Some(a));
 
@@ -1033,7 +1043,7 @@ mod tests {
                 while let Some(chain) = inbox.drain() {
                     for r in chain {
                         // SAFETY: `r` is `run_ptr`, live for the scope of this test.
-                        if unsafe { r.as_ref() }.accept() {
+                        if unsafe { r.as_ref() }.accept() == Accept::Requeue {
                             let _ = inbox.push(r);
                         }
                     }
@@ -1055,7 +1065,7 @@ mod tests {
         let class = class_id(64, 8);
         let run = test_run_discard(30, class);
         let ptr = alloc_block(&run).unwrap();
-        assert_eq!(run.free(ptr), Ok(false));
+        assert_eq!(run.free(ptr), Ok(RunFree::Unchanged));
         run.discard_empty();
         assert!(!run.is_live());
         assert!(run.allocate().is_none());
@@ -1068,7 +1078,7 @@ mod tests {
         let class = class_id(64, 8);
         let run = test_run(31, class);
         let ptr = alloc_block(&run).unwrap();
-        assert_eq!(run.free(ptr), Ok(false));
+        assert_eq!(run.free(ptr), Ok(RunFree::Unchanged));
         assert_eq!(run.allocate(), Some(ptr));
     }
 
@@ -1078,7 +1088,7 @@ mod tests {
         let run = test_run_discard(32, class);
         let ptr = alloc_block(&run).unwrap();
         assert_eq!(run.claim(ptr), Ok(()));
-        assert!(!run.accept());
+        assert_eq!(run.accept(), Accept::Done);
         assert!(!run.is_live());
         assert!(run.allocate().is_none());
         assert_eq!(run.claim(ptr), Err(RunError::DoubleFree));
@@ -1092,7 +1102,7 @@ mod tests {
         let run = test_run_discard(33, class);
         let base = run.range().base();
         let ptr = alloc_block(&run).unwrap();
-        assert_eq!(run.free(ptr), Ok(false));
+        assert_eq!(run.free(ptr), Ok(RunFree::Unchanged));
         run.discard_empty();
         // SAFETY: space stays mapped; DONTNEED may zero the page.
         unsafe {

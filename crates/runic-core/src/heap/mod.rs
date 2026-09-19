@@ -29,7 +29,7 @@ pub(crate) use extent::Extent;
 pub(crate) use extent::heap::{ExtentHeap, ExtentInit};
 pub(crate) use heaps::Heaps;
 pub(crate) use id::HeapId;
-pub(crate) use run::{Run, RunError, RunHeap, RunId};
+pub(crate) use run::{Accept, Run, RunError, RunFree, RunHeap, RunId};
 pub(crate) use state::HeapMode;
 pub(crate) use thread::{THREAD_HEAP, ThreadFreeError, ThreadHeap};
 
@@ -58,6 +58,12 @@ pub(super) struct HeapInner {
     extents: ExtentHeap,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum OwnerState {
+    Live,
+    Empty,
+}
+
 /// Process `PageMap` + `Heaps` for miss / bind / unbind / Draining.
 ///
 /// [`crate::allocator::Allocator::ctx`] is `'static`. Bind/install still require
@@ -77,7 +83,6 @@ impl HeapInner {
     }
 
     fn rebind(&mut self, id: HeapId) {
-        self.runs.rebind(id);
         self.extents.rebind(id);
     }
 
@@ -97,12 +102,12 @@ impl HeapInner {
         &mut self,
         class: SizeClass,
         pages: &PageMap,
-        heap: &Heap,
+        heap: &'static Heap,
     ) -> Option<NonNull<Run>> {
-        self.runs.acquire(class, heap.id(), Some(heap), pages)
+        self.runs.acquire(class, heap, pages)
     }
 
-    /// Owner-local free. `Ok(true)` when this owner is no longer live.
+    /// Owner-local free. `Empty` when this owner is no longer live.
     ///
     /// Caller owns inbox `flush`. A live owner means the heap is not reclaimable,
     /// so Draining `Heaps::free` can skip the arena scan.
@@ -111,20 +116,24 @@ impl HeapInner {
         owner: PageOwner,
         ptr: NonNull<u8>,
         pages: &PageMap,
-    ) -> Result<bool, HeapError> {
+    ) -> Result<OwnerState, HeapError> {
         match owner {
             PageOwner::Run(run) => {
                 // SAFETY: PageMap / inbox carry only live arena run pointers.
                 let run_ref = unsafe { run.as_ref() };
-                if run_ref.free(ptr).map_err(HeapError::from)? {
+                if run_ref.free(ptr).map_err(HeapError::from)? == RunFree::Available {
                     self.runs.push_available(run)?;
                 }
                 run_ref.discard_empty();
-                Ok(!run_ref.is_live())
+                Ok(if run_ref.is_live() {
+                    OwnerState::Live
+                } else {
+                    OwnerState::Empty
+                })
             }
             PageOwner::Extent(extent) => {
                 self.extents.free(extent, ptr, pages)?;
-                Ok(true)
+                Ok(OwnerState::Empty)
             }
         }
     }
@@ -281,7 +290,7 @@ impl Heap {
         while let Some(chain) = self.run_inbox.drain() {
             for run in chain {
                 // SAFETY: dequeued from this heap's run inbox; live arena run.
-                if inner.runs.accept(run)? {
+                if inner.runs.accept(run)? == Accept::Requeue {
                     let _ = self.run_inbox.push(run);
                 }
             }

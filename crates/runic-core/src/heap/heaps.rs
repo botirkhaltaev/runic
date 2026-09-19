@@ -8,7 +8,7 @@ use core::{
 use crate::{arena::Arena, config::AllocatorConfig, heap::HeapError, memory::PageOwner};
 
 use super::state::HeapMode;
-use super::{AllocatorCtx, Heap, HeapId, HeapInner};
+use super::{AllocatorCtx, Heap, HeapId, HeapInner, OwnerState};
 
 const FREE_END: u32 = u32::MAX;
 
@@ -121,8 +121,8 @@ impl Heaps {
         ctx: &AllocatorCtx,
     ) -> Result<(), HeapError> {
         let (heap, mut inner) = self.admit(id)?;
-        let emptied = inner.free(owner, ptr, ctx.pages)?;
-        if emptied {
+        let state = inner.free(owner, ptr, ctx.pages)?;
+        if state == OwnerState::Empty {
             heap.reclaim(&inner, self);
         }
         Ok(())

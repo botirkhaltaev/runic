@@ -285,7 +285,7 @@ impl Allocator {
         let heap_id = owner.heap_id();
         let heap = match owner {
             // SAFETY: PageMap / header_of store only live arena run pointers.
-            PageOwner::Run(run) => unsafe { run.as_ref() }.heap(),
+            PageOwner::Run(run) => Some(unsafe { run.as_ref() }.heap()),
             PageOwner::Extent(_) => None,
         }
         .or_else(|| ctx.heaps.get(heap_id))
@@ -694,7 +694,7 @@ mod tests {
             let run = run_of(pages, ptr);
             // SAFETY: user-held block; claim is the remote admission path.
             assert_eq!(unsafe { run.as_ref() }.claim(ptr), Ok(()));
-            assert!(!unsafe { run.as_ref() }.accept());
+            assert_eq!(unsafe { run.as_ref() }.accept(), crate::heap::Accept::Done);
             assert_eq!(unsafe { run.as_ref() }.allocate(), Some(ptr));
             assert!(unsafe { run.as_ref() }.free(ptr).is_ok());
             unbind(tls);

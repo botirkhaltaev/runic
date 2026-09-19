@@ -2,7 +2,7 @@ use core::{cell::Cell, ptr::NonNull};
 
 use crate::{
     allocator::Allocator,
-    heap::{Extent, ExtentInit, HeapError, HeapId, Run, RunError},
+    heap::{Extent, ExtentInit, HeapError, HeapId, Run, RunError, RunFree},
     layout::LayoutSpec,
     memory::{PageMap, PageOwner},
     size_class::{SizeClass, SizeClasses},
@@ -183,11 +183,11 @@ impl ThreadHeap {
             return Err(ThreadFreeError::Remote(PageOwner::Run(run)));
         }
         match run_ref.free(ptr) {
-            Ok(false) => {
+            Ok(RunFree::Unchanged) => {
                 run_ref.discard_empty();
                 Ok(())
             }
-            Ok(true) => {
+            Ok(RunFree::Available) => {
                 self.push_available(run);
                 run_ref.discard_empty();
                 Ok(())

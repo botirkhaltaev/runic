@@ -5,18 +5,24 @@ use core::{
 
 use crate::{
     arena::Arena,
-    heap::{Heap, HeapError, HeapId, Run, RunId},
+    heap::{Heap, HeapError, Run, RunId},
     memory::{Mapping, OsMemory, PageMap},
     size_class::{SizeClass, SizeClasses},
 };
 
 use super::{
-    MAP_RUNS, MAP_SIZE, RUN_SIZE, RUN_SPACE,
+    Accept, MAP_RUNS, MAP_SIZE, RUN_SIZE, RUN_SPACE,
     config::{RunConfig, RunPolicy},
 };
 
+/// Owner-local run directory and aggregate live count.
+///
+/// Once `acquire` constructs the first run, this value must remain at its
+/// process-lifetime address: each run keeps a back-pointer for 0↔1 live edges.
+/// Production satisfies this by constructing runs only after the owning
+/// `Heap` is published in its immovable arena slot.
 pub(crate) struct RunHeap {
-    /// Occupied runs with `live > 0`. Updated on the 0↔1 edge only.
+    /// Runs with live blocks. Updated only on each run's 0↔1 edge.
     live: AtomicUsize,
     /// In-space header pointers. The `Run` itself lives at `base + RUN_SIZE`.
     runs: Arena<NonNull<Run>>,
@@ -27,9 +33,9 @@ pub(crate) struct RunHeap {
     policy: RunPolicy,
 }
 
-// SAFETY: RunHeap owns run metadata and available-list pointers into its own
-// arena. Moving the heap to another thread does not permit concurrent mutation;
-// global allocator access remains synchronized by the allocator boundary.
+// SAFETY: production moves `RunHeap` only before its first run is constructed.
+// Afterwards the owning arena `Heap` is immovable, and owner-local mutation is
+// serialized by `HeapInner`.
 unsafe impl Send for RunHeap {}
 
 impl RunHeap {
@@ -49,29 +55,25 @@ impl RunHeap {
     pub(crate) fn acquire(
         &mut self,
         class: SizeClass,
-        heap_id: HeapId,
-        heap: Option<&Heap>,
+        heap: &'static Heap,
         pages: &PageMap,
     ) -> Option<NonNull<Run>> {
         self.take_available(class)
-            .or_else(|| self.new_run(class, heap_id, heap, pages))
+            .or_else(|| self.new_run(class, heap, pages))
     }
 
     #[cold]
     fn new_run(
         &mut self,
         class: SizeClass,
-        heap_id: HeapId,
-        heap: Option<&Heap>,
+        heap: &'static Heap,
         pages: &PageMap,
     ) -> Option<NonNull<Run>> {
         let base = self.take()?;
         let index = self.runs.vacant()?;
         let id = RunId::from_index(index)?;
-        let mut run = Run::new(id, heap_id, base, class, self.policy)?;
-        if let Some(heap) = heap {
-            run.set_heap(heap, self);
-        }
+        let runs = NonNull::from(&*self);
+        let run = Run::new(id, heap, runs, base, class, self.policy)?;
         let run = self.insert_run(index, id, run, pages)?;
         self.used += 1;
         Some(run)
@@ -102,32 +104,25 @@ impl RunHeap {
 
     /// Owner: drain every claimed bit on `run` and publish the freed blocks.
     ///
-    /// Returns whether the caller must `Inbox::push` `run` again because a straggling claim
+    /// Returns `Requeue` when the caller must queue `run` again because a straggling claim
     /// raced the scan (see `Run::accept`).
-    pub(crate) fn accept(&mut self, run: NonNull<Run>) -> Result<bool, HeapError> {
+    pub(crate) fn accept(&mut self, run: NonNull<Run>) -> Result<Accept, HeapError> {
         // SAFETY: the run inbox only ever carries pointers published from this allocator's
         // live arena.
         let run_ref = unsafe { run.as_ref() };
         let was_full = run_ref.is_full();
-        let needs_push = run_ref.accept();
+        let accept = run_ref.accept();
         if was_full && !run_ref.is_full() {
             self.push_available(run)?;
         }
-        Ok(needs_push)
+        Ok(accept)
     }
 
-    pub(crate) fn rebind(&mut self, heap_id: HeapId) {
-        for run in self.runs.iter_mut() {
-            // SAFETY: directory stores only in-space headers from this heap.
-            unsafe { run.as_mut() }.set_heap_id(heap_id);
-        }
-    }
-
-    pub(crate) fn add_live(&self) {
+    pub(super) fn add_live(&self) {
         self.live.fetch_add(1, Ordering::Release);
     }
 
-    pub(crate) fn sub_live(&self) {
+    pub(super) fn sub_live(&self) {
         self.live.fetch_sub(1, Ordering::AcqRel);
     }
 
@@ -223,13 +218,14 @@ mod tests {
     use core::alloc::Layout;
 
     use crate::{
-        heap::{HeapId, Run, RunId},
+        config::AllocatorConfig,
+        heap::{Heap, HeapId, Run, RunId},
         layout::LayoutSpec,
         memory::{OsMemory, PageMap, PageOwner},
         size_class::SizeClasses,
     };
 
-    use super::super::{MAP_RUNS, RUN_SIZE, RUN_SPACE, config::RunConfig};
+    use super::super::{MAP_RUNS, RUN_SIZE, RUN_SPACE, RunFree, config::RunConfig};
     use super::*;
 
     fn class_id(size: usize, align: usize) -> SizeClass {
@@ -248,11 +244,11 @@ mod tests {
 
     fn alloc_block(
         heap: &mut RunHeap,
+        owner: &'static Heap,
         class: SizeClass,
         pages: &PageMap,
     ) -> Option<(NonNull<Run>, NonNull<u8>)> {
-        let heap_id = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
-        let mut run = heap.acquire(class, heap_id, None, pages)?;
+        let mut run = heap.acquire(class, owner, pages)?;
         // SAFETY: RunHeap returns pointers to live runs from its arena.
         let run_ref = unsafe { run.as_mut() };
         let ptr = run_ref.allocate().or_else(|| {
@@ -270,10 +266,14 @@ mod tests {
     fn run_heap_relinks_previously_full_run_after_free() {
         let mut heap = RunHeap::new(RunConfig::new());
         let pages = PageMap::new();
+        let owner = Box::leak(Box::new(Heap::new(
+            HeapId::new(0, core::num::NonZeroU32::MIN).unwrap(),
+            AllocatorConfig::new(),
+        )));
         let class = class_id(64, 8);
         let class_index = class.index();
         let capacity = RUN_SIZE / class.size();
-        let (_run, first) = alloc_block(&mut heap, class, &pages).unwrap();
+        let (_run, first) = alloc_block(&mut heap, owner, class, &pages).unwrap();
         let PageOwner::Run(run_ptr) = pages.get(first).unwrap() else {
             panic!("small allocation should publish a run entry");
         };
@@ -281,16 +281,19 @@ mod tests {
         let id = unsafe { run_ptr.as_ref().id() };
 
         for _ in 1..capacity {
-            assert!(alloc_block(&mut heap, class, &pages).is_some());
+            assert!(alloc_block(&mut heap, owner, class, &pages).is_some());
         }
 
         assert_eq!(available_run_id(&heap, class_index), None);
         // SAFETY: run_ptr is the live page-map run we just filled.
-        assert_eq!(unsafe { run_ptr.as_ref() }.free(first), Ok(true));
+        assert_eq!(
+            unsafe { run_ptr.as_ref() }.free(first),
+            Ok(RunFree::Available)
+        );
         assert_eq!(heap.push_available(run_ptr), Ok(()));
         assert_eq!(available_run_id(&heap, class_index), Some(id));
 
-        let (_run, reused) = alloc_block(&mut heap, class, &pages).unwrap();
+        let (_run, reused) = alloc_block(&mut heap, owner, class, &pages).unwrap();
 
         assert_eq!(reused, first);
         assert_eq!(available_run_id(&heap, class_index), None);
@@ -301,7 +304,10 @@ mod tests {
         let mut heap = RunHeap::new(RunConfig::new());
         let pages = PageMap::new();
         let class = class_id(64, 8);
-        let heap_id = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
+        let owner = Box::leak(Box::new(Heap::new(
+            HeapId::new(0, core::num::NonZeroU32::MIN).unwrap(),
+            AllocatorConfig::new(),
+        )));
         let mapping = OsMemory::map_aligned(RUN_SPACE, RUN_SIZE).unwrap();
         let existing = NonNull::dangling();
         let range = crate::memory::AddressRange::new(mapping.base(), RUN_SIZE);
@@ -309,30 +315,12 @@ mod tests {
 
         let index = heap.runs.vacant().unwrap();
         let id = RunId::from_index(index).unwrap();
-        let run =
-            Run::new(id, heap_id, mapping.base(), class, RunPolicy::Keep).expect("conflict run");
+        let runs = NonNull::from(&heap);
+        let run = Run::new(id, owner, runs, mapping.base(), class, RunPolicy::Keep)
+            .expect("conflict run");
         assert_eq!(heap.insert_run(index, id, run, &pages), None);
         assert!(heap.runs.get_mut(index).is_none());
         assert_eq!(pages.get(mapping.base()), Some(PageOwner::Run(existing)));
-    }
-
-    #[test]
-    fn rebind_rebinds_runs_off_the_available_list() {
-        let mut heap = RunHeap::new(RunConfig::new());
-        let pages = PageMap::new();
-        let class = class_id(64, 8);
-        let old = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
-        let new = HeapId::new(0, core::num::NonZeroU32::new(2).unwrap()).unwrap();
-
-        let run = heap.acquire(class, old, None, &pages).unwrap();
-        // Leave the run checked out (not on available): reincarnation still rebinds it.
-        // SAFETY: run came from this heap's live arena.
-        assert_eq!(unsafe { run.as_ref() }.heap_id(), old);
-
-        heap.rebind(new);
-
-        // SAFETY: run remains a live arena entry after rebind.
-        assert_eq!(unsafe { run.as_ref() }.heap_id(), new);
     }
 
     #[test]
@@ -341,10 +329,13 @@ mod tests {
         let pages = PageMap::new();
         let class = class_id(64, 8);
         let class_index = class.index();
-        let heap_id = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
+        let owner = Box::leak(Box::new(Heap::new(
+            HeapId::new(0, core::num::NonZeroU32::MIN).unwrap(),
+            AllocatorConfig::new(),
+        )));
 
-        let run_a = heap.acquire(class, heap_id, None, &pages).unwrap();
-        let run_b = heap.acquire(class, heap_id, None, &pages).unwrap();
+        let run_a = heap.acquire(class, owner, &pages).unwrap();
+        let run_b = heap.acquire(class, owner, &pages).unwrap();
         // SAFETY: both from this heap's live arena.
         let id_a = unsafe { run_a.as_ref().id() };
         let id_b = unsafe { run_b.as_ref().id() };
@@ -354,8 +345,8 @@ mod tests {
         assert_eq!(heap.push_available(run_b), Ok(()));
         assert_eq!(heap.push_available(run_a), Ok(()));
 
-        let first = heap.acquire(class, heap_id, None, &pages).unwrap();
-        let second = heap.acquire(class, heap_id, None, &pages).unwrap();
+        let first = heap.acquire(class, owner, &pages).unwrap();
+        let second = heap.acquire(class, owner, &pages).unwrap();
         // SAFETY: just acquired from this heap.
         assert_eq!(unsafe { first.as_ref().id() }, id_b);
         assert_eq!(unsafe { second.as_ref().id() }, id_a);
@@ -368,9 +359,12 @@ mod tests {
         let pages = PageMap::new();
         let class = class_id(64, 8);
         let class_index = class.index();
-        let heap_id = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
+        let owner = Box::leak(Box::new(Heap::new(
+            HeapId::new(0, core::num::NonZeroU32::MIN).unwrap(),
+            AllocatorConfig::new(),
+        )));
 
-        let mut run = heap.acquire(class, heap_id, None, &pages).unwrap();
+        let mut run = heap.acquire(class, owner, &pages).unwrap();
         // SAFETY: live arena run, exclusive to this test.
         let run_ref = unsafe { run.as_mut() };
         let ptr = run_ref
@@ -381,13 +375,13 @@ mod tests {
             })
             .unwrap();
         let id = run_ref.id();
-        assert_eq!(run_ref.free(ptr), Ok(false));
+        assert_eq!(run_ref.free(ptr), Ok(RunFree::Unchanged));
         assert_eq!(available_run_id(&heap, class_index), None);
 
         assert_eq!(heap.push_available(run), Ok(()));
         assert_eq!(available_run_id(&heap, class_index), Some(id));
 
-        let (_run, reused) = alloc_block(&mut heap, class, &pages).unwrap();
+        let (_run, reused) = alloc_block(&mut heap, owner, class, &pages).unwrap();
         assert_eq!(reused, ptr);
     }
 
@@ -396,8 +390,11 @@ mod tests {
         let mut heap = RunHeap::new(RunConfig::new());
         let pages = PageMap::new();
         let class = class_id(64, 8);
-        let heap_id = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
-        let run = heap.acquire(class, heap_id, None, &pages).unwrap();
+        let owner = Box::leak(Box::new(Heap::new(
+            HeapId::new(0, core::num::NonZeroU32::MIN).unwrap(),
+            AllocatorConfig::new(),
+        )));
+        let run = heap.acquire(class, owner, &pages).unwrap();
         // SAFETY: live arena run.
         let base = unsafe { run.as_ref() }.range().base();
         assert!(pages.get(base).is_some());
@@ -410,12 +407,15 @@ mod tests {
         let mut heap = RunHeap::new(RunConfig::new());
         let pages = PageMap::new();
         let class = class_id(64, 8);
-        let heap_id = HeapId::new(0, core::num::NonZeroU32::MIN).unwrap();
+        let owner = Box::leak(Box::new(Heap::new(
+            HeapId::new(0, core::num::NonZeroU32::MIN).unwrap(),
+            AllocatorConfig::new(),
+        )));
         for _ in 0..MAP_RUNS {
-            assert!(heap.acquire(class, heap_id, None, &pages).is_some());
+            assert!(heap.acquire(class, owner, &pages).is_some());
         }
         assert_eq!(heap.maps.iter().count(), 1);
-        assert!(heap.acquire(class, heap_id, None, &pages).is_some());
+        assert!(heap.acquire(class, owner, &pages).is_some());
         assert_eq!(heap.maps.iter().count(), 2);
     }
 }
