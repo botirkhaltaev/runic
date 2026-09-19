@@ -14,7 +14,7 @@ use crate::{
 use super::{ExtentId, cache::ExtentCache};
 
 /// Zeroed Keep reuse at or above this size discards instead of memset.
-const LAZY_ZERO: usize = 256 * 1024;
+const LAZY_ZERO: usize = 64 * 1024;
 
 pub(crate) struct ExtentHeap {
     /// Allocated/claimed extents. Cached Free extents are not live.
@@ -27,7 +27,7 @@ pub(crate) struct ExtentHeap {
 ///
 /// Fresh anonymous mappings are already kernel-zeroed. Cached extents may be
 /// dirty, so [`ExtentInit::Zeroed`] zeros on cache hits: Discard-insert already
-/// dropped the pages, else Keep discards when `size ≥ 256 KiB` or memsets.
+/// dropped the pages, else Keep discards when `size ≥ 64 KiB` or memsets.
 /// Allocate-time Keep discard does not set the cache-clean flag.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExtentInit {

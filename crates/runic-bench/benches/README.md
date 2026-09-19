@@ -4,39 +4,35 @@ Thin Criterion entry points. Registration lives in `src/suite/`.
 
 ## Targets
 
-- `global_{runic,system,mimalloc,jemalloc,snmalloc}`: `#[global_allocator]` collections and library traffic.
+- `global_{runic,system,mimalloc,jemalloc,snmalloc}`: the same application
+  workloads under each process-global allocator.
 
 ## Naming
 
-- `global/<alloc>/<group>` — `global/runic/tree`, `global/runic/json_api`
+- `global/<alloc>/<workload>` — `global/runic/word_count`,
+  `global/runic/json_api`
 
 ## Filters
 
-Collections:
-
-- `global/runic/vec_push_clear`
-- `global/runic/tree`
 - `global/runic/word_count`
-
-Libraries:
-
+- `global/runic/vec_growth_log`
+- `global/runic/hashmap_grow`
+- `global/runic/vecdeque_events`
+- `global/runic/text_index`
+- `global/runic/lru_cache`
+- `global/runic/records_sort`
+- `global/runic/graph_shortest_path`
 - `global/runic/json_api`
 - `global/runic/regex_search`
-- `global/runic/http_buffers`
-- `global/runic/large_buffers`
-- `global/runic/large_buffers_dirty`
-- `global/runic/run_churn_bursty`
+- `global/runic/http_parse`
+- `global/runic/csv_pipeline`
+- `global/runic/compress_roundtrip`
+- `global/runic/toml_config`
+- `global/runic/async_server`
+- `global/runic/thread_pool_jobs`
+- `global/runic/log_pipeline`
 
-Threaded (profile with `RUNIC_PROFILE_CPUS=0-3`):
-
-- `global/runic/channel_pipeline`
-- `global/runic/arc_share_drop`
-- `global/runic/scoped_map_reduce`
-
-Lifecycle (profile with `RUNIC_PROFILE_CPUS=0-7`; thread counts follow the mask):
-
-- `global/runic/spawn_churn`
-- `global/runic/oversubscribed`
+Use `RUNIC_PROFILE_CPUS=0-3` for threaded workloads.
 
 ## Run
 
@@ -51,7 +47,7 @@ cargo bench -p runic-bench --bench global_runic -- 'global/runic/json_api' --exa
 
 ```sh
 scripts/profile.sh --preflight
-scripts/profile.sh -l baseline global_runic 'global/runic/tree'
+scripts/profile.sh -l baseline global_runic 'global/runic/word_count'
 scripts/profile.sh -l baseline global_runic 'global/runic/json_api'
-scripts/profile.sh --with callgrind global_runic 'global/runic/http_buffers'
+scripts/profile.sh --with callgrind global_runic 'global/runic/http_parse'
 ```

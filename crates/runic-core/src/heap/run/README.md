@@ -10,7 +10,7 @@ Run metadata owns small size-class allocations.
 
 ## Invariants
 
-- A run owns one size class and one range in a heap-owned map (not its own `Mapping`). The base is `RUN_SIZE`-aligned. Payload is `RUN_SIZE` bytes; the `Run` header lives at `base + RUN_SIZE` (`base`/`span`/`recip` next to `RunState`; remote `issued`/`link`/`claims` on the next 64-byte line); claim words follow the header. `Run::range` is the payload span only. `PageMap::publish_run` stamps that payload. A map holds `MAP_RUNS` spaces (`RUN_SPACE` each). Small free uses `Run::header_of` (`ptr & !(RUN_SIZE-1)`); self-check `base`, else `PageMap`.
+- A run owns one size class and one range in a heap-owned map (not its own `Mapping`). The base is `RUN_SIZE`-aligned. Payload is `RUN_SIZE` bytes; the `Run` header lives at `base + RUN_SIZE` (`base`/`span`/`recip` next to `RunState`; remote `issued`/`link`/`claims` on the next 64-byte line); claim words follow the header. `Run::range` is the payload span only. `PageMap::publish_run` stamps that payload. A map holds `MAP_RUNS` spaces (`RUN_SPACE` each). Small free uses `Run::header_of` (`ptr & !(RUN_SIZE-1)`), which checks the raw `base` word before constructing a `Run` pointer; otherwise lookup falls back to `PageMap`.
 - Returned blocks must be valid block boundaries inside the payload span.
 - `locate` is offset from the run base. `Run::header_of` is the small-free / realloc probe.
 - Owner Free/Live **authority** is freelist membership + `live` (+ bump). `allocate` is pop only. Empty freelist → `extend` threads one page of fresh blocks (at least 32, or remaining) and advances `issued` once. Hit free is `free` (`locate` → `live--` → pointer push). Miss / accept may `discard_empty`. Owner double-free is undefined.

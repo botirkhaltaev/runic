@@ -36,13 +36,13 @@
 | Lint | `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
 | Bench build | `cargo bench -p runic-bench --no-run` |
 | Profile | `scripts/profile.sh` |
-| Policy grid | `scripts/policy_grid.sh` |
 
 ## External References
 
 | Need | File |
 |------|------|
 | Thesis, milestones, architecture | `ROADMAP.md` |
+| Measurement log | `diary.md` |
 | librseq-in-Rust word ops (not a runic hit) | https://github.com/botirkhaltaev/rseq-rs |
 | Install / usage | `README.md` |
 | Core crate | `crates/runic-core/README.md` |
@@ -53,4 +53,4 @@
 
 - v0.6 in: Linux x86_64, Rust nightly, `#[thread_local]` `THREAD_HEAP`, `GlobalAlloc`, owner-local heaps, TLS current run, run/extent retention, remote-free, `realloc` / `alloc_zeroed`, tests, benches.
 - v0.6 out: quarantine, canaries, hugepages, NUMA, C ABI, ML placement, dashboards, background purge.
-- Next: LTO `vec_many_small` 31.0–32.7. Hit free is `Run::free` (`__rust_dealloc` has no callee-saved). `issued` lives on `RemoteLine`. Live counts live on `RunHeap` / `ExtentHeap`; reclaim / retire scan after. Zeroed Keep reuse ≥256 KiB discards pages without the Discard-insert clean flag; below that, memset. `ExtentPolicy::Discard` matches snmalloc — not a medium class. `Heaps::get` is a lock-free `Arena` read. One adopted heap; multi-slot adopt lost on `channel_pipeline`. Do not compact `CLASS_FOR_SIZE`, retry first-fit extent reuse, identity, batch take, O(1) TLS steal, `#135` RSEQ, per-CPU heaps on rseq-rs (Phase 0 declined: runic wins `spawn_churn` / `oversubscribed` Cost; lifecycle ≤ 7% wall), locate-offset dual free, or multi-slot adopt. Do not port snmalloc. Open Where: `spawn_churn` minflt 5–8× the C allocators under every policy.
+- Next: retain only when the real-workload Criterion corpus improves and no workload regresses >1%. Hit free is `Run::free` (`__rust_dealloc` has no callee-saved). `header_of` checks raw `base` before constructing `Run`. `issued` / `link` / claims live on `RemoteLine`. Live counts live on `RunHeap` / `ExtentHeap`; reclaim / retire scan after. Zeroed Keep reuse ≥64 KiB discards pages without the Discard-insert clean flag; below that, memset. `ExtentPolicy::Discard` matches snmalloc — not a medium class. `Heaps::get` is a lock-free `Arena` read. One adopted heap; multi-slot adopt lost on `channel_pipeline`. Do not compact `CLASS_FOR_SIZE`, retry first-fit extent reuse, identity, batch take, O(1) TLS steal, `#135` RSEQ, per-CPU heaps on rseq-rs, locate-offset dual free, multi-slot adopt, reclaim live-scan elimination, realloc known-owner reuse, or the `spawn_churn` fault package. Do not port snmalloc. Claimed remote frees retry Active/Draining transitions; a generation advance proves the owner accepted the claim.
