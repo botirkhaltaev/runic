@@ -1,5 +1,5 @@
 use core::{
-    cell::UnsafeCell,
+    cell::Cell,
     mem::{align_of, offset_of, size_of},
     num::NonZeroU32,
     ptr::NonNull,
@@ -120,8 +120,7 @@ pub(crate) enum Accept {
 /// `accept` drains bits onto the pointer freelist.
 struct ClaimBits {
     /// 8-aligned claim words in the space tail.
-    words: NonNull<AtomicU64>,
-    word_count: usize,
+    words: NonNull<[AtomicU64]>,
 }
 
 impl ClaimBits {
@@ -146,9 +145,9 @@ impl ClaimBits {
         if !addr.is_multiple_of(align_of::<AtomicU64>()) {
             return None;
         }
+        let words = NonNull::new(core::ptr::with_exposed_provenance_mut(addr))?;
         Some(Self {
-            words: NonNull::new(core::ptr::with_exposed_provenance_mut(addr))?,
-            word_count: Self::word_count(capacity),
+            words: NonNull::slice_from_raw_parts(words, Self::word_count(capacity)),
         })
     }
 
@@ -174,14 +173,14 @@ impl ClaimBits {
     /// Cheap post-scan check for a straggling claim a bulk drain may have missed.
     #[inline]
     fn any_set(&self) -> bool {
-        (0..self.word_count).any(|word| self.word_unchecked(word).load(Ordering::Acquire) != 0)
+        (0..self.words.len()).any(|word| self.word_unchecked(word).load(Ordering::Acquire) != 0)
     }
 
     fn word_unchecked(&self, word: usize) -> &AtomicU64 {
-        debug_assert!(word < self.word_count);
-        // SAFETY: `word < word_count`; `words` points at the claim span in this
+        debug_assert!(word < self.words.len());
+        // SAFETY: `word < words.len()`; `words` points at the claim span in this
         // run's space tail and aligned for `AtomicU64`.
-        unsafe { &*self.words.as_ptr().add(word) }
+        unsafe { &*self.words.as_ptr().cast::<AtomicU64>().add(word) }
     }
 }
 
@@ -196,7 +195,7 @@ pub(crate) struct Run {
     span: u32,
     /// `ceil(2^32 / stride)` — exact `floor(offset / stride)` for `offset < 2^16`.
     recip: u32,
-    state: UnsafeCell<RunState>,
+    state: RunState,
     stride: usize,
     class: SizeClass,
     id: RunId,
@@ -236,13 +235,13 @@ const FREE_END: usize = 0;
 
 struct RunState {
     /// `FREE_END` or a payload address of a free block.
-    free: usize,
-    live: usize,
+    free: Cell<usize>,
+    live: Cell<usize>,
     capacity: usize,
-    bump: usize,
-    available_next: Option<NonNull<Run>>,
+    bump: Cell<usize>,
+    available_next: Cell<Option<NonNull<Run>>>,
     /// On this class's `RunHeap` available list. `push_available` is a no-op when set.
-    on_available: bool,
+    on_available: Cell<bool>,
 }
 
 impl Run {
@@ -273,7 +272,7 @@ impl Run {
             base,
             span,
             recip: Self::recip(u32::try_from(stride).ok()?)?,
-            state: UnsafeCell::new(RunState::new(capacity)),
+            state: RunState::new(capacity),
             stride,
             class,
             id,
@@ -328,38 +327,30 @@ impl Run {
     /// True when every block is outstanding (allocated or remote-claimed).
     #[inline]
     pub(crate) fn is_full(&self) -> bool {
-        // SAFETY: owner-local methods are called only by the owning heap.
-        let state = unsafe { &*self.state.get() };
-        state.live == state.capacity
+        self.state.live.get() == self.state.capacity
     }
 
     /// Outstanding blocks on this run (allocated or remote-claimed).
     pub(crate) fn is_live(&self) -> bool {
-        // SAFETY: read under owner-local access or table-locked reclaim.
-        unsafe { &*self.state.get() }.live != 0
+        self.state.live.get() != 0
     }
 
     pub(crate) fn is_available(&self) -> bool {
-        // SAFETY: owner-local methods are called only by the owning heap.
-        unsafe { &*self.state.get() }.on_available
+        self.state.on_available.get()
     }
 
     /// Link onto the available list. Caller already checked `!is_available()`.
     pub(crate) fn link_available(&self, next: Option<NonNull<Run>>) {
-        // SAFETY: owner-local methods are called only by the owning heap.
-        let state = unsafe { &mut *self.state.get() };
-        debug_assert!(!state.on_available);
-        state.available_next = next;
-        state.on_available = true;
+        debug_assert!(!self.state.on_available.get());
+        self.state.available_next.set(next);
+        self.state.on_available.set(true);
     }
 
     /// Unlink from the available list. Returns the previous successor.
     pub(crate) fn unlink_available(&self) -> Option<NonNull<Run>> {
-        // SAFETY: owner-local methods are called only by the owning heap.
-        let state = unsafe { &mut *self.state.get() };
-        debug_assert!(state.on_available);
-        state.on_available = false;
-        state.available_next.take()
+        debug_assert!(self.state.on_available.get());
+        self.state.on_available.set(false);
+        self.state.available_next.take()
     }
 
     pub(crate) fn range(&self) -> AddressRange {
@@ -369,14 +360,13 @@ impl Run {
     /// Hit: pop one block from the pointer freelist. Empty → caller `extend`.
     #[inline]
     pub(crate) fn allocate(&self) -> Option<NonNull<u8>> {
-        // SAFETY: owner-local methods are called only by the owning heap.
-        let state = unsafe { &mut *self.state.get() };
-        let ptr = Self::pop_free(state)?;
-        debug_assert!(state.live < state.capacity);
-        if state.live == 0 {
+        let ptr = Self::pop_free(&self.state)?;
+        let live = self.state.live.get();
+        debug_assert!(live < self.state.capacity);
+        if live == 0 {
             self.add_live();
         }
-        state.live += 1;
+        self.state.live.set(live + 1);
         Some(ptr)
     }
 
@@ -385,17 +375,16 @@ impl Run {
     /// `issued` advances once. Returns `false` when no fresh blocks remain.
     #[inline(never)]
     pub(crate) fn extend(&self) -> bool {
-        // SAFETY: owner-local methods are called only by the owning heap.
-        let state = unsafe { &mut *self.state.get() };
-        if state.bump >= state.capacity {
+        let bump = self.state.bump.get();
+        if bump >= self.state.capacity {
             return false;
         }
         let page_worth = PAGE_SIZE / self.stride;
-        let n = page_worth.max(32).min(state.capacity - state.bump);
+        let n = page_worth.max(32).min(self.state.capacity - bump);
         if n == 0 {
             return false;
         }
-        let start = state.bump;
+        let start = bump;
         let end = start + n;
         for index in start..end - 1 {
             Self::write_link(
@@ -403,9 +392,14 @@ impl Run {
                 self.address(BlockIndex::new(index + 1)).as_ptr().addr(),
             );
         }
-        Self::write_link(self.address(BlockIndex::new(end - 1)), state.free);
-        state.free = self.address(BlockIndex::new(start)).as_ptr().addr();
-        state.bump = end;
+        Self::write_link(
+            self.address(BlockIndex::new(end - 1)),
+            self.state.free.get(),
+        );
+        self.state
+            .free
+            .set(self.address(BlockIndex::new(start)).as_ptr().addr());
+        self.state.bump.set(end);
         self.remote.issued.store(end, Ordering::Relaxed);
         true
     }
@@ -418,13 +412,12 @@ impl Run {
     #[inline]
     pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<RunFree, RunError> {
         let block = self.locate(ptr)?;
-        // SAFETY: owner-local methods are called only by the owning heap.
-        let state = unsafe { &mut *self.state.get() };
-        let was_full = state.live == state.capacity;
-        debug_assert!(state.live > 0);
-        state.live -= 1;
-        Self::push_free(state, block.ptr());
-        if state.live == 0 {
+        let live = self.state.live.get();
+        let was_full = live == self.state.capacity;
+        debug_assert!(live > 0);
+        self.state.live.set(live - 1);
+        Self::push_free(&self.state, block.ptr());
+        if live == 1 {
             self.sub_live();
         }
         Ok(if was_full {
@@ -456,28 +449,27 @@ impl Run {
     pub(crate) fn accept(&self) -> Accept {
         self.remote.link.clear_queued();
 
-        // SAFETY: owner-local methods are called only by the owning heap.
-        let state = unsafe { &mut *self.state.get() };
-        let was_live = state.live != 0;
-        for word in 0..self.remote.claims.word_count {
+        let was_live = self.state.live.get() != 0;
+        for word in 0..self.remote.claims.words.len() {
             let mut bits = self.remote.claims.drain_word(word);
             while bits != 0 {
                 // `trailing_zeros` of a nonzero `u64` is always < 64, so this never truncates.
                 let bit = usize::try_from(bits.trailing_zeros()).unwrap();
                 bits &= bits - 1;
                 let index = BlockIndex::new(word * CLAIM_WORD_BITS + bit);
-                debug_assert!(index.get() < state.capacity);
-                debug_assert!(state.live > 0);
-                state.live -= 1;
-                Self::push_free(state, self.address(index));
+                debug_assert!(index.get() < self.state.capacity);
+                let live = self.state.live.get();
+                debug_assert!(live > 0);
+                self.state.live.set(live - 1);
+                Self::push_free(&self.state, self.address(index));
             }
         }
 
-        if was_live && state.live == 0 {
+        if was_live && self.state.live.get() == 0 {
             self.sub_live();
         }
-        if state.live == 0 && self.policy == RunPolicy::Discard {
-            self.maybe_discard(state);
+        if self.state.live.get() == 0 && self.policy == RunPolicy::Discard {
+            self.maybe_discard();
         }
         if self.remote.claims.any_set() {
             Accept::Requeue
@@ -503,26 +495,22 @@ impl Run {
         if self.policy != RunPolicy::Discard || self.is_live() {
             return;
         }
-        // SAFETY: owner-local; `is_live` just observed empty.
-        let state = unsafe { &mut *self.state.get() };
-        self.maybe_discard(state);
+        self.maybe_discard();
     }
 
     #[cold]
-    fn maybe_discard(&self, state: &mut RunState) {
+    fn maybe_discard(&self) {
         debug_assert_eq!(self.policy, RunPolicy::Discard);
-        debug_assert_eq!(state.live, 0);
-        state.bump = 0;
-        state.free = FREE_END;
+        debug_assert_eq!(self.state.live.get(), 0);
+        self.state.bump.set(0);
+        self.state.free.set(FREE_END);
         self.remote.issued.store(0, Ordering::Relaxed);
         OsMemory::discard(self.range());
     }
 
     pub(crate) fn allocated(&self, ptr: NonNull<u8>) -> Result<Block, RunError> {
         let block = self.locate(ptr)?;
-        // SAFETY: owner-local methods are called only by the owning heap.
-        let state = unsafe { &*self.state.get() };
-        if block.index().get() >= state.bump {
+        if block.index().get() >= self.state.bump.get() {
             return Err(RunError::DoubleFree);
         }
         if self.remote.claims.is_set(block.index()) {
@@ -567,8 +555,7 @@ impl Run {
     /// Payload pointer for a freelist or extend index in `0..capacity`.
     #[inline]
     fn address(&self, index: BlockIndex) -> NonNull<u8> {
-        // SAFETY: owner-local methods are called only by the owning heap.
-        debug_assert!(index.get() < unsafe { &*self.state.get() }.capacity);
+        debug_assert!(index.get() < self.state.capacity);
         let byte_offset = index.get() * self.stride;
         // SAFETY: freelist / `extend` only yield `index < capacity`, so
         // `byte_offset < RUN_SIZE` inside the payload span.
@@ -576,21 +563,21 @@ impl Run {
     }
 
     #[inline]
-    fn pop_free(state: &mut RunState) -> Option<NonNull<u8>> {
-        let raw = state.free;
+    fn pop_free(state: &RunState) -> Option<NonNull<u8>> {
+        let raw = state.free.get();
         if raw == FREE_END {
             return None;
         }
         let ptr = NonNull::new(core::ptr::without_provenance_mut(raw))?;
-        state.free = Self::read_link(ptr);
+        state.free.set(Self::read_link(ptr));
         Some(ptr)
     }
 
     /// Push using the payload pointer already proven by `locate` / `address`.
     #[inline]
-    fn push_free(state: &mut RunState, ptr: NonNull<u8>) {
-        Self::write_link(ptr, state.free);
-        state.free = ptr.as_ptr().addr();
+    fn push_free(state: &RunState, ptr: NonNull<u8>) {
+        Self::write_link(ptr, state.free.get());
+        state.free.set(ptr.as_ptr().addr());
     }
 
     #[inline]
@@ -611,12 +598,12 @@ impl Run {
 impl RunState {
     fn new(capacity: usize) -> Self {
         Self {
-            live: 0,
+            live: Cell::new(0),
             capacity,
-            bump: 0,
-            available_next: None,
-            free: FREE_END,
-            on_available: false,
+            bump: Cell::new(0),
+            available_next: Cell::new(None),
+            free: Cell::new(FREE_END),
+            on_available: Cell::new(false),
         }
     }
 }
@@ -629,6 +616,7 @@ mod tests {
 
     use crate::{
         config::AllocatorConfig,
+        heap::Heap,
         layout::LayoutSpec,
         memory::{Mapping, OsMemory},
         size_class::SizeClasses,
@@ -1041,10 +1029,10 @@ mod tests {
             loop {
                 let finished = done.load(Ordering::Acquire);
                 while let Some(chain) = inbox.drain() {
-                    for r in chain {
-                        // SAFETY: `r` is `run_ptr`, live for the scope of this test.
-                        if unsafe { r.as_ref() }.accept() == Accept::Requeue {
-                            let _ = inbox.push(r);
+                    for run in chain {
+                        // SAFETY: `run` is `run_ptr`, live for the scope of this test.
+                        if unsafe { run.as_ref() }.accept() == Accept::Requeue {
+                            let _ = inbox.push(run);
                         }
                     }
                 }
