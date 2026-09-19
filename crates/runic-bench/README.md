@@ -16,8 +16,9 @@ cargo bench -p runic-bench --bench global_runic -- 'global/runic/json_api' --exa
   indexing, LRU, record sorting, and graph search.
 - Libraries: JSON, regex, HTTP parsing, CSV aggregation, gzip roundtrip, and
   TOML.
-- Threaded: Tokio request handling, a long-lived worker pool, and a log
-  pipeline. Profile these with `RUNIC_PROFILE_CPUS=0-3`.
+- Threaded: Tokio request handling, a long-lived worker pool, a log pipeline,
+  shard aggregation, a 64 KiB buffer pool, and `Arc<str>` broadcast. Profile
+  these with `RUNIC_PROFILE_CPUS=0-3`.
 
 Default Criterion settings are developer-sized (`sample_size=10`, 1s, 2000 resamples, no plots, no Rayon). CLI flags (`--measurement-time`, `--sample-size`, `--profile-time`) override them. Rayon is off because Criterion analysis allocates through `#[global_allocator]`.
 

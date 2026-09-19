@@ -28,6 +28,13 @@ reclaim live-scan elimination
 realloc known-owner reuse
 spawn_churn-only fault package (one-page extend, lazy Arena, front-header, …)
 snmalloc port
+per-run deferred remote list (`thread_free`)
+BatchIt-on-Inbox (last-run skip and bounded four-way delayed cache)
+heap-local available fullness bins
+cross-heap empty-run restamp / abandon pool
+2 MiB-aligned maps without over-map trim
+owner-local empty-run DONTNEED on unbind
+128-slot / 128 MiB extent budget
 ```
 
 ## Hit diet and run-local
@@ -316,3 +323,75 @@ free_ring/4/live:256          2081     1613     1.29
 
 `profile.sh` is user-cycles only. Pair it with `page-faults` + `time` sys on
 mixed/large benches.
+
+## Architecture campaign (`perf/architecture-campaign`)
+
+Branch from `origin/master` `1128acc`. Corpus gained `shard_aggregator`,
+`buffer_pool`, and `arc_broadcast`. Isolated experiments vs Criterion
+`--save-baseline pre-tf` (`taskset -c 0-3`, sample_size 10). Gate: geomean up
+and no workload >1% slower. All architecture diffs reverted; workloads kept.
+
+```text
+deferred remote list   lose: first cut SIGSEGV (bitmap drain reused a block
+                       still being linked); after steal-only accept,
+                       thread_pool_jobs ~−15% thrpt, async_server/log_pipeline
+                       also slower
+BatchIt last-run skip  no causal remote win; single-thread “gains” matched
+                       cold first baseline; arc_broadcast estimate >1% slower
+fullness bins          lose: regex_search ~−8%, vec_growth_log ~−5%, lru_cache
+                       ~−3%
+empty-run restamp      initially blocked by in-map headers
+2 MiB maps + decay     lose: unbind DONTNEED; thread_pool_jobs ~−56% thrpt,
+                       shard_aggregator ~−75%, buffer_pool ~−68%
+```
+
+Follow-up completed the remaining variants. `profile.sh` first measured
+`free_remote` at 11.42% and `Heap::flush` at 3.75% on `thread_pool_jobs`;
+`shard_aggregator` was mostly Draining (`Heaps::free` 15.52%), not inbox CAS.
+Baseline peak RSS (KiB): thread pool 12664, log 18040, shard 12688, buffer
+12664, Arc 12572.
+
+```text
+bounded BatchIt       four Run ways, eight claims/way, flush on eviction/TLS
+                      exit; unit + remote stress passed, async_server aborted
+                      in optimized Criterion; reverted. HeapId outbox stopped:
+                      inbox CAS was not the sampled wall.
+empty-run pool        safely removed empty current runs from donor directories,
+                      retained donor map ownership, re-ID/restamped on acquire;
+                      lost broadly (lru_cache −14.1%, regex −10.3%,
+                      vecdeque −7.1%); reverted. This is also the run
+                      abandon/reclaim mechanism, so no larger pool retry.
+2 MiB map only        retained untrimmed over-map and aligned run maps to 2 MiB;
+                      shard_aggregator −7.5%, buffer_pool −2.0%; reverted.
+two-generation decay isolated DONTNEED after two empty unbind scans;
+                      regex −6.2%, log −5.0%, shard −6.4%, buffer −6.8%;
+                      reverted.
+extent budget         64/64 MiB → 128/128 MiB; no causal large-workload win,
+                      shard/async/Arc midpoint estimates worse than 1%;
+                      reverted. Cache keys are already page-rounded mapping
+                      lengths, so page-rounded exact reuse was already present.
+```
+
+The out-of-scope closeout then tried the remaining families against baseline
+`out-of-campaign` on the same pinned Criterion corpus. This host has two NUMA
+nodes and THP `always`; it has no reserved hugetlb pages. Time deltas below are
+Criterion midpoints (negative is faster). Every allocator diff was reverted.
+
+```text
+first-fit extents     want ≤ have ≤ 2*want: geomean −0.30%, but csv +3.19%,
+                      thread_pool +2.34%, json +1.71%; rejected.
+THP-aligned maps      2 MiB-align run maps and extents ≥2 MiB: geomean −1.09%,
+                      but thread_pool +3.80%, json +2.65%; rejected. Explicit
+                      MAP_HUGETLB cannot run here (HugePages_Total=0).
+NUMA local mbind      bind fresh maps MPOL_PREFERRED to the allocating thread's
+                      node: geomean +1.49%, regex +10.66%, lru +7.29%; rejected.
+TLS magazine         eight blocks per class ahead of the current run: geomean
+                      +1.49%, vec_growth +12.16%, regex +11.11%; rejected.
+one-page extend      remove the 32-block minimum: geomean −0.54%, but
+                      thread_pool +1.36%; rejected.
+rseq-rs front        rseq-rs 0.8.0 at f208f9b, one still-live pointer per CPU
+                      and class: first 15 workloads geomean +27.24% (vecdeque
+                      +94.32%), then thread_pool aborted during TLS teardown;
+                      rejected for both throughput and correctness.
+```
+

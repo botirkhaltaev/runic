@@ -31,6 +31,9 @@ Thin Criterion entry points. Registration lives in `src/suite/`.
 - `global/runic/async_server`
 - `global/runic/thread_pool_jobs`
 - `global/runic/log_pipeline`
+- `global/runic/shard_aggregator`
+- `global/runic/buffer_pool`
+- `global/runic/arc_broadcast`
 
 Use `RUNIC_PROFILE_CPUS=0-3` for threaded workloads.
 
