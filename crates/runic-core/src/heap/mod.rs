@@ -82,10 +82,6 @@ impl HeapInner {
         }
     }
 
-    fn rebind(&mut self, id: HeapId) {
-        self.extents.rebind(id);
-    }
-
     pub(super) fn occupied(&self) -> bool {
         self.runs.occupied() || self.extents.occupied()
     }
@@ -256,10 +252,9 @@ impl Heap {
         self.inner.lock()
     }
 
-    pub(super) fn reactivate(&self, id: HeapId) {
-        self.lock_inner().rebind(id);
-        self.state
-            .store(id.generation(), HeapMode::Active, false, 0);
+    pub(super) fn reactivate(&self) {
+        let generation = self.state.generation();
+        self.state.store(generation, HeapMode::Active, false, 0);
     }
 
     /// Mark Free and bump generation when Draining, empty, and leases == 0.
@@ -307,7 +302,7 @@ impl Heap {
 
     /// Flush inboxes if needed, then allocate one large block.
     pub(super) fn alloc_extent(
-        &self,
+        &'static self,
         inner: &mut HeapInner,
         spec: LayoutSpec,
         init: ExtentInit,
@@ -316,7 +311,7 @@ impl Heap {
         if !self.inboxes_empty() {
             self.flush(inner, ctx).ok()?;
         }
-        inner.extents.allocate(spec, self.id(), ctx.pages, init)
+        inner.extents.allocate(spec, self, ctx.pages, init)
     }
 }
 

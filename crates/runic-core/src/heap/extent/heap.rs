@@ -6,7 +6,7 @@ use core::{
 use crate::{
     arena::Arena,
     heap::extent::config::ExtentConfig,
-    heap::{Extent, HeapError, HeapId},
+    heap::{Extent, Heap, HeapError},
     layout::LayoutSpec,
     memory::{OsMemory, PageMap},
 };
@@ -69,16 +69,10 @@ impl ExtentHeap {
         self.extents.iter().any(Extent::is_live)
     }
 
-    pub(crate) fn rebind(&mut self, heap_id: HeapId) {
-        for extent in self.extents.iter_mut() {
-            extent.set_heap_id(heap_id);
-        }
-    }
-
     pub(crate) fn allocate(
         &mut self,
         spec: LayoutSpec,
-        heap_id: HeapId,
+        heap: &'static Heap,
         pages: &PageMap,
         init: ExtentInit,
     ) -> Option<NonNull<u8>> {
@@ -87,7 +81,7 @@ impl ExtentHeap {
             // SAFETY: cache only stores live arena extents owned by this heap.
             let extent = unsafe { extent_ptr.as_mut() };
             let cache_clean = extent.discarded();
-            if let Some(ptr) = extent.reuse(heap_id, spec) {
+            if let Some(ptr) = extent.reuse(spec) {
                 if init == ExtentInit::Zeroed && !cache_clean {
                     let zeroed =
                         spec.size() >= LAZY_ZERO && OsMemory::discard(extent.mapping().range());
@@ -104,7 +98,7 @@ impl ExtentHeap {
         }
 
         let mapping = OsMemory::map(len)?;
-        let ptr = self.allocate_mapping(spec, heap_id, mapping, pages)?;
+        let ptr = self.allocate_mapping(spec, heap, mapping, pages)?;
         self.add_live();
         Some(ptr)
     }
@@ -112,13 +106,13 @@ impl ExtentHeap {
     fn allocate_mapping(
         &mut self,
         spec: LayoutSpec,
-        heap_id: HeapId,
+        heap: &'static Heap,
         mapping: crate::memory::Mapping,
         pages: &PageMap,
     ) -> Option<NonNull<u8>> {
         let index = self.extents.vacant()?;
         let id = ExtentId::from_index(index)?;
-        let extent = Extent::new(id, heap_id, mapping, spec)?;
+        let extent = Extent::new(id, heap, mapping, spec)?;
         debug_assert_eq!(extent.id(), id);
         let ptr = extent.ptr();
 
@@ -209,15 +203,19 @@ impl ExtentHeap {
 #[cfg(test)]
 mod tests {
     use core::{alloc::Layout, num::NonZeroU32, ptr::write_bytes};
+    use std::sync::OnceLock;
 
     use crate::{
+        config::AllocatorConfig,
         heap::extent::config::{ExtentConfig, ExtentPolicy},
-        heap::{Extent, HeapId, extent::ExtentId},
+        heap::{Extent, Heap, HeapId, extent::ExtentId},
         layout::LayoutSpec,
         memory::{OsMemory, PageMap, PageOwner},
     };
 
     use super::*;
+
+    static OWNER: OnceLock<Heap> = OnceLock::new();
 
     fn layout_spec(size: usize, align: usize) -> LayoutSpec {
         LayoutSpec::from_layout(Layout::from_size_align(size, align).unwrap())
@@ -228,7 +226,18 @@ mod tests {
         let len = spec.mapping_len(OsMemory::page_size()).unwrap();
         let mapping = OsMemory::map(len).unwrap();
 
-        Extent::new(id, HeapId::new(0, NonZeroU32::MIN).unwrap(), mapping, spec).unwrap()
+        Extent::new(
+            id,
+            OWNER.get_or_init(|| {
+                Heap::new(
+                    HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                    AllocatorConfig::new(),
+                )
+            }),
+            mapping,
+            spec,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -253,10 +262,15 @@ mod tests {
         let mut heap = ExtentHeap::new(ExtentConfig::new());
         let pages = PageMap::new();
         let spec = layout_spec(128 * 1024, 4096);
-        let heap_id = HeapId::new(0, NonZeroU32::MIN).unwrap();
+        let owner = OWNER.get_or_init(|| {
+            Heap::new(
+                HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                AllocatorConfig::new(),
+            )
+        });
 
         let ptr = heap
-            .allocate(spec, heap_id, &pages, ExtentInit::Uninit)
+            .allocate(spec, owner, &pages, ExtentInit::Uninit)
             .unwrap();
         let Some(PageOwner::Extent(extent)) = pages.get(ptr) else {
             panic!("expected extent owner");
@@ -272,10 +286,15 @@ mod tests {
         let mut heap = ExtentHeap::new(ExtentConfig::new());
         let pages = PageMap::new();
         let spec = layout_spec(128 * 1024, 4096);
-        let heap_id = HeapId::new(0, NonZeroU32::MIN).unwrap();
+        let owner = OWNER.get_or_init(|| {
+            Heap::new(
+                HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                AllocatorConfig::new(),
+            )
+        });
 
         let first = heap
-            .allocate(spec, heap_id, &pages, ExtentInit::Uninit)
+            .allocate(spec, owner, &pages, ExtentInit::Uninit)
             .unwrap();
         let Some(PageOwner::Extent(extent)) = pages.get(first) else {
             panic!("expected extent owner");
@@ -283,7 +302,7 @@ mod tests {
         heap.free(extent, first, &pages).unwrap();
 
         let reused = heap
-            .allocate(spec, heap_id, &pages, ExtentInit::Uninit)
+            .allocate(spec, owner, &pages, ExtentInit::Uninit)
             .unwrap();
         assert_eq!(reused, first);
         assert_eq!(pages.get(reused), Some(PageOwner::Extent(extent)));
@@ -294,10 +313,15 @@ mod tests {
         let mut heap = ExtentHeap::new(ExtentConfig::new().with_policy(ExtentPolicy::Unmap));
         let pages = PageMap::new();
         let spec = layout_spec(128 * 1024, 4096);
-        let heap_id = HeapId::new(0, NonZeroU32::MIN).unwrap();
+        let owner = OWNER.get_or_init(|| {
+            Heap::new(
+                HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                AllocatorConfig::new(),
+            )
+        });
 
         let ptr = heap
-            .allocate(spec, heap_id, &pages, ExtentInit::Uninit)
+            .allocate(spec, owner, &pages, ExtentInit::Uninit)
             .unwrap();
         let Some(PageOwner::Extent(extent)) = pages.get(ptr) else {
             panic!("expected extent owner");
@@ -313,10 +337,15 @@ mod tests {
         let mut heap = ExtentHeap::new(ExtentConfig::new());
         let pages = PageMap::new();
         let spec = layout_spec(128 * 1024, 4096);
-        let heap_id = HeapId::new(0, NonZeroU32::MIN).unwrap();
+        let owner = OWNER.get_or_init(|| {
+            Heap::new(
+                HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                AllocatorConfig::new(),
+            )
+        });
 
         let ptr = heap
-            .allocate(spec, heap_id, &pages, ExtentInit::Uninit)
+            .allocate(spec, owner, &pages, ExtentInit::Uninit)
             .unwrap();
         let Some(PageOwner::Extent(extent)) = pages.get(ptr) else {
             panic!("expected extent owner");
@@ -333,10 +362,15 @@ mod tests {
         let pages = PageMap::new();
         let spec = layout_spec(128 * 1024, 4096);
         let size = 128 * 1024;
-        let heap_id = HeapId::new(0, NonZeroU32::MIN).unwrap();
+        let owner = OWNER.get_or_init(|| {
+            Heap::new(
+                HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                AllocatorConfig::new(),
+            )
+        });
 
         let first = heap
-            .allocate(spec, heap_id, &pages, ExtentInit::Zeroed)
+            .allocate(spec, owner, &pages, ExtentInit::Zeroed)
             .unwrap();
         // SAFETY: first is valid for size bytes.
         unsafe { write_bytes(first.as_ptr(), 0xab, size) };
@@ -347,7 +381,7 @@ mod tests {
         heap.free(extent, first, &pages).unwrap();
 
         let reused = heap
-            .allocate(spec, heap_id, &pages, ExtentInit::Zeroed)
+            .allocate(spec, owner, &pages, ExtentInit::Zeroed)
             .unwrap();
         assert_eq!(reused, first);
         // SAFETY: reused is valid for size bytes.
@@ -368,10 +402,15 @@ mod tests {
         let mut heap = ExtentHeap::new(ExtentConfig::new());
         let pages = PageMap::new();
         let spec = layout_spec(LAZY_ZERO, 4096);
-        let heap_id = HeapId::new(0, NonZeroU32::MIN).unwrap();
+        let owner = OWNER.get_or_init(|| {
+            Heap::new(
+                HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                AllocatorConfig::new(),
+            )
+        });
 
         let first = heap
-            .allocate(spec, heap_id, &pages, ExtentInit::Zeroed)
+            .allocate(spec, owner, &pages, ExtentInit::Zeroed)
             .unwrap();
         // SAFETY: first is valid for LAZY_ZERO bytes.
         unsafe { write_bytes(first.as_ptr(), 0xab, LAZY_ZERO) };
@@ -381,7 +420,7 @@ mod tests {
         heap.free(extent, first, &pages).unwrap();
 
         let second = heap
-            .allocate(spec, heap_id, &pages, ExtentInit::Zeroed)
+            .allocate(spec, owner, &pages, ExtentInit::Zeroed)
             .unwrap();
         assert_eq!(second, first);
         // SAFETY: second is a Zeroed reuse of the same mapping.
@@ -395,7 +434,7 @@ mod tests {
         heap.free(extent, second, &pages).unwrap();
 
         let third = heap
-            .allocate(spec, heap_id, &pages, ExtentInit::Zeroed)
+            .allocate(spec, owner, &pages, ExtentInit::Zeroed)
             .unwrap();
         assert_eq!(third, first);
         // SAFETY: third must be zero even after a prior Keep lazy-zero discard.
@@ -413,10 +452,15 @@ mod tests {
         let pages = PageMap::new();
         let spec = layout_spec(128 * 1024, 4096);
         let size = 128 * 1024;
-        let heap_id = HeapId::new(0, NonZeroU32::MIN).unwrap();
+        let owner = OWNER.get_or_init(|| {
+            Heap::new(
+                HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                AllocatorConfig::new(),
+            )
+        });
 
         let first = heap
-            .allocate(spec, heap_id, &pages, ExtentInit::Zeroed)
+            .allocate(spec, owner, &pages, ExtentInit::Zeroed)
             .unwrap();
         // SAFETY: first is valid for size bytes.
         unsafe { write_bytes(first.as_ptr(), 0xab, size) };
@@ -428,7 +472,7 @@ mod tests {
         assert_eq!(pages.get(first), Some(PageOwner::Extent(extent)));
 
         let reused = heap
-            .allocate(spec, heap_id, &pages, ExtentInit::Zeroed)
+            .allocate(spec, owner, &pages, ExtentInit::Zeroed)
             .unwrap();
         assert_eq!(reused, first);
         // SAFETY: reused is valid for size bytes; Discard must yield zeros without Keep memset.
@@ -450,10 +494,15 @@ mod tests {
         let pages = PageMap::new();
         let spec = layout_spec(128 * 1024, 4096);
         let size = 128 * 1024;
-        let heap_id = HeapId::new(0, NonZeroU32::MIN).unwrap();
+        let owner = OWNER.get_or_init(|| {
+            Heap::new(
+                HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                AllocatorConfig::new(),
+            )
+        });
 
         let first = heap
-            .allocate(spec, heap_id, &pages, ExtentInit::Uninit)
+            .allocate(spec, owner, &pages, ExtentInit::Uninit)
             .unwrap();
         // SAFETY: first is valid for size bytes.
         unsafe { write_bytes(first.as_ptr(), 0xcd, size) };
@@ -464,7 +513,7 @@ mod tests {
         heap.free(extent, first, &pages).unwrap();
 
         let reused = heap
-            .allocate(spec, heap_id, &pages, ExtentInit::Uninit)
+            .allocate(spec, owner, &pages, ExtentInit::Uninit)
             .unwrap();
         assert_eq!(reused, first);
         // SAFETY: reused is valid for size bytes.

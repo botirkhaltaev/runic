@@ -97,9 +97,9 @@ mod tests {
     use core::{alloc::Layout, num::NonZeroU32};
 
     use crate::{
-        config::Budget,
+        config::{AllocatorConfig, Budget},
         heap::extent::config::{ExtentConfig, ExtentPolicy},
-        heap::{Extent, HeapId, extent::ExtentId},
+        heap::{Extent, Heap, HeapId, extent::ExtentId},
         layout::LayoutSpec,
         memory::OsMemory,
     };
@@ -109,21 +109,25 @@ mod tests {
     /// Owns heap-allocated Free extents for cache tests; drops after the cache.
     struct OwnedExtents {
         extents: Vec<NonNull<Extent>>,
+        owner: &'static Heap,
     }
 
     impl OwnedExtents {
         fn new() -> Self {
             Self {
                 extents: Vec::new(),
+                owner: Box::leak(Box::new(Heap::new(
+                    HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                    AllocatorConfig::new(),
+                ))),
             }
         }
 
         fn free_extent(&mut self, mapping_len: usize) -> NonNull<Extent> {
-            let heap_id = HeapId::new(0, NonZeroU32::MIN).unwrap();
             let spec = LayoutSpec::from_layout(Layout::from_size_align(mapping_len, 8).unwrap());
             let mapping = OsMemory::map(mapping_len).unwrap();
             let extent =
-                Extent::new(ExtentId::from_index(0).unwrap(), heap_id, mapping, spec).unwrap();
+                Extent::new(ExtentId::from_index(0).unwrap(), self.owner, mapping, spec).unwrap();
             assert_eq!(extent.free(extent.ptr()), Ok(()));
             let ptr = NonNull::from(Box::leak(Box::new(extent)));
             self.extents.push(ptr);

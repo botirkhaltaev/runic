@@ -49,7 +49,7 @@ impl Heaps {
             if heap.state.is_retired() || !heap.state.is_free() {
                 continue;
             }
-            heap.reactivate(heap.id());
+            heap.reactivate();
             return Some(heap);
         }
     }

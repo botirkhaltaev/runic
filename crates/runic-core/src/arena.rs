@@ -214,14 +214,6 @@ impl<T> Arena<T> {
             index: 0,
         }
     }
-
-    pub(crate) fn iter_mut(&mut self) -> IterMut<'_, T> {
-        IterMut {
-            arena: NonNull::from(self),
-            index: 0,
-            marker: PhantomData,
-        }
-    }
 }
 
 impl<T> Drop for Arena<T> {
@@ -251,32 +243,6 @@ impl<'a, T> Iterator for Iter<'a, T> {
             self.index += 1;
             if let Some(value) = self.arena.get(index) {
                 return Some(value);
-            }
-        }
-        None
-    }
-}
-
-pub(crate) struct IterMut<'a, T> {
-    arena: NonNull<Arena<T>>,
-    index: u32,
-    marker: PhantomData<&'a mut Arena<T>>,
-}
-
-impl<'a, T> Iterator for IterMut<'a, T> {
-    type Item = &'a mut T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // SAFETY: IterMut owns the exclusive Arena borrow for 'a. Indices increase
-        // monotonically, so each occupied slot is yielded at most once.
-        let arena = unsafe { self.arena.as_mut() };
-        while self.index < arena.published() {
-            let index = self.index;
-            self.index += 1;
-            if let Some(value) = arena.get_mut(index) {
-                let value = NonNull::from(value);
-                // SAFETY: this slot has not been yielded before and remains stable.
-                return Some(unsafe { &mut *value.as_ptr() });
             }
         }
         None
@@ -380,8 +346,10 @@ mod tests {
         }
         assert_eq!(arena.remove(1), Some(2));
         assert_eq!(arena.iter().copied().collect::<Vec<_>>(), vec![1, 3]);
-        for value in arena.iter_mut() {
-            *value *= 2;
+        for index in 0..3 {
+            if let Some(value) = arena.get_mut(index) {
+                *value *= 2;
+            }
         }
         assert_eq!(arena.iter().copied().collect::<Vec<_>>(), vec![2, 6]);
     }

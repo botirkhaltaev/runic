@@ -15,7 +15,7 @@ use crate::{
 };
 
 use super::{
-    HeapId,
+    Heap, HeapId,
     inbox::{InboxLink, InboxNode},
 };
 
@@ -69,7 +69,7 @@ impl ExtentState {
 
 pub(crate) struct Extent {
     id: ExtentId,
-    heap: HeapId,
+    heap: &'static Heap,
     mapping: Mapping,
     range: AddressRange,
     state: AtomicU8,
@@ -92,7 +92,7 @@ impl InboxNode for Extent {
 impl Extent {
     pub(crate) fn new(
         id: ExtentId,
-        heap: HeapId,
+        heap: &'static Heap,
         mapping: Mapping,
         spec: LayoutSpec,
     ) -> Option<Self> {
@@ -120,12 +120,8 @@ impl Extent {
         self.id
     }
 
-    pub(crate) const fn heap_id(&self) -> HeapId {
-        self.heap
-    }
-
-    pub(crate) fn set_heap_id(&mut self, heap_id: HeapId) {
-        self.heap = heap_id;
+    pub(crate) fn heap_id(&self) -> HeapId {
+        self.heap.id()
     }
 
     pub(crate) const fn next(&self) -> Option<NonNull<Extent>> {
@@ -256,7 +252,7 @@ impl Extent {
     }
 
     /// Reuse a Free cached extent for `spec` without republishing its mapping.
-    pub(crate) fn reuse(&mut self, heap_id: HeapId, spec: LayoutSpec) -> Option<NonNull<u8>> {
+    pub(crate) fn reuse(&mut self, spec: LayoutSpec) -> Option<NonNull<u8>> {
         if self.load_state().ok()? != ExtentState::Free {
             return None;
         }
@@ -268,7 +264,6 @@ impl Extent {
             return None;
         }
 
-        self.heap = heap_id;
         self.range = range;
         self.discarded = false;
         self.state
@@ -296,17 +291,16 @@ impl Extent {
 #[cfg(test)]
 mod tests {
     use core::{alloc::Layout, num::NonZeroU32};
+    use std::sync::OnceLock;
 
-    use crate::{layout::LayoutSpec, memory::OsMemory};
+    use crate::{config::AllocatorConfig, layout::LayoutSpec, memory::OsMemory};
 
     use super::*;
 
+    static OWNER: OnceLock<Heap> = OnceLock::new();
+
     fn layout_spec(size: usize, align: usize) -> LayoutSpec {
         LayoutSpec::from_layout(Layout::from_size_align(size, align).unwrap())
-    }
-
-    fn test_heap_id() -> HeapId {
-        HeapId::new(0, NonZeroU32::MIN).unwrap()
     }
 
     #[test]
@@ -316,7 +310,12 @@ mod tests {
         let mapping_range = mapping.range();
         let extent = Extent::new(
             ExtentId::from_index(0).unwrap(),
-            test_heap_id(),
+            OWNER.get_or_init(|| {
+                Heap::new(
+                    HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                    AllocatorConfig::new(),
+                )
+            }),
             mapping,
             spec,
         )
@@ -333,7 +332,12 @@ mod tests {
         let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
         let extent = Extent::new(
             ExtentId::from_index(1).unwrap(),
-            test_heap_id(),
+            OWNER.get_or_init(|| {
+                Heap::new(
+                    HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                    AllocatorConfig::new(),
+                )
+            }),
             mapping,
             spec,
         )
@@ -351,7 +355,12 @@ mod tests {
         let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
         let extent = Extent::new(
             ExtentId::from_index(2).unwrap(),
-            test_heap_id(),
+            OWNER.get_or_init(|| {
+                Heap::new(
+                    HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                    AllocatorConfig::new(),
+                )
+            }),
             mapping,
             spec,
         )
@@ -367,7 +376,12 @@ mod tests {
         let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
         let extent = Extent::new(
             ExtentId::from_index(8).unwrap(),
-            test_heap_id(),
+            OWNER.get_or_init(|| {
+                Heap::new(
+                    HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                    AllocatorConfig::new(),
+                )
+            }),
             mapping,
             spec,
         )
@@ -385,7 +399,12 @@ mod tests {
         let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
         let mut extent = Extent::new(
             ExtentId::from_index(3).unwrap(),
-            test_heap_id(),
+            OWNER.get_or_init(|| {
+                Heap::new(
+                    HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                    AllocatorConfig::new(),
+                )
+            }),
             mapping,
             spec,
         )
@@ -401,7 +420,12 @@ mod tests {
         let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
         let mut extent = Extent::new(
             ExtentId::from_index(4).unwrap(),
-            test_heap_id(),
+            OWNER.get_or_init(|| {
+                Heap::new(
+                    HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                    AllocatorConfig::new(),
+                )
+            }),
             mapping,
             spec,
         )
@@ -417,7 +441,12 @@ mod tests {
         let mapping = OsMemory::map(512 * 1024).unwrap();
         let mut extent = Extent::new(
             ExtentId::from_index(5).unwrap(),
-            test_heap_id(),
+            OWNER.get_or_init(|| {
+                Heap::new(
+                    HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                    AllocatorConfig::new(),
+                )
+            }),
             mapping,
             spec,
         )
@@ -434,7 +463,12 @@ mod tests {
         let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
         let mut extent = Extent::new(
             ExtentId::from_index(6).unwrap(),
-            test_heap_id(),
+            OWNER.get_or_init(|| {
+                Heap::new(
+                    HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                    AllocatorConfig::new(),
+                )
+            }),
             mapping,
             spec,
         )
@@ -451,7 +485,12 @@ mod tests {
         let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
         let mut extent = Extent::new(
             ExtentId::from_index(7).unwrap(),
-            test_heap_id(),
+            OWNER.get_or_init(|| {
+                Heap::new(
+                    HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                    AllocatorConfig::new(),
+                )
+            }),
             mapping,
             spec,
         )
