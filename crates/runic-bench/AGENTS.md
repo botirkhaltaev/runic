@@ -2,7 +2,8 @@
 
 Scope: `crates/runic-bench/`.
 
-- Internal (`publish = false`). Deterministic workloads; do not change allocator semantics to win a bench.
+- Deterministic workloads; do not change allocator semantics to win a bench.
 - Touch allocated memory so work is not optimized away.
-- Benches are process-global (`#[global_allocator]`): std collections plus `serde_json` / `regex` / `bytes`. No synthetic `GlobalAlloc` ports.
-- After changes: `cargo bench -p runic-bench --no-run`. Perf claims need paired `scripts/profile.sh` (prefer `--compare`; fresh bench bins) — do not gate on Criterion alone or inferred wins.
+- Benches are process-global (`#[global_allocator]`) application workloads. No synthetic `GlobalAlloc` ports or lifecycle probes.
+- Keep one self-contained file per workload; share only code with genuine reuse.
+- After changes: build every bench, run the Criterion test pass, then profile representative workloads with `scripts/profile.sh`.

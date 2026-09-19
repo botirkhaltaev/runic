@@ -307,14 +307,15 @@ impl Run {
     pub(crate) fn header_of(ptr: NonNull<u8>) -> Option<NonNull<Self>> {
         let masked = ptr.as_ptr().addr() & !(RUN_SIZE - 1);
         let header = masked.wrapping_add(RUN_SIZE);
-        // SAFETY: run spaces map this address. Extents never carry a size-class
-        // layout (`resize_in_place` refuses). Unmapped foreign small pointers
-        // SIGSEGV (accepted). Mapped-but-foreign fails the base check.
-        let run = unsafe { &*core::ptr::with_exposed_provenance::<Self>(header) };
-        if run.base.as_ptr().addr() != masked {
+        let base_ptr = core::ptr::with_exposed_provenance::<usize>(header);
+        // SAFETY: run spaces map this aligned address and `base` is the first
+        // `repr(C)` field. Reading it as `usize` is valid even for a zeroed,
+        // unused run slot; only a matching initialized header is returned.
+        if unsafe { base_ptr.read() } != masked {
             return None;
         }
-        Some(NonNull::from(run))
+        // SAFETY: `header` is nonzero and the raw base word matched this run.
+        Some(unsafe { NonNull::new_unchecked(base_ptr.cast_mut().cast()) })
     }
 
     pub(crate) const fn heap_id(&self) -> HeapId {
@@ -685,6 +686,15 @@ mod tests {
         )
         .expect("test run");
         TestRun { run, _map: map }
+    }
+
+    #[test]
+    fn header_of_rejects_zeroed_unused_map_slot() {
+        let map = OsMemory::map_aligned(RUN_SPACE * 2, RUN_SIZE).unwrap();
+        let unused = map.base().as_ptr().wrapping_byte_add(RUN_SPACE);
+        let unused = NonNull::new(unused).unwrap();
+
+        assert_eq!(Run::header_of(unused), None);
     }
 
     #[test]

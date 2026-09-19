@@ -326,16 +326,33 @@ impl Allocator {
             }
         }
 
-        match heap.enqueue(heap_id, owner) {
-            Ok(()) => Ok(()),
-            // Close won: claim held, not queued — Draining push+flush (no stranded Queued).
-            Err(HeapError::InvalidHeap) => {
-                ctx.heaps
-                    .enqueue(heap_id, owner)
-                    .map_err(AllocatorError::from)?;
-                ctx.heaps.flush(heap_id, ctx).map_err(AllocatorError::from)
+        loop {
+            match heap.enqueue(heap_id, owner) {
+                Ok(()) => return Ok(()),
+                // Close won: the claim is held but not necessarily queued.
+                Err(HeapError::InvalidHeap) => {}
+                Err(error) => return Err(AllocatorError::from(error)),
             }
-            Err(error) => Err(AllocatorError::from(error)),
+
+            match ctx.heaps.enqueue(heap_id, owner) {
+                Ok(()) => match ctx.heaps.flush(heap_id, ctx) {
+                    Ok(()) => return Ok(()),
+                    // Adoption won after the Draining push. The queued link is
+                    // visible to the new owner; retrying Active enqueue coalesces.
+                    Err(HeapError::InvalidHeap) => {}
+                    Err(error) => return Err(AllocatorError::from(error)),
+                },
+                // Adoption won before the Draining push. Retry Active enqueue
+                // with the existing claim instead of claiming the block twice.
+                Err(HeapError::InvalidHeap) => {}
+                Err(error) => return Err(AllocatorError::from(error)),
+            }
+
+            if !heap.matches(heap_id) {
+                // Reclaim cannot advance the generation while this claim is
+                // outstanding. A mismatch proves an owner accepted it first.
+                return Ok(());
+            }
         }
     }
 

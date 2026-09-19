@@ -55,7 +55,7 @@ Runic v0.6 implements:
 - basic `alloc_zeroed`
 - randomized allocation trace tests
 
-Correctness comes before speed. See `ROADMAP.md` for the project thesis, current scope, architecture, benchmarks, and follow-up plan.
+Correctness comes before speed. See `ROADMAP.md` for the project thesis, current scope, architecture, and follow-up plan. Measurement history lives in `diary.md`.
 
 ## Crates
 
@@ -63,7 +63,7 @@ Correctness comes before speed. See `ROADMAP.md` for the project thesis, current
 crates/runic-core          allocator mechanics and global state; published as runic-core
 crates/runic               GlobalAlloc wrapper; published as runic-alloc, imported as runic
 crates/runic-test-support  reusable test machinery; not published
-crates/runic-bench         benchmark harness; not published
+crates/runic-bench         benchmark harness
 ```
 
 Published crates:
@@ -87,7 +87,7 @@ benches; script wraps the resolved ELF under perf). Cost is `metrics.txt` /
 
 ```sh
 scripts/profile.sh --preflight
-scripts/profile.sh -l baseline global_runic 'global/runic/tree'
+scripts/profile.sh -l baseline global_runic 'global/runic/json_api'
 scripts/profile.sh --compare target/runic-profiles/run-before target/runic-profiles/run-after
 ```
 

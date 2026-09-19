@@ -46,7 +46,7 @@ impl ThreadHeap {
         self.heap_id.get() == Some(id) || self.adopted_id.get() == Some(id)
     }
 
-    /// Small: in-page header. Else `PageMap` (extents / fallback).
+    /// Small: validated in-page header. Else `PageMap` (extents / fallback).
     pub(crate) fn lookup(pages: &PageMap, ptr: NonNull<u8>, spec: LayoutSpec) -> Option<PageOwner> {
         if SizeClasses::class_for(spec).is_some()
             && let Some(run) = Run::header_of(ptr)
@@ -298,7 +298,9 @@ impl ThreadHeap {
         if !heap.inboxes_empty() {
             return;
         }
-        let inner = heap.require_inner();
+        let Some(inner) = heap.try_inner() else {
+            return;
+        };
         let idle = !inner.occupied() && !inner.has_live();
         drop(inner);
         if idle {
