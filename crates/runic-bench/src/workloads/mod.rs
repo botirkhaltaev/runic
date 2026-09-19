@@ -1,4 +1,6 @@
+mod arc_broadcast;
 mod async_server;
+mod buffer_pool;
 mod compress_roundtrip;
 mod csv_pipeline;
 mod graph_shortest_path;
@@ -9,6 +11,7 @@ mod log_pipeline;
 mod lru_cache;
 mod records_sort;
 mod regex_search;
+mod shard_aggregator;
 mod text_index;
 mod thread_pool_jobs;
 mod toml_config;
@@ -72,4 +75,7 @@ pub const WORKLOADS: &[Workload] = &[
     workload!(async_server),
     workload!(thread_pool_jobs),
     workload!(log_pipeline),
+    workload!(shard_aggregator),
+    workload!(buffer_pool),
+    workload!(arc_broadcast),
 ];
