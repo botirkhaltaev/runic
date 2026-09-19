@@ -256,7 +256,7 @@ impl Allocator {
     /// Not owner-local on TLS: bind Active heap, then flush-then-alloc (run or extent).
     #[cold]
     #[inline(never)]
-    fn bind_alloc(ctx: &AllocatorCtx<'_>, request: AllocKind) -> *mut u8 {
+    fn bind_alloc(ctx: &AllocatorCtx<'static>, request: AllocKind) -> *mut u8 {
         if THREAD_HEAP.bind(ctx).is_none() {
             return null_mut();
         }
@@ -278,7 +278,7 @@ impl Allocator {
     #[cold]
     #[inline(never)]
     fn free_remote(
-        ctx: &AllocatorCtx<'_>,
+        ctx: &AllocatorCtx<'static>,
         owner: PageOwner,
         ptr: NonNull<u8>,
     ) -> Result<(), AllocatorError> {
@@ -392,7 +392,7 @@ impl Allocator {
 
     /// Bound-extent miss: TLS extent alloc, else bind.
     #[inline(never)]
-    fn alloc_extent(ctx: &AllocatorCtx<'_>, spec: LayoutSpec, init: ExtentInit) -> *mut u8 {
+    fn alloc_extent(ctx: &AllocatorCtx<'static>, spec: LayoutSpec, init: ExtentInit) -> *mut u8 {
         if let Some(ptr) = THREAD_HEAP.alloc_extent(spec, init, ctx) {
             return ptr.as_ptr();
         }
@@ -402,7 +402,7 @@ impl Allocator {
     /// Cross-heap or domain-error after the TLS hit missed.
     #[cold]
     #[inline(never)]
-    fn free_fail(ctx: &AllocatorCtx<'_>, ptr: NonNull<u8>, error: ThreadFreeError) {
+    fn free_fail(ctx: &AllocatorCtx<'static>, ptr: NonNull<u8>, error: ThreadFreeError) {
         match error {
             ThreadFreeError::Heap(_) => Self::abort(),
             ThreadFreeError::Remote(owner) => {
@@ -477,7 +477,7 @@ mod tests {
         tls.unbind(&ctx);
     }
 
-    fn bind_alloc_small(tls: &ThreadHeap, ctx: &AllocatorCtx<'_>, layout: Layout) -> NonNull<u8> {
+    fn bind_alloc_small(tls: &ThreadHeap, ctx: &AllocatorCtx, layout: Layout) -> NonNull<u8> {
         let class = SizeClasses::class_for(LayoutSpec::from_layout(layout)).unwrap();
         tls.alloc(class)
             .or_else(|| tls.alloc_miss(class, ctx))
@@ -486,7 +486,7 @@ mod tests {
 
     fn bind_alloc_extent(
         tls: &ThreadHeap,
-        ctx: &AllocatorCtx<'_>,
+        ctx: &AllocatorCtx,
         layout: Layout,
         init: ExtentInit,
     ) -> NonNull<u8> {
@@ -510,7 +510,7 @@ mod tests {
 
     fn alloc_live(
         tls: &ThreadHeap,
-        ctx: &AllocatorCtx<'_>,
+        ctx: &AllocatorCtx,
         layout: Layout,
         n: u32,
     ) -> Vec<NonNull<u8>> {

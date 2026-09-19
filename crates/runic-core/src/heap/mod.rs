@@ -58,7 +58,10 @@ pub(super) struct HeapInner {
     extents: ExtentHeap,
 }
 
-/// Parent bag passed into heap children (`PageMap` + `Heaps`).
+/// Process `PageMap` + `Heaps` for miss / bind / unbind / Draining.
+///
+/// [`crate::allocator::Allocator::ctx`] is `'static`. Bind/install still require
+/// that so TLS can store the heap. Other methods take a call-scoped borrow.
 #[derive(Clone, Copy)]
 pub(crate) struct AllocatorCtx<'a> {
     pub pages: &'a PageMap,
@@ -274,11 +277,7 @@ impl Heap {
     }
 
     /// Drain both inboxes into run/extent metadata (accept).
-    pub(super) fn flush(
-        &self,
-        inner: &mut HeapInner,
-        ctx: &AllocatorCtx<'_>,
-    ) -> Result<(), HeapError> {
+    pub(super) fn flush(&self, inner: &mut HeapInner, ctx: &AllocatorCtx) -> Result<(), HeapError> {
         while let Some(chain) = self.run_inbox.drain() {
             for run in chain {
                 // SAFETY: dequeued from this heap's run inbox; live arena run.
@@ -303,7 +302,7 @@ impl Heap {
         inner: &mut HeapInner,
         spec: LayoutSpec,
         init: ExtentInit,
-        ctx: &AllocatorCtx<'_>,
+        ctx: &AllocatorCtx,
     ) -> Option<NonNull<u8>> {
         if !self.inboxes_empty() {
             self.flush(inner, ctx).ok()?;

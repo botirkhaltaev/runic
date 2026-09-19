@@ -118,7 +118,7 @@ impl Heaps {
         id: HeapId,
         owner: PageOwner,
         ptr: NonNull<u8>,
-        ctx: &AllocatorCtx<'_>,
+        ctx: &AllocatorCtx,
     ) -> Result<(), HeapError> {
         let (heap, mut inner) = self.admit(id)?;
         let emptied = inner.free(owner, ptr, ctx.pages)?;
@@ -129,7 +129,7 @@ impl Heaps {
     }
 
     /// Accept inboxes while Draining. Then reclaim.
-    pub(crate) fn flush(&self, id: HeapId, ctx: &AllocatorCtx<'_>) -> Result<(), HeapError> {
+    pub(crate) fn flush(&self, id: HeapId, ctx: &AllocatorCtx) -> Result<(), HeapError> {
         let (heap, mut inner) = self.admit(id)?;
         heap.flush(&mut inner, ctx)?;
         heap.reclaim(&inner, self);
@@ -149,7 +149,7 @@ impl Heaps {
     }
 
     /// Owner thread gives up the heap: close Active, wait leases, reclaim, flush.
-    pub(crate) fn retire(&self, id: HeapId, ctx: &AllocatorCtx<'_>) -> Result<(), HeapError> {
+    pub(crate) fn retire(&self, id: HeapId, ctx: &AllocatorCtx) -> Result<(), HeapError> {
         {
             let Some(heap) = self.get(id) else {
                 return Ok(());
@@ -198,23 +198,22 @@ mod tests {
     use super::*;
     use crate::memory::PageMap;
 
-    fn retire(heaps: &Heaps, id: HeapId) -> Result<(), HeapError> {
-        let pages = PageMap::new();
-        heaps.retire(
-            id,
-            &AllocatorCtx {
-                pages: &pages,
-                heaps,
-            },
-        )
-    }
-
     #[test]
     fn acquire_retire_reactivate_bumps_generation() {
         let heaps = Heaps::new(AllocatorConfig::new());
         let first = heaps.acquire().unwrap().id();
         assert_eq!(first.generation().get(), 1);
-        assert_eq!(retire(&heaps, first), Ok(()));
+        let pages = PageMap::new();
+        assert_eq!(
+            heaps.retire(
+                first,
+                &AllocatorCtx {
+                    pages: &pages,
+                    heaps: &heaps
+                }
+            ),
+            Ok(())
+        );
         assert!(heaps.get(first).is_none());
 
         let second = heaps.acquire().unwrap().id();
@@ -228,7 +227,17 @@ mod tests {
     fn stale_heap_id_rejected_after_reclaim() {
         let heaps = Heaps::new(AllocatorConfig::new());
         let id = heaps.acquire().unwrap().id();
-        assert_eq!(retire(&heaps, id), Ok(()));
+        let pages = PageMap::new();
+        assert_eq!(
+            heaps.retire(
+                id,
+                &AllocatorCtx {
+                    pages: &pages,
+                    heaps: &heaps
+                }
+            ),
+            Ok(())
+        );
         assert!(heaps.get(id).is_none());
     }
 
@@ -255,13 +264,23 @@ mod tests {
         let id = heaps.acquire().unwrap().id();
         let heap = heaps.get(id).unwrap();
         let lease = heap.state.acquire_lease(id).unwrap();
+        let pages = PageMap::new();
         let start = Barrier::new(2);
         let (done_tx, done_rx) = mpsc::channel();
 
         thread::scope(|scope| {
             scope.spawn(|| {
                 start.wait();
-                assert_eq!(retire(&heaps, id), Ok(()));
+                assert_eq!(
+                    heaps.retire(
+                        id,
+                        &AllocatorCtx {
+                            pages: &pages,
+                            heaps: &heaps
+                        }
+                    ),
+                    Ok(())
+                );
                 done_tx.send(()).unwrap();
             });
 
@@ -283,6 +302,7 @@ mod tests {
     fn acquire_grows_past_sixty_four_live_heaps() {
         const LIVE: usize = 96;
         let heaps = Heaps::new(AllocatorConfig::new());
+        let pages = PageMap::new();
         let (tx, rx) = mpsc::channel();
         thread::scope(|scope| {
             let heaps = &heaps;
@@ -304,7 +324,16 @@ mod tests {
             assert_eq!(indexes.len(), unique);
 
             for id in ids {
-                assert_eq!(retire(heaps, id), Ok(()));
+                assert_eq!(
+                    heaps.retire(
+                        id,
+                        &AllocatorCtx {
+                            pages: &pages,
+                            heaps,
+                        }
+                    ),
+                    Ok(())
+                );
             }
         });
 
