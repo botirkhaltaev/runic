@@ -35,11 +35,6 @@ pub(crate) enum ExtentInit {
     Zeroed,
 }
 
-// SAFETY: ExtentHeap owns extent metadata and cache pointers into its own
-// arena. Moving the heap to another thread does not permit concurrent mutation;
-// exclusive access stays under HeapInner.
-unsafe impl Send for ExtentHeap {}
-
 impl ExtentHeap {
     pub(crate) fn new(config: ExtentConfig) -> Self {
         Self {
@@ -77,9 +72,8 @@ impl ExtentHeap {
         init: ExtentInit,
     ) -> Option<NonNull<u8>> {
         let len = spec.mapping_len(OsMemory::page_size())?;
-        if let Some(mut extent_ptr) = self.cache.acquire(len) {
-            // SAFETY: cache only stores live arena extents owned by this heap.
-            let extent = unsafe { extent_ptr.as_mut() };
+        if let Some(id) = self.cache.acquire(&self.extents, len) {
+            let extent = self.extents.get(id.index())?;
             let cache_clean = extent.discarded();
             if let Some(ptr) = extent.reuse(spec) {
                 if init == ExtentInit::Zeroed && !cache_clean {
@@ -94,7 +88,7 @@ impl ExtentHeap {
                 return Some(ptr);
             }
             // Cache keyed by mapping length; reuse failure is rare (align) — release and remap.
-            let _ = self.unmap(extent_ptr, pages);
+            let _ = self.unmap_id(id, pages);
         }
 
         let mapping = OsMemory::map(len)?;
@@ -123,51 +117,61 @@ impl ExtentHeap {
 
     pub(crate) fn free(
         &mut self,
-        extent_ptr: NonNull<Extent>,
+        extent: NonNull<Extent>,
         ptr: NonNull<u8>,
         pages: &PageMap,
     ) -> Result<(), HeapError> {
         // SAFETY: PageMap stores only pointers published from this allocator's live arena.
-        unsafe { extent_ptr.as_ref() }.free(ptr)?;
-        self.cache_or_unmap(extent_ptr, pages)
+        let extent = unsafe { extent.as_ref() };
+        extent.free(ptr)?;
+        self.cache_or_unmap(extent, pages)
     }
 
     pub(crate) fn accept(
         &mut self,
-        extent_ptr: NonNull<Extent>,
+        extent: NonNull<Extent>,
         ptr: NonNull<u8>,
         pages: &PageMap,
     ) -> Result<(), HeapError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
-        unsafe { extent_ptr.as_ref() }.accept(ptr)?;
-        self.cache_or_unmap(extent_ptr, pages)
+        // SAFETY: the extent inbox carries only live arena extents.
+        let extent = unsafe { extent.as_ref() };
+        extent.accept(ptr)?;
+        self.cache_or_unmap(extent, pages)
     }
 
     /// After free/accept: Keep/Discard retain published in cache; Unmap / over-budget unpublish.
-    fn cache_or_unmap(
-        &mut self,
-        extent_ptr: NonNull<Extent>,
-        pages: &PageMap,
-    ) -> Result<(), HeapError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
-        debug_assert!(!unsafe { extent_ptr.as_ref() }.is_live());
+    fn cache_or_unmap(&mut self, extent: &Extent, pages: &PageMap) -> Result<(), HeapError> {
+        debug_assert!(!extent.is_live());
         self.sub_live();
-        if self.cache.insert(extent_ptr).is_ok() {
+        if self.cache.insert(&self.extents, extent.id()).is_ok() {
             return Ok(());
         }
 
-        self.unmap(extent_ptr, pages)
+        self.unmap(extent, pages)
     }
 
-    fn unmap(&mut self, extent_ptr: NonNull<Extent>, pages: &PageMap) -> Result<(), HeapError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
-        let extent = unsafe { extent_ptr.as_ref() };
+    fn unmap(&mut self, extent: &Extent, pages: &PageMap) -> Result<(), HeapError> {
         let id = extent.id();
 
         pages
-            .unpublish_extent(extent.mapping(), extent_ptr)
+            .unpublish_extent(extent.mapping(), NonNull::from(extent))
             .map_err(|_| HeapError::InvalidMetadata)?;
 
+        self.remove(id)
+    }
+
+    fn unmap_id(&mut self, id: ExtentId, pages: &PageMap) -> Result<(), HeapError> {
+        let Some(extent) = self.extents.get(id.index()) else {
+            return Err(HeapError::MissingExtent);
+        };
+        pages
+            .unpublish_extent(extent.mapping(), NonNull::from(extent))
+            .map_err(|_| HeapError::InvalidMetadata)?;
+
+        self.remove(id)
+    }
+
+    fn remove(&mut self, id: ExtentId) -> Result<(), HeapError> {
         let index = id.index();
         let Some(extent) = self.extents.remove(index) else {
             return Err(HeapError::MissingExtent);
@@ -183,26 +187,25 @@ impl ExtentHeap {
         id: ExtentId,
         extent: Extent,
         pages: &PageMap,
-    ) -> Option<NonNull<Extent>> {
+    ) -> Option<&Extent> {
         let inserted_extent = self.extents.insert(index, extent)?;
         debug_assert_eq!(inserted_extent.id(), id);
-        let extent_ptr = NonNull::from(&mut *inserted_extent);
 
         if pages
-            .publish_extent(inserted_extent.mapping(), extent_ptr)
+            .publish_extent(inserted_extent.mapping(), NonNull::from(&*inserted_extent))
             .is_err()
         {
             let _removed = self.extents.remove(index);
             return None;
         }
 
-        Some(extent_ptr)
+        Some(inserted_extent)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use core::{alloc::Layout, num::NonZeroU32, ptr::write_bytes};
+    use core::{alloc::Layout, ptr::write_bytes};
     use std::sync::OnceLock;
 
     use crate::{
@@ -230,7 +233,7 @@ mod tests {
             id,
             OWNER.get_or_init(|| {
                 Heap::new(
-                    HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                    HeapId::new(0, core::num::NonZeroU32::MIN).unwrap(),
                     AllocatorConfig::new(),
                 )
             }),
@@ -247,12 +250,15 @@ mod tests {
         let index = heap.extents.vacant().unwrap();
         let id = ExtentId::from_index(index).unwrap();
         let extent = reusable_extent(id);
-        let existing = NonNull::dangling();
+        let existing = Box::leak(Box::new(reusable_extent(
+            ExtentId::from_index(index + 1).unwrap(),
+        )));
         let base = extent.mapping().range().base();
 
+        let existing = NonNull::from(&*existing);
         pages.publish_extent(extent.mapping(), existing).unwrap();
 
-        assert_eq!(heap.insert_extent(index, id, extent, &pages), None);
+        assert!(heap.insert_extent(index, id, extent, &pages).is_none());
         assert!(heap.extents.get_mut(index).is_none());
         assert_eq!(pages.get(base), Some(PageOwner::Extent(existing)));
     }
@@ -264,7 +270,7 @@ mod tests {
         let spec = layout_spec(128 * 1024, 4096);
         let owner = OWNER.get_or_init(|| {
             Heap::new(
-                HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                HeapId::new(0, core::num::NonZeroU32::MIN).unwrap(),
                 AllocatorConfig::new(),
             )
         });
@@ -288,7 +294,7 @@ mod tests {
         let spec = layout_spec(128 * 1024, 4096);
         let owner = OWNER.get_or_init(|| {
             Heap::new(
-                HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                HeapId::new(0, core::num::NonZeroU32::MIN).unwrap(),
                 AllocatorConfig::new(),
             )
         });
@@ -315,7 +321,7 @@ mod tests {
         let spec = layout_spec(128 * 1024, 4096);
         let owner = OWNER.get_or_init(|| {
             Heap::new(
-                HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                HeapId::new(0, core::num::NonZeroU32::MIN).unwrap(),
                 AllocatorConfig::new(),
             )
         });
@@ -339,7 +345,7 @@ mod tests {
         let spec = layout_spec(128 * 1024, 4096);
         let owner = OWNER.get_or_init(|| {
             Heap::new(
-                HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                HeapId::new(0, core::num::NonZeroU32::MIN).unwrap(),
                 AllocatorConfig::new(),
             )
         });
@@ -364,7 +370,7 @@ mod tests {
         let size = 128 * 1024;
         let owner = OWNER.get_or_init(|| {
             Heap::new(
-                HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                HeapId::new(0, core::num::NonZeroU32::MIN).unwrap(),
                 AllocatorConfig::new(),
             )
         });
@@ -404,7 +410,7 @@ mod tests {
         let spec = layout_spec(LAZY_ZERO, 4096);
         let owner = OWNER.get_or_init(|| {
             Heap::new(
-                HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                HeapId::new(0, core::num::NonZeroU32::MIN).unwrap(),
                 AllocatorConfig::new(),
             )
         });
@@ -454,7 +460,7 @@ mod tests {
         let size = 128 * 1024;
         let owner = OWNER.get_or_init(|| {
             Heap::new(
-                HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                HeapId::new(0, core::num::NonZeroU32::MIN).unwrap(),
                 AllocatorConfig::new(),
             )
         });
@@ -496,7 +502,7 @@ mod tests {
         let size = 128 * 1024;
         let owner = OWNER.get_or_init(|| {
             Heap::new(
-                HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                HeapId::new(0, core::num::NonZeroU32::MIN).unwrap(),
                 AllocatorConfig::new(),
             )
         });
