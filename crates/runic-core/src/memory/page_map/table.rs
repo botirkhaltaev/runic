@@ -13,7 +13,7 @@ use super::{
     page::{L1Index, L2Index, L2Segment, PageRange},
 };
 
-/// L1 root for lock-free `get` and cold install/stamp state.
+/// L1 root for lock-free `get` and cold publication/stamp state.
 ///
 /// Layout (hot first): dense `tables` for `get`, then per-L2 `writes` and `mappings`.
 /// `get` indexes only `tables`. Stamp exclusion stays off [`L2Table`] so each L2 mmap
@@ -28,7 +28,7 @@ pub(super) struct L1Table {
     tables: [AtomicPtr<L2Table>; L1_ENTRIES],
     /// Per-L2 stamp exclusion. Not read by `get`.
     writes: [AtomicBool; L1_ENTRIES],
-    /// L2 mmap ownership. Written by install CAS winner; read only on `PageMap` drop.
+    /// L2 mmap ownership. Written by publication CAS winner; read only on `PageMap` drop.
     mappings: [UnsafeCell<Option<Mapping>>; L1_ENTRIES],
 }
 
@@ -54,7 +54,7 @@ impl L1Table {
     #[inline]
     pub(super) fn owner(&self, l1_index: L1Index, l2_index: L2Index) -> Option<PageOwner> {
         let l2 = self.l2_table_ref(l1_index)?;
-        l2.owner(l2_index)
+        l2.entry(l2_index).owner()
     }
 
     #[inline]
@@ -65,7 +65,7 @@ impl L1Table {
         Some(unsafe { table.as_ref() })
     }
 
-    pub(super) fn install_l2(&self, index: L1Index) -> Result<&L2Table, PageMapError> {
+    pub(super) fn ensure_l2(&self, index: L1Index) -> Result<&L2Table, PageMapError> {
         if let Some(table) = self.l2_table_ref(index) {
             return Ok(table);
         }
@@ -98,28 +98,18 @@ impl L1Table {
 
     /// Lock distinct L2 write flags in ascending L1 order (segment iteration order).
     ///
-    /// Caller must have installed L2s for every touched index (insert) or accept that a
+    /// Caller must have ensured L2s for every touched index (insert) or accept that a
     /// missing L2 is an invariant violation (remove after a published range).
     pub(super) fn lock_range(&self, range: PageRange) -> L1WriteGuard<'_> {
-        let mut prev = None;
         for segment in range.segments() {
-            if prev == Some(segment.l1) {
-                continue;
-            }
             self.lock_write(segment.l1);
-            prev = Some(segment.l1);
         }
         L1WriteGuard { l1: self, range }
     }
 
     fn unlock_range(&self, range: PageRange) {
-        let mut prev = None;
         for segment in range.segments() {
-            if prev == Some(segment.l1) {
-                continue;
-            }
             self.unlock_write(segment.l1);
-            prev = Some(segment.l1);
         }
     }
 
@@ -219,7 +209,7 @@ impl L1Table {
 }
 
 // SAFETY: `tables` are published atomically for lock-free get. `writes` serialize stamp
-// mutation per L2. `mappings` are written once by the install CAS winner and read only on
+// mutation per L2. `mappings` are written once by the publication CAS winner and read only on
 // exclusive `PageMap` drop — `get` never touches cold arrays. Zero-filled mmap is valid.
 unsafe impl Sync for L1Table {}
 
@@ -237,14 +227,9 @@ const _: () = assert!(size_of::<L2Table>() == 0x8000);
 
 impl L2Table {
     #[inline]
-    pub(super) fn owner(&self, index: L2Index) -> Option<PageOwner> {
-        self.entry(index).owner()
-    }
-
-    #[inline]
-    pub(super) fn entry(&self, index: L2Index) -> MapEntry {
+    pub(super) fn entry(&self, index: L2Index) -> &AtomicMapEntry {
         // SAFETY: `L2Index` is only constructed for values `< L2_ENTRIES`.
-        unsafe { self.pages.get_unchecked(index.get()) }.load()
+        unsafe { self.pages.get_unchecked(index.get()) }
     }
 
     /// Caller must hold [`L1Table`] write exclusion for this L2's L1 index.

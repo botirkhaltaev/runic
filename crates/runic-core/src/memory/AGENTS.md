@@ -6,5 +6,5 @@ Scope: `crates/runic-core/src/memory/`.
 - `PageMap::get` is lock-free via hot `tables` only; never touches cold `writes` / `mappings`. Small free probes `Run::header_of`; this map is miss / extent / fallback.
 - Checked `Page::split` on untrusted pointers (fail closed outside 48-bit geometry).
 - One in-memory encoding per published range — no layered span fallback beside per-page stamps.
-- No dead `unpublish_run` until empty-run reclaim has a real caller.
+- `publish` / `unpublish` take a `PageOwner` and derive its pages; never pass geometry alongside an owner. Runs stay published until empty-run reclaim has a real caller.
 - Details: `crates/runic-core/src/memory/README.md`.

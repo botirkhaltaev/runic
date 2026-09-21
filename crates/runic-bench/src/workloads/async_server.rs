@@ -29,7 +29,7 @@ pub(super) fn run() -> usize {
             let (tx, mut rx) = tokio_mpsc::channel::<(usize, String)>(QUEUE);
             let connections: Vec<_> = (0..CONNECTIONS)
                 .map(|conn| {
-                    let tx = tx.clone();
+                    let outbound = tx.clone();
                     tokio::spawn(async move {
                         let mut served = 0_usize;
                         for i in 0..REQUESTS {
@@ -59,7 +59,7 @@ pub(super) fn run() -> usize {
                                  content-length: {}\r\n\r\n{body}",
                                 body.len()
                             );
-                            if tx.send((head, response)).await.is_err() {
+                            if outbound.send((head, response)).await.is_err() {
                                 break;
                             }
                             served += 1;

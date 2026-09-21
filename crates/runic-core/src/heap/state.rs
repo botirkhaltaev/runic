@@ -1,4 +1,4 @@
-//! Packed heap lifecycle state: generation, mode, retired flag, and enqueue leases.
+//! Packed heap lifecycle state: generation, mode, and enqueue leases.
 
 use core::{
     num::NonZeroU32,
@@ -11,8 +11,6 @@ use crate::{
 };
 
 const MODE_SHIFT: u32 = 32;
-const MODE_MASK: u64 = 0b11 << MODE_SHIFT;
-const RETIRED_BIT: u64 = 1 << 34;
 const LEASE_SHIFT: u32 = 35;
 const LEASE_MASK: u64 = ((1u64 << 29) - 1) << LEASE_SHIFT;
 pub(super) const MAX_LEASES: u32 = (1 << 29) - 1;
@@ -23,6 +21,7 @@ pub(crate) enum HeapMode {
     Free = 0,
     Active = 1,
     Draining = 2,
+    Retired = 3,
 }
 
 impl HeapMode {
@@ -31,6 +30,7 @@ impl HeapMode {
             Self::Free => 0,
             Self::Active => 1,
             Self::Draining => 2,
+            Self::Retired => 3,
         }
     }
 
@@ -39,6 +39,7 @@ impl HeapMode {
             0 => Some(Self::Free),
             1 => Some(Self::Active),
             2 => Some(Self::Draining),
+            3 => Some(Self::Retired),
             _ => None,
         }
     }
@@ -49,52 +50,50 @@ impl HeapMode {
 pub(super) struct Snapshot {
     pub(super) generation: NonZeroU32,
     pub(super) mode: HeapMode,
-    pub(super) retired: bool,
     pub(super) leases: u32,
 }
 
-/// Packed generation + mode + retired + lease count — sole heap lifecycle authority.
+/// Packed generation + mode + lease count — sole heap lifecycle authority.
 ///
 /// Linearization / ordering:
 /// - Active enqueue admit: successful `acquire_lease` `AcqRel` CAS
 /// - Inbox link: head CAS in [`super::inbox::Inbox::link`] (after lease admit)
 /// - Active→Draining close: `close` `AcqRel` CAS (preserves lease count)
-/// - Draining→Active adopt: `adopt` `AcqRel` CAS (preserves lease count)
-/// - Lease release: `Release` `fetch_sub`; retire observes zero with `Acquire` loads
-/// - Free reactivation: `Release` store of Active after metadata rebind under Inner
+/// - Draining→Active adopt: Inner lock, then `adopt` `AcqRel` CAS (preserves lease count)
+/// - Lease release: `Release` `fetch_sub`; unbind observes zero with `Acquire` loads
+/// - Draining→Free reclaim: `bump_or_retire` `AcqRel` CAS; cannot overwrite adoption
+/// - Free reactivation: `Release` store of Active; owner identity is the stable `&Heap`
 pub(crate) struct HeapState {
     word: AtomicU64,
 }
 
 impl HeapState {
-    pub(super) fn new(generation: NonZeroU32, mode: HeapMode) -> Self {
+    pub(super) const fn new(generation: NonZeroU32, mode: HeapMode) -> Self {
         Self {
-            word: AtomicU64::new(Self::pack(generation, mode, false, 0)),
+            word: AtomicU64::new(Self::pack(generation, mode, 0)),
         }
     }
 
-    fn pack(generation: NonZeroU32, mode: HeapMode, retired: bool, leases: u32) -> u64 {
+    const fn pack(generation: NonZeroU32, mode: HeapMode, leases: u32) -> u64 {
         debug_assert!(leases <= MAX_LEASES);
-        let mut word = u64::from(generation.get());
-        word |= u64::from(mode.raw()) << MODE_SHIFT;
-        if retired {
-            word |= RETIRED_BIT;
-        }
-        word |= u64::from(leases) << LEASE_SHIFT;
+        // These byte widenings stay const without integer casts.
+        let [g0, g1, g2, g3] = generation.get().to_le_bytes();
+        let mut word = u64::from_le_bytes([g0, g1, g2, g3, 0, 0, 0, 0]);
+        word |= u64::from_le_bytes([mode.raw(), 0, 0, 0, 0, 0, 0, 0]) << MODE_SHIFT;
+        let [l0, l1, l2, l3] = leases.to_le_bytes();
+        word |= u64::from_le_bytes([l0, l1, l2, l3, 0, 0, 0, 0]) << LEASE_SHIFT;
         word
     }
 
     fn decode(word: u64) -> Snapshot {
-        let retired = word & RETIRED_BIT != 0;
-        let generation = NonZeroU32::new(u32::try_from(word & 0xffff_ffff).unwrap_or(0))
-            .unwrap_or(NonZeroU32::MIN);
-        let mode = HeapMode::from_raw(u8::try_from((word & MODE_MASK) >> MODE_SHIFT).unwrap_or(0))
-            .unwrap_or(HeapMode::Free);
-        let leases = u32::try_from((word & LEASE_MASK) >> LEASE_SHIFT).unwrap_or(0);
+        let [g0, g1, g2, g3, m0, l0, l1, l2] = word.to_le_bytes();
+        let generation = NonZeroU32::new(u32::from_le_bytes([g0, g1, g2, g3]))
+            .unwrap_or_else(|| Allocator::abort());
+        let mode = HeapMode::from_raw(m0 & 0b11).unwrap_or_else(|| Allocator::abort());
+        let leases = u32::from_le_bytes([m0, l0, l1, l2]) >> 3;
         Snapshot {
             generation,
             mode,
-            retired,
             leases,
         }
     }
@@ -103,16 +102,14 @@ impl HeapState {
         Self::decode(self.word.load(Ordering::Acquire))
     }
 
-    pub(super) fn store(&self, generation: NonZeroU32, mode: HeapMode, retired: bool, leases: u32) {
-        self.word.store(
-            Self::pack(generation, mode, retired, leases),
-            Ordering::Release,
-        );
+    pub(super) fn store(&self, generation: NonZeroU32, mode: HeapMode, leases: u32) {
+        self.word
+            .store(Self::pack(generation, mode, leases), Ordering::Release);
     }
 
     pub(super) fn matches(&self, id: HeapId) -> bool {
         let snap = self.load();
-        !snap.retired && snap.generation == id.generation()
+        snap.mode != HeapMode::Retired && snap.generation == id.generation()
     }
 
     pub(crate) fn mode(&self) -> HeapMode {
@@ -124,17 +121,17 @@ impl HeapState {
     }
 
     pub(super) fn is_retired(&self) -> bool {
-        self.load().retired
+        self.load().mode == HeapMode::Retired
     }
 
     pub(super) fn is_free(&self) -> bool {
         let snap = self.load();
-        !snap.retired && snap.mode == HeapMode::Free && snap.leases == 0
+        snap.mode == HeapMode::Free && snap.leases == 0
     }
 
     pub(crate) fn is_active(&self) -> bool {
         let snap = self.load();
-        !snap.retired && snap.mode == HeapMode::Active
+        snap.mode == HeapMode::Active
     }
 
     pub(super) fn leases(&self) -> u32 {
@@ -150,13 +147,13 @@ impl HeapState {
         loop {
             let word = self.word.load(Ordering::Acquire);
             let snap = Self::decode(word);
-            if snap.retired || snap.generation != id.generation() || snap.mode != HeapMode::Active {
+            if snap.generation != id.generation() || snap.mode != HeapMode::Active {
                 return Err(HeapError::InvalidHeap);
             }
             if snap.leases == MAX_LEASES {
                 return Err(HeapError::InvalidMetadata);
             }
-            let next = Self::pack(snap.generation, snap.mode, false, snap.leases + 1);
+            let next = Self::pack(snap.generation, snap.mode, snap.leases + 1);
             if self
                 .word
                 .compare_exchange_weak(word, next, Ordering::AcqRel, Ordering::Acquire)
@@ -181,12 +178,12 @@ impl HeapState {
         loop {
             let word = self.word.load(Ordering::Acquire);
             let snap = Self::decode(word);
-            if snap.retired || snap.generation != id.generation() {
+            if snap.generation != id.generation() {
                 return Err(HeapError::InvalidHeap);
             }
             match snap.mode {
                 HeapMode::Active => {
-                    let next = Self::pack(snap.generation, HeapMode::Draining, false, snap.leases);
+                    let next = Self::pack(snap.generation, HeapMode::Draining, snap.leases);
                     if self
                         .word
                         .compare_exchange_weak(word, next, Ordering::AcqRel, Ordering::Acquire)
@@ -196,7 +193,7 @@ impl HeapState {
                     }
                 }
                 HeapMode::Draining => return Ok(()),
-                HeapMode::Free => return Err(HeapError::InvalidHeap),
+                HeapMode::Free | HeapMode::Retired => return Err(HeapError::InvalidHeap),
             }
         }
     }
@@ -206,12 +203,12 @@ impl HeapState {
         loop {
             let word = self.word.load(Ordering::Acquire);
             let snap = Self::decode(word);
-            if snap.retired || snap.generation != id.generation() {
+            if snap.generation != id.generation() {
                 return Err(HeapError::InvalidHeap);
             }
             match snap.mode {
                 HeapMode::Draining => {
-                    let next = Self::pack(snap.generation, HeapMode::Active, false, snap.leases);
+                    let next = Self::pack(snap.generation, HeapMode::Active, snap.leases);
                     if self
                         .word
                         .compare_exchange_weak(word, next, Ordering::AcqRel, Ordering::Acquire)
@@ -220,25 +217,37 @@ impl HeapState {
                         return Ok(());
                     }
                 }
-                HeapMode::Active | HeapMode::Free => return Err(HeapError::InvalidHeap),
+                HeapMode::Active | HeapMode::Free | HeapMode::Retired => {
+                    return Err(HeapError::InvalidHeap);
+                }
             }
         }
     }
 
-    /// Bump generation and set Free (leases must already be zero), or permanently retire.
-    pub(super) fn bump_or_retire(&self) {
-        let snap = self.load();
-        debug_assert_eq!(snap.mode, HeapMode::Draining);
-        debug_assert_eq!(snap.leases, 0);
-        match snap
+    /// Bump generation and set Free, or permanently retire.
+    ///
+    /// Fails when another lifecycle transition changed `expected`; reclaim must
+    /// never overwrite a concurrent Draining → Active adoption.
+    pub(super) fn bump_or_retire(&self, expected: Snapshot) -> bool {
+        debug_assert_eq!(expected.mode, HeapMode::Draining);
+        debug_assert_eq!(expected.leases, 0);
+        let next = match expected
             .generation
             .get()
             .checked_add(1)
             .and_then(NonZeroU32::new)
         {
-            Some(next) => self.store(next, HeapMode::Free, false, 0),
-            None => self.store(snap.generation, HeapMode::Free, true, 0),
-        }
+            Some(generation) => Self::pack(generation, HeapMode::Free, 0),
+            None => Self::pack(expected.generation, HeapMode::Retired, 0),
+        };
+        self.word
+            .compare_exchange(
+                Self::pack(expected.generation, expected.mode, expected.leases),
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 }
 

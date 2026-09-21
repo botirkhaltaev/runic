@@ -17,7 +17,7 @@ pub(super) fn run() -> usize {
         let (tx, rx) = mpsc::sync_channel::<Vec<(String, u64)>>(THREADS);
         thread::scope(|scope| {
             for worker in 0..THREADS {
-                let tx = tx.clone();
+                let posted = tx.clone();
                 scope.spawn(move || {
                     let mut shard = Vec::with_capacity(KEYS);
                     for key in 0..KEYS {
@@ -26,7 +26,7 @@ pub(super) fn run() -> usize {
                             * u64::try_from(HITS).unwrap_or(1);
                         shard.push((name, count));
                     }
-                    let _ = tx.send(shard);
+                    let _ = posted.send(shard);
                 });
             }
             drop(tx);

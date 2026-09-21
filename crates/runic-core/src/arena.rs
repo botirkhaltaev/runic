@@ -46,12 +46,12 @@ unsafe impl<T: Send> Send for Arena<T> {}
 unsafe impl<T: Sync> Sync for Arena<T> {}
 
 impl<T> Arena<T> {
-    pub(crate) fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
-            ptrs: core::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
+            ptrs: [const { AtomicPtr::new(ptr::null_mut()) }; MAX_CHUNKS],
             len: AtomicU32::new(0),
             grow: Mutex::new(Grow {
-                mappings: core::array::from_fn(|_| None),
+                mappings: [const { None }; MAX_CHUNKS],
                 bump: 0,
             }),
             vacant_head: VACANT_END,
@@ -106,7 +106,7 @@ impl<T> Arena<T> {
         self.slot(index)?.get()
     }
 
-    pub(crate) fn get_mut(&mut self, index: u32) -> Option<&mut T> {
+    fn get_mut(&mut self, index: u32) -> Option<&mut T> {
         self.slot_mut(index)?.get_mut()
     }
 
@@ -147,7 +147,7 @@ impl<T> Arena<T> {
         // SAFETY: just written Occupied; published; grows only append.
         Some((index, unsafe {
             match slot.as_ref() {
-                Slot::Occupied(value) => value,
+                Slot::Occupied(occupied) => occupied,
                 Slot::Vacant { .. } => core::hint::unreachable_unchecked(),
             }
         }))
@@ -173,23 +173,20 @@ impl<T> Arena<T> {
             if index != self.vacant_head {
                 return None;
             }
-            let next = {
-                let slot = self.slot_mut(index)?;
-                let Slot::Vacant { next } = slot else {
-                    return None;
-                };
-                let next = *next;
-                *slot = Slot::Occupied(value);
-                next
+            let slot = self.slot_mut(index)?;
+            let Slot::Vacant { next } = slot else {
+                return None;
             };
-            self.vacant_head = next;
+            let successor = *next;
+            *slot = Slot::Occupied(value);
+            self.vacant_head = successor;
             return self.get_mut(index);
         }
 
         if index != self.published() {
             return None;
         }
-        let (index, _) = self.push(|_| Some(value))?;
+        self.push(|_| Some(value))?;
         self.get_mut(index)
     }
 
@@ -212,14 +209,6 @@ impl<T> Arena<T> {
         Iter {
             arena: self,
             index: 0,
-        }
-    }
-
-    pub(crate) fn iter_mut(&mut self) -> IterMut<'_, T> {
-        IterMut {
-            arena: NonNull::from(self),
-            index: 0,
-            marker: PhantomData,
         }
     }
 }
@@ -251,32 +240,6 @@ impl<'a, T> Iterator for Iter<'a, T> {
             self.index += 1;
             if let Some(value) = self.arena.get(index) {
                 return Some(value);
-            }
-        }
-        None
-    }
-}
-
-pub(crate) struct IterMut<'a, T> {
-    arena: NonNull<Arena<T>>,
-    index: u32,
-    marker: PhantomData<&'a mut Arena<T>>,
-}
-
-impl<'a, T> Iterator for IterMut<'a, T> {
-    type Item = &'a mut T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // SAFETY: IterMut owns the exclusive Arena borrow for 'a. Indices increase
-        // monotonically, so each occupied slot is yielded at most once.
-        let arena = unsafe { self.arena.as_mut() };
-        while self.index < arena.published() {
-            let index = self.index;
-            self.index += 1;
-            if let Some(value) = arena.get_mut(index) {
-                let value = NonNull::from(value);
-                // SAFETY: this slot has not been yielded before and remains stable.
-                return Some(unsafe { &mut *value.as_ptr() });
             }
         }
         None
@@ -380,8 +343,10 @@ mod tests {
         }
         assert_eq!(arena.remove(1), Some(2));
         assert_eq!(arena.iter().copied().collect::<Vec<_>>(), vec![1, 3]);
-        for value in arena.iter_mut() {
-            *value *= 2;
+        for index in 0..3 {
+            if let Some(value) = arena.get_mut(index) {
+                *value *= 2;
+            }
         }
         assert_eq!(arena.iter().copied().collect::<Vec<_>>(), vec![2, 6]);
     }
@@ -458,15 +423,15 @@ mod tests {
         let n = Arena::<u32>::slots_per_chunk() + 8;
         let (tx, rx) = mpsc::channel();
         thread::scope(|scope| {
-            let arena = &arena;
-            scope.spawn(move || {
+            scope.spawn(|| {
                 for i in 0..n {
                     let (index, _) = arena.push(|_| Some(i)).unwrap();
                     tx.send(index).unwrap();
                 }
             });
             let mut seen = 0u32;
-            for index in rx {
+            for _ in 0..n {
+                let index = rx.recv().unwrap();
                 while arena.get(index).is_none() {
                     core::hint::spin_loop();
                 }

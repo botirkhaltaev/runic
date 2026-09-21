@@ -43,7 +43,8 @@ scope.
 Latest published release: `0.6.0`.
 
 The tree ships the v0.6 owner-local heap frontend: TLS heaps own runs and
-extents stamped with `HeapId`, private run claim-bitmap remote admission,
+extents that store their process-lifetime `&Heap` owner and derive `HeapId`,
+private run claim-bitmap remote admission,
 run/extent `Inbox` coalesced by owner, and Draining lifecycle after thread exit,
 with explicit page-map ownership. Heap lifecycle lives on `Heaps` / `Heap`
 (Heaps indexes each Heap; each `Heap` owns inboxes and `RunHeap`/`ExtentHeap`).
@@ -56,8 +57,8 @@ Owner free hit is `Run::free`; `push_available` is miss / slow / unbind. One
 process-wide payload; `Allocator::ctx()` is the handle. A Draining heap may be
 `adopt`ed by the first remote freer (`Draining` → `Active`).
 
-`Heaps::get` is a lock-free `Arena` read. Live counts live on `RunHeap` /
-`ExtentHeap`. Default extent policy is Keep; empty-run Discard is opt-in
+`Heaps::get` is a lock-free `Arena` read. Live counts are atomics on `Heap`,
+confirmed by run/extent arena scans during reclaim. Default extent policy is Keep; empty-run Discard is opt-in
 `madvise` on the payload. Zeroed Keep reuse ≥64 KiB discards pages without the
 Discard-insert clean flag; below that, memset.
 
@@ -67,9 +68,9 @@ Build only:
 
 ```text
 Linux x86_64
-Rust nightly (`#[thread_local]` `THREAD_HEAP`)
+Rust nightly (`#[thread_local]` `THREAD_HEAPS`)
 GlobalAlloc
-owner-local heaps via Heaps / ThreadHeap
+owner-local heaps via Heaps / ThreadHeaps
 heap-owned 2 MiB run maps (16 spaces) for size-classed allocations
 mmap-backed extents for dedicated allocations (heap-local)
 out-of-line metadata
@@ -127,10 +128,10 @@ GlobalAlloc
       -> Allocator          // const handle; ctx() borrows Process
           -> Process { pages: PageMap, heaps: Heaps }  // mmap; not returned
               -> Heaps { Arena<Heap>, free list, config }
-                  -> ThreadHeap
+                  -> ThreadHeaps
               -> Heap { HeapState, Inbox, Mutex<HeapInner> }
-                  -> HeapInner { id, RunHeap, ExtentHeap }
-                  -> RunHeap { Arena<Run>, available[] }
+                  -> HeapInner { RunHeap, ExtentHeap }
+                  -> RunHeap { Arena<&'static Run>, available[] }
                   -> ExtentHeap { Arena<Extent>, cache }
               -> Run
               -> Extent
@@ -138,11 +139,13 @@ GlobalAlloc
 ```
 
 `Heaps::get` is a lock-free `Arena` read: `len` Acquire, chunk pointer Acquire,
-then `state.matches`. Occupied slots never move. Active enqueue uses `HeapState`
+then `Heap::matches` (slot + generation). Occupied slots never move. Active enqueue uses `HeapState`
 leases (lease before new `try_queue`). Arena grow covers mapping ownership and
 bump insert only. Draining exclusivity is `Mutex<HeapInner>` via
 `Heaps::{enqueue,free,flush,reclaim}` (not the arena grow lock across flush).
-Shared `&Heap` is atomics-only; Active body mutation is `ThreadHeap` +
+Adoption takes that mutex before its Draining→Active CAS; reclaim advances the
+generation with a CAS so it cannot overwrite an adoption winner.
+Shared `&Heap` is atomics-only; Active body mutation is `ThreadHeaps` +
 `require_inner`; reclaim is `Heap::reclaim` through `Heaps`. `Allocator::ctx()`
 is the only handle into the process payload. Same-thread small-run hits use
 TLS-owned heap metadata with no locks or atomics. `PageMap` stays outside heaps
@@ -153,22 +156,23 @@ arena locks so dealloc lookup is not heaps-locked.
 ```text
 RunicAlloc     owns the Rust GlobalAlloc boundary.
 Allocator      owns the core public allocator API, abort, and cold unbound routing.
-AllocatorCtx   borrows PageMap + Heaps for miss / bind / unbind / body / Draining.
+AllocatorCtx   carries process-lifetime PageMap + Heaps references for miss / bind / unbind / body / Draining.
 Process        owns the process-wide mmap payload (PageMap + Heaps); not returned.
-Heaps          owns `Arena<Heap>`, the Free-heap freelist, and Draining `enqueue` / `free` / `flush` / `reclaim`.
+Heaps          owns `Arena<Heap>`, the Free-heap freelist, owner `unbind`, and Draining `enqueue` / `free` / `flush` / `reclaim`.
 Heap           owns HeapState, Inbox, and `Mutex<HeapInner>`; shared surface is atomics only (`enqueue` / mode).
 HeapInner      owns RunHeap / ExtentHeap (exclusive metadata).
 Arena          owns published immovable slots (`get` lock-free; `push` shared; `vacant` / `insert` / `remove` exclusive).
 LayoutSpec     owns normalized layout semantics.
 SizeClasses    owns size-class selection.
 OsMemory       maps anonymous pages; Mapping owns the mmap lifecycle (Drop munmaps).
-PageMap        owns page-indexed owner-pointer lookup.
-RunHeap        owns Arena<NonNull<Run>> (in-space headers), run checkout (acquire), and available run lists.
-Run            owns in-page header, pointer freelist + extend + live, claim bitmap, and embedded InboxLink. Owner DF undefined.
+PageMap        owns page-indexed lookup and returns borrowed Run / Extent owners.
+RunHeap        owns Arena<&'static Run> (in-space headers), run checkout (acquire), and available run lists.
+Run            owns in-page header, owning `&Heap`, pointer freelist + extend + live, claim bitmap, and embedded Link<Run>. Owner DF undefined.
 ExtentHeap     owns Arena<Extent>, dedicated allocation policy, and mapping reuse.
-ExtentCache    owns an intrusive head list of retained extents and exact-budget reuse.
-Extent         owns dedicated allocation metadata, embedded InboxLink, and Claimed byte state.
-ThreadHeap     owns TLS bind, current[class], at most one adopted heap, and the sole Active body path.
+ExtentCache    owns an intrusive ExtentId list of retained extents and exact-budget reuse.
+Extent         owns dedicated allocation metadata, owning `&Heap`, embedded Link<Extent>, and Claimed byte state.
+ThreadHeaps    owns equal TLS `ThreadHeap` slots, current[class], and the sole Active body path.
+ThreadHeap     is one TLS-owned process heap: Vacant or Active (`&Heap` + captured HeapId).
 ```
 
 Prefer direct methods on the entity that owns the state. Do not add passive

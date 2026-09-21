@@ -2,13 +2,63 @@ use core::{cell::Cell, ptr::NonNull};
 
 use crate::{
     allocator::Allocator,
-    heap::{Extent, ExtentInit, HeapError, HeapId, Run, RunError},
+    heap::{Extent, ExtentInit, HeapError, HeapId, Run, RunError, RunFree},
     layout::LayoutSpec,
     memory::{PageMap, PageOwner},
     size_class::{SizeClass, SizeClasses},
 };
 
 use super::{AllocatorCtx, Heap};
+
+/// One process [`Heap`] this thread owns. `Active` captures generation at bind/adopt.
+#[derive(Clone, Copy)]
+enum ThreadHeap {
+    Vacant,
+    Active { heap: &'static Heap, id: HeapId },
+}
+
+impl ThreadHeap {
+    fn active(heap: &'static Heap) -> Self {
+        Self::Active {
+            heap,
+            id: heap.id(),
+        }
+    }
+
+    fn heap(self) -> Option<&'static Heap> {
+        match self {
+            Self::Vacant => None,
+            Self::Active { heap, .. } => Some(heap),
+        }
+    }
+
+    fn id(self) -> Option<HeapId> {
+        match self {
+            Self::Vacant => None,
+            Self::Active { id, .. } => Some(id),
+        }
+    }
+
+    fn owns(self, owner: &Heap) -> bool {
+        match self {
+            Self::Vacant => false,
+            Self::Active { heap, id } => heap == owner && id == owner.id(),
+        }
+    }
+
+    fn is_idle(self) -> bool {
+        let Some(heap) = self.heap() else {
+            return false;
+        };
+        if !heap.inboxes_empty() || heap.occupied() {
+            return false;
+        }
+        let Some(inner) = heap.try_inner() else {
+            return false;
+        };
+        !inner.has_live()
+    }
+}
 
 /// Owner-local TLS free failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -19,31 +69,42 @@ pub(crate) enum ThreadFreeError {
     Heap(HeapError),
 }
 
-/// Thread-local frontend: bound heap, at most one adopted heap, per-class current run.
+/// Thread-local frontend: owned heaps and per-class current run.
 ///
 /// Hit is current-run pop / `Run::free`. Miss / bind / unbind / adopt take
-/// [`AllocatorCtx`]. `lookup` is miss / realloc. `alloc` never uses the adopted heap.
-pub(crate) struct ThreadHeap {
-    heap_id: Cell<Option<HeapId>>,
-    heap: Cell<*mut Heap>,
-    adopted_id: Cell<Option<HeapId>>,
-    adopted: Cell<*mut Heap>,
-    current: [Cell<*mut Run>; SizeClasses::COUNT],
+/// [`AllocatorCtx`]. `lookup` is miss / realloc. Alloc uses any active heap.
+pub(crate) struct ThreadHeaps {
+    heaps: [Cell<ThreadHeap>; 2],
+    current: [Cell<Option<&'static Run>>; SizeClasses::COUNT],
 }
 
-impl ThreadHeap {
+impl ThreadHeaps {
     const fn new() -> Self {
         Self {
-            heap_id: Cell::new(None),
-            heap: Cell::new(core::ptr::null_mut()),
-            adopted_id: Cell::new(None),
-            adopted: Cell::new(core::ptr::null_mut()),
-            current: [const { Cell::new(core::ptr::null_mut()) }; SizeClasses::COUNT],
+            heaps: [const { Cell::new(ThreadHeap::Vacant) }; 2],
+            current: [const { Cell::new(None) }; SizeClasses::COUNT],
         }
     }
 
-    fn owns(&self, id: HeapId) -> bool {
-        self.heap_id.get() == Some(id) || self.adopted_id.get() == Some(id)
+    fn owns(&self, owner: &Heap) -> bool {
+        let id = owner.id();
+        self.heaps.iter().any(|slot| match slot.get() {
+            ThreadHeap::Vacant => false,
+            ThreadHeap::Active { heap, id: bound } => heap == owner && bound == id,
+        })
+    }
+
+    fn vacant(&self) -> Option<&Cell<ThreadHeap>> {
+        self.heaps
+            .iter()
+            .find(|slot| matches!(slot.get(), ThreadHeap::Vacant))
+    }
+
+    fn active(&self) -> Option<ThreadHeap> {
+        self.heaps.iter().find_map(|slot| match slot.get() {
+            ThreadHeap::Vacant => None,
+            heap @ ThreadHeap::Active { .. } => Some(heap),
+        })
     }
 
     /// Small: validated in-page header. Else `PageMap` (extents / fallback).
@@ -61,21 +122,17 @@ impl ThreadHeap {
     /// Hit is pop. Empty / unbound → caller miss.
     #[inline]
     pub(crate) fn alloc(&self, class: SizeClass) -> Option<NonNull<u8>> {
-        let run = NonNull::new(self.current(class).get())?;
-        // SAFETY: `current` stores only live arena run pointers while bound.
-        unsafe { run.as_ref().allocate() }
+        self.current(class)?.allocate()
     }
 
     /// Owner-local small free via the current run for `class`.
     ///
-    /// Hit is `Run::free` (`locate` + push). Ignores `was_full` and Discard.
+    /// Hit is `Run::free` (`locate` + push). Ignores the `RunFree` outcome and Discard.
     /// `OutOfRange` / unbound → caller `dealloc_slow`. Interior is
     /// `InvalidPointer` → abort.
     #[inline]
     pub(crate) fn free(&self, ptr: NonNull<u8>, class: SizeClass) -> Option<()> {
-        let run = NonNull::new(self.current(class).get())?;
-        // SAFETY: `current` stores only live arena run pointers while bound.
-        match unsafe { run.as_ref() }.free(ptr) {
+        match self.current(class)?.free(ptr) {
             Ok(_) => Some(()),
             Err(RunError::OutOfRange) => None,
             Err(_) => Allocator::abort(),
@@ -87,134 +144,91 @@ impl ThreadHeap {
     pub(crate) fn alloc_miss(
         &self,
         class: SizeClass,
-        ctx: &AllocatorCtx<'_>,
-    ) -> Option<NonNull<u8>> {
-        if self.is_empty() {
-            return None;
-        }
+        ctx: &AllocatorCtx,
+    ) -> Result<Option<NonNull<u8>>, HeapError> {
+        let Some(heap) = self.heap() else {
+            return Ok(None);
+        };
         if let Some(ptr) = self.extend_current(class) {
-            return Some(ptr);
+            return Ok(Some(ptr));
         }
-        let heap = self.bound_heap();
         let mut inner = heap.require_inner();
         // Same as `Heap::alloc_extent`: accept remote claims before mapping another run.
         // Mapping first fills the run arena with claimed-full runs and `alloc` returns null.
         if !heap.inboxes_empty() {
-            heap.flush(&mut inner, ctx).ok()?;
+            heap.flush(&mut inner, ctx)?;
         }
-        if let Some(run) = inner.acquire_run(class, ctx.pages, heap) {
-            return self.install_current(class, run);
-        }
-        None
+        let Some(run) = inner.acquire_run(class, ctx.pages, heap) else {
+            return Ok(None);
+        };
+        self.set_current(class, Some(run));
+        Ok(self.extend_current(class))
     }
 
     fn extend_current(&self, class: SizeClass) -> Option<NonNull<u8>> {
-        let run = NonNull::new(self.current(class).get())?;
-        // SAFETY: `current` stores only live arena run pointers while bound.
-        let run = unsafe { run.as_ref() };
-        if run.extend() {
-            return run.allocate();
-        }
-        None
+        let run = self.current(class)?;
+        run.allocate().or_else(|| {
+            run.extend();
+            run.allocate()
+        })
     }
 
-    fn install_current(&self, class: SizeClass, run: NonNull<Run>) -> Option<NonNull<u8>> {
-        self.current(class).set(run.as_ptr());
-        // SAFETY: run was just returned by this heap's live arena.
-        let run_ref = unsafe { run.as_ref() };
-        if let Some(ptr) = run_ref.allocate() {
-            return Some(ptr);
-        }
-        if run_ref.extend() {
-            return run_ref.allocate();
-        }
-        None
-    }
-
-    /// Owner-local large allocation via the bound heap.
+    /// Owner-local large allocation via an attached heap.
     ///
-    /// Returns `None` when this thread is not bound (caller should `bind`).
+    /// Returns `None` when this thread has no attached heap (caller should `bind`).
     #[inline(never)]
     pub(crate) fn alloc_extent(
         &self,
         spec: LayoutSpec,
         init: ExtentInit,
-        ctx: &AllocatorCtx<'_>,
-    ) -> Option<NonNull<u8>> {
-        if self.is_empty() {
-            return None;
-        }
-        let heap = self.bound_heap();
+        ctx: &AllocatorCtx,
+    ) -> Result<Option<NonNull<u8>>, HeapError> {
+        let Some(heap) = self.heap() else {
+            return Ok(None);
+        };
         let mut inner = heap.require_inner();
         heap.alloc_extent(&mut inner, spec, init, ctx)
     }
 
-    /// Owner drain of remote-free inboxes (Active TLS).
-    pub(crate) fn flush(&self, ctx: &AllocatorCtx<'_>) -> Result<(), HeapError> {
-        if self.is_empty() {
-            return Err(HeapError::InvalidHeap);
-        }
-        let heap = self.bound_heap();
-        let mut inner = heap.require_inner();
-        heap.flush(&mut inner, ctx)
-    }
-
-    /// Available-list insert after a full run took a free. Off the free hit.
-    #[inline(never)]
-    pub(crate) fn push_available(&self, run: NonNull<Run>) {
-        // SAFETY: caller just owner-freed `run` on a heap this TLS owns.
-        let heap_id = unsafe { run.as_ref() }.heap_id();
-        let heap = self.owned_heap(heap_id);
-        let mut inner = heap.require_inner();
-        if inner.push_available(run).is_err() {
-            Allocator::abort();
-        }
-    }
-
-    /// Owner-local free for a run owned by the bound or adopted heap.
+    /// Owner-local free for a run owned by a TLS heap.
     ///
     /// `Run::free` is lock-free. `push_available` only when the run was full.
     /// Heap-id stays: `lookup` can still return a foreign run.
-    #[inline]
     pub(crate) fn free_run(
         &self,
-        run: NonNull<Run>,
+        run: &'static Run,
         ptr: NonNull<u8>,
     ) -> Result<(), ThreadFreeError> {
-        // SAFETY: caller supplies a PageMap / arena run pointer.
-        let run_ref = unsafe { run.as_ref() };
-        if !self.owns(run_ref.heap_id()) {
+        if !self.owns(run.heap()) {
             return Err(ThreadFreeError::Remote(PageOwner::Run(run)));
         }
-        match run_ref.free(ptr) {
-            Ok(false) => {
-                run_ref.discard_empty();
-                Ok(())
+        let Ok(outcome) = run.free(ptr) else {
+            Allocator::abort()
+        };
+        if outcome == RunFree::Available {
+            let mut inner = run.heap().require_inner();
+            if inner.push_available(run).is_err() {
+                Allocator::abort();
             }
-            Ok(true) => {
-                self.push_available(run);
-                run_ref.discard_empty();
-                Ok(())
-            }
-            Err(_) => Allocator::abort(),
         }
+        if run.is_discardable() {
+            run.discard();
+        }
+        Ok(())
     }
 
-    /// Owner-local free for an extent owned by the bound or adopted heap.
+    /// Owner-local free for an extent owned by a TLS heap.
     pub(crate) fn free_extent(
         &self,
-        extent: NonNull<Extent>,
+        extent: &'static Extent,
         ptr: NonNull<u8>,
-        ctx: &AllocatorCtx<'_>,
+        ctx: &AllocatorCtx,
     ) -> Result<(), ThreadFreeError> {
-        // SAFETY: PageMap stores only pointers published from this allocator's live arena.
-        let heap_id = unsafe { extent.as_ref() }.heap_id();
-        if !self.owns(heap_id) {
+        if !self.owns(extent.heap()) {
             return Err(ThreadFreeError::Remote(PageOwner::Extent(extent)));
         }
 
-        let heap = self.owned_heap(heap_id);
-        let mut inner = heap.require_inner();
+        let mut inner = extent.heap().require_inner();
         inner
             .free(PageOwner::Extent(extent), ptr, ctx.pages)
             .map(|_| ())
@@ -223,132 +237,92 @@ impl ThreadHeap {
 
     /// Bind this thread to a heap in `ctx`.
     ///
-    /// Reuses the current binding when already attached; otherwise acquires a
-    /// fresh heap (Heaps locks internally).
+    /// Reuses an already attached heap; otherwise acquires into the first
+    /// vacant slot (Heaps locks internally).
     #[cold]
-    pub(crate) fn bind(&self, ctx: &AllocatorCtx<'_>) -> Option<HeapId> {
+    pub(crate) fn bind(&self, ctx: &AllocatorCtx<'static>) -> Option<HeapId> {
         UNBIND_GUARD.with(|_| {});
-        if !self.is_empty() {
-            return self.heap_id.get();
+        if let Some(id) = self.active().and_then(ThreadHeap::id) {
+            return Some(id);
         }
 
         let heap = ctx.heaps.acquire()?;
-        self.install(heap);
+        let Some(slot) = self.vacant() else {
+            Allocator::abort();
+        };
+        slot.set(ThreadHeap::active(heap));
         Some(heap.id())
     }
 
-    fn install(&self, heap: &Heap) {
-        self.heap.set(core::ptr::from_ref(heap).cast_mut());
-        self.heap_id.set(Some(heap.id()));
-    }
-
-    /// No bound heap. An adopted heap may still be set.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.heap.get().is_null()
-    }
-
-    fn install_adopted(&self, heap: &Heap) {
-        self.adopted.set(core::ptr::from_ref(heap).cast_mut());
-        self.adopted_id.set(Some(heap.id()));
-    }
-
-    /// First Draining freer becomes Active owner. One adopted heap; a different
-    /// heap stays on `Heaps::free` until this slot is retired at unbind.
+    /// First Draining freer becomes Active owner. A third heap stays on
+    /// `Heaps::free` until a slot is unbound.
     #[cold]
-    pub(crate) fn adopt(&self, heap: &Heap, id: HeapId, ctx: &AllocatorCtx<'_>) -> bool {
+    pub(crate) fn adopt(&self, heap: &'static Heap, ctx: &AllocatorCtx) -> bool {
         UNBIND_GUARD.with(|_| {});
-        if self.adopted_id.get() == Some(id) {
+        if self.owns(heap) {
             return true;
         }
-        if self.adopted_id.get().is_some() {
+        let Some(slot) = self.vacant() else {
             return false;
-        }
-        if heap.adopt(id).is_err() {
+        };
+        let Ok(mut inner) = heap.adopt(heap.id()) else {
             return false;
-        }
-        self.install_adopted(heap);
-        let mut inner = heap.lock_inner();
+        };
+        slot.set(ThreadHeap::active(heap));
         if heap.flush(&mut inner, ctx).is_err() {
             Allocator::abort();
         }
         true
     }
 
-    /// Close, flush, and reclaim the adopted heap. Slot is empty afterwards.
-    #[cold]
-    pub(crate) fn retire_adopted(&self, ctx: &AllocatorCtx<'_>) {
-        let Some(id) = self.adopted_id.replace(None) else {
+    fn unbind_slot(&self, slot: &Cell<ThreadHeap>, ctx: &AllocatorCtx) {
+        let ThreadHeap::Active { heap, id } = slot.replace(ThreadHeap::Vacant) else {
             return;
         };
-        self.adopted.set(core::ptr::null_mut());
-        match ctx.heaps.retire(id, ctx) {
-            Ok(()) | Err(HeapError::InvalidHeap) => {}
-            Err(_) => Allocator::abort(),
+        self.release_current(heap);
+        if ctx.heaps.unbind(id, ctx).is_err() {
+            Allocator::abort();
         }
     }
 
-    /// Retire the adopted heap when `id` is that heap and it has no live blocks.
-    fn retire_if_idle(&self, id: HeapId, ctx: &AllocatorCtx<'_>) {
-        if self.adopted_id.get() != Some(id) {
-            return;
+    /// Idle extra heap: reclaim an attached heap with no live work, but keep the
+    /// last slot so retained empty runs stay on an attached heap.
+    fn idle(&self, owner: &Heap) -> Option<&Cell<ThreadHeap>> {
+        let attached = self
+            .heaps
+            .iter()
+            .filter(|slot| slot.get().heap().is_some())
+            .count();
+        if attached <= 1 {
+            return None;
         }
-        let Some(heap) = self.adopted_heap() else {
-            return;
-        };
-        if !heap.inboxes_empty() {
-            return;
-        }
-        let Some(inner) = heap.try_inner() else {
-            return;
-        };
-        let idle = !inner.occupied() && !inner.has_live();
-        drop(inner);
-        if idle {
-            self.retire_adopted(ctx);
-        }
+        self.heaps.iter().find(|slot| {
+            let heap = slot.get();
+            heap.owns(owner) && heap.is_idle()
+        })
     }
 
-    fn adopted_heap(&self) -> Option<&Heap> {
-        // SAFETY: adopted pointer is a live arena heap while the slot is set.
-        Some(unsafe { NonNull::new(self.adopted.get())?.as_ref() })
-    }
-
-    fn owned_heap(&self, id: HeapId) -> &Heap {
-        if self.heap_id.get() == Some(id) {
-            return self.bound_heap();
-        }
-        if self.adopted_id.get() == Some(id)
-            && let Some(heap) = self.adopted_heap()
-        {
-            return heap;
-        }
-        Allocator::abort()
-    }
-
-    /// Bound or adopted owner-local free. Reclaim the adopted heap when idle.
+    /// Owner-local free. Unbind the owner if it is idle.
     pub(crate) fn free_owner(
         &self,
         owner: PageOwner,
         ptr: NonNull<u8>,
-        ctx: &AllocatorCtx<'_>,
+        ctx: &AllocatorCtx,
     ) -> Result<(), ThreadFreeError> {
         match owner {
             PageOwner::Run(run) => {
                 self.free_run(run, ptr)?;
-                if self.adopted_id.get().is_some() {
-                    // SAFETY: same live arena run just freed.
-                    let run = unsafe { run.as_ref() };
-                    if !run.is_live() {
-                        self.retire_if_idle(run.heap_id(), ctx);
-                    }
+                if !run.is_live()
+                    && let Some(slot) = self.idle(run.heap())
+                {
+                    self.unbind_slot(slot, ctx);
                 }
                 Ok(())
             }
             PageOwner::Extent(extent) => {
                 self.free_extent(extent, ptr, ctx)?;
-                if self.adopted_id.get().is_some() {
-                    // SAFETY: PageMap extent; `heap_id` is stable across free.
-                    self.retire_if_idle(unsafe { extent.as_ref() }.heap_id(), ctx);
+                if let Some(slot) = self.idle(extent.heap()) {
+                    self.unbind_slot(slot, ctx);
                 }
                 Ok(())
             }
@@ -361,92 +335,89 @@ impl ThreadHeap {
         &self,
         ptr: NonNull<u8>,
         spec: LayoutSpec,
-        ctx: &AllocatorCtx<'_>,
+        ctx: &AllocatorCtx,
     ) -> Result<(), ThreadFreeError> {
         let Some(owner) = Self::lookup(ctx.pages, ptr, spec) else {
-            return Err(ThreadFreeError::Heap(HeapError::InvalidRunPointer));
+            let error = if SizeClasses::class_for(spec).is_some() {
+                HeapError::InvalidRunPointer
+            } else {
+                HeapError::MissingExtent
+            };
+            return Err(ThreadFreeError::Heap(error));
         };
         self.free_owner(owner, ptr, ctx)
     }
 
-    fn current(&self, class: SizeClass) -> &Cell<*mut Run> {
+    fn current(&self, class: SizeClass) -> Option<&Run> {
         debug_assert!(class.index() < self.current.len());
         // SAFETY: SizeClass values are created only by SizeClasses for indexes in this array.
-        unsafe { self.current.get_unchecked(class.index()) }
+        let cell = unsafe { self.current.get_unchecked(class.index()) };
+        cell.get()
     }
 
-    /// Bound heap after a successful heap-id check.
-    fn bound_heap(&self) -> &Heap {
-        let Some(heap) = NonNull::new(self.heap.get()) else {
-            Allocator::abort();
-        };
-        // SAFETY: bound pointer is a live arena heap.
-        unsafe { heap.as_ref() }
+    fn set_current(&self, class: SizeClass, run: Option<&'static Run>) {
+        debug_assert!(class.index() < self.current.len());
+        // SAFETY: SizeClass values are created only by SizeClasses for indexes in this array.
+        unsafe { self.current.get_unchecked(class.index()) }.set(run);
     }
 
-    /// Retire the bound heap. `live` stays exact. The process payload stays.
+    fn heap(&self) -> Option<&'static Heap> {
+        self.active().and_then(ThreadHeap::heap)
+    }
+
+    /// Push this heap's non-full current runs back onto it and clear those cells.
+    fn release_current(&self, owner: &Heap) {
+        let mut inner = None;
+        for cell in &self.current {
+            let Some(run) = cell.get() else {
+                continue;
+            };
+            if run.heap() != owner {
+                continue;
+            }
+            if !run.is_full() {
+                let guard = inner.get_or_insert_with(|| owner.require_inner());
+                if guard.push_available(run).is_err() {
+                    Allocator::abort();
+                }
+            }
+            cell.set(None);
+        }
+    }
+
+    /// Unbind TLS heaps. `live` stays exact. The process payload stays.
     ///
     /// Non-full current runs go back on the available list so reincarnation
     /// can reuse them. `push_available` is idempotent if a run is already linked.
     #[cold]
-    pub(crate) fn unbind(&self, ctx: &AllocatorCtx<'_>) {
-        if !self.is_empty() {
-            let heap = self.bound_heap();
-            let mut inner = heap.require_inner();
-            for cell in &self.current {
-                let Some(run) = NonNull::new(cell.get()) else {
-                    continue;
-                };
-                // SAFETY: `current` stores only live arena run pointers while bound.
-                if unsafe { run.as_ref() }.is_full() {
-                    continue;
-                }
-                if inner.push_available(run).is_err() {
-                    Allocator::abort();
-                }
-            }
+    pub(crate) fn unbind(&self, ctx: &AllocatorCtx) {
+        for slot in &self.heaps {
+            self.unbind_slot(slot, ctx);
         }
-        for cell in &self.current {
-            cell.set(core::ptr::null_mut());
-        }
-        let heap_id = self.heap_id.replace(None);
-        self.heap.set(core::ptr::null_mut());
-        if let Some(heap_id) = heap_id
-            && ctx.heaps.retire(heap_id, ctx).is_err()
-        {
-            Allocator::abort();
-        }
-        self.retire_adopted(ctx);
     }
 }
 
-/// `LocalKey` so `Drop` retires the heap. `THREAD_HEAP` is `!Drop` ELF TLS.
+/// `LocalKey` so `Drop` unbinds the heaps. `THREAD_HEAPS` is `!Drop` ELF TLS.
 struct UnbindGuard;
 
 impl Drop for UnbindGuard {
     fn drop(&mut self) {
         let Some(ctx) = Allocator::ctx() else {
-            if !THREAD_HEAP.is_empty()
-                || THREAD_HEAP.heap_id.get().is_some()
-                || THREAD_HEAP.adopted_id.get().is_some()
+            if THREAD_HEAPS
+                .heaps
+                .iter()
+                .any(|slot| !matches!(slot.get(), ThreadHeap::Vacant))
             {
                 Allocator::abort();
             }
             return;
         };
-        THREAD_HEAP.unbind(&ctx);
-    }
-}
-
-#[cfg(test)]
-impl ThreadHeap {
-    pub(crate) fn adopted_id_for_test(&self) -> Option<HeapId> {
-        self.adopted_id.get()
+        THREAD_HEAPS.unbind(&ctx);
     }
 }
 
 #[thread_local]
-pub(crate) static THREAD_HEAP: ThreadHeap = ThreadHeap::new();
+pub(crate) static THREAD_HEAPS: ThreadHeaps = ThreadHeaps::new();
 
 std::thread_local! {
     static UNBIND_GUARD: UnbindGuard = const { UnbindGuard };

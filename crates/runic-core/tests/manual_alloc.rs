@@ -1,9 +1,5 @@
 use core::alloc::Layout;
-use std::{
-    sync::{Arc, mpsc},
-    thread,
-    time::Duration,
-};
+use std::{sync::mpsc, thread, time::Duration};
 
 use runic_core::Allocator;
 
@@ -38,7 +34,7 @@ fn allocator_returns_aligned_pointer() {
 
     let ptr = unsafe { allocator.alloc(layout) };
     assert!(!ptr.is_null());
-    assert_eq!(ptr as usize % layout.align(), 0);
+    assert_eq!(ptr.expose_provenance() % layout.align(), 0);
 
     unsafe { allocator.dealloc(ptr, layout) };
 }
@@ -151,7 +147,7 @@ fn allocator_handles_large_allocation() {
 
     let ptr = unsafe { allocator.alloc(layout) };
     assert!(!ptr.is_null());
-    assert_eq!(ptr as usize % layout.align(), 0);
+    assert_eq!(ptr.expose_provenance() % layout.align(), 0);
 
     unsafe {
         ptr.write(0xab);
@@ -197,7 +193,11 @@ fn allocator_returns_aligned_pointer_for_size_alignment_matrix() {
             let ptr = unsafe { allocator.alloc(layout) };
 
             assert!(!ptr.is_null(), "size {size}, align {align}");
-            assert_eq!(ptr as usize % align, 0, "size {size}, align {align}");
+            assert_eq!(
+                ptr.expose_provenance() % align,
+                0,
+                "size {size}, align {align}"
+            );
 
             unsafe { allocator.dealloc(ptr, layout) };
         }
@@ -324,7 +324,7 @@ fn allocator_survives_deterministic_random_trace() {
             };
 
             assert!(!ptr.is_null());
-            assert_eq!(ptr as usize % align, 0);
+            assert_eq!(ptr.expose_provenance() % align, 0);
 
             if zeroed {
                 let bytes = unsafe { core::slice::from_raw_parts(ptr, size) };
@@ -352,7 +352,7 @@ fn allocator_survives_deterministic_random_trace() {
             let old = live[index].layout;
             let new_ptr = unsafe { allocator.realloc(live[index].ptr, old, new_size) };
             assert!(!new_ptr.is_null());
-            assert_eq!(new_ptr as usize % old.align(), 0);
+            assert_eq!(new_ptr.expose_provenance() % old.align(), 0);
 
             let preserved = old.size().min(new_size);
             live[index].check_prefix(new_ptr, preserved);
@@ -376,19 +376,19 @@ fn allocator_survives_deterministic_random_trace() {
 fn allocator_supports_scoped_threaded_use() {
     let allocator = Allocator::new();
     let layout = Layout::from_size_align(128, 8).unwrap();
+    let shared = &allocator;
 
     thread::scope(|scope| {
         for byte in 0_u8..4 {
-            let allocator = &allocator;
             scope.spawn(move || {
-                let ptr = unsafe { allocator.alloc(layout) };
+                let ptr = unsafe { shared.alloc(layout) };
 
                 assert!(!ptr.is_null());
 
                 unsafe {
                     ptr.write(byte);
                     assert_eq!(ptr.read(), byte);
-                    allocator.dealloc(ptr, layout);
+                    shared.dealloc(ptr, layout);
                 }
             });
         }
@@ -400,20 +400,19 @@ fn allocator_frees_thread_owned_small_allocation_after_owner_thread_exits() {
     let allocator = Allocator::new();
     let layout = Layout::from_size_align(64, 8).unwrap();
 
-    let ptr = thread::scope(|scope| {
-        let allocator = &allocator;
+    let addr = thread::scope(|scope| {
         scope
-            .spawn(move || {
+            .spawn(|| {
                 let ptr = unsafe { allocator.alloc(layout) };
                 assert!(!ptr.is_null());
                 unsafe { ptr.write(0x5a) };
-                ptr.addr()
+                ptr.expose_provenance()
             })
             .join()
             .unwrap()
     });
 
-    let ptr = ptr as *mut u8;
+    let ptr = addr as *mut u8;
     assert_eq!(unsafe { ptr.read() }, 0x5a);
     unsafe { allocator.dealloc(ptr, layout) };
 }
@@ -423,20 +422,19 @@ fn allocator_frees_thread_owned_large_allocation_after_owner_thread_exits() {
     let allocator = Allocator::new();
     let layout = Layout::from_size_align(128 * 1024, 4096).unwrap();
 
-    let ptr = thread::scope(|scope| {
-        let allocator = &allocator;
+    let addr = thread::scope(|scope| {
         scope
-            .spawn(move || {
+            .spawn(|| {
                 let ptr = unsafe { allocator.alloc(layout) };
                 assert!(!ptr.is_null());
                 unsafe { ptr.write(0x5a) };
-                ptr.addr()
+                ptr.expose_provenance()
             })
             .join()
             .unwrap()
     });
 
-    let ptr = ptr as *mut u8;
+    let ptr = addr as *mut u8;
     assert_eq!(unsafe { ptr.read() }, 0x5a);
     unsafe { allocator.dealloc(ptr, layout) };
 }
@@ -447,13 +445,13 @@ fn allocator_drains_remote_free_when_owner_thread_exits() {
     let layout = Layout::from_size_align(64, 8).unwrap();
     let (ptr_tx, ptr_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
+    let shared = &allocator;
 
     thread::scope(|scope| {
-        let allocator = &allocator;
         scope.spawn(move || {
-            let ptr = unsafe { allocator.alloc(layout) };
+            let ptr = unsafe { shared.alloc(layout) };
             assert!(!ptr.is_null());
-            ptr_tx.send(ptr.addr()).unwrap();
+            ptr_tx.send(ptr.expose_provenance()).unwrap();
             done_rx.recv().unwrap();
         });
 
@@ -472,14 +470,14 @@ fn allocator_draining_accepts_active_remote_claim_after_owner_exits() {
     let (ptr_tx, ptr_rx) = mpsc::channel();
     let (batched_tx, batched_rx) = mpsc::channel();
     let (owner_done_tx, owner_done_rx) = mpsc::channel();
+    let shared = &allocator;
 
     thread::scope(|scope| {
-        let allocator = &allocator;
         scope.spawn(move || {
-            let ptr = unsafe { allocator.alloc(layout) };
+            let ptr = unsafe { shared.alloc(layout) };
             assert!(!ptr.is_null());
             unsafe { ptr.write(0x5a) };
-            ptr_tx.send(ptr.addr()).unwrap();
+            ptr_tx.send(ptr.expose_provenance()).unwrap();
             batched_rx.recv().unwrap();
             owner_done_tx.send(()).unwrap();
         });
@@ -487,7 +485,7 @@ fn allocator_draining_accepts_active_remote_claim_after_owner_exits() {
         scope.spawn(move || {
             let ptr = ptr_rx.recv().unwrap() as *mut u8;
             assert_eq!(unsafe { ptr.read() }, 0x5a);
-            unsafe { allocator.dealloc(ptr, layout) };
+            unsafe { shared.dealloc(ptr, layout) };
             batched_tx.send(()).unwrap();
             owner_done_rx.recv().unwrap();
         });
@@ -511,15 +509,14 @@ fn unbound_remote_freer_publishes_without_binding() {
     let layout = Layout::from_size_align(64, 8).unwrap();
 
     let addrs = thread::scope(|scope| {
-        let allocator = &allocator;
         scope
-            .spawn(move || {
+            .spawn(|| {
                 let mut addrs = Vec::with_capacity(8);
                 for _ in 0..8 {
                     let ptr = unsafe { allocator.alloc(layout) };
                     assert!(!ptr.is_null());
                     unsafe { ptr.write(0x3c) };
-                    addrs.push(ptr.addr());
+                    addrs.push(ptr.expose_provenance());
                 }
                 addrs
             })
@@ -528,9 +525,8 @@ fn unbound_remote_freer_publishes_without_binding() {
     });
 
     thread::scope(|scope| {
-        let allocator = &allocator;
         scope
-            .spawn(move || {
+            .spawn(|| {
                 for addr in addrs {
                     let ptr = addr as *mut u8;
                     assert_eq!(unsafe { ptr.read() }, 0x3c);
@@ -557,33 +553,35 @@ fn draining_entry_completes_retained_bound_frees() {
     let layout = Layout::from_size_align(64, 8).unwrap();
     let (ptrs_tx, ptrs_rx) = mpsc::channel();
     let (owner_hold_tx, owner_hold_rx) = mpsc::channel();
+    let shared = &allocator;
 
     thread::scope(|scope| {
-        let allocator = &allocator;
         let owner = scope.spawn(move || {
-            let a = unsafe { allocator.alloc(layout) };
-            let b = unsafe { allocator.alloc(layout) };
+            let a = unsafe { shared.alloc(layout) };
+            let b = unsafe { shared.alloc(layout) };
             assert!(!a.is_null() && !b.is_null());
             unsafe {
                 a.write(0x41);
                 b.write(0x42);
             }
-            ptrs_tx.send((a.addr(), b.addr())).unwrap();
+            ptrs_tx
+                .send((a.expose_provenance(), b.expose_provenance()))
+                .unwrap();
             owner_hold_rx.recv().unwrap();
         });
 
         scope.spawn(move || {
             // Bind freer TLS so the first free coalesces on the owner's inbox.
-            let binder = unsafe { allocator.alloc(layout) };
+            let binder = unsafe { shared.alloc(layout) };
             assert!(!binder.is_null());
-            unsafe { allocator.dealloc(binder, layout) };
+            unsafe { shared.dealloc(binder, layout) };
 
             let (a, b) = ptrs_rx.recv().unwrap();
-            unsafe { allocator.dealloc(a as *mut u8, layout) };
+            unsafe { shared.dealloc(a as *mut u8, layout) };
             owner_hold_tx.send(()).unwrap();
             // Owner exit closes Active→Draining before the second free.
             owner.join().unwrap();
-            unsafe { allocator.dealloc(b as *mut u8, layout) };
+            unsafe { shared.dealloc(b as *mut u8, layout) };
         });
     });
 
@@ -601,40 +599,38 @@ fn concurrent_active_remote_frees_through_public_dealloc() {
     let allocator = Allocator::new();
     let layout = Layout::from_size_align(64, 8).unwrap();
     let (ready_tx, ready_rx) = mpsc::channel();
-    let start = Arc::new(std::sync::Barrier::new(FREERS + 1));
-    let done = Arc::new(std::sync::Barrier::new(FREERS + 1));
+    let start = std::sync::Barrier::new(FREERS + 1);
+    let done = std::sync::Barrier::new(FREERS + 1);
+    let shared = &allocator;
 
     thread::scope(|scope| {
-        let allocator = &allocator;
-        let start_owner = Arc::clone(&start);
-        let done_owner = Arc::clone(&done);
-        scope.spawn(move || {
+        scope.spawn(|| {
             let mut addrs = Vec::with_capacity(FREERS * PER_FREER);
             for _ in 0..(FREERS * PER_FREER) {
-                let ptr = unsafe { allocator.alloc(layout) };
+                let ptr = unsafe { shared.alloc(layout) };
                 assert!(!ptr.is_null());
                 unsafe { ptr.write(0x11) };
-                addrs.push(ptr.addr());
+                addrs.push(ptr.expose_provenance());
             }
             ready_tx.send(addrs).unwrap();
-            start_owner.wait();
+            start.wait();
             // Stay Active until every freer finishes publishing.
-            done_owner.wait();
+            done.wait();
         });
 
         let addrs = ready_rx.recv().unwrap();
-        for t in 0..FREERS {
-            let start = Arc::clone(&start);
-            let done = Arc::clone(&done);
-            let chunk: Vec<usize> = addrs[t * PER_FREER..(t + 1) * PER_FREER].to_vec();
+        let go = &start;
+        let finish = &done;
+        for i in 0..FREERS {
+            let chunk = addrs[i * PER_FREER..(i + 1) * PER_FREER].to_vec();
             scope.spawn(move || {
-                start.wait();
+                go.wait();
                 for addr in chunk {
                     let ptr = addr as *mut u8;
                     assert_eq!(unsafe { ptr.read() }, 0x11);
-                    unsafe { allocator.dealloc(ptr, layout) };
+                    unsafe { shared.dealloc(ptr, layout) };
                 }
-                done.wait();
+                finish.wait();
             });
         }
     });
@@ -657,15 +653,15 @@ fn remote_fan_in_enqueues_while_owner_stays_active() {
     let layout = Layout::from_size_align(64, 8).unwrap();
     let (ptrs_tx, ptrs_rx) = mpsc::channel::<Vec<usize>>();
     let (done_tx, done_rx) = mpsc::channel();
+    let shared = &allocator;
 
     thread::scope(|scope| {
-        let allocator = &allocator;
         scope.spawn(move || {
             let mut addrs = Vec::with_capacity(COUNT);
             for _ in 0..COUNT {
-                let ptr = unsafe { allocator.alloc(layout) };
+                let ptr = unsafe { shared.alloc(layout) };
                 assert!(!ptr.is_null());
-                addrs.push(ptr.addr());
+                addrs.push(ptr.expose_provenance());
             }
             ptrs_tx.send(addrs).unwrap();
             done_rx.recv().unwrap();
@@ -685,13 +681,13 @@ fn allocator_frees_large_allocation_from_non_owner_thread() {
     let layout = Layout::from_size_align(128 * 1024, 4096).unwrap();
     let (ptr_tx, ptr_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
+    let shared = &allocator;
 
     thread::scope(|scope| {
-        let allocator = &allocator;
         scope.spawn(move || {
-            let ptr = unsafe { allocator.alloc(layout) };
+            let ptr = unsafe { shared.alloc(layout) };
             assert!(!ptr.is_null());
-            ptr_tx.send(ptr.addr()).unwrap();
+            ptr_tx.send(ptr.expose_provenance()).unwrap();
             done_rx.recv().unwrap();
         });
 
@@ -715,15 +711,15 @@ fn allocator_completes_remote_free_burst_without_owner_progress() {
     let (ptr_tx, ptr_rx) = mpsc::channel();
     let (park_tx, park_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
+    let shared = &allocator;
 
     thread::scope(|scope| {
-        let allocator = &allocator;
         let owner = scope.spawn(move || {
             for _ in 0..BURST {
-                let ptr = unsafe { allocator.alloc(layout) };
+                let ptr = unsafe { shared.alloc(layout) };
                 assert!(!ptr.is_null());
                 unsafe { ptr.write(0x5a) };
-                ptr_tx.send(ptr.addr()).unwrap();
+                ptr_tx.send(ptr.expose_provenance()).unwrap();
             }
             // Stay parked so every free below arrives remotely while the
             // owner performs no local allocation or free of its own.
@@ -738,15 +734,15 @@ fn allocator_completes_remote_free_burst_without_owner_progress() {
 
             for ptr in pointers {
                 assert_eq!(unsafe { ptr.read() }, 0x5a);
-                unsafe { allocator.dealloc(ptr, layout) };
+                unsafe { shared.dealloc(ptr, layout) };
             }
 
             // The allocator must still make forward progress after the burst.
-            let ptr = unsafe { allocator.alloc(layout) };
+            let ptr = unsafe { shared.alloc(layout) };
             assert!(!ptr.is_null());
             unsafe { ptr.write(0xa5) };
             assert_eq!(unsafe { ptr.read() }, 0xa5);
-            unsafe { allocator.dealloc(ptr, layout) };
+            unsafe { shared.dealloc(ptr, layout) };
 
             park_tx.send(()).unwrap();
             done_tx.send(()).unwrap();
@@ -811,10 +807,7 @@ impl TraceRng {
     }
 
     fn next_usize(&mut self, upper: usize) -> usize {
-        let upper = u64::try_from(upper).unwrap();
-        let value = self.next() % upper;
-
-        usize::try_from(value).unwrap()
+        usize::try_from(self.next() % u64::try_from(upper).unwrap()).unwrap()
     }
 
     fn biased_size(&mut self, max: usize) -> usize {
