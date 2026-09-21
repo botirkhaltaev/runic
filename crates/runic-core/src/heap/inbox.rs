@@ -62,14 +62,15 @@ pub(crate) trait Node: Sized {
 
 /// Lock-free MPSC inbox of distinct owner entities (run or extent).
 ///
-/// Producers may only use shared references. Single-consumer `drain`.
-pub(crate) struct Inbox<T: Node> {
+/// Producers may only queue nodes borrowed for `'a`; every drained node retains
+/// that same lifetime. Single-consumer `drain`.
+pub(crate) struct Inbox<'a, T: Node> {
     /// Head of the pending intrusive chain (newer publishes link in front).
     head: AtomicPtr<T>,
-    marker: PhantomData<T>,
+    marker: PhantomData<&'a T>,
 }
 
-impl<T: Node> Inbox<T> {
+impl<'a, T: Node> Inbox<'a, T> {
     pub(crate) const fn new() -> Self {
         Self {
             head: AtomicPtr::new(ptr::null_mut()),
@@ -78,7 +79,7 @@ impl<T: Node> Inbox<T> {
     }
 
     /// Queue `node` if not already queued. Returns `true` when newly queued and linked.
-    pub(crate) fn queue(&self, node: &T) -> bool {
+    pub(crate) fn queue(&self, node: &'a T) -> bool {
         let link = node.link();
         if !link.try_queue() {
             return false;
@@ -89,7 +90,7 @@ impl<T: Node> Inbox<T> {
 
     /// Treiber-link an already-queued `node`. Caller won [`Link::try_queue`] (or holds
     /// the heaps exclusive path for an exclusive drain-path link).
-    fn link(&self, node: &T) {
+    fn link(&self, node: &'a T) {
         let link = node.link();
         let raw = core::ptr::from_ref(node).cast_mut();
         let mut old = self.head.load(Ordering::Acquire);
@@ -114,7 +115,7 @@ impl<T: Node> Inbox<T> {
     /// Detach the entire pending chain. Single-consumer only.
     ///
     /// Returns a null-terminated walk (one pass). Empty → `None`.
-    pub(crate) fn drain(&self) -> Option<Chain<'_, T>> {
+    pub(crate) fn drain(&self) -> Option<Chain<'a, T>> {
         let head = self.head.swap(ptr::null_mut(), Ordering::AcqRel);
         NonNull::new(head).map(|first| Chain {
             cursor: Some(first),
@@ -125,8 +126,8 @@ impl<T: Node> Inbox<T> {
 
 /// Null-terminated intrusive chain detached by [`Inbox::drain`] (single walk for accept).
 ///
-/// The borrow is tied to the inbox capability. Nodes must remain resident until the owner
-/// finishes this walk and clears their queued links; run and extent arenas provide that storage.
+/// The borrow is tied to the queued nodes, not to the call-scoped inbox borrow.
+/// Production inboxes use `'static` run headers and extent slots.
 pub(crate) struct Chain<'a, T: Node> {
     cursor: Option<NonNull<T>>,
     marker: PhantomData<&'a T>,
@@ -247,7 +248,7 @@ mod tests {
 
     #[test]
     fn inbox_drain_empty_is_none() {
-        let inbox: Inbox<TestNode> = Inbox::new();
+        let inbox: Inbox<'_, TestNode> = Inbox::new();
         assert!(inbox.drain().is_none());
         assert!(inbox.is_empty());
     }
@@ -328,7 +329,7 @@ mod tests {
         const PRODUCERS: usize = 4;
         const PER_ITER: usize = PRODUCERS;
 
-        let inbox: Inbox<TestNode> = Inbox::new();
+        let inbox: Inbox<'_, TestNode> = Inbox::new();
         let pool: Vec<_> = (0..ITERATIONS * PER_ITER)
             .map(|_| TestNode::new())
             .collect();

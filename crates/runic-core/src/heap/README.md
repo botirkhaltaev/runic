@@ -9,7 +9,7 @@ Owner-local heap frontend: runs for small size classes, extents for dedicated la
 - `mod.rs`: `Heap`, `HeapInner`, `AllocatorCtx`, and re-exports.
 - `heaps.rs`: `Heaps` (`Arena<Heap>` + Free-heap freelist).
 - `state.rs`: `HeapMode`, `HeapState`, `Lease` (`store` is module-private to reactivate / bump).
-- `inbox.rs`: generic `Inbox<T>` / `Node` / `Link<T>` / `Chain<'_, T>`.
+- `inbox.rs`: generic `Inbox<'a, T>` / `Node` / `Link<T>` / `Chain<'a, T>`; queueing stores the node borrow, so draining returns that lifetime rather than extending an inbox borrow.
 - `thread.rs`: `ThreadHeaps` / `ThreadHeap`.
 - `run/`: size-classed fixed-block runs (`Run` in-page header, heap-owned maps, `RunHeap` with `Arena<&'static Run>`).
 - `extent/`: dedicated mappings (`Extent`, `ExtentHeap` with `Arena<Extent>`, `ExtentCache`).

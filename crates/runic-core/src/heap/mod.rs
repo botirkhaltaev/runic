@@ -50,8 +50,8 @@ pub(crate) struct Heap {
     runs_live: AtomicUsize,
     /// Occupied extents. Updated on allocate / cache-or-unmap. Release store / Acquire load.
     extents_live: AtomicUsize,
-    run_inbox: Inbox<Run>,
-    extent_inbox: Inbox<Extent>,
+    run_inbox: Inbox<'static, Run>,
+    extent_inbox: Inbox<'static, Extent>,
     inner: Mutex<HeapInner>,
     /// Next Free heap index for [`Heaps`] (`u32::MAX` = end).
     pub(super) free_next: AtomicU32,
@@ -199,11 +199,11 @@ impl Heap {
         }
     }
 
-    fn enqueue_node<T: Node>(
+    fn enqueue_node<T: Node + 'static>(
         &self,
         id: HeapId,
-        inbox: &Inbox<T>,
-        node: &T,
+        inbox: &Inbox<'static, T>,
+        node: &'static T,
     ) -> Result<(), HeapError> {
         if node.link().is_queued() {
             return Ok(());
@@ -309,8 +309,6 @@ impl Heap {
     pub(super) fn flush(&self, inner: &mut HeapInner, ctx: &AllocatorCtx) -> Result<(), HeapError> {
         while let Some(chain) = self.run_inbox.drain() {
             for run in chain {
-                // SAFETY: run headers live in heap maps for the process; arena slots never unmap.
-                let run: &'static Run = unsafe { &*core::ptr::from_ref(run) };
                 if inner.runs.accept(run)? == Accept::Requeue {
                     self.run_inbox.queue(run);
                 }
@@ -318,8 +316,6 @@ impl Heap {
         }
         while let Some(chain) = self.extent_inbox.drain() {
             for extent in chain {
-                // SAFETY: extent slots are immortal; unmap drops only the mapping.
-                let extent: &'static Extent = unsafe { &*core::ptr::from_ref(extent) };
                 inner.extents.accept(extent, extent.ptr(), ctx.pages)?;
             }
         }

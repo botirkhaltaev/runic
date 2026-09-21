@@ -1007,7 +1007,7 @@ mod tests {
         let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
         let a = alloc_block(run).unwrap();
         let b = alloc_block(run).unwrap();
-        let inbox: Inbox<Run> = Inbox::new();
+        let inbox: Inbox<'_, Run> = Inbox::new();
 
         assert_eq!(run.claim(a), Ok(()));
         // First claim on an idle run wins the queue race and must push.
@@ -1047,7 +1047,7 @@ mod tests {
         let addrs: Vec<usize> = (0..capacity)
             .map(|_| alloc_block(run).unwrap().as_ptr().expose_provenance())
             .collect();
-        let inbox: Inbox<Run> = Inbox::new();
+        let inbox: Inbox<'_, Run> = Inbox::new();
         let done = AtomicBool::new(false);
 
         std::thread::scope(|scope| {
