@@ -22,16 +22,16 @@ pub(super) fn run() -> usize {
     let queue = Arc::new(Mutex::new(job_rx));
     let workers: Vec<_> = (0..THREADS)
         .map(|_| {
-            let queue = Arc::clone(&queue);
-            let result_tx = result_tx.clone();
+            let inbox = Arc::clone(&queue);
+            let outbound = result_tx.clone();
             thread::spawn(move || {
                 // The guard is released inside `map`, before the job runs.
-                while let Ok(Ok((round, index))) = queue.lock().map(|inbox| inbox.recv()) {
+                while let Ok(Ok((round, index))) = inbox.lock().map(|guard| guard.recv()) {
                     let fields: Vec<String> = (0..FIELDS)
                         .map(|field| format!("r{round}-j{index}-f{field}"))
                         .collect();
                     let local = round ^ index ^ fields.iter().map(String::len).sum::<usize>();
-                    if result_tx.send((local, fields)).is_err() {
+                    if outbound.send((local, fields)).is_err() {
                         break;
                     }
                 }

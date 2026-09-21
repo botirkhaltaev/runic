@@ -8,7 +8,7 @@ use core::{
 use crate::{arena::Arena, config::AllocatorConfig, heap::HeapError, memory::PageOwner};
 
 use super::state::HeapMode;
-use super::{AllocatorCtx, Heap, HeapId, HeapInner};
+use super::{AllocatorCtx, Heap, HeapId, HeapInner, OwnerState};
 
 const FREE_END: u32 = u32::MAX;
 
@@ -22,7 +22,7 @@ pub(crate) struct Heaps {
 }
 
 impl Heaps {
-    pub(crate) fn new(config: AllocatorConfig) -> Self {
+    pub(crate) const fn new(config: AllocatorConfig) -> Self {
         Self {
             arena: Arena::new(),
             free_head: AtomicU32::new(FREE_END),
@@ -49,7 +49,7 @@ impl Heaps {
             if heap.state.is_retired() || !heap.state.is_free() {
                 continue;
             }
-            heap.reactivate(heap.id());
+            heap.reactivate();
             return Some(heap);
         }
     }
@@ -75,7 +75,8 @@ impl Heaps {
     }
 
     /// Link a just-reclaimed Free heap. Caller holds Inner.
-    pub(super) fn push_free(&self, heap: &Heap, index: u32) {
+    pub(super) fn push_free(&self, heap: &Heap) {
+        let index = heap.id().index();
         let mut prev = self.free_head.load(Ordering::Relaxed);
         loop {
             heap.free_next.store(prev, Ordering::Relaxed);
@@ -94,19 +95,15 @@ impl Heaps {
     /// Generation-checked shared borrow. Lock-free directory read.
     pub(crate) fn get(&self, id: HeapId) -> Option<&Heap> {
         let heap = self.arena.get(id.index())?;
-        heap.state.matches(id).then_some(heap)
-    }
-
-    /// Try to return a Draining heap to the Free list. No inbox accept.
-    pub(crate) fn reclaim(&self, id: HeapId) -> Result<(), HeapError> {
-        let (heap, inner) = self.admit(id)?;
-        heap.reclaim(&inner, self);
-        Ok(())
+        heap.matches(id).then_some(heap)
     }
 
     /// Inbox push while Draining (no Active lease). Then reclaim.
     pub(crate) fn enqueue(&self, id: HeapId, owner: PageOwner) -> Result<(), HeapError> {
         let (heap, inner) = self.admit(id)?;
+        if heap != owner.heap() {
+            return Err(HeapError::InvalidHeap);
+        }
         heap.drain_enqueue(owner);
         heap.reclaim(&inner, self);
         Ok(())
@@ -118,18 +115,21 @@ impl Heaps {
         id: HeapId,
         owner: PageOwner,
         ptr: NonNull<u8>,
-        ctx: &AllocatorCtx<'_>,
+        ctx: &AllocatorCtx,
     ) -> Result<(), HeapError> {
         let (heap, mut inner) = self.admit(id)?;
-        let emptied = inner.free(owner, ptr, ctx.pages)?;
-        if emptied {
+        if heap != owner.heap() {
+            return Err(HeapError::InvalidHeap);
+        }
+        let state = inner.free(owner, ptr, ctx.pages)?;
+        if state == OwnerState::Empty {
             heap.reclaim(&inner, self);
         }
         Ok(())
     }
 
     /// Accept inboxes while Draining. Then reclaim.
-    pub(crate) fn flush(&self, id: HeapId, ctx: &AllocatorCtx<'_>) -> Result<(), HeapError> {
+    pub(crate) fn flush(&self, id: HeapId, ctx: &AllocatorCtx) -> Result<(), HeapError> {
         let (heap, mut inner) = self.admit(id)?;
         heap.flush(&mut inner, ctx)?;
         heap.reclaim(&inner, self);
@@ -142,14 +142,14 @@ impl Heaps {
             return Err(HeapError::InvalidHeap);
         }
         let inner = heap.lock_inner();
-        if !heap.state.matches(id) || heap.mode() != HeapMode::Draining {
+        if !heap.matches(id) || heap.mode() != HeapMode::Draining {
             return Err(HeapError::InvalidHeap);
         }
         Ok((heap, inner))
     }
 
-    /// Owner thread gives up the heap: close Active, wait leases, reclaim, flush.
-    pub(crate) fn retire(&self, id: HeapId, ctx: &AllocatorCtx<'_>) -> Result<(), HeapError> {
+    /// Owner gives up the heap: close Active, wait leases, reclaim, flush.
+    pub(crate) fn unbind(&self, id: HeapId, ctx: &AllocatorCtx) -> Result<(), HeapError> {
         {
             let Some(heap) = self.get(id) else {
                 return Ok(());
@@ -158,12 +158,6 @@ impl Heaps {
         }
 
         self.wait_leases(id);
-
-        match self.reclaim(id) {
-            Ok(()) => {}
-            Err(HeapError::InvalidHeap) => return Ok(()),
-            Err(error) => return Err(error),
-        }
 
         match self.flush(id, ctx) {
             Ok(()) | Err(HeapError::InvalidHeap) => Ok(()),
@@ -192,29 +186,34 @@ impl Heaps {
 
 #[cfg(test)]
 mod tests {
+    use core::alloc::Layout;
+    use core::sync::atomic::AtomicBool;
+    use std::sync::OnceLock;
     use std::sync::{Barrier, mpsc};
     use std::thread;
 
     use super::*;
-    use crate::memory::PageMap;
-
-    fn retire(heaps: &Heaps, id: HeapId) -> Result<(), HeapError> {
-        let pages = PageMap::new();
-        heaps.retire(
-            id,
-            &AllocatorCtx {
-                pages: &pages,
-                heaps,
-            },
-        )
-    }
+    use crate::{
+        layout::LayoutSpec,
+        memory::{PageMap, PageOwner},
+    };
 
     #[test]
-    fn acquire_retire_reactivate_bumps_generation() {
+    fn acquire_unbind_reactivate_bumps_generation() {
         let heaps = Heaps::new(AllocatorConfig::new());
         let first = heaps.acquire().unwrap().id();
         assert_eq!(first.generation().get(), 1);
-        assert_eq!(retire(&heaps, first), Ok(()));
+        let pages = PageMap::new();
+        assert_eq!(
+            heaps.unbind(
+                first,
+                &AllocatorCtx {
+                    pages: &pages,
+                    heaps: &heaps
+                }
+            ),
+            Ok(())
+        );
         assert!(heaps.get(first).is_none());
 
         let second = heaps.acquire().unwrap().id();
@@ -228,8 +227,53 @@ mod tests {
     fn stale_heap_id_rejected_after_reclaim() {
         let heaps = Heaps::new(AllocatorConfig::new());
         let id = heaps.acquire().unwrap().id();
-        assert_eq!(retire(&heaps, id), Ok(()));
+        let pages = PageMap::new();
+        assert_eq!(
+            heaps.unbind(
+                id,
+                &AllocatorCtx {
+                    pages: &pages,
+                    heaps: &heaps
+                }
+            ),
+            Ok(())
+        );
         assert!(heaps.get(id).is_none());
+    }
+
+    #[test]
+    fn cached_extent_derives_reactivated_generation() {
+        static HEAPS: OnceLock<Heaps> = OnceLock::new();
+        static PAGES: OnceLock<PageMap> = OnceLock::new();
+
+        let heaps = HEAPS.get_or_init(|| Heaps::new(AllocatorConfig::new()));
+        let pages = PAGES.get_or_init(PageMap::new);
+        let ctx = AllocatorCtx { pages, heaps };
+        let heap = heaps.acquire().unwrap();
+        let first = heap.id();
+        let spec = LayoutSpec::from_layout(Layout::from_size_align(128 * 1024, 4096).unwrap());
+        let ptr = {
+            let mut inner = heap.require_inner();
+            inner
+                .extents
+                .allocate(spec, heap, pages, crate::heap::ExtentInit::Uninit)
+                .unwrap()
+                .unwrap()
+        };
+        let Some(PageOwner::Extent(extent)) = pages.get(ptr) else {
+            panic!("expected extent owner");
+        };
+        {
+            let mut inner = heap.require_inner();
+            inner.extents.free(extent, ptr, pages).unwrap();
+        }
+
+        assert_eq!(heaps.unbind(first, &ctx), Ok(()));
+        let second = heaps.acquire().unwrap().id();
+        assert_eq!(second.index(), first.index());
+        assert_ne!(second.generation(), first.generation());
+        assert_eq!(extent.heap().id(), second);
+        assert_eq!(heaps.unbind(second, &ctx), Ok(()));
     }
 
     #[test]
@@ -239,9 +283,11 @@ mod tests {
         let index = id.index();
         let max_gen = NonZeroU32::new(u32::MAX).unwrap();
         let heap = heaps.get(id).unwrap();
-        heap.state.store(max_gen, HeapMode::Draining, false, 0);
+        heap.state.store(max_gen, HeapMode::Draining, 0);
         let id_max = HeapId::new(index, max_gen).unwrap();
-        assert_eq!(heaps.reclaim(id_max), Ok(()));
+        let inner = heap.lock_inner();
+        assert!(heap.reclaim(&inner, &heaps));
+        drop(inner);
         assert!(heaps.get(id).is_none());
         assert!(heaps.get(id_max).is_none());
         assert!(heaps.arena.get(index).unwrap().state.is_retired());
@@ -250,18 +296,28 @@ mod tests {
     }
 
     #[test]
-    fn retire_waits_for_in_flight_lease() {
+    fn unbind_waits_for_in_flight_lease() {
         let heaps = Heaps::new(AllocatorConfig::new());
         let id = heaps.acquire().unwrap().id();
         let heap = heaps.get(id).unwrap();
         let lease = heap.state.acquire_lease(id).unwrap();
+        let pages = PageMap::new();
         let start = Barrier::new(2);
         let (done_tx, done_rx) = mpsc::channel();
 
         thread::scope(|scope| {
             scope.spawn(|| {
                 start.wait();
-                assert_eq!(retire(&heaps, id), Ok(()));
+                assert_eq!(
+                    heaps.unbind(
+                        id,
+                        &AllocatorCtx {
+                            pages: &pages,
+                            heaps: &heaps
+                        }
+                    ),
+                    Ok(())
+                );
                 done_tx.send(()).unwrap();
             });
 
@@ -280,33 +336,78 @@ mod tests {
     }
 
     #[test]
+    fn adopt_and_reclaim_cannot_both_win() {
+        let heaps = Heaps::new(AllocatorConfig::new());
+        let id = heaps.acquire().unwrap().id();
+        let heap = heaps.get(id).unwrap();
+        assert_eq!(heap.close(id), Ok(()));
+        let start = Barrier::new(3);
+        let adopted = AtomicBool::new(false);
+
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                start.wait();
+                if let Ok(inner) = heap.adopt(id) {
+                    adopted.store(true, Ordering::Release);
+                    drop(inner);
+                }
+            });
+            scope.spawn(|| {
+                start.wait();
+                let inner = heap.lock_inner();
+                heap.reclaim(&inner, &heaps);
+            });
+            start.wait();
+        });
+
+        let pages = PageMap::new();
+        let ctx = AllocatorCtx {
+            pages: &pages,
+            heaps: &heaps,
+        };
+        if adopted.load(Ordering::Acquire) {
+            assert_eq!(heaps.get(id).map(Heap::mode), Some(HeapMode::Active));
+            assert_eq!(heaps.unbind(id, &ctx), Ok(()));
+        } else {
+            assert!(heaps.get(id).is_none());
+        }
+    }
+
+    #[test]
     fn acquire_grows_past_sixty_four_live_heaps() {
         const LIVE: usize = 96;
         let heaps = Heaps::new(AllocatorConfig::new());
+        let pages = PageMap::new();
         let (tx, rx) = mpsc::channel();
         thread::scope(|scope| {
-            let heaps = &heaps;
             for _ in 0..LIVE {
-                let tx = tx.clone();
-                scope.spawn(move || {
-                    let id = heaps.acquire().unwrap().id();
-                    tx.send(id).unwrap();
+                scope.spawn(|| {
+                    tx.send(heaps.acquire().unwrap().id()).unwrap();
                 });
             }
-            drop(tx);
-            let ids: Vec<_> = rx.iter().collect();
-            assert_eq!(ids.len(), LIVE);
-
-            let mut indexes: Vec<u32> = ids.iter().map(|id| id.index()).collect();
-            indexes.sort_unstable();
-            let unique = indexes.len();
-            indexes.dedup();
-            assert_eq!(indexes.len(), unique);
-
-            for id in ids {
-                assert_eq!(retire(heaps, id), Ok(()));
-            }
         });
+        drop(tx);
+        let ids: Vec<_> = rx.iter().collect();
+        assert_eq!(ids.len(), LIVE);
+
+        let mut indexes: Vec<u32> = ids.iter().map(|id| id.index()).collect();
+        indexes.sort_unstable();
+        let unique = indexes.len();
+        indexes.dedup();
+        assert_eq!(indexes.len(), unique);
+
+        for id in ids {
+            assert_eq!(
+                heaps.unbind(
+                    id,
+                    &AllocatorCtx {
+                        pages: &pages,
+                        heaps: &heaps,
+                    }
+                ),
+                Ok(())
+            );
+        }
 
         let reused = heaps.acquire().unwrap().id();
         assert!(reused.index() < u32::try_from(LIVE).unwrap());
@@ -318,15 +419,14 @@ mod tests {
         let n = 32;
         let (tx, rx) = mpsc::channel();
         thread::scope(|scope| {
-            let heaps = &heaps;
-            scope.spawn(move || {
+            scope.spawn(|| {
                 for _ in 0..n {
-                    let id = heaps.acquire().unwrap().id();
-                    tx.send(id).unwrap();
+                    tx.send(heaps.acquire().unwrap().id()).unwrap();
                 }
             });
             let mut seen = 0usize;
-            for id in rx {
+            for _ in 0..n {
+                let id = rx.recv().unwrap();
                 while heaps.get(id).is_none() {
                     hint::spin_loop();
                 }

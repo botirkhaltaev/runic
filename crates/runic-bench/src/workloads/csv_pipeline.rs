@@ -40,8 +40,8 @@ fn csv_pipeline(rounds: usize, rows: usize) -> usize {
         let mut reader = csv::Reader::from_reader(bytes.as_slice());
         let mut totals: HashMap<String, u64> = HashMap::new();
         let mut count = 0_usize;
-        for record in reader.records() {
-            let Ok(record) = record else {
+        for result in reader.records() {
+            let Ok(record) = result else {
                 continue;
             };
             let Some(category) = record.get(1) else {

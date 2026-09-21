@@ -1,6 +1,6 @@
 //! Intrusive multi-producer, single-consumer Treiber stack, coalesced by owner.
 //!
-//! [`Inbox`] carries at most one entry per run or extent at a time: [`Inbox::push`]
+//! [`Inbox`] carries at most one entry per run or extent at a time: [`Inbox::queue`]
 //! queues a node only on the idle→queued transition, so many remote frees against the
 //! same run collapse into a single inbox entry. The owner [`Inbox::drain`]s and
 //! [`crate::heap::Run::accept`]s (or extent accept) claimed work in one pass.
@@ -10,6 +10,7 @@
 //! head always walks the full prior chain.
 
 use core::{
+    marker::PhantomData,
     ptr::{self, NonNull},
     sync::atomic::{AtomicBool, AtomicPtr, Ordering},
 };
@@ -18,12 +19,12 @@ use core::{
 ///
 /// Embedded on the owning `Run` / `Extent`. Idle (`queued == false`) means the entity is
 /// off every inbox and safe to re-link; Queued means it is linked into exactly one inbox.
-pub(crate) struct InboxLink<T> {
+pub(crate) struct Link<T> {
     next: AtomicPtr<T>,
     queued: AtomicBool,
 }
 
-impl<T> InboxLink<T> {
+impl<T> Link<T> {
     pub(crate) const fn new() -> Self {
         Self {
             next: AtomicPtr::new(ptr::null_mut()),
@@ -54,38 +55,31 @@ impl<T> InboxLink<T> {
     }
 }
 
-/// Types that embed an [`InboxLink`] for coalesced inbox membership.
-pub(crate) trait InboxNode: Sized {
-    fn link(&self) -> &InboxLink<Self>;
+/// Types that embed a [`Link`] for coalesced inbox membership.
+pub(crate) trait Node: Sized {
+    fn link(&self) -> &Link<Self>;
 }
 
-/// Lock-free MPSC inbox of distinct owner entities (run or extent pointers).
+/// Lock-free MPSC inbox of distinct owner entities (run or extent).
 ///
 /// Producers may only use shared references. Single-consumer `drain`.
-pub(crate) struct Inbox<T: InboxNode> {
+pub(crate) struct Inbox<T: Node> {
     /// Head of the pending intrusive chain (newer publishes link in front).
     head: AtomicPtr<T>,
+    marker: PhantomData<T>,
 }
 
-// SAFETY: producers and the single consumer only coordinate through `head` and each node's
-// intrusive `InboxLink::next`.
-unsafe impl<T: InboxNode> Sync for Inbox<T> {}
-
-impl<T: InboxNode> Inbox<T> {
+impl<T: Node> Inbox<T> {
     pub(crate) const fn new() -> Self {
         Self {
             head: AtomicPtr::new(ptr::null_mut()),
+            marker: PhantomData,
         }
     }
 
     /// Queue `node` if not already queued. Returns `true` when newly queued and linked.
-    ///
-    /// Already-queued → `false` (coalesce). Active freers that need an enqueue lease must
-    /// use [`InboxLink::try_queue`] then [`Self::link`] under the lease instead, so coalesced
-    /// claims skip the lease entirely.
-    pub(crate) fn push(&self, node: NonNull<T>) -> bool {
-        // SAFETY: `node` is a stable heap-owned entity for as long as it may be claimed.
-        let link = unsafe { node.as_ref() }.link();
+    pub(crate) fn queue(&self, node: &T) -> bool {
+        let link = node.link();
         if !link.try_queue() {
             return false;
         }
@@ -93,12 +87,11 @@ impl<T: InboxNode> Inbox<T> {
         true
     }
 
-    /// Treiber-link an already-queued `node`. Caller won [`InboxLink::try_queue`] (or holds
+    /// Treiber-link an already-queued `node`. Caller won [`Link::try_queue`] (or holds
     /// the heaps exclusive path for an exclusive drain-path link).
-    pub(crate) fn link(&self, node: NonNull<T>) {
-        // SAFETY: `node` is a stable heap-owned entity for as long as it may be claimed.
-        let link = unsafe { node.as_ref() }.link();
-        let raw = node.as_ptr();
+    fn link(&self, node: &T) {
+        let link = node.link();
+        let raw = core::ptr::from_ref(node).cast_mut();
         let mut old = self.head.load(Ordering::Acquire);
         loop {
             // Store the tail link before publishing the new head so a concurrent drain
@@ -121,36 +114,44 @@ impl<T: InboxNode> Inbox<T> {
     /// Detach the entire pending chain. Single-consumer only.
     ///
     /// Returns a null-terminated walk (one pass). Empty → `None`.
-    pub(crate) fn drain(&self) -> Option<InboxChain<T>> {
+    pub(crate) fn drain(&self) -> Option<Chain<'_, T>> {
         let head = self.head.swap(ptr::null_mut(), Ordering::AcqRel);
-        NonNull::new(head).map(|first| InboxChain {
+        NonNull::new(head).map(|first| Chain {
             cursor: Some(first),
+            marker: PhantomData,
         })
     }
 }
 
 /// Null-terminated intrusive chain detached by [`Inbox::drain`] (single walk for accept).
-pub(crate) struct InboxChain<T: InboxNode> {
+///
+/// The borrow is tied to the inbox capability. Nodes must remain resident until the owner
+/// finishes this walk and clears their queued links; run and extent arenas provide that storage.
+pub(crate) struct Chain<'a, T: Node> {
     cursor: Option<NonNull<T>>,
+    marker: PhantomData<&'a T>,
 }
 
-impl<T: InboxNode> Iterator for InboxChain<T> {
-    type Item = NonNull<T>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let node = self.cursor?;
+impl<'a, T: Node> Chain<'a, T> {
+    fn step(node: NonNull<T>) -> (&'a T, Option<NonNull<T>>) {
         // SAFETY: dequeued nodes keep their producer-linked next pointer valid until the
-        // owner clears queued (`InboxLink::clear_queued`).
-        let next = unsafe { node.as_ref() }.link().next.load(Ordering::Acquire);
-        self.cursor = NonNull::new(next);
-        Some(node)
+        // owner clears queued (`Link::clear_queued`).
+        let node = unsafe { node.as_ref() };
+        let next = NonNull::new(node.link().next.load(Ordering::Acquire));
+        (node, next)
     }
 }
 
-/// Coalesced inbox of remotely-freed runs.
-pub(crate) type RunInbox = Inbox<crate::heap::Run>;
-/// Coalesced inbox of remotely-freed extents.
-pub(crate) type ExtentInbox = Inbox<crate::heap::Extent>;
+impl<'a, T: Node> Iterator for Chain<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let node = self.cursor?;
+        let (item, next) = Self::step(node);
+        self.cursor = next;
+        Some(item)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -160,41 +161,44 @@ mod tests {
 
     #[repr(C)]
     struct TestNode {
-        link: InboxLink<TestNode>,
+        link: Link<TestNode>,
         accepted: AtomicBool,
     }
+
+    impl PartialEq for TestNode {
+        fn eq(&self, other: &Self) -> bool {
+            core::ptr::eq(self, other)
+        }
+    }
+
+    impl Eq for TestNode {}
 
     impl TestNode {
         fn new() -> Self {
             Self {
-                link: InboxLink::new(),
+                link: Link::new(),
                 accepted: AtomicBool::new(false),
             }
         }
     }
 
-    impl InboxNode for TestNode {
-        fn link(&self) -> &InboxLink<Self> {
+    impl Node for TestNode {
+        fn link(&self) -> &Link<Self> {
             &self.link
         }
     }
 
-    fn node_ptr(node: &TestNode) -> NonNull<TestNode> {
-        NonNull::from(node)
-    }
-
-    fn collect_chain(chain: InboxChain<TestNode>) -> Vec<NonNull<TestNode>> {
-        chain.collect()
+    fn collect_chain(chain: Chain<'_, TestNode>) -> Vec<usize> {
+        chain.map(|node| core::ptr::from_ref(node).addr()).collect()
     }
 
     #[test]
     fn inbox_push_drain_single() {
         let inbox = Inbox::new();
         let node = TestNode::new();
-        let ptr = node_ptr(&node);
-        assert!(inbox.push(ptr));
+        assert!(inbox.queue(&node));
         let chain = inbox.drain().unwrap();
-        assert_eq!(collect_chain(chain), [ptr]);
+        assert_eq!(collect_chain(chain), [core::ptr::from_ref(&node).addr()]);
         assert!(inbox.is_empty());
     }
 
@@ -202,12 +206,11 @@ mod tests {
     fn inbox_repeated_push_before_drain_queues_once() {
         let inbox = Inbox::new();
         let node = TestNode::new();
-        let ptr = node_ptr(&node);
-        assert!(inbox.push(ptr));
-        assert!(!inbox.push(ptr));
-        assert!(!inbox.push(ptr));
+        assert!(inbox.queue(&node));
+        assert!(!inbox.queue(&node));
+        assert!(!inbox.queue(&node));
         let chain = inbox.drain().unwrap();
-        assert_eq!(collect_chain(chain), [ptr]);
+        assert_eq!(collect_chain(chain), [core::ptr::from_ref(&node).addr()]);
         assert!(inbox.is_empty());
     }
 
@@ -215,14 +218,13 @@ mod tests {
     fn inbox_push_after_clear_queued_requeues() {
         let inbox = Inbox::new();
         let node = TestNode::new();
-        let ptr = node_ptr(&node);
-        assert!(inbox.push(ptr));
+        assert!(inbox.queue(&node));
         assert!(inbox.drain().is_some());
 
         node.link.clear_queued();
-        assert!(inbox.push(ptr));
+        assert!(inbox.queue(&node));
         let chain = inbox.drain().unwrap();
-        assert_eq!(collect_chain(chain), [ptr]);
+        assert_eq!(collect_chain(chain), [core::ptr::from_ref(&node).addr()]);
     }
 
     #[test]
@@ -230,12 +232,16 @@ mod tests {
         let inbox = Inbox::new();
         let first_node = TestNode::new();
         let second_node = TestNode::new();
-        let first = node_ptr(&first_node);
-        let second = node_ptr(&second_node);
-        assert!(inbox.push(first));
-        assert!(inbox.push(second));
+        assert!(inbox.queue(&first_node));
+        assert!(inbox.queue(&second_node));
         let chain = inbox.drain().unwrap();
-        assert_eq!(collect_chain(chain), [second, first]);
+        assert_eq!(
+            collect_chain(chain),
+            [
+                core::ptr::from_ref(&second_node).addr(),
+                core::ptr::from_ref(&first_node).addr(),
+            ]
+        );
         assert!(inbox.is_empty());
     }
 
@@ -253,10 +259,7 @@ mod tests {
         let inbox = Inbox::new();
         let older = TestNode::new();
         let newer = TestNode::new();
-        let older_ptr = node_ptr(&older);
-        let newer_ptr = node_ptr(&newer);
-
-        assert!(inbox.push(older_ptr));
+        assert!(inbox.queue(&older));
 
         let published = AtomicBool::new(false);
         let drained = AtomicUsize::new(0);
@@ -273,7 +276,7 @@ mod tests {
             });
 
             published.store(true, AtomicOrdering::Release);
-            assert!(inbox.push(newer_ptr));
+            assert!(inbox.queue(&newer));
         });
 
         let seen = drained.load(AtomicOrdering::Acquire);
@@ -296,21 +299,21 @@ mod tests {
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 for node in &left {
-                    assert!(inbox.push(node_ptr(node)));
+                    assert!(inbox.queue(node));
                 }
             });
             scope.spawn(|| {
                 for node in &right {
-                    assert!(inbox.push(node_ptr(node)));
+                    assert!(inbox.queue(node));
                 }
             });
         });
 
         let mut count = 0usize;
         while let Some(chain) = inbox.drain() {
-            for ptr in chain {
+            for node in chain {
                 count += 1;
-                let known = left.iter().chain(right.iter()).any(|n| node_ptr(n) == ptr);
+                let known = left.iter().chain(right.iter()).any(|n| n == node);
                 assert!(known, "unknown pointer drained");
             }
         }
@@ -338,9 +341,7 @@ mod tests {
                 let mut local = 0usize;
                 while !stop.load(AtomicOrdering::Acquire) || !inbox.is_empty() {
                     if let Some(chain) = inbox.drain() {
-                        for ptr in chain {
-                            // SAFETY: pointers drained here come from the fixed `pool` below.
-                            let node = unsafe { ptr.as_ref() };
+                        for node in chain {
                             assert!(
                                 !node.accepted.swap(true, AtomicOrdering::AcqRel),
                                 "double accept"
@@ -355,10 +356,7 @@ mod tests {
             });
 
             for _ in 0..PRODUCERS {
-                let inbox = &inbox;
-                let pool = &pool;
-                let next_index = &next_index;
-                scope.spawn(move || {
+                scope.spawn(|| {
                     loop {
                         let i = next_index.fetch_add(1, AtomicOrdering::Relaxed);
                         if i >= ITERATIONS * PER_ITER {
@@ -369,7 +367,7 @@ mod tests {
                             !node.accepted.load(AtomicOrdering::Acquire),
                             "producer must not publish an already-accepted node"
                         );
-                        assert!(inbox.push(node_ptr(node)));
+                        assert!(inbox.queue(node));
                     }
                 });
             }
@@ -383,9 +381,7 @@ mod tests {
         });
 
         while let Some(chain) = inbox.drain() {
-            for ptr in chain {
-                // SAFETY: pointers drained here come from the fixed `pool` above.
-                let node = unsafe { ptr.as_ref() };
+            for node in chain {
                 assert!(
                     !node.accepted.swap(true, AtomicOrdering::AcqRel),
                     "node accepted twice on final sweep"

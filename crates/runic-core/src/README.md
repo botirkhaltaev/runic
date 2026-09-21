@@ -4,7 +4,7 @@ Allocator core organized around entities and invariants.
 
 ## Modules
 
-- `allocator`: public core facade, abort, and `Allocator::ctx()` (`Process` is private mmap).
+- `allocator`: public core facade, abort, and process-lifetime `Allocator::ctx()` (`Process` is private mmap).
 - `arena`: published immovable slots (`get` lock-free; `push` shared; `vacant` / `insert` / `remove` exclusive). Heap/run/extent metadata; growth maps another 256 KiB chunk.
 - `config`: `AllocatorConfig` and `Budget`. Run/extent policy live in `heap/run/config.rs` and `heap/extent/config.rs`.
 - `heap`: owner-local heaps, TLS current run, run/extent heaps, `Heaps`, and thread binding.
@@ -14,7 +14,7 @@ Allocator core organized around entities and invariants.
 
 ## Invariant
 
-Every returned pointer must map to exactly one page-map entry. Runs accept only valid block-boundary frees; extents accept only the exact returned pointer.
+Every returned pointer must map to exactly one borrowed page-map owner. Runs accept only valid block-boundary frees; extents accept only the exact returned pointer. Raw decoding stays in page-map/run leaves; higher layers operate on `&Run`, `&Extent`, and `&'static Heap`.
 
 ## Tests
 

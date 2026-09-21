@@ -395,3 +395,69 @@ rseq-rs front        rseq-rs 0.8.0 at f208f9b, one still-live pointer per CPU
                       rejected for both throughput and correctness.
 ```
 
+## Unsafe-leaf architecture cleanup
+
+Replaced higher-layer raw owner handles with process-lifetime `&Heap` and
+process-lifetime `PageOwner` entities; moved run state to `Cell`, extent cache links
+to `ExtentId`, and inbox queue/link traversal behind `Inbox<T>`. Run/extent
+identity callers derive `HeapId` from the owning heap. Live edges update
+atomics on `Heap`; reclaim confirms them by scanning the run/extent arenas.
+Extent slots remain immortal when their mappings are dropped.
+
+Gate on this host: workspace tests, strict Clippy, and bench build pass.
+`vec_growth_log` profile: 360.388 cycles/element, 10.586 Melem/s; Criterion
+midpoint throughput changed +0.31%. The first unpinned `arc_broadcast` sample
+was 8.91 ms; a dedicated 20-sample, 10-second rerun was 4.20 ms.
+
+The final stack audit found and fixed a lifecycle race inherited from the old
+shape: reclaim loaded Draining twice and then unconditionally stored Free, so
+it could overwrite a concurrent Draining→Active adoption. Adoption now locks
+`HeapInner` before its CAS and keeps the guard for the first flush; reclaim
+bumps the generation with a CAS. TLS retains the generation captured at
+bind/adopt because it is an independent stale-incarnation token, not a second
+owner handle. Flush errors now remain typed until the sole allocator abort
+sink instead of becoming null allocation results.
+
+Paired `profile.sh` runs (three 2-second perf-stat repeats, pinned CPU) compared
+`origin/master` with the repaired tree on remote-heavy real workloads. Cycles
+per element changed: `thread_pool_jobs` 3771.675→3758.070 (-0.36%),
+`shard_aggregator` 460.468→464.074 (+0.78%), `buffer_pool`
+9638.356→9421.610 (-2.25%), and `arc_broadcast` 2275.956→2241.304
+(-1.52%). No workload regressed beyond the 1% gate.
+
+The final unsafe-leaf pass kept the lock-free owner-free protocol, stored typed
+run references in TLS and the run directory, and moved dirty extent zeroing onto
+`Extent`. A second paired screen against `origin/master` (three 2-second
+perf-stat repeats, CPUs 24–27) measured cycles/element:
+`thread_pool_jobs` 6152.260→6035.207 (-1.90%),
+`shard_aggregator` 535.509→489.530 (-8.59%),
+`buffer_pool` 17512.680→17150.313 (-2.07%), and
+`arc_broadcast` 9907.942→9933.413 (+0.26%). No workload crossed the 1% regression
+gate.
+
+Read that screen as "did not regress", not as a win. The pass is ownership and
+type cleanup with no protocol change, so it should be performance-neutral. The
+`shard_aggregator` delta is noise: total cycles rose (8.24G→8.30G) and only the
+Criterion element rate moved (6.53→7.28 Melem/s), and an earlier screen of the
+same tree reported +0.78% on that workload. Two-second threaded samples on this
+host carry swings of that size.
+
+State cleanup then replaced `available_next` + `on_available` with
+`AvailableLink::{Unlisted,Tail,Next}` and folded the separate retired bit into
+`HeapMode::Retired`. True binary synchronization/observations stayed bools.
+The same pinned gate against `origin/master` measured cycles/element:
+`thread_pool_jobs` 6152.260→6116.179 (-0.59%),
+`shard_aggregator` 535.509→474.701 (-11.36%, threaded noise),
+`buffer_pool` 17512.680→17468.074 (-0.25%), and
+`arc_broadcast` 9907.942→9608.833 (-3.02%). No regression crossed 1%; as above,
+these are gate results, not claimed improvements.
+
+TLS then dropped the bound/adopted field pair. Process `Heap`/`Heaps` stay;
+one thread-owned heap is `ThreadHeap::{Vacant, Active}` and the frontend is
+`THREAD_HEAPS`. Hit paths still do not load TLS heap slots. Paired 2s×3
+`profile.sh` vs this branch HEAD (CPUs 24–27) kept instruction counts flat on
+the hit corpus (word_count / hashmap_grow / graph_shortest_path within 0.2%).
+Cycles/elem moved more than 1% on some 2s samples (`hashmap_grow` +4.5% cpe with
+−0.2% instructions); treat as the same host noise as earlier screens, not a
+protocol change.
+

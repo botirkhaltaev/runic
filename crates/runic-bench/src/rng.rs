@@ -24,8 +24,8 @@ impl TraceRng {
     #[must_use]
     pub fn next_usize(&mut self, upper: usize) -> usize {
         assert!(upper > 0);
-        let upper = u64::try_from(upper).unwrap();
-        usize::try_from(self.next_u64() % upper).unwrap()
+        let bound = u64::try_from(upper).unwrap();
+        usize::try_from(self.next_u64() % bound).unwrap()
     }
 
     #[must_use]

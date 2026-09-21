@@ -9,34 +9,35 @@ Owner-local heap frontend: runs for small size classes, extents for dedicated la
 - `mod.rs`: `Heap`, `HeapInner`, `AllocatorCtx`, and re-exports.
 - `heaps.rs`: `Heaps` (`Arena<Heap>` + Free-heap freelist).
 - `state.rs`: `HeapMode`, `HeapState`, `Lease` (`store` is module-private to reactivate / bump).
-- `inbox.rs`: `Inbox` / `InboxLink`.
-- `thread.rs`: `ThreadHeap`.
-- `run/`: size-classed fixed-block runs (`Run` in-page header, heap-owned maps, `RunHeap` with `Arena<NonNull<Run>>`).
+- `inbox.rs`: generic `Inbox<T>` / `Node` / `Link<T>` / `Chain<'_, T>`.
+- `thread.rs`: `ThreadHeaps` / `ThreadHeap`.
+- `run/`: size-classed fixed-block runs (`Run` in-page header, heap-owned maps, `RunHeap` with `Arena<&'static Run>`).
 - `extent/`: dedicated mappings (`Extent`, `ExtentHeap` with `Arena<Extent>`, `ExtentCache`).
 
 ## Capabilities
 
 | Entity | May do | Must not |
 |--------|--------|----------|
-| `Heaps` | `acquire` / `get` / `retire` / `enqueue` / `free` / `flush` / `reclaim` | hold arena grow lock across flush/accept |
+| `Heaps` | `acquire` / `get` / `unbind` / `enqueue` / `free` / `flush` | hold arena grow lock across flush/accept |
 | `&Heap` (shared) | `id`, `enqueue`, mode / active queries | body mutation, expose `&HeapState` |
-| `ThreadHeap` | sole Active body path (`require_inner` + `AllocatorCtx`) | be bypassed via `&Heap` from allocator / tests |
-| `AllocatorCtx` | pass `PageMap` + `Heaps` into Heap / ThreadHeap / Heaps methods | contain a mutex guard |
+| `ThreadHeaps` | sole Active body path (`require_inner` + `AllocatorCtx`) | be bypassed via `&Heap` from allocator / tests |
+| `AllocatorCtx` | pass `PageMap` + `Heaps` into Heap / ThreadHeaps / Heaps methods | contain a mutex guard |
 
 ## Invariants
 
-- Every `Run` and `Extent` stores a `HeapId`; there is no root/central ownership heap. `Heap` owns lifecycle, inboxes, and run/extent metadata (`RunHeap` / `ExtentHeap`).
+- Every `Run` and `Extent` stores its process-lifetime owning `&Heap`; `heap().id()` derives the current generation. There is no root/central ownership heap. `Heap` owns lifecycle, inboxes, and run/extent metadata (`RunHeap` / `ExtentHeap`).
+- `Heap`, `Run`, and `Extent` implement identity `Eq`; protocol code compares entities directly. Raw pointer equality stays inside those trait implementations.
 - Small allocations are owned by a heap's runs; large allocations by that heap's extents.
-- Cross-thread frees: `claim` → `Heap::enqueue` (Active: lease before a new `try_queue`) or `Heaps::{enqueue,free,flush}` (Draining). A claimed free retries when close/adopt changes the mode; if reclamation advances the generation, the old owner necessarily accepted that claim. The first remote freer into a Draining heap may `adopt` it (`Draining` → `Active`); later frees from that thread are owner-local. One adopted heap besides the bound heap; a second Draining heap stays on `Heaps::free` until unbind (multi-slot adopt lost on `channel_pipeline`). `alloc` never uses it. Coalescing is by owner. Owner `flush` drains via `accept`.
+- Cross-thread frees: `claim` → `Heap::enqueue` (Active: lease before a new `try_queue`) or `Heaps::{enqueue,free,flush}` (Draining). A claimed free retries when close/adopt changes the mode; if reclamation advances the generation, the old owner necessarily accepted that claim. The first remote freer into a Draining heap may `adopt` it (`Draining` → `Active`); adoption locks `HeapInner` before its lifecycle CAS and keeps that guard for the first flush, so reclaim cannot overwrite a winner. Later frees from that thread are owner-local. TLS `ThreadHeaps` holds two equal `ThreadHeap::{Vacant, Active}` values. `Active` is `&Heap` plus the captured `HeapId`. Bind and adopt take the first vacant slot; alloc uses the first active heap. A third Draining heap stays on `Heaps::free` until a slot is unbound (two-heap cap lost on `channel_pipeline`). Coalescing is by owner. Owner `flush` drains via `accept`.
 - Run remote admission is a private claim bitmap in the space tail. Owner `Run::free` is locate + pointer push; owner DF is undefined. Extents use byte `Claimed`.
 - Inbox is a Treiber stack of run/extent nodes. `drain` is a single-pass walk.
-- Draining reclaim observes live ownership via `RunHeap` / `ExtentHeap` live counts, then a scan. In-flight claim bits keep the heap live. `Heap::reclaim` returns a Free heap to the table freelist.
+- Draining reclaim first observes `Heap` run/extent live atomics, then confirms with arena scans. In-flight claim bits keep the heap live. `Heap::reclaim` returns a Free heap to the table freelist.
 - Never-bound freers enqueue each successful claim in `Allocator::free_remote`. Bound producers coalesce by run/extent. `ThreadFreeError::Remote` carries the `PageOwner` `free_slow` already looked up.
-- Owner free hit: `Run::free` (lock-free locate + push). Hit ignores `was_full` and Discard. `push_available` / `discard_empty` are miss / slow / unbind. Miss / adopt-local is `ThreadHeap::free_run` after `lookup`. `unbind` / `retire_adopted` retire the adopted heap; `retire_if_idle` opportunistically confirms `has_live` with `try_inner`. Draining late free uses `Heap::free` via `Heaps::free` when adopt does not win. Domain ops are `free` / `claim` / `accept`. Invalid domain state after lifecycle retries aborts.
+- Owner free hit: `Run::free` (lock-free locate + push). Hit ignores the `RunFree` outcome and Discard. `push_available` / `discard` (guarded by `is_discardable`) are miss / slow / unbind. Miss / extra-local is `ThreadHeaps::free_run` after `lookup`. `idle` is a query over every slot; its caller returns that heap's current runs then unbinds the `ThreadHeap` when another heap is still attached. Draining late free uses `Heaps::free` when adopt does not win. Domain ops are `free` / `claim` / `accept`. Invalid domain state after lifecycle retries aborts.
 - Current-run empty: `extend`; accept inbox if nonempty; then local/OS `acquire_run`. Unbound: `bind` then `flush` then alloc. Hit: current pop / `Run::free`. Inbox `flush` is remote `accept`. `lookup` is miss / realloc.
-- `HeapState` packs generation, mode (`Free` / `Active` / `Draining`), retired, and in-flight lease count for Active enqueue admits. `adopt` is Draining→Active (leases unchanged). Inbox depth stays live via claim bits / `has_live`.
-- `Heaps` is `Arena<Heap>`. `get` is lock-free `Arena` then `state.matches`. Arena grow covers mapping ownership and bump insert only. Free heaps sit on an intrusive index freelist. Fail only when the OS will not map more, or the arena is full.
-- `THREAD_HEAP` is a `#[thread_local]` `!Drop` value (`%fs` load). `UnbindGuard` is the only `LocalKey` (touched in `bind`; `Drop` retires the heap).
+- `HeapState` packs generation, mode (`Free` / `Active` / `Draining` / terminal `Retired`), and in-flight lease count for Active enqueue admits. `adopt` is Draining→Active (leases unchanged). Inbox depth stays live via claim bits / `has_live`.
+- `Heaps` is `Arena<Heap>`. `get` is lock-free `Arena` then `Heap::matches` (slot + generation). Arena grow covers mapping ownership and bump insert only. Free heaps sit on an intrusive index freelist. Reclaim uses a lifecycle CAS, never an unconditional store. Fail only when the OS will not map more, or the arena is full.
+- `THREAD_HEAPS` is a `#[thread_local]` `!Drop` value (`%fs` load). Each active `ThreadHeap` captures `&Heap` plus the generation token at bind/adopt so unbind cannot close a later incarnation. `UnbindGuard` is the only `LocalKey` (touched in `bind`; `Drop` unbinds every slot).
 
 ## Current run (hit)
 
@@ -44,8 +45,8 @@ A small block is on exactly one of: user, run freelist, or remote-claimed.
 
 | Hit | Work | Not on the hit |
 |-----|------|----------------|
-| **alloc** | `class_for` → `current[class]` → `Run::allocate` (pop) | `extend`, claim bits, locks, acquire, flush. `RunHeap` live only on 0→1 |
-| **owner free** | `current[class]` → `Run::free` (one `locate` + push); `OutOfRange` is miss | `push_available`, Discard, claim bits, `extend`, locks, `PageMap`. `RunHeap` live only on 1→0 |
+| **alloc** | `class_for` → `current[class]` → `Run::allocate` (pop) | `extend`, claim bits, locks, acquire, flush. Heap live counter only on 0→1 |
+| **owner free** | `current[class]` → `Run::free` (one `locate` + push); `OutOfRange` is miss | `push_available`, Discard, claim bits, `extend`, locks, `PageMap`. Heap live counter only on 1→0 |
 
 `current[class]` is a hint, not ownership. Available list is the reservoir; a run may be both current and listed. Frees never touch `current`. Interior pointers abort on `locate`. Owner DF is undefined.
 

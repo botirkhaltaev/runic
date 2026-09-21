@@ -19,14 +19,13 @@ pub(super) fn run() -> usize {
     let Ok(pattern) = Regex::new(r"^(\w+) svc=([a-z]+-\d+) user_(\d+) latency=(\d+)ms$") else {
         return 0;
     };
-    let pattern = &pattern;
     let mut checksum = 0_usize;
     for round in 0..ROUNDS {
         let (line_tx, line_rx) = mpsc::channel::<String>();
         let (record_tx, record_rx) = mpsc::channel::<(String, usize)>();
         let totals = thread::scope(|scope| {
             for producer in 0..THREADS {
-                let line_tx = line_tx.clone();
+                let posted = line_tx.clone();
                 scope.spawn(move || {
                     for i in 0..LINES {
                         let level = LEVELS[(i + producer) % LEVELS.len()];
@@ -35,16 +34,17 @@ pub(super) fn run() -> usize {
                         let latency = (i % 250) + 1;
                         let line =
                             format!("{level} svc=api-{service} user_{user} latency={latency}ms");
-                        if line_tx.send(line).is_err() {
+                        if posted.send(line).is_err() {
                             break;
                         }
                     }
                 });
             }
             drop(line_tx);
+            let matcher = &pattern;
             scope.spawn(move || {
                 while let Ok(line) = line_rx.recv() {
-                    let Some(fields) = pattern.captures(&line) else {
+                    let Some(fields) = matcher.captures(&line) else {
                         continue;
                     };
                     let (Some(level), Some(service), Some(latency)) =
@@ -68,9 +68,9 @@ pub(super) fn run() -> usize {
             });
             aggregator.join().ok()
         });
-        if let Some(totals) = totals {
-            checksum ^= totals.len() ^ totals.values().sum::<usize>();
-            black_box(totals);
+        if let Some(merged) = totals {
+            checksum ^= merged.len() ^ merged.values().sum::<usize>();
+            black_box(merged);
         }
     }
     black_box(checksum)

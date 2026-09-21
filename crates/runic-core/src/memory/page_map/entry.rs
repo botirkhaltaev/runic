@@ -23,6 +23,27 @@ impl AtomicMapEntry {
     pub(super) fn store(&self, entry: MapEntry) {
         self.raw.store(entry.raw, Ordering::Release);
     }
+
+    pub(super) fn owner(&self) -> Option<PageOwner> {
+        let raw = self.raw.load(Ordering::Acquire);
+        if raw == 0 {
+            return None;
+        }
+
+        let addr = raw & MapEntry::POINTER_MASK;
+        // SAFETY: `from_owner` stores a nonzero exposed address. Arena chunks never
+        // unmap; run headers and extent slots are process-immortal.
+        let ptr =
+            unsafe { NonNull::new_unchecked(core::ptr::with_exposed_provenance_mut::<()>(addr)) };
+
+        if raw & MapEntry::KIND_EXTENT == 0 {
+            // SAFETY: the published tag identifies a live `Run` header.
+            Some(PageOwner::Run(unsafe { ptr.cast().as_ref() }))
+        } else {
+            // SAFETY: the published tag identifies an immortal `Extent` slot.
+            Some(PageOwner::Extent(unsafe { ptr.cast().as_ref() }))
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,8 +61,11 @@ impl MapEntry {
 
     pub(super) fn from_owner(entry: PageOwner) -> Option<Self> {
         let (ptr, kind) = match entry {
-            PageOwner::Run(ptr) => (ptr.cast::<()>().as_ptr().addr(), 0),
-            PageOwner::Extent(ptr) => (ptr.cast::<()>().as_ptr().addr(), Self::KIND_EXTENT),
+            PageOwner::Run(run) => (core::ptr::from_ref(run).expose_provenance(), 0),
+            PageOwner::Extent(extent) => (
+                core::ptr::from_ref(extent).expose_provenance(),
+                Self::KIND_EXTENT,
+            ),
         };
 
         if ptr & Self::KIND_EXTENT != 0 {
@@ -49,22 +73,5 @@ impl MapEntry {
         }
 
         Some(Self { raw: ptr | kind })
-    }
-
-    pub(super) fn owner(self) -> Option<PageOwner> {
-        if self.raw == 0 {
-            return None;
-        }
-
-        let addr = self.raw & Self::POINTER_MASK;
-        // SAFETY: `from_owner` only stores nonzero `NonNull` addresses; empty is `raw == 0`.
-        let ptr =
-            unsafe { NonNull::new_unchecked(core::ptr::with_exposed_provenance_mut::<()>(addr)) };
-
-        if self.raw & Self::KIND_EXTENT == 0 {
-            Some(PageOwner::Run(ptr.cast()))
-        } else {
-            Some(PageOwner::Extent(ptr.cast()))
-        }
     }
 }

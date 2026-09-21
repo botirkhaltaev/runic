@@ -1,5 +1,5 @@
 use core::{
-    cell::UnsafeCell,
+    cell::Cell,
     mem::{align_of, offset_of, size_of},
     num::NonZeroU32,
     ptr::NonNull,
@@ -16,8 +16,8 @@ use crate::{
 };
 
 use super::{
-    Heap, HeapId,
-    inbox::{InboxLink, InboxNode},
+    Heap,
+    inbox::{Link, Node},
 };
 
 use config::RunPolicy;
@@ -42,7 +42,9 @@ pub(crate) struct RunId {
 
 impl RunId {
     pub(crate) fn from_index(index: u32) -> Option<Self> {
-        NonZeroU32::new(index.checked_add(1)?).map(|index| Self { index })
+        Some(Self {
+            index: NonZeroU32::new(index.checked_add(1)?)?,
+        })
     }
 
     pub(crate) const fn index(self) -> u32 {
@@ -101,6 +103,18 @@ pub(crate) enum RunError {
     DoubleFree,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RunFree {
+    Unchanged,
+    Available,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Accept {
+    Done,
+    Requeue,
+}
+
 /// Run-owned remote-admission bitmap.
 ///
 /// Remote `claim` is `issued` + `try_set`. A second claim on the same bit is
@@ -108,8 +122,7 @@ pub(crate) enum RunError {
 /// `accept` drains bits onto the pointer freelist.
 struct ClaimBits {
     /// 8-aligned claim words in the space tail.
-    words: NonNull<AtomicU64>,
-    word_count: usize,
+    words: NonNull<[AtomicU64]>,
 }
 
 impl ClaimBits {
@@ -134,9 +147,9 @@ impl ClaimBits {
         if !addr.is_multiple_of(align_of::<AtomicU64>()) {
             return None;
         }
+        let words = NonNull::new(core::ptr::with_exposed_provenance_mut(addr))?;
         Some(Self {
-            words: NonNull::new(core::ptr::with_exposed_provenance_mut(addr))?,
-            word_count: Self::word_count(capacity),
+            words: NonNull::slice_from_raw_parts(words, Self::word_count(capacity)),
         })
     }
 
@@ -162,14 +175,14 @@ impl ClaimBits {
     /// Cheap post-scan check for a straggling claim a bulk drain may have missed.
     #[inline]
     fn any_set(&self) -> bool {
-        (0..self.word_count).any(|word| self.word_unchecked(word).load(Ordering::Acquire) != 0)
+        (0..self.words.len()).any(|word| self.word_unchecked(word).load(Ordering::Acquire) != 0)
     }
 
     fn word_unchecked(&self, word: usize) -> &AtomicU64 {
-        debug_assert!(word < self.word_count);
-        // SAFETY: `word < word_count`; `words` points at the claim span in this
+        debug_assert!(word < self.words.len());
+        // SAFETY: `word < words.len()`; `words` points at the claim span in this
         // run's space tail and aligned for `AtomicU64`.
-        unsafe { &*self.words.as_ptr().add(word) }
+        unsafe { &*self.words.as_ptr().cast::<AtomicU64>().add(word) }
     }
 }
 
@@ -184,38 +197,46 @@ pub(crate) struct Run {
     span: u32,
     /// `ceil(2^32 / stride)` — exact `floor(offset / stride)` for `offset < 2^16`.
     recip: u32,
-    state: UnsafeCell<RunState>,
+    state: RunState,
     stride: usize,
     class: SizeClass,
     id: RunId,
-    heap: HeapId,
+    heap: &'static Heap,
     policy: RunPolicy,
-    /// Owning `Heap`; never moves. Null in unit tests that construct a stack `Run`.
-    heap_ptr: *mut Heap,
-    /// Owning [`RunHeap::live`]. Null in stack tests.
-    runs: *mut RunHeap,
     remote: RemoteLine,
 }
+
+impl PartialEq for Run {
+    fn eq(&self, other: &Self) -> bool {
+        core::ptr::eq(self, other)
+    }
+}
+
+impl Eq for Run {}
 
 #[repr(C, align(64))]
 struct RemoteLine {
     /// Mirror of `RunState.bump` for remote `claim`. Off the owner hit line.
     issued: AtomicUsize,
-    link: InboxLink<Run>,
+    link: Link<Run>,
     claims: ClaimBits,
 }
 
-// SAFETY: owner-local methods are called only by the owning heap. Remote methods only touch
-// the claim bitmap / `InboxLink`, load `issued`, and never mutate `RunState`
-// (except `accept`, itself an owner-local method called only through the owning heap's flush).
+// SAFETY: owner-local methods (`allocate` / `free` / `extend` / `accept` / available-list
+// membership) run only on the owning thread (or under `HeapInner`). Remote-safe surface is
+// `locate`, `claim`, `link`, `heap`, `class`, `range`, `header_of`, and `resize_in_place`
+// (which reads `issued`, not `RunState` Cells). Every `Cell` reader is owner-or-locked.
+unsafe impl Send for Run {}
+// SAFETY: same remote-safe surface as `Send`; shared access is atomic (`issued` / `link` /
+// claims) or immutable after publication (`base`, `span`, `recip`, `heap`).
 unsafe impl Sync for Run {}
 
 const _: () = assert!(offset_of!(Run, state) == 16);
 const _: () = assert!(offset_of!(Run, remote) % 64 == 0);
 const _: () = assert!(RUN_SPACE >= RUN_SIZE + size_of::<Run>() + (RUN_SIZE / 8).div_ceil(64) * 8);
 
-impl InboxNode for Run {
-    fn link(&self) -> &InboxLink<Self> {
+impl Node for Run {
+    fn link(&self) -> &Link<Self> {
         &self.remote.link
     }
 }
@@ -223,21 +244,50 @@ impl InboxNode for Run {
 /// Empty freelist head / end-of-list link. Payload address `0` is never a block.
 const FREE_END: usize = 0;
 
+/// Intrusive membership on this class's `RunHeap` available list.
+///
+/// `Unlisted` is off the list. `Tail` is listed with no successor — the same `None`
+/// next pointer as `Unlisted`, which is why membership is not a separate bool.
+#[derive(Clone, Copy)]
+enum AvailableLink {
+    Unlisted,
+    Tail,
+    Next(&'static Run),
+}
+
+impl AvailableLink {
+    fn is_unlisted(self) -> bool {
+        matches!(self, Self::Unlisted)
+    }
+
+    fn from_next(next: Option<&'static Run>) -> Self {
+        match next {
+            None => Self::Tail,
+            Some(run) => Self::Next(run),
+        }
+    }
+
+    fn successor(self) -> Option<&'static Run> {
+        match self {
+            Self::Unlisted | Self::Tail => None,
+            Self::Next(run) => Some(run),
+        }
+    }
+}
+
 struct RunState {
     /// `FREE_END` or a payload address of a free block.
-    free: usize,
-    live: usize,
+    free: Cell<usize>,
+    live: Cell<usize>,
     capacity: usize,
-    bump: usize,
-    available_next: Option<NonNull<Run>>,
-    /// On this class's `RunHeap` available list. `push_available` is a no-op when set.
-    on_available: bool,
+    bump: Cell<usize>,
+    available: Cell<AvailableLink>,
 }
 
 impl Run {
     pub(crate) fn new(
         id: RunId,
-        heap: HeapId,
+        heap: &'static Heap,
         base: NonNull<u8>,
         class: SizeClass,
         policy: RunPolicy,
@@ -261,17 +311,15 @@ impl Run {
             base,
             span,
             recip: Self::recip(u32::try_from(stride).ok()?)?,
-            state: UnsafeCell::new(RunState::new(capacity)),
+            state: RunState::new(capacity),
             stride,
             class,
             id,
             heap,
             policy,
-            heap_ptr: core::ptr::null_mut(),
-            runs: core::ptr::null_mut(),
             remote: RemoteLine {
                 issued: AtomicUsize::new(0),
-                link: InboxLink::new(),
+                link: Link::new(),
                 claims,
             },
         })
@@ -286,25 +334,13 @@ impl Run {
         self.id
     }
 
-    pub(crate) fn set_heap_id(&mut self, heap: HeapId) {
-        self.heap = heap;
-    }
-
-    pub(crate) fn set_heap(&mut self, heap: &Heap, runs: &RunHeap) {
-        self.heap_ptr = core::ptr::from_ref(heap).cast_mut();
-        self.runs = core::ptr::from_ref(runs).cast_mut();
-    }
-
-    /// Owning heap when `heap_ptr` is set and the generation still matches.
-    pub(crate) fn heap(&self) -> Option<&Heap> {
-        // SAFETY: `heap_ptr` is the immovable arena slot when published.
-        let heap = unsafe { NonNull::new(self.heap_ptr)?.as_ref() };
-        heap.matches(self.heap).then_some(heap)
+    pub(crate) const fn heap(&self) -> &'static Heap {
+        self.heap
     }
 
     /// In-page header at `(ptr & !(RUN_SIZE-1)) + RUN_SIZE`. Self-check `base`.
     #[inline]
-    pub(crate) fn header_of(ptr: NonNull<u8>) -> Option<NonNull<Self>> {
+    pub(crate) fn header_of(ptr: NonNull<u8>) -> Option<&'static Self> {
         let masked = ptr.as_ptr().addr() & !(RUN_SIZE - 1);
         let header = masked.wrapping_add(RUN_SIZE);
         let base_ptr = core::ptr::with_exposed_provenance::<usize>(header);
@@ -314,12 +350,20 @@ impl Run {
         if unsafe { base_ptr.read() } != masked {
             return None;
         }
-        // SAFETY: `header` is nonzero and the raw base word matched this run.
-        Some(unsafe { NonNull::new_unchecked(base_ptr.cast_mut().cast()) })
+        // SAFETY: `header` is `RUN_SIZE`-aligned and the raw base word matched
+        // this run. Run mappings stay live for the process.
+        Some(unsafe { &*core::ptr::with_exposed_provenance::<Self>(header) })
     }
 
-    pub(crate) const fn heap_id(&self) -> HeapId {
-        self.heap
+    /// Clear the in-page `base` word so [`Self::header_of`] fails closed.
+    pub(super) fn poison(&self) {
+        // SAFETY: unpublished header, exclusive to the constructing `RunHeap`.
+        unsafe {
+            core::ptr::from_ref(self)
+                .cast::<usize>()
+                .cast_mut()
+                .write(0);
+        }
     }
 
     pub(crate) const fn class(&self) -> SizeClass {
@@ -329,38 +373,36 @@ impl Run {
     /// True when every block is outstanding (allocated or remote-claimed).
     #[inline]
     pub(crate) fn is_full(&self) -> bool {
-        // SAFETY: owner-local methods are called only by the owning heap.
-        let state = unsafe { &*self.state.get() };
-        state.live == state.capacity
+        self.state.live.get() == self.state.capacity
     }
 
     /// Outstanding blocks on this run (allocated or remote-claimed).
     pub(crate) fn is_live(&self) -> bool {
-        // SAFETY: read under owner-local access or table-locked reclaim.
-        unsafe { &*self.state.get() }.live != 0
+        self.state.live.get() != 0
     }
 
-    pub(crate) fn is_available(&self) -> bool {
-        // SAFETY: owner-local methods are called only by the owning heap.
-        unsafe { &*self.state.get() }.on_available
+    /// Empty Discard payload: [`Self::discard`] returns it to the OS. Keep retains.
+    pub(crate) fn is_discardable(&self) -> bool {
+        self.policy == RunPolicy::Discard && !self.is_live()
     }
 
-    /// Link onto the available list. Caller already checked `!is_available()`.
-    pub(crate) fn link_available(&self, next: Option<NonNull<Run>>) {
-        // SAFETY: owner-local methods are called only by the owning heap.
-        let state = unsafe { &mut *self.state.get() };
-        debug_assert!(!state.on_available);
-        state.available_next = next;
-        state.on_available = true;
+    pub(super) fn listed(&self) -> bool {
+        !self.state.available.get().is_unlisted()
+    }
+
+    /// Link onto the available list. Caller already checked `!listed()`.
+    pub(super) fn list_available(&self, next: Option<&'static Run>) {
+        debug_assert!(!self.listed());
+        self.state.available.set(AvailableLink::from_next(next));
     }
 
     /// Unlink from the available list. Returns the previous successor.
-    pub(crate) fn unlink_available(&self) -> Option<NonNull<Run>> {
-        // SAFETY: owner-local methods are called only by the owning heap.
-        let state = unsafe { &mut *self.state.get() };
-        debug_assert!(state.on_available);
-        state.on_available = false;
-        state.available_next.take()
+    pub(super) fn unlist_available(&self) -> Option<&'static Run> {
+        debug_assert!(self.listed());
+        self.state
+            .available
+            .replace(AvailableLink::Unlisted)
+            .successor()
     }
 
     pub(crate) fn range(&self) -> AddressRange {
@@ -370,14 +412,13 @@ impl Run {
     /// Hit: pop one block from the pointer freelist. Empty → caller `extend`.
     #[inline]
     pub(crate) fn allocate(&self) -> Option<NonNull<u8>> {
-        // SAFETY: owner-local methods are called only by the owning heap.
-        let state = unsafe { &mut *self.state.get() };
-        let ptr = Self::pop_free(state)?;
-        debug_assert!(state.live < state.capacity);
-        if state.live == 0 {
+        let ptr = Self::pop_free(&self.state)?;
+        let live = self.state.live.get();
+        debug_assert!(live < self.state.capacity);
+        if live == 0 {
             self.add_live();
         }
-        state.live += 1;
+        self.state.live.set(live + 1);
         Some(ptr)
     }
 
@@ -386,49 +427,55 @@ impl Run {
     /// `issued` advances once. Returns `false` when no fresh blocks remain.
     #[inline(never)]
     pub(crate) fn extend(&self) -> bool {
-        // SAFETY: owner-local methods are called only by the owning heap.
-        let state = unsafe { &mut *self.state.get() };
-        if state.bump >= state.capacity {
+        let bump = self.state.bump.get();
+        if bump >= self.state.capacity {
             return false;
         }
         let page_worth = PAGE_SIZE / self.stride;
-        let n = page_worth.max(32).min(state.capacity - state.bump);
+        let n = page_worth.max(32).min(self.state.capacity - bump);
         if n == 0 {
             return false;
         }
-        let start = state.bump;
-        let end = start + n;
-        for index in start..end - 1 {
+        let end = bump + n;
+        for index in bump..end - 1 {
             Self::write_link(
                 self.address(BlockIndex::new(index)),
                 self.address(BlockIndex::new(index + 1)).as_ptr().addr(),
             );
         }
-        Self::write_link(self.address(BlockIndex::new(end - 1)), state.free);
-        state.free = self.address(BlockIndex::new(start)).as_ptr().addr();
-        state.bump = end;
+        Self::write_link(
+            self.address(BlockIndex::new(end - 1)),
+            self.state.free.get(),
+        );
+        self.state
+            .free
+            .set(self.address(BlockIndex::new(bump)).as_ptr().addr());
+        self.state.bump.set(end);
         self.remote.issued.store(end, Ordering::Relaxed);
         true
     }
 
-    /// Owner-local: live → pointer freelist. `Ok(true)` when the run was full.
+    /// Owner-local: live → pointer freelist. `Available` when the run was full.
     ///
-    /// Hit ignores the flag and does not discard. Miss / slow / unbind call
-    /// [`Self::discard_empty`] and `push_available` from the flag. Owner DF is
+    /// Hit ignores the outcome and does not discard. Miss / slow / unbind call
+    /// [`Self::discard`] and `push_available` from the outcome. Owner DF is
     /// undefined. Remote admission is `claim` / `accept`.
     #[inline]
-    pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<bool, RunError> {
+    pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<RunFree, RunError> {
         let block = self.locate(ptr)?;
-        // SAFETY: owner-local methods are called only by the owning heap.
-        let state = unsafe { &mut *self.state.get() };
-        let was_full = state.live == state.capacity;
-        debug_assert!(state.live > 0);
-        state.live -= 1;
-        Self::push_free(state, block.ptr());
-        if state.live == 0 {
+        let live = self.state.live.get();
+        let was_full = live == self.state.capacity;
+        debug_assert!(live > 0);
+        self.state.live.set(live - 1);
+        Self::push_free(&self.state, block.ptr());
+        if live == 1 {
             self.sub_live();
         }
-        Ok(was_full)
+        Ok(if was_full {
+            RunFree::Available
+        } else {
+            RunFree::Unchanged
+        })
     }
 
     /// Freer: reserve remote admission before publish / payload reuse.
@@ -447,80 +494,64 @@ impl Run {
     /// Owner: clear inbox queued, drain every claimed bit, publish blocks to the freelist.
     ///
     /// Wakeup proof (idle-first + recheck): clears queued *before* scanning, so a racing
-    /// `claim` + `Inbox::push` may re-queue the run once it is dequeued. Returns `true` when
-    /// claim bits remain after the scan — the caller must `Inbox::push` again (or a racer
-    /// already did). Exactly one of those pushes keeps the run queued when work remains.
-    pub(crate) fn accept(&self) -> bool {
+    /// `claim` + `Inbox::queue` may re-queue the run once it is dequeued. Returns `Requeue` when
+    /// claim bits remain after the scan — the caller must `Inbox::queue` again (or a racer
+    /// already did). Exactly one of those queues keeps the run queued when work remains.
+    pub(crate) fn accept(&self) -> Accept {
         self.remote.link.clear_queued();
 
-        // SAFETY: owner-local methods are called only by the owning heap.
-        let state = unsafe { &mut *self.state.get() };
-        let was_live = state.live != 0;
-        for word in 0..self.remote.claims.word_count {
+        let was_live = self.state.live.get() != 0;
+        for word in 0..self.remote.claims.words.len() {
             let mut bits = self.remote.claims.drain_word(word);
             while bits != 0 {
                 // `trailing_zeros` of a nonzero `u64` is always < 64, so this never truncates.
                 let bit = usize::try_from(bits.trailing_zeros()).unwrap();
                 bits &= bits - 1;
                 let index = BlockIndex::new(word * CLAIM_WORD_BITS + bit);
-                debug_assert!(index.get() < state.capacity);
-                debug_assert!(state.live > 0);
-                state.live -= 1;
-                Self::push_free(state, self.address(index));
+                debug_assert!(index.get() < self.state.capacity);
+                let live = self.state.live.get();
+                debug_assert!(live > 0);
+                self.state.live.set(live - 1);
+                Self::push_free(&self.state, self.address(index));
             }
         }
 
-        if was_live && state.live == 0 {
+        if was_live && self.state.live.get() == 0 {
             self.sub_live();
         }
-        if state.live == 0 && self.policy == RunPolicy::Discard {
-            self.maybe_discard(state);
+        if self.is_discardable() {
+            self.discard();
         }
-        self.remote.claims.any_set()
+        if self.remote.claims.any_set() {
+            Accept::Requeue
+        } else {
+            Accept::Done
+        }
     }
 
     fn add_live(&self) {
-        let Some(runs) = NonNull::new(self.runs) else {
-            return;
-        };
-        // SAFETY: `runs` is the immovable `RunHeap` in the owning `Heap`.
-        unsafe { runs.as_ref() }.add_live();
+        self.heap.add_run_live();
     }
 
     fn sub_live(&self) {
-        let Some(runs) = NonNull::new(self.runs) else {
-            return;
-        };
-        // SAFETY: `runs` is the immovable `RunHeap` in the owning `Heap`.
-        unsafe { runs.as_ref() }.sub_live();
+        self.heap.sub_run_live();
     }
 
-    /// `madvise` empty Discard payload. Keep is a no-op. Off the free hit.
+    /// `madvise` the payload and reset the run to fresh. Off the free hit.
+    ///
+    /// Caller checked [`Self::is_discardable`].
     #[cold]
-    pub(crate) fn discard_empty(&self) {
-        if self.policy != RunPolicy::Discard || self.is_live() {
-            return;
-        }
-        // SAFETY: owner-local; `is_live` just observed empty.
-        let state = unsafe { &mut *self.state.get() };
-        self.maybe_discard(state);
-    }
-
-    #[cold]
-    fn maybe_discard(&self, state: &mut RunState) {
-        debug_assert_eq!(self.policy, RunPolicy::Discard);
-        debug_assert_eq!(state.live, 0);
-        state.bump = 0;
-        state.free = FREE_END;
+    pub(crate) fn discard(&self) {
+        debug_assert!(self.is_discardable());
+        self.state.bump.set(0);
+        self.state.free.set(FREE_END);
         self.remote.issued.store(0, Ordering::Relaxed);
         OsMemory::discard(self.range());
     }
 
     pub(crate) fn allocated(&self, ptr: NonNull<u8>) -> Result<Block, RunError> {
         let block = self.locate(ptr)?;
-        // SAFETY: owner-local methods are called only by the owning heap.
-        let state = unsafe { &*self.state.get() };
-        if block.index().get() >= state.bump {
+        if block.index().get() >= self.remote.issued.load(Ordering::Acquire) {
             return Err(RunError::DoubleFree);
         }
         if self.remote.claims.is_set(block.index()) {
@@ -549,10 +580,7 @@ impl Run {
         // `recip = ceil(2^32 / stride)` is exact for `offset < 2^16`, `stride ≤ 2^15`.
         // `stride | offset` iff the low 32 bits of `offset * recip` are `< recip`.
         let product = offset.wrapping_mul(u64::from(self.recip));
-        // Keep the truncation in place — a helper does not inline on this hit.
-        #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
-        let remainder = product as u32;
-        if remainder >= self.recip {
+        if product & u64::from(u32::MAX) >= u64::from(self.recip) {
             return Err(RunError::InvalidPointer);
         }
         let index = product >> 32;
@@ -565,8 +593,7 @@ impl Run {
     /// Payload pointer for a freelist or extend index in `0..capacity`.
     #[inline]
     fn address(&self, index: BlockIndex) -> NonNull<u8> {
-        // SAFETY: owner-local methods are called only by the owning heap.
-        debug_assert!(index.get() < unsafe { &*self.state.get() }.capacity);
+        debug_assert!(index.get() < self.state.capacity);
         let byte_offset = index.get() * self.stride;
         // SAFETY: freelist / `extend` only yield `index < capacity`, so
         // `byte_offset < RUN_SIZE` inside the payload span.
@@ -574,21 +601,21 @@ impl Run {
     }
 
     #[inline]
-    fn pop_free(state: &mut RunState) -> Option<NonNull<u8>> {
-        let raw = state.free;
+    fn pop_free(state: &RunState) -> Option<NonNull<u8>> {
+        let raw = state.free.get();
         if raw == FREE_END {
             return None;
         }
         let ptr = NonNull::new(core::ptr::without_provenance_mut(raw))?;
-        state.free = Self::read_link(ptr);
+        state.free.set(Self::read_link(ptr));
         Some(ptr)
     }
 
     /// Push using the payload pointer already proven by `locate` / `address`.
     #[inline]
-    fn push_free(state: &mut RunState, ptr: NonNull<u8>) {
-        Self::write_link(ptr, state.free);
-        state.free = ptr.as_ptr().addr();
+    fn push_free(state: &RunState, ptr: NonNull<u8>) {
+        Self::write_link(ptr, state.free.get());
+        state.free.set(ptr.as_ptr().addr());
     }
 
     #[inline]
@@ -609,12 +636,11 @@ impl Run {
 impl RunState {
     fn new(capacity: usize) -> Self {
         Self {
-            live: 0,
+            live: Cell::new(0),
             capacity,
-            bump: 0,
-            available_next: None,
-            free: FREE_END,
-            on_available: false,
+            bump: Cell::new(0),
+            available: Cell::new(AvailableLink::Unlisted),
+            free: Cell::new(FREE_END),
         }
     }
 }
@@ -623,30 +649,22 @@ impl RunState {
 mod tests {
     use core::alloc::Layout;
 
-    use core::ops::Deref;
-
     use crate::{
+        config::AllocatorConfig,
+        heap::{Heap, HeapId},
         layout::LayoutSpec,
-        memory::{Mapping, OsMemory},
+        memory::{OsMemory, PageMap, PageOwner},
         size_class::SizeClasses,
     };
 
-    use super::config::RunPolicy;
+    use super::config::{RunConfig, RunPolicy};
 
     use super::*;
 
-    struct TestRun {
-        run: Run,
-        _map: Mapping,
-    }
-
-    impl Deref for TestRun {
-        type Target = Run;
-
-        fn deref(&self) -> &Run {
-            &self.run
-        }
-    }
+    static OWNER: Heap = Heap::new(
+        HeapId::new(0, NonZeroU32::MIN).unwrap(),
+        AllocatorConfig::new(),
+    );
 
     fn layout_spec(size: usize, align: usize) -> LayoutSpec {
         LayoutSpec::from_layout(Layout::from_size_align(size, align).unwrap())
@@ -663,49 +681,39 @@ mod tests {
         })
     }
 
-    fn test_heap_id() -> HeapId {
-        HeapId::new(0, NonZeroU32::MIN).unwrap()
-    }
+    #[test]
+    fn run_equality_is_identity() {
+        let mut runs = RunHeap::new(RunConfig::new());
+        let pages = PageMap::new();
+        let class = class_id(64, 8);
+        let first = runs.acquire(class, &OWNER, &pages).unwrap();
+        let second = runs.acquire(class, &OWNER, &pages).unwrap();
+        let ptr = alloc_block(first).unwrap();
 
-    fn test_run(index: u32, class: SizeClass) -> TestRun {
-        test_run_with(index, class, RunPolicy::Keep)
-    }
-
-    fn test_run_discard(index: u32, class: SizeClass) -> TestRun {
-        test_run_with(index, class, RunPolicy::Discard)
-    }
-
-    fn test_run_with(index: u32, class: SizeClass, policy: RunPolicy) -> TestRun {
-        let map = OsMemory::map_aligned(RUN_SPACE, RUN_SIZE).unwrap();
-        let run = Run::new(
-            RunId::from_index(index).unwrap(),
-            test_heap_id(),
-            map.base(),
-            class,
-            policy,
-        )
-        .expect("test run");
-        TestRun { run, _map: map }
+        assert!(first == first);
+        assert!(first != second);
+        assert!(first == Run::header_of(ptr).unwrap());
     }
 
     #[test]
     fn header_of_rejects_zeroed_unused_map_slot() {
         let map = OsMemory::map_aligned(RUN_SPACE * 2, RUN_SIZE).unwrap();
-        let unused = map.base().as_ptr().wrapping_byte_add(RUN_SPACE);
-        let unused = NonNull::new(unused).unwrap();
+        let unused = NonNull::new(map.base().as_ptr().wrapping_byte_add(RUN_SPACE)).unwrap();
 
-        assert_eq!(Run::header_of(unused), None);
+        assert!(Run::header_of(unused).is_none());
     }
 
     #[test]
     fn reusable_run_takes_each_block_once() {
+        let mut runs = RunHeap::new(RunConfig::new());
+        let pages = PageMap::new();
         let class = class_id(64, 8);
-        let run = test_run(0, class);
+        let run = runs.acquire(class, &OWNER, &pages).unwrap();
         let capacity = RUN_SIZE / class.size();
         let mut seen = vec![false; capacity];
 
         for _ in 0..capacity {
-            let ptr = alloc_block(&run).unwrap();
+            let ptr = alloc_block(run).unwrap();
             let block = run.locate(ptr).unwrap();
             let index = block.index().get();
 
@@ -722,8 +730,10 @@ mod tests {
 
     #[test]
     fn extend_threads_fresh_blocks_onto_freelist() {
+        let mut runs = RunHeap::new(RunConfig::new());
+        let pages = PageMap::new();
         let class = class_id(64, 8);
-        let run = test_run(21, class);
+        let run = runs.acquire(class, &OWNER, &pages).unwrap();
         assert!(run.allocate().is_none());
         assert!(run.extend());
         let first = run.allocate().unwrap();
@@ -739,10 +749,11 @@ mod tests {
 
     #[test]
     fn reusable_run_reuses_returned_block() {
-        let class = class_id(128, 8);
-        let run = test_run(1, class);
+        let mut runs = RunHeap::new(RunConfig::new());
+        let pages = PageMap::new();
+        let run = runs.acquire(class_id(128, 8), &OWNER, &pages).unwrap();
 
-        let ptr = alloc_block(&run).unwrap();
+        let ptr = alloc_block(run).unwrap();
 
         assert!(run.free(ptr).is_ok());
 
@@ -751,20 +762,22 @@ mod tests {
 
     #[test]
     fn reusable_run_resizes_block_in_place_for_same_class_layout() {
-        let class = class_id(64, 8);
-        let run = test_run(7, class);
+        let mut runs = RunHeap::new(RunConfig::new());
+        let pages = PageMap::new();
+        let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
         let new = layout_spec(64, 8);
-        let ptr = alloc_block(&run).unwrap();
+        let ptr = alloc_block(run).unwrap();
 
         assert_eq!(run.resize_in_place(ptr, new), Ok(true));
     }
 
     #[test]
     fn reusable_run_rejects_allocated_block_that_needs_larger_class() {
-        let class = class_id(64, 8);
-        let run = test_run(8, class);
+        let mut runs = RunHeap::new(RunConfig::new());
+        let pages = PageMap::new();
+        let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
         let new = layout_spec(80, 8);
-        let ptr = alloc_block(&run).unwrap();
+        let ptr = alloc_block(run).unwrap();
 
         assert_eq!(run.resize_in_place(ptr, new), Ok(false));
     }
@@ -779,8 +792,8 @@ mod tests {
                 let product = u64::try_from(offset)
                     .unwrap()
                     .wrapping_mul(u64::from(recip));
-                #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
-                let divisible = (product as u32) < recip;
+                let [b0, b1, b2, b3, _, _, _, _] = product.to_le_bytes();
+                let divisible = u32::from_le_bytes([b0, b1, b2, b3]) < recip;
                 assert_eq!(
                     divisible,
                     offset.is_multiple_of(size),
@@ -802,9 +815,10 @@ mod tests {
 
     #[test]
     fn reusable_run_rejects_interior_pointer() {
-        let class = class_id(64, 8);
-        let run = test_run(2, class);
-        let ptr = alloc_block(&run).unwrap();
+        let mut runs = RunHeap::new(RunConfig::new());
+        let pages = PageMap::new();
+        let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
+        let ptr = alloc_block(run).unwrap();
         let interior = unsafe { NonNull::new_unchecked(ptr.as_ptr().add(1)) };
 
         assert_eq!(run.locate(interior), Err(RunError::InvalidPointer));
@@ -812,12 +826,13 @@ mod tests {
 
     #[test]
     fn reusable_run_locate_covers_all_classes_boundaries_and_tail_slack() {
-        for (run_index, &size) in SizeClasses::SIZES.iter().enumerate() {
-            let class = class_id(size, 8);
-            let run = test_run(u32::try_from(run_index).unwrap(), class);
+        let mut runs = RunHeap::new(RunConfig::new());
+        let pages = PageMap::new();
+        for &size in &SizeClasses::SIZES {
+            let run = runs.acquire(class_id(size, 8), &OWNER, &pages).unwrap();
             let capacity = RUN_SIZE / size;
 
-            let first = alloc_block(&run).unwrap();
+            let first = alloc_block(run).unwrap();
             assert!(run.locate(first).is_ok(), "size={size}");
             assert_eq!(
                 run.locate(unsafe { NonNull::new_unchecked(first.as_ptr().add(1)) }),
@@ -841,9 +856,10 @@ mod tests {
 
     #[test]
     fn reusable_run_rejects_interior_pointer_for_non_power_of_two_class() {
-        let class = class_id(24, 8);
-        let run = test_run(2, class);
-        let ptr = alloc_block(&run).unwrap();
+        let mut runs = RunHeap::new(RunConfig::new());
+        let pages = PageMap::new();
+        let run = runs.acquire(class_id(24, 8), &OWNER, &pages).unwrap();
+        let ptr = alloc_block(run).unwrap();
         let interior = unsafe { NonNull::new_unchecked(ptr.as_ptr().add(1)) };
 
         assert!(run.locate(ptr).is_ok());
@@ -852,10 +868,11 @@ mod tests {
 
     #[test]
     fn reusable_run_round_trips_hotspot_non_power_of_two_classes() {
-        for (run_index, size) in [80, 96].into_iter().enumerate() {
-            let class = class_id(size, 8);
-            let run = test_run(u32::try_from(run_index).unwrap(), class);
-            let ptr = alloc_block(&run).unwrap();
+        let mut runs = RunHeap::new(RunConfig::new());
+        let pages = PageMap::new();
+        for size in [80, 96] {
+            let run = runs.acquire(class_id(size, 8), &OWNER, &pages).unwrap();
+            let ptr = alloc_block(run).unwrap();
 
             assert!(run.locate(ptr).is_ok(), "size={size}");
             assert!(run.free(ptr).is_ok(), "size={size}");
@@ -865,8 +882,9 @@ mod tests {
 
     #[test]
     fn reusable_run_rejects_claim_tail() {
-        let class = class_id(64, 8);
-        let run = test_run(3, class);
+        let mut runs = RunHeap::new(RunConfig::new());
+        let pages = PageMap::new();
+        let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
         let claim_tail =
             unsafe { NonNull::new_unchecked(run.range().base().as_ptr().add(RUN_SIZE)) };
 
@@ -875,10 +893,17 @@ mod tests {
 
     #[test]
     fn reusable_run_rejects_foreign_run_same_offset() {
+        let mut runs = RunHeap::new(RunConfig::new());
+        let pages = PageMap::new();
         let class = class_id(64, 8);
-        let run_a = test_run(4, class);
-        let run_b = test_run(5, class);
-        let ptr = alloc_block(&run_b).unwrap();
+        let base_a = runs.acquire(class, &OWNER, &pages).unwrap().range().base();
+        let base_b = runs.acquire(class, &OWNER, &pages).unwrap().range().base();
+        let (Some(PageOwner::Run(run_a)), Some(PageOwner::Run(run_b))) =
+            (pages.get(base_a), pages.get(base_b))
+        else {
+            panic!("expected two published runs");
+        };
+        let ptr = alloc_block(run_b).unwrap();
 
         assert!(run_b.locate(ptr).is_ok());
         assert_eq!(run_a.locate(ptr), Err(RunError::OutOfRange));
@@ -886,9 +911,11 @@ mod tests {
 
     #[test]
     fn reusable_run_rejects_aligned_tail_slack() {
-        for (run_index, size) in [80, 96].into_iter().enumerate() {
+        let mut runs = RunHeap::new(RunConfig::new());
+        let pages = PageMap::new();
+        for size in [80, 96] {
             let class = class_id(size, 8);
-            let run = test_run(u32::try_from(run_index).unwrap(), class);
+            let run = runs.acquire(class, &OWNER, &pages).unwrap();
             let capacity = RUN_SIZE / class.size();
             let slack_offset = capacity * class.size();
             assert!(slack_offset < RUN_SIZE, "size={size}");
@@ -901,9 +928,10 @@ mod tests {
 
     #[test]
     fn claim_run_reports_duplicate_remote_free() {
-        let class = class_id(64, 8);
-        let run = test_run(9, class);
-        let ptr = alloc_block(&run).unwrap();
+        let mut runs = RunHeap::new(RunConfig::new());
+        let pages = PageMap::new();
+        let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
+        let ptr = alloc_block(run).unwrap();
 
         assert_eq!(run.claim(ptr), Ok(()));
         assert_eq!(run.claim(ptr), Err(RunError::DoubleFree));
@@ -911,53 +939,59 @@ mod tests {
 
     #[test]
     fn claim_run_completes_to_reusable() {
-        let class = class_id(64, 8);
-        let run = test_run(11, class);
-        let ptr = alloc_block(&run).unwrap();
+        let mut runs = RunHeap::new(RunConfig::new());
+        let pages = PageMap::new();
+        let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
+        let ptr = alloc_block(run).unwrap();
 
         assert_eq!(run.claim(ptr), Ok(()));
-        assert!(!run.accept());
+        assert_eq!(run.accept(), Accept::Done);
         assert_eq!(run.allocate(), Some(ptr));
     }
 
     #[test]
     fn accept_without_any_claim_is_a_noop() {
-        let class = class_id(64, 8);
-        let run = test_run(16, class);
-        let ptr = alloc_block(&run).unwrap();
-        assert!(!run.accept());
+        let mut runs = RunHeap::new(RunConfig::new());
+        let pages = PageMap::new();
+        let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
+        let ptr = alloc_block(run).unwrap();
+        assert_eq!(run.accept(), Accept::Done);
         // `ptr`'s block is still live (never claimed), so the next allocate is fresh.
-        assert_ne!(alloc_block(&run).unwrap(), ptr);
+        assert_ne!(alloc_block(run).unwrap(), ptr);
     }
 
     #[test]
     fn claim_accept_works_for_all_size_classes() {
-        for (run_index, &size) in SizeClasses::SIZES.iter().enumerate() {
-            let class = class_id(size, 8);
-            let run = test_run(u32::try_from(run_index).unwrap(), class);
-            let ptr = alloc_block(&run).unwrap();
+        let mut runs = RunHeap::new(RunConfig::new());
+        let pages = PageMap::new();
+        for &size in &SizeClasses::SIZES {
+            let run = runs.acquire(class_id(size, 8), &OWNER, &pages).unwrap();
+            let ptr = alloc_block(run).unwrap();
             assert_eq!(run.claim(ptr), Ok(()), "size={size}");
-            assert!(!run.accept(), "size={size}");
+            assert_eq!(run.accept(), Accept::Done, "size={size}");
             assert_eq!(run.allocate(), Some(ptr), "size={size}");
         }
     }
 
     #[test]
     fn reusable_run_returns_aligned_blocks_for_alignment_sensitive_layout() {
+        let mut runs = RunHeap::new(RunConfig::new());
+        let pages = PageMap::new();
         let class = class_id(17, 16);
-        let run = test_run(3, class);
+        let run = runs.acquire(class, &OWNER, &pages).unwrap();
         let capacity = RUN_SIZE / class.size();
 
         for _ in 0..capacity {
-            let ptr = alloc_block(&run).unwrap();
+            let ptr = alloc_block(run).unwrap();
             assert_eq!(ptr.as_ptr() as usize % 16, 0);
         }
     }
 
     #[test]
     fn run_range_reports_payload_span() {
-        let class = class_id(8, 8);
-        let run = test_run(5, class);
+        let mut runs = RunHeap::new(RunConfig::new());
+        let pages = PageMap::new();
+        let run = runs.acquire(class_id(8, 8), &OWNER, &pages).unwrap();
         let base = run.range().base();
 
         assert_eq!(run.range().base(), base);
@@ -968,30 +1002,30 @@ mod tests {
     fn try_queue_wins_once_until_cleared() {
         use super::super::inbox::Inbox;
 
-        let class = class_id(64, 8);
-        let run = test_run(17, class);
-        let a = alloc_block(&run).unwrap();
-        let b = alloc_block(&run).unwrap();
+        let mut runs = RunHeap::new(RunConfig::new());
+        let pages = PageMap::new();
+        let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
+        let a = alloc_block(run).unwrap();
+        let b = alloc_block(run).unwrap();
         let inbox: Inbox<Run> = Inbox::new();
-        let run_ptr = NonNull::from(&*run);
 
         assert_eq!(run.claim(a), Ok(()));
         // First claim on an idle run wins the queue race and must push.
-        assert!(inbox.push(run_ptr));
+        assert!(inbox.queue(run));
 
         assert_eq!(run.claim(b), Ok(()));
         // A second claim while still queued must not push again.
-        assert!(!inbox.push(run_ptr));
+        assert!(!inbox.queue(run));
 
         // accept coalesces both claims from the single queued entry.
         let _ = inbox.drain();
-        assert!(!run.accept());
+        assert_eq!(run.accept(), Accept::Done);
         assert_eq!(run.allocate(), Some(b));
         assert_eq!(run.allocate(), Some(a));
 
         // Cleared by accept: a fresh claim can queue again.
         assert_eq!(run.claim(a), Ok(()));
-        assert!(inbox.push(run_ptr));
+        assert!(inbox.queue(run));
     }
 
     /// Faithful simulation of the real `Heap::flush` loop: a freer claims and
@@ -1003,26 +1037,26 @@ mod tests {
 
         use super::super::inbox::Inbox;
 
+        let mut runs = RunHeap::new(RunConfig::new());
+        let pages = PageMap::new();
         let class = class_id(64, 8);
-        let run = test_run(20, class);
+        let run = runs.acquire(class, &OWNER, &pages).unwrap();
         let capacity = RUN_SIZE / class.size();
         // Addresses, not `NonNull<u8>`: a raw-pointer `Vec` is not `Sync`, and this slice
         // only ever crosses the thread boundary by shared reference below.
         let addrs: Vec<usize> = (0..capacity)
-            .map(|_| alloc_block(&run).unwrap().as_ptr() as usize)
+            .map(|_| alloc_block(run).unwrap().as_ptr().expose_provenance())
             .collect();
         let inbox: Inbox<Run> = Inbox::new();
         let done = AtomicBool::new(false);
-        let run_ref: &Run = &run;
 
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                let run_ptr = NonNull::from(run_ref);
                 for &addr in &addrs {
                     // SAFETY: addr is one of this run's own blocks, allocated above.
-                    let ptr = NonNull::new(addr as *mut u8).unwrap();
-                    run_ref.claim(ptr).unwrap();
-                    let _ = inbox.push(run_ptr);
+                    let ptr = NonNull::new(core::ptr::with_exposed_provenance_mut(addr)).unwrap();
+                    run.claim(ptr).unwrap();
+                    inbox.queue(run);
                 }
                 done.store(true, Ordering::Release);
             });
@@ -1031,10 +1065,9 @@ mod tests {
             loop {
                 let finished = done.load(Ordering::Acquire);
                 while let Some(chain) = inbox.drain() {
-                    for r in chain {
-                        // SAFETY: `r` is `run_ptr`, live for the scope of this test.
-                        if unsafe { r.as_ref() }.accept() {
-                            let _ = inbox.push(r);
+                    for run in chain {
+                        if run.accept() == Accept::Requeue {
+                            inbox.queue(run);
                         }
                     }
                 }
@@ -1051,12 +1084,14 @@ mod tests {
     }
 
     #[test]
-    fn discard_empty_run_resets_then_extend_reuses() {
-        let class = class_id(64, 8);
-        let run = test_run_discard(30, class);
-        let ptr = alloc_block(&run).unwrap();
-        assert_eq!(run.free(ptr), Ok(false));
-        run.discard_empty();
+    fn discarded_run_resets_then_extend_reuses() {
+        let mut runs = RunHeap::new(RunConfig::new().with_policy(RunPolicy::Discard));
+        let pages = PageMap::new();
+        let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
+        let ptr = alloc_block(run).unwrap();
+        assert_eq!(run.free(ptr), Ok(RunFree::Unchanged));
+        assert!(run.is_discardable());
+        run.discard();
         assert!(!run.is_live());
         assert!(run.allocate().is_none());
         assert!(run.extend());
@@ -1065,20 +1100,23 @@ mod tests {
 
     #[test]
     fn keep_empty_run_leaves_freelist() {
-        let class = class_id(64, 8);
-        let run = test_run(31, class);
-        let ptr = alloc_block(&run).unwrap();
-        assert_eq!(run.free(ptr), Ok(false));
+        let mut runs = RunHeap::new(RunConfig::new());
+        let pages = PageMap::new();
+        let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
+        let ptr = alloc_block(run).unwrap();
+        assert_eq!(run.free(ptr), Ok(RunFree::Unchanged));
+        assert!(!run.is_discardable());
         assert_eq!(run.allocate(), Some(ptr));
     }
 
     #[test]
     fn discard_after_accept_resets() {
-        let class = class_id(64, 8);
-        let run = test_run_discard(32, class);
-        let ptr = alloc_block(&run).unwrap();
+        let mut runs = RunHeap::new(RunConfig::new().with_policy(RunPolicy::Discard));
+        let pages = PageMap::new();
+        let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
+        let ptr = alloc_block(run).unwrap();
         assert_eq!(run.claim(ptr), Ok(()));
-        assert!(!run.accept());
+        assert_eq!(run.accept(), Accept::Done);
         assert!(!run.is_live());
         assert!(run.allocate().is_none());
         assert_eq!(run.claim(ptr), Err(RunError::DoubleFree));
@@ -1088,12 +1126,13 @@ mod tests {
 
     #[test]
     fn discard_does_not_unmap_space() {
-        let class = class_id(64, 8);
-        let run = test_run_discard(33, class);
+        let mut runs = RunHeap::new(RunConfig::new().with_policy(RunPolicy::Discard));
+        let pages = PageMap::new();
+        let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
         let base = run.range().base();
-        let ptr = alloc_block(&run).unwrap();
-        assert_eq!(run.free(ptr), Ok(false));
-        run.discard_empty();
+        let ptr = alloc_block(run).unwrap();
+        assert_eq!(run.free(ptr), Ok(RunFree::Unchanged));
+        run.discard();
         // SAFETY: space stays mapped; DONTNEED may zero the page.
         unsafe {
             base.as_ptr().write(0x11);

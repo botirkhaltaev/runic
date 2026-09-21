@@ -8,9 +8,15 @@ pub(crate) struct HeapId {
 }
 
 impl HeapId {
-    pub(crate) fn new(slot: u32, generation: NonZeroU32) -> Option<Self> {
+    pub(crate) const fn new(slot: u32, generation: NonZeroU32) -> Option<Self> {
+        let Some(incremented) = slot.checked_add(1) else {
+            return None;
+        };
+        let Some(nz_slot) = NonZeroU32::new(incremented) else {
+            return None;
+        };
         Some(Self {
-            slot: NonZeroU32::new(slot.checked_add(1)?)?,
+            slot: nz_slot,
             generation,
         })
     }

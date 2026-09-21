@@ -6,8 +6,9 @@ use core::{
 };
 
 use crate::{
-    heap::{Extent, HeapId, Run},
-    memory::{AddressRange, Mapping, OsMemory, PAGE_SIZE},
+    heap::{Extent, Heap, HeapError, Run},
+    layout::LayoutSpec,
+    memory::{Mapping, OsMemory, PAGE_SIZE},
 };
 
 mod entry;
@@ -35,25 +36,54 @@ pub(crate) enum PageMapError {
     UnexpectedEntry,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Owner resolved through the page-map lookup capability.
+///
+/// Entries point into process-lifetime heap arenas. Run headers and extent slots
+/// are immortal; unmap drops only an extent's mapping.
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum PageOwner {
-    // Pointers must refer to live arena entries until their page-map range is removed.
-    Run(NonNull<Run>),
-    // Pointers must refer to live arena entries until their page-map range is removed.
-    Extent(NonNull<Extent>),
+    Run(&'static Run),
+    Extent(&'static Extent),
+}
+
+impl core::fmt::Debug for PageOwner {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Run(_) => "PageOwner::Run",
+            Self::Extent(_) => "PageOwner::Extent",
+        })
+    }
 }
 
 impl PageOwner {
-    pub(crate) fn heap_id(self) -> HeapId {
+    pub(crate) fn heap(self) -> &'static Heap {
+        match self {
+            Self::Run(run) => run.heap(),
+            Self::Extent(extent) => extent.heap(),
+        }
+    }
+
+    pub(crate) fn resize_in_place(
+        self,
+        ptr: NonNull<u8>,
+        spec: LayoutSpec,
+    ) -> Result<bool, HeapError> {
+        match self {
+            Self::Run(run) => run.resize_in_place(ptr, spec).map_err(HeapError::from),
+            Self::Extent(extent) => extent.resize_in_place(ptr, spec).map_err(HeapError::from),
+        }
+    }
+
+    /// Pages this owner is stamped over: a run's payload, an extent's whole mapping.
+    ///
+    /// A run's claim tail sits past the payload and stays unstamped.
+    fn pages(self) -> Option<PageRange> {
         match self {
             Self::Run(run) => {
-                // SAFETY: PageMap / header_of store only live arena pointers.
-                unsafe { run.as_ref() }.heap_id()
+                let range = run.range();
+                PageRange::from_aligned(range.base(), range.len())
             }
-            Self::Extent(extent) => {
-                // SAFETY: PageMap stores only live arena pointers.
-                unsafe { extent.as_ref() }.heap_id()
-            }
+            Self::Extent(extent) => PageRange::from_mapping(extent.mapping()),
         }
     }
 }
@@ -66,7 +96,7 @@ pub(crate) struct PageMap {
 }
 
 // SAFETY: `l1` is published atomically for lock-free get. `l1_mapping` is written once by the
-// install CAS winner and read only on exclusive drop — `get` never touches it.
+// publication CAS winner and read only on exclusive drop — `get` never touches it.
 unsafe impl Sync for PageMap {}
 
 impl PageMap {
@@ -84,32 +114,14 @@ impl PageMap {
         self.l1()?.owner(l1_index, l2_index)
     }
 
-    pub(crate) fn publish_run(
-        &self,
-        range: AddressRange,
-        run: NonNull<Run>,
-    ) -> Result<(), PageMapError> {
-        let range =
-            PageRange::from_aligned(range.base(), range.len()).ok_or(PageMapError::InvalidRange)?;
-        self.insert(range, PageOwner::Run(run))
+    /// Stamp every page of `owner` with its entry; fails closed on any occupied page.
+    pub(crate) fn publish(&self, owner: PageOwner) -> Result<(), PageMapError> {
+        self.insert(owner.pages().ok_or(PageMapError::InvalidRange)?, owner)
     }
 
-    pub(crate) fn publish_extent(
-        &self,
-        mapping: &Mapping,
-        extent: NonNull<Extent>,
-    ) -> Result<(), PageMapError> {
-        let range = PageRange::from_mapping(mapping).ok_or(PageMapError::InvalidRange)?;
-        self.insert(range, PageOwner::Extent(extent))
-    }
-
-    pub(crate) fn unpublish_extent(
-        &self,
-        mapping: &Mapping,
-        extent: NonNull<Extent>,
-    ) -> Result<(), PageMapError> {
-        let range = PageRange::from_mapping(mapping).ok_or(PageMapError::InvalidRange)?;
-        self.remove(range, PageOwner::Extent(extent))
+    /// Clear `owner`'s pages; fails closed if any page holds a different entry.
+    pub(crate) fn unpublish(&self, owner: PageOwner) -> Result<(), PageMapError> {
+        self.remove(owner.pages().ok_or(PageMapError::InvalidRange)?, owner)
     }
 
     fn insert(&self, range: PageRange, entry: PageOwner) -> Result<(), PageMapError> {
@@ -117,7 +129,7 @@ impl PageMap {
         let l1 = self.l1_or_init()?;
 
         for segment in range.segments() {
-            l1.install_l2(segment.l1)?;
+            l1.ensure_l2(segment.l1)?;
         }
 
         let _guard = l1.lock_range(range);
@@ -125,7 +137,7 @@ impl PageMap {
     }
 
     fn remove(&self, range: PageRange, expected: PageOwner) -> Result<(), PageMapError> {
-        let expected = MapEntry::from_owner(expected).ok_or(PageMapError::InvalidRange)?;
+        let entry = MapEntry::from_owner(expected).ok_or(PageMapError::InvalidRange)?;
         let l1 = self.l1().ok_or(PageMapError::UnexpectedEntry)?;
 
         for segment in range.segments() {
@@ -135,7 +147,7 @@ impl PageMap {
         }
 
         let _guard = l1.lock_range(range);
-        l1.stamp_remove(range, expected)
+        l1.stamp_remove(range, entry)
     }
 
     #[inline]
@@ -143,7 +155,7 @@ impl PageMap {
         let l1 = NonNull::new(self.l1.load(Ordering::Acquire))?;
 
         // SAFETY: `l1` points at the anonymous mmap owned by `l1_mapping` until PageMap drop.
-        // Zero-filled mmap is a valid empty `L1Table` before any L2 install.
+        // Zero-filled mmap is a valid empty `L1Table` before any L2 publication.
         Some(unsafe { l1.as_ref() })
     }
 

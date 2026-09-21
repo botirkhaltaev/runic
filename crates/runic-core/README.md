@@ -10,7 +10,8 @@ This crate is published for the public `runic-alloc` crate, but most modules are
 - Select size classes.
 - Manage heap-owned run maps and dedicated extents.
 - Store run headers in the run space (`base + RUN_SIZE`) and extent metadata in an arena.
-- Map returned pointers back to page-map owner pointers.
+- Map returned pointers back to borrowed run/extent owners.
+- Keep raw pointer decoding and intrusive traversal inside page-map, run-heap, and inbox leaves.
 - Enforce run block-boundary checks and extent exact-pointer checks.
 
 ## Usage

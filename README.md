@@ -2,7 +2,7 @@
 
 Runic is a correctness-first Rust allocator with a small auditable unsafe core, out-of-line metadata, and explicit allocation invariants.
 
-The current release is an experimental v0.6 owner-local heap allocator for Linux x86_64. It requires Rust nightly (`#[thread_local]` `THREAD_HEAP`). It is useful for allocator development, threaded performance work, remote-free protocol experiments, tests, and architecture iteration; it is not yet a production allocator.
+The current release is an experimental v0.6 owner-local heap allocator for Linux x86_64. It requires Rust nightly (`#[thread_local]` `THREAD_HEAPS`). It is useful for allocator development, threaded performance work, remote-free protocol experiments, tests, and architecture iteration; it is not yet a production allocator.
 
 ## Install
 
@@ -35,7 +35,7 @@ fn main() {
 Runic v0.6 implements:
 
 - `GlobalAlloc`
-- owner-local heaps via `Heaps` / `ThreadHeap`
+- owner-local heaps via `Heaps` / `ThreadHeaps`
 - lockless TLS current run on the owner-local hit (`Run::allocate` is pop only; `extend` on miss)
 - `HeapId` ownership on runs and extents
 - lock-free remote-free run/extent inboxes with claim → enqueue → flush/`accept`

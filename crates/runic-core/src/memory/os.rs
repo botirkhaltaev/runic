@@ -15,6 +15,12 @@ pub(crate) struct Mapping {
     len: NonZeroUsize,
 }
 
+// SAFETY: `Mapping` uniquely owns an mmap; moving ownership across threads is
+// valid, shared access is immutable, and `Drop` requires exclusive ownership.
+unsafe impl Send for Mapping {}
+// SAFETY: shared methods expose only the immutable address range.
+unsafe impl Sync for Mapping {}
+
 impl Mapping {
     /// Private: every `Mapping` must describe a live mmap region owned uniquely
     /// by that `Mapping`, so construction is confined to `OsMemory::map` /
@@ -45,10 +51,6 @@ impl Drop for Mapping {
     }
 }
 
-// SAFETY: Mapping owns a process-private mmap region. Moving ownership to another
-// thread does not permit concurrent mutation of allocator metadata.
-unsafe impl Send for Mapping {}
-
 pub(crate) struct OsMemory;
 
 impl OsMemory {
@@ -62,7 +64,6 @@ impl OsMemory {
         }
 
         let rounded_len = Self::round_to_page(len)?;
-        let rounded_len = NonZeroUsize::new(rounded_len)?;
         // SAFETY: mmap is called with a null hint, anonymous private mapping, and a page-rounded length.
         let ptr = unsafe {
             libc::mmap(
@@ -92,7 +93,6 @@ impl OsMemory {
         }
 
         let keep = Self::round_to_page(len)?;
-        let keep = NonZeroUsize::new(keep)?;
         let total = keep.get().checked_add(align)?;
         // SAFETY: anonymous private mapping, page-rounded over-map length.
         let ptr = unsafe {
@@ -159,13 +159,14 @@ impl OsMemory {
         unsafe { libc::madvise(range.base().as_ptr().cast(), len, libc::MADV_DONTNEED) == 0 }
     }
 
-    pub(crate) fn round_to_page(len: usize) -> Option<usize> {
+    pub(crate) fn round_to_page(len: usize) -> Option<NonZeroUsize> {
         if len == 0 {
             return None;
         }
 
         let mask = PAGE_SIZE - 1;
-        len.checked_add(mask).map(|value| value & !mask)
+        let rounded = len.checked_add(mask).map(|value| value & !mask)?;
+        NonZeroUsize::new(rounded)
     }
 }
 
@@ -175,12 +176,18 @@ mod tests {
 
     #[test]
     fn os_memory_round_to_page_keeps_page_sized_value() {
-        assert_eq!(OsMemory::round_to_page(PAGE_SIZE), Some(PAGE_SIZE));
+        assert_eq!(
+            OsMemory::round_to_page(PAGE_SIZE).map(NonZeroUsize::get),
+            Some(PAGE_SIZE)
+        );
     }
 
     #[test]
     fn os_memory_round_to_page_rounds_up() {
-        assert_eq!(OsMemory::round_to_page(PAGE_SIZE + 1), Some(PAGE_SIZE * 2));
+        assert_eq!(
+            OsMemory::round_to_page(PAGE_SIZE + 1).map(NonZeroUsize::get),
+            Some(PAGE_SIZE * 2)
+        );
     }
 
     #[test]
