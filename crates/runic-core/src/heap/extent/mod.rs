@@ -184,6 +184,11 @@ impl Extent {
         NonNull::new(self.base.load(Ordering::Relaxed)).unwrap_or_else(|| Allocator::abort())
     }
 
+    /// Holder-side user length (`malloc_usable_size` / C realloc).
+    pub(crate) fn len(&self) -> usize {
+        self.len.get()
+    }
+
     /// Allocated or claimed — cached Free extents are not live.
     pub(crate) fn is_live(&self) -> bool {
         matches!(

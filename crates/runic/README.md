@@ -38,6 +38,9 @@ static GLOBAL: RunicAlloc = RunicAlloc::builder()
 
 `dealloc` requires a live pointer this allocator returned. Null is forbidden (`GlobalAlloc` contract) and aborts; it is not a no-op.
 
+For C `LD_PRELOAD`, use the separate `runic-cabi` package. Keeping the cdylib
+separate prevents C symbols from entering Rust dependents.
+
 ## Crate Shape
 
 - `src/lib.rs`: public export surface.

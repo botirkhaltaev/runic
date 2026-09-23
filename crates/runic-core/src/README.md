@@ -4,7 +4,7 @@ Allocator core organized around entities and invariants.
 
 ## Modules
 
-- `allocator`: public core facade, abort, and process-lifetime `Allocator::ctx()` (`Process` is private mmap).
+- `allocator`: public core facade (`alloc` / `dealloc` / `free` / `usable_size` / `resize`), abort, and process-lifetime `Allocator::ctx()` (`Process` is private mmap).
 - `arena`: published immovable slots (`get` lock-free; `push` shared; `vacant` / `insert` / `remove` exclusive). Heap/run/extent metadata; growth maps another 256 KiB chunk.
 - `config`: `AllocatorConfig` and `Budget`. Run/extent policy live in `heap/run/config.rs` and `heap/extent/config.rs`.
 - `heap`: owner-local heaps, TLS current run, run/extent heaps, `Heaps`, and thread binding.

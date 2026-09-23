@@ -1,0 +1,4 @@
+# `runic-preload` takes a cdylib artifact dependency on `runic-cabi` so that
+# `cargo test` builds and locates `librunic.so` itself.
+[unstable]
+bindeps = true

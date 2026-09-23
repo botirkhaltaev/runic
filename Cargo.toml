@@ -1,14 +1,15 @@
 [workspace]
 members = [
   "crates/runic",
+  "crates/runic-cabi",
   "crates/runic-core",
-  "crates/runic-test-support",
+  "crates/runic-preload",
   "crates/runic-bench",
 ]
 resolver = "3"
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/botirkhaltaev/runic"
@@ -21,6 +22,9 @@ unsafe_op_in_unsafe_fn = "deny"
 debug = "line-tables-only"
 lto = "fat"
 codegen-units = 1
+
+[profile.release]
+panic = "abort"
 
 [workspace.lints.clippy]
 

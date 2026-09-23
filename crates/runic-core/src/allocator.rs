@@ -96,6 +96,94 @@ impl Allocator {
         Self::dealloc_slow(live, spec);
     }
 
+    /// Pointer-only free for callers without a `Layout` (the C ABI).
+    ///
+    /// The owner comes from `PageMap`, never [`Run::header_of`]: an extent
+    /// mapping need not cover the run-header address, so that probe can fault
+    /// on a pointer whose size class is unknown. Null is forbidden here; the C
+    /// boundary no-ops `free(NULL)`. Unknown pointers abort.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be a pointer previously returned by this allocator.
+    pub unsafe fn free(&self, ptr: *mut u8) {
+        let Some(live) = NonNull::new(ptr) else {
+            Self::abort();
+        };
+        let Some(ctx) = Self::ctx() else {
+            Self::abort();
+        };
+        let Some(owner) = ctx.pages.get(live) else {
+            Self::abort();
+        };
+        if let PageOwner::Run(run) = owner
+            && THREAD_HEAPS.free(live, run.class()).is_some()
+        {
+            return;
+        }
+        match THREAD_HEAPS.free_owner(owner, live, &ctx) {
+            Ok(()) => {}
+            Err(error) => Self::free_fail(&ctx, live, error),
+        }
+    }
+
+    /// Usable size of a live allocation (`malloc_usable_size`).
+    ///
+    /// Null is 0; unknown pointers abort.
+    #[must_use]
+    pub fn usable_size(&self, ptr: *mut u8) -> usize {
+        let Some(live) = NonNull::new(ptr) else {
+            return 0;
+        };
+        let Some(ctx) = Self::ctx() else {
+            Self::abort();
+        };
+        match ctx.pages.get(live) {
+            Some(owner) => owner.usable(),
+            None => Self::abort(),
+        }
+    }
+
+    /// Pointer-only realloc. Owner from `PageMap`, never [`Run::header_of`].
+    ///
+    /// `new` is the requested layout of the replacement (`max_align_t` at the C
+    /// boundary). Null `ptr` is forbidden here; the C boundary maps
+    /// `realloc(NULL, n)` to `malloc`.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be a pointer previously returned by this allocator.
+    #[must_use]
+    pub unsafe fn resize(&self, ptr: *mut u8, new: Layout) -> *mut u8 {
+        let Some(live) = NonNull::new(ptr) else {
+            Self::abort();
+        };
+        let Some(ctx) = Self::ctx() else {
+            Self::abort();
+        };
+        let Some(owner) = ctx.pages.get(live) else {
+            Self::abort();
+        };
+        let old_len = owner.usable();
+        let new_spec = LayoutSpec::from_layout(new);
+        match owner.resize_in_place(live, new_spec) {
+            Ok(true) => return ptr,
+            Ok(false) => {}
+            Err(_) => Self::abort(),
+        }
+
+        // SAFETY: `new` is well-formed.
+        let new_ptr = unsafe { self.alloc(new) };
+        if new_ptr.is_null() {
+            return null_mut();
+        }
+        // SAFETY: `new_ptr` is fresh; `ptr` is live for `old_len` bytes.
+        unsafe { copy_nonoverlapping(ptr, new_ptr, old_len.min(new.size())) };
+        // SAFETY: `ptr` is still the live original.
+        unsafe { self.free(ptr) };
+        new_ptr
+    }
+
     /// Changes the size of an allocation using allocate-copy-free semantics.
     ///
     /// # Safety
@@ -1308,5 +1396,53 @@ mod tests {
             Ok(())
         );
         assert!(ctx.heaps.get(id).is_none());
+    }
+
+    #[test]
+    fn free_recovers_run_class() {
+        let allocator = Allocator::new();
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        // SAFETY: valid layout.
+        let ptr = unsafe { allocator.alloc(layout) };
+        assert!(!ptr.is_null());
+        let class = SizeClasses::class_for(LayoutSpec::from_layout(layout)).unwrap();
+        assert_eq!(allocator.usable_size(ptr), class.size());
+        // SAFETY: ptr was returned by alloc.
+        unsafe { allocator.free(ptr) };
+    }
+
+    #[test]
+    fn free_recovers_extent_len() {
+        let allocator = Allocator::new();
+        let layout = Layout::from_size_align(128 * 1024, 4096).unwrap();
+        // SAFETY: valid extent layout.
+        let ptr = unsafe { allocator.alloc(layout) };
+        assert!(!ptr.is_null());
+        assert_eq!(allocator.usable_size(ptr), layout.size());
+        // SAFETY: ptr was returned by alloc.
+        unsafe { allocator.free(ptr) };
+    }
+
+    #[test]
+    fn usable_size_null_is_zero() {
+        let allocator = Allocator::new();
+        assert_eq!(allocator.usable_size(core::ptr::null_mut()), 0);
+    }
+
+    #[test]
+    fn resize_overaligned_extent_preserves_prefix() {
+        let allocator = Allocator::new();
+        let layout = Layout::from_size_align(32, 8192).unwrap();
+        // SAFETY: valid extent layout.
+        let ptr = unsafe { allocator.alloc(layout) };
+        assert!(!ptr.is_null());
+        unsafe { ptr.write(0xa5) };
+        let new = Layout::from_size_align(64, 16).unwrap();
+        // SAFETY: ptr came from alloc; resize recovers the owner via PageMap.
+        let grown = unsafe { allocator.resize(ptr, new) };
+        assert!(!grown.is_null());
+        assert_eq!(unsafe { grown.read() }, 0xa5);
+        // SAFETY: grown is live.
+        unsafe { allocator.free(grown) };
     }
 }

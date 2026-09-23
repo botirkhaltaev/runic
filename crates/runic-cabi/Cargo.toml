@@ -1,0 +1,18 @@
+[package]
+name = "runic-cabi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Runic malloc-family interceptor for LD_PRELOAD"
+
+[lib]
+name = "runic"
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+libc = "0.2"
+runic-core = { version = "0.8.0", path = "../runic-core", features = ["c-abi"] }

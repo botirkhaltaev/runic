@@ -8,6 +8,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   verify:
     name: Verify Release
@@ -28,30 +31,13 @@ jobs:
 
       - name: Validate tag
         run: |
-          if [[ ! "$GITHUB_REF_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Release tags must use plain semver, for example 0.1.0"
-            exit 1
-          fi
+          # Every crate inherits workspace.package.version, so the workspace
+          # has exactly one version and the tag has to name it.
+          version=$(cargo metadata --format-version 1 --no-deps |
+            jq -r '[.packages[].version] | unique | join(" ")')
 
-      - name: Validate package version
-        run: |
-          metadata=$(cargo metadata --format-version 1)
-          runic_version=$(jq -r '.packages[] | select(.name == "runic-alloc") | .version' <<< "$metadata")
-          core_version=$(jq -r '.packages[] | select(.name == "runic-core") | .version' <<< "$metadata")
-          core_requirement=$(jq -r '.packages[] | select(.name == "runic-alloc") | .dependencies[] | select(.name == "runic-core") | .req' <<< "$metadata")
-
-          if [[ "$GITHUB_REF_NAME" != "$runic_version" ]]; then
-            echo "Tag $GITHUB_REF_NAME does not match runic-alloc version $runic_version"
-            exit 1
-          fi
-
-          if [[ "$GITHUB_REF_NAME" != "$core_version" ]]; then
-            echo "Tag $GITHUB_REF_NAME does not match runic-core version $core_version"
-            exit 1
-          fi
-
-          if [[ "^$GITHUB_REF_NAME" != "$core_requirement" ]]; then
-            echo "runic dependency on runic-core is $core_requirement, expected ^$GITHUB_REF_NAME"
+          if [[ "$GITHUB_REF_NAME" != "$version" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not name the workspace version $version"
             exit 1
           fi
 
@@ -70,8 +56,8 @@ jobs:
       - name: Build benchmarks
         run: cargo bench -p runic-bench --no-run
 
-      - name: Dry-run publish runic-core
-        run: cargo publish -p runic-core --dry-run
+      - name: Dry-run publish
+        run: cargo publish --workspace --dry-run
 
   publish:
     name: Publish Crates
@@ -87,16 +73,8 @@ jobs:
         with:
           toolchain: nightly-2026-09-08
 
-      - name: Publish runic-core
-        run: cargo publish -p runic-core
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-      - name: Dry-run publish runic-alloc
-        run: cargo publish -p runic-alloc --dry-run
-
-      - name: Publish runic-alloc
-        run: cargo publish -p runic-alloc
+      - name: Publish crates
+        run: cargo publish --workspace
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 

@@ -40,9 +40,8 @@ scope.
 
 ## Current Status
 
-Latest published release: `0.7.0`.
-
-The tree ships the v0.7 owner-local heap frontend: TLS heaps own runs and
+Runic v0.8 adds the `runic-cabi` malloc-family LD_PRELOAD cdylib to the
+owner-local heap frontend. TLS heaps own runs and
 extents that store their process-lifetime `&Heap` owner and derive `HeapId`,
 private run claim-bitmap remote admission,
 run/extent `Inbox` coalesced by owner, and Draining lifecycle after thread exit,
@@ -85,6 +84,8 @@ run block-boundary checks
 extent exact-pointer checks
 basic realloc
 basic alloc_zeroed
+C malloc family (`runic-cabi` LD_PRELOAD cdylib)
+pointer-only free (`PageMap` owner; not `header_of` on extents)
 randomized tests
 ```
 
@@ -96,8 +97,6 @@ quarantine
 canaries
 hugepages
 NUMA
-C ABI
-LD_PRELOAD
 ML/lifetime placement
 stats dashboard
 background purge
@@ -123,6 +122,9 @@ allocator can be made faster without guessing.
 ## Architecture
 
 ```text
+C malloc / LD_PRELOAD (runic-cabi)
+  -> cabi                // Layout at the C boundary; free(NULL) no-op
+      -> Allocator
 GlobalAlloc
   -> RunicAlloc
       -> Allocator          // const handle; ctx() borrows Process
@@ -155,6 +157,7 @@ arena locks so dealloc lookup is not heaps-locked.
 
 ```text
 RunicAlloc     owns the Rust GlobalAlloc boundary.
+runic-cabi     owns the C malloc-family / LD_PRELOAD boundary.
 Allocator      owns the core public allocator API, abort, and cold unbound routing.
 AllocatorCtx   carries process-lifetime PageMap + Heaps references for miss / bind / unbind / body / Draining.
 Process        owns the process-wide mmap payload (PageMap + Heaps); not returned.
@@ -187,8 +190,11 @@ crates/runic-core
 crates/runic
   public GlobalAlloc wrapper; published as runic-alloc, imported as runic
 
-crates/runic-test-support
-  reusable test support
+crates/runic-cabi
+  cdylib-only C malloc-family interceptor; published as runic-cabi
+
+crates/runic-preload
+  LD_PRELOAD fixtures and tests for librunic.so
 
 crates/runic-bench
   Criterion `global_*` application workloads
@@ -313,6 +319,20 @@ rseq-rs is a separate crate; not wired into the hit
 ```
 
 `tag: 0.7.0` — `runic-core` / `runic-alloc` 0.7.0.
+
+### v0.8: C ABI / LD_PRELOAD
+
+```text
+cdylib malloc family + posix_memalign / aligned_alloc / memalign / malloc_usable_size
+glibc __libc_* aliases; valloc / reallocarray / cfree
+separate cdylib package so Rust dependents cannot export malloc
+Allocator::free recovers the owner via PageMap; C free then tries the current-run hit
+Allocator::resize is pointer-only realloc (no guessed Layout / header_of)
+C free(NULL) is a no-op; GlobalAlloc dealloc null still aborts
+header_of is not used on unknown pointers (extent mappings may omit the run header page)
+```
+
+Tag `0.8.0` after merge — `runic-core` / `runic-alloc` 0.8.0.
 
 ### Next: Hardening
 

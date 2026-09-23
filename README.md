@@ -2,7 +2,7 @@
 
 Runic is a correctness-first Rust allocator with a small auditable unsafe core, out-of-line metadata, and explicit allocation invariants.
 
-The current release is an experimental v0.7 owner-local heap allocator for Linux x86_64. It requires Rust nightly (`#[thread_local]` `THREAD_HEAPS`). It is useful for allocator development, threaded performance work, remote-free protocol experiments, tests, and architecture iteration; it is not yet a production allocator.
+Runic v0.8 is an experimental owner-local heap allocator for Linux x86_64. It requires Rust nightly (`#[thread_local]` `THREAD_HEAPS`). It is useful for allocator development, threaded performance work, remote-free protocol experiments, C/LD_PRELOAD workloads (mimalloc-bench), tests, and architecture iteration; it is not yet a production allocator.
 
 ## Install
 
@@ -13,6 +13,23 @@ cargo add runic-alloc
 ```
 
 The Rust library name is `runic`, so code imports `runic::RunicAlloc`.
+
+LD_PRELOAD for C programs and [mimalloc-bench](https://github.com/daanx/mimalloc-bench):
+
+```sh
+cargo build -p runic-cabi --release
+# target/release/librunic.so
+export LD_PRELOAD=$PWD/target/release/librunic.so
+```
+
+In mimalloc-bench, register the same `.so` then run:
+
+```sh
+alloc_lib_add "runic" "/path/to/runic/target/release/librunic.so"
+./bench.sh runic cfrac espresso
+```
+
+`runic-alloc` is rlib-only. The separate `runic-cabi` package produces the interceptor.
 
 ## Usage
 
@@ -32,9 +49,10 @@ fn main() {
 
 ## Status
 
-Runic v0.7 implements:
+Runic v0.8 implements:
 
 - `GlobalAlloc`
+- C malloc-family LD_PRELOAD (`cargo build -p runic-cabi --release` produces `librunic.so`)
 - owner-local heaps via `Heaps` / `ThreadHeaps`
 - two equal TLS heaps; a third Draining adopt stays on `Heaps::free`
 - lockless TLS current run on the owner-local hit (`Run::allocate` is pop only; `extend` on miss)
@@ -66,13 +84,15 @@ Correctness comes before speed. See `ROADMAP.md` for the project thesis, current
 ```text
 crates/runic-core          allocator mechanics and global state; published as runic-core
 crates/runic               GlobalAlloc wrapper; published as runic-alloc, imported as runic
-crates/runic-test-support  reusable test machinery; not published
+crates/runic-cabi          cdylib-only C LD_PRELOAD interceptor; published as runic-cabi
+crates/runic-preload       LD_PRELOAD fixtures and tests; not published
 crates/runic-bench         benchmark harness
 ```
 
 Published crates:
 
 - `runic-alloc`: https://crates.io/crates/runic-alloc
+- `runic-cabi`: https://crates.io/crates/runic-cabi
 - `runic-core`: https://crates.io/crates/runic-core
 
 ## Development
