@@ -1,8 +1,9 @@
 [workspace]
 members = [
   "crates/runic",
+  "crates/runic-cabi",
   "crates/runic-core",
-  "crates/runic-test-support",
+  "crates/runic-preload",
   "crates/runic-bench",
 ]
 resolver = "3"
@@ -21,6 +22,9 @@ unsafe_op_in_unsafe_fn = "deny"
 debug = "line-tables-only"
 lto = "fat"
 codegen-units = 1
+
+[profile.release]
+panic = "abort"
 
 [workspace.lints.clippy]
 

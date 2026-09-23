@@ -169,7 +169,8 @@ impl Heaps {
             spins = spins.saturating_add(1);
             if spins == 64 {
                 spins = 0;
-                std::thread::yield_now();
+                // SAFETY: `sched_yield` has no pointer or ownership contract.
+                unsafe { libc::sched_yield() };
             }
         }
     }

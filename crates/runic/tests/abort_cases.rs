@@ -35,7 +35,7 @@ impl AbortCase {
     }
 
     fn assert_aborts(self) {
-        let status = Command::new(env!("CARGO_BIN_EXE_abort_case"))
+        let status = Command::new(env!("CARGO_BIN_EXE_abort-case"))
             .arg(self.name)
             .status()
             .unwrap();

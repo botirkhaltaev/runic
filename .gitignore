@@ -4,6 +4,9 @@
 # Local external allocator references. Keep read-only and out of commits.
 /allocator-refs/
 
+# Local agent state
+/.cursor/hooks/state/
+
 # Editor and OS files
 .DS_Store
 *.swp

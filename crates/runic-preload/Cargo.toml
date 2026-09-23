@@ -1,0 +1,18 @@
+[package]
+name = "runic-preload"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "LD_PRELOAD fixtures and tests for librunic.so"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+libc = "0.2"
+runic-cabi = { path = "../runic-cabi", artifact = "cdylib", lib = false }
+
+[dev-dependencies]
+object = "0.37"

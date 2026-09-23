@@ -327,6 +327,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "object"
+version = "0.37.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe"
+dependencies = [
+ "flate2",
+ "memchr",
+ "ruzstd",
+]
+
+[[package]]
 name = "oorandom"
 version = "11.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -389,7 +400,6 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 name = "runic-alloc"
 version = "0.8.0"
 dependencies = [
- "libc",
  "runic-core",
 ]
 
@@ -413,6 +423,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "runic-cabi"
+version = "0.8.0"
+dependencies = [
+ "libc",
+ "runic-core",
+]
+
+[[package]]
 name = "runic-core"
 version = "0.8.0"
 dependencies = [
@@ -421,11 +439,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "runic-test-support"
+name = "runic-preload"
 version = "0.8.0"
 dependencies = [
- "runic-alloc",
- "runic-core",
+ "libc",
+ "object",
+ "runic-cabi",
+]
+
+[[package]]
+name = "ruzstd"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7c1c839d570d835527c9a5e4db7cb2198683a988cb9d7293fc8674e6bd58fc8"
+dependencies = [
+ "twox-hash",
 ]
 
 [[package]]
@@ -628,6 +656,12 @@ name = "toml_writer"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
+
+[[package]]
+name = "twox-hash"
+version = "2.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5283634e518fe9e82c7b20520bb4bc209009fd16c82077c802f8111ecbb0117a"
 
 [[package]]
 name = "unicode-ident"
