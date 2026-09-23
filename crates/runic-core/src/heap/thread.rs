@@ -156,7 +156,7 @@ impl ThreadHeaps {
         // Same as `Heap::alloc_extent`: accept remote claims before mapping another run.
         // Mapping first fills the run arena with claimed-full runs and `alloc` returns null.
         if !heap.inboxes_empty() {
-            heap.flush(&mut inner, ctx)?;
+            heap.flush(&mut inner, ctx, None)?;
         }
         let Some(run) = inner.acquire_run(class, ctx.pages, heap) else {
             return Ok(None);
@@ -269,7 +269,7 @@ impl ThreadHeaps {
             return false;
         };
         slot.set(ThreadHeap::active(heap));
-        if heap.flush(&mut inner, ctx).is_err() {
+        if heap.flush(&mut inner, ctx, None).is_err() {
             Allocator::abort();
         }
         true

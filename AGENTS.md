@@ -15,10 +15,10 @@
 - Small hit: `ThreadHeaps::{alloc,free}` take no inner. `&PageMap` on miss. Cold unbound: `Allocator::{bind_alloc,free_remote}`.
 - Naming: short, clear, domain words only — same term means the same thing everywhere. No long compound jargon, invented synonyms, or parallel names for one concept. Frontend `alloc`, domain block/extent `allocate`, checkout `acquire`, current-run `extend`. Free protocol: `free` / `claim` / `accept`. Prefer existing vocabulary (`run`, `extent`, `heap`, `inbox`, `flush`, `bind`, `current`, `extend`) over new coinages.
 - Indices: `Arena` / `HeapId` / `RunId` / `ExtentId` use `u32`; convert to `usize` only when indexing Rust arrays or doing pointer/byte math — no free cast-wrapper helpers.
-- Remote free: claim → `adopt` a Draining heap (then owner `free`) or `Heap::enqueue` (Active; lease before new `try_queue`) or `Heaps::{enqueue,free,flush}` (Draining). Coalesce by owner (`Inbox`), never a freer TLS batch.
+- Remote free: claim → `adopt` a Draining heap (then owner `free`) or `Heap::enqueue` (Active; lease before new `try_queue`) or `Heaps::{free,flush}` (Draining). Coalesce by owner (`Inbox`), never a freer TLS batch.
 - Flush policy: current-run empty = `extend`; inbox flush if nonempty; then local/OS `acquire_run`. Unbound = `bind` then `flush` then alloc; hit = current pop / `Run::free` (ignore `RunFree` / Discard). `push_available` is miss / slow / unbind. Inbox `flush` is remote `accept` only. `lookup` is miss / realloc.
 - `Layout` only at the public boundary → `LayoutSpec` inward once.
-- No root/shared ownership heap; every run/extent stores its owning `&Heap` and derives `HeapId`. Shared `&Heap` = atomics only (`id` / `enqueue` / mode / live counts). TLS keeps the generation token captured on bind/adopt so unbind cannot close a later incarnation. `PageOwner` carries process-lifetime run headers / immortal extent slots; extent unmap drops only `Mapping`. Active exclusive = `ThreadHeaps` + `require_inner` + `AllocatorCtx`. Draining = `Heaps::{enqueue,free,flush}` + `AllocatorCtx`. No `Heap::state()` projection; no `*_fresh` dual alloc APIs.
+- No root/shared ownership heap; every run/extent stores its owning `&Heap` and derives `HeapId`. Shared `&Heap` = atomics only (`id` / `active_id` / `enqueue` / mode / live counts). TLS keeps the generation token captured on bind/adopt so unbind cannot close a later incarnation. `PageOwner` carries process-lifetime run headers / immortal extent slots; extent unmap drops only `Mapping`. Active exclusive = `ThreadHeaps` + `require_inner` + `AllocatorCtx`. Draining = `Heaps::{free,flush}` + `AllocatorCtx`. No `Heap::state()` projection; no `*_fresh` dual alloc APIs.
 - One abort sink: `Allocator::abort`. Preserve abort kinds through `HeapError` (`InvalidRunPointer` / `InvalidExtentPointer` / `MissingExtent`). `HeapError::DoubleFree` is remote `claim` / interior-foreign only — not owner DF. Never hold the arena grow lock across flush / accept / user-memory copies.
 - No allocator-internal `Vec` / `Box` / `HashMap` / `String` / formatting / panic unless recursion risk is addressed.
 - `#![deny(unsafe_op_in_unsafe_fn)]`. No test-only methods on production `impl` blocks.
@@ -66,6 +66,7 @@
 - Do not shadow or add redundant reassignments (e.g. `let start = bump`).
 - Compare owners with entity methods/traits (`owns`), not `ptr::eq` or other raw pointer ops.
 - TLS `ThreadHeap` slots are equal; scan all of them (`idle`) — do not special-case a primary/first heap.
+- Do not keep unused parameters; drop redundant args when a domain type already carries the info (e.g. `SizeClass` vs inward `Layout`).
 
 ## Learned Workspace Facts
 

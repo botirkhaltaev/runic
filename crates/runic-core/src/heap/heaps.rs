@@ -7,7 +7,6 @@ use core::{
 
 use crate::{arena::Arena, config::AllocatorConfig, heap::HeapError, memory::PageOwner};
 
-use super::state::HeapMode;
 use super::{AllocatorCtx, Heap, HeapId, HeapInner, OwnerState};
 
 const FREE_END: u32 = u32::MAX;
@@ -98,17 +97,6 @@ impl Heaps {
         heap.matches(id).then_some(heap)
     }
 
-    /// Inbox push while Draining (no Active lease). Then reclaim.
-    pub(crate) fn enqueue(&self, id: HeapId, owner: PageOwner) -> Result<(), HeapError> {
-        let (heap, inner) = self.admit(id)?;
-        if heap != owner.heap() {
-            return Err(HeapError::InvalidHeap);
-        }
-        heap.drain_enqueue(owner);
-        heap.reclaim(&inner, self);
-        Ok(())
-    }
-
     /// Late free while Draining. Then reclaim if this owner emptied.
     pub(crate) fn free(
         &self,
@@ -117,10 +105,7 @@ impl Heaps {
         ptr: NonNull<u8>,
         ctx: &AllocatorCtx,
     ) -> Result<(), HeapError> {
-        let (heap, mut inner) = self.admit(id)?;
-        if heap != owner.heap() {
-            return Err(HeapError::InvalidHeap);
-        }
+        let (heap, mut inner) = self.admit(id, Some(owner))?;
         let state = inner.free(owner, ptr, ctx.pages)?;
         if state == OwnerState::Empty {
             heap.reclaim(&inner, self);
@@ -128,24 +113,30 @@ impl Heaps {
         Ok(())
     }
 
-    /// Accept inboxes while Draining. Then reclaim.
-    pub(crate) fn flush(&self, id: HeapId, ctx: &AllocatorCtx) -> Result<(), HeapError> {
-        let (heap, mut inner) = self.admit(id)?;
-        heap.flush(&mut inner, ctx)?;
+    /// Accept inboxes while Draining. `owner` queues a claimed remote first.
+    pub(crate) fn flush(
+        &self,
+        id: HeapId,
+        ctx: &AllocatorCtx,
+        owner: Option<PageOwner>,
+    ) -> Result<(), HeapError> {
+        let (heap, mut inner) = self.admit(id, owner)?;
+        heap.flush(&mut inner, ctx, owner)?;
         heap.reclaim(&inner, self);
         Ok(())
     }
 
-    fn admit(&self, id: HeapId) -> Result<(&Heap, spin::MutexGuard<'_, HeapInner>), HeapError> {
-        let heap = self.get(id).ok_or(HeapError::InvalidHeap)?;
-        if heap.mode() != HeapMode::Draining {
-            return Err(HeapError::InvalidHeap);
-        }
-        let inner = heap.lock_inner();
-        if !heap.matches(id) || heap.mode() != HeapMode::Draining {
-            return Err(HeapError::InvalidHeap);
-        }
-        Ok((heap, inner))
+    /// Inner while Draining. `owner` uses `owner.heap()`; `None` looks up `id`.
+    fn admit(
+        &self,
+        id: HeapId,
+        owner: Option<PageOwner>,
+    ) -> Result<(&Heap, spin::MutexGuard<'_, HeapInner>), HeapError> {
+        let heap = match owner {
+            Some(owner) => owner.heap(),
+            None => self.get(id).ok_or(HeapError::InvalidHeap)?,
+        };
+        Ok((heap, heap.admit(id, owner)?))
     }
 
     /// Owner gives up the heap: close Active, wait leases, reclaim, flush.
@@ -159,7 +150,7 @@ impl Heaps {
 
         self.wait_leases(id);
 
-        match self.flush(id, ctx) {
+        match self.flush(id, ctx, None) {
             Ok(()) | Err(HeapError::InvalidHeap) => Ok(()),
             Err(error) => Err(error),
         }
@@ -194,6 +185,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        heap::HeapMode,
         layout::LayoutSpec,
         memory::{PageMap, PageOwner},
     };

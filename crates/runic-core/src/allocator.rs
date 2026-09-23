@@ -258,9 +258,10 @@ impl Allocator {
         ptr: NonNull<u8>,
     ) -> Result<(), HeapError> {
         let heap = owner.heap();
-        let heap_id = heap.id();
 
-        if !heap.is_active() {
+        let heap_id = if let Some(id) = heap.active_id() {
+            id
+        } else {
             if THREAD_HEAPS.adopt(heap, ctx) {
                 return THREAD_HEAPS
                     .free_owner(owner, ptr, ctx)
@@ -269,15 +270,14 @@ impl Allocator {
                         ThreadFreeError::Remote(_) => HeapError::InvalidMetadata,
                     });
             }
+            let heap_id = heap.id();
             match ctx.heaps.free(heap_id, owner, ptr, ctx) {
                 Ok(()) => return Ok(()),
                 Err(HeapError::InvalidHeap) => {}
                 Err(error) => return Err(error),
             }
-            if !heap.is_active() {
-                return Err(HeapError::InvalidMetadata);
-            }
-        }
+            heap.active_id().ok_or(HeapError::InvalidMetadata)?
+        };
 
         match owner {
             PageOwner::Run(run) => {
@@ -295,12 +295,8 @@ impl Allocator {
                 Err(error) => return Err(error),
             }
 
-            match ctx.heaps.enqueue(heap_id, owner) {
-                Ok(()) => match ctx.heaps.flush(heap_id, ctx) {
-                    Ok(()) => return Ok(()),
-                    Err(HeapError::InvalidHeap) => {}
-                    Err(error) => return Err(error),
-                },
+            match ctx.heaps.flush(heap_id, ctx, Some(owner)) {
+                Ok(()) => return Ok(()),
                 Err(HeapError::InvalidHeap) => {}
                 Err(error) => return Err(error),
             }
@@ -763,8 +759,7 @@ mod tests {
 
         assert_eq!(ctx.heaps.unbind(id, &ctx), Ok(()));
         assert_eq!(ctx.heaps.get(id).map(Heap::mode), Some(HeapMode::Draining));
-        assert_eq!(ctx.heaps.enqueue(id, PageOwner::Run(run)), Ok(()));
-        assert_eq!(ctx.heaps.flush(id, &ctx), Ok(()));
+        assert_eq!(ctx.heaps.flush(id, &ctx, Some(PageOwner::Run(run))), Ok(()));
         assert!(ctx.heaps.get(id).is_none());
     }
 
@@ -798,7 +793,7 @@ mod tests {
                     start_a.recv().unwrap();
                     let heap = ctx.heaps.get(id).unwrap();
                     let mut inner = heap.require_inner();
-                    assert_eq!(heap.flush(&mut inner, &ctx), Ok(()));
+                    assert_eq!(heap.flush(&mut inner, &ctx, None), Ok(()));
                     done_a.send(run.is_live()).unwrap();
                     drop(inner);
                     tls.unbind(&ctx);
@@ -820,7 +815,7 @@ mod tests {
                     start_b.recv().unwrap();
                     let heap = ctx.heaps.get(id).unwrap();
                     let mut inner = heap.require_inner();
-                    assert_eq!(heap.flush(&mut inner, &ctx), Ok(()));
+                    assert_eq!(heap.flush(&mut inner, &ctx, None), Ok(()));
                     done_b.send(run.is_live()).unwrap();
                     drop(inner);
                     tls.unbind(&ctx);
@@ -906,7 +901,7 @@ mod tests {
         {
             let tls = &THREAD_HEAPS;
             let mut inner = heap.require_inner();
-            assert_eq!(heap.flush(&mut inner, &ctx), Ok(()));
+            assert_eq!(heap.flush(&mut inner, &ctx, None), Ok(()));
             assert!(!run.is_live());
             drop(inner);
             tls.unbind(&ctx);
@@ -933,7 +928,7 @@ mod tests {
             id
         };
 
-        assert_eq!(ctx.heaps.flush(id, &ctx), Ok(()));
+        assert_eq!(ctx.heaps.flush(id, &ctx, None), Ok(()));
         assert!(ctx.heaps.get(id).is_none());
         THREAD_HEAPS.unbind(&ctx);
     }
@@ -956,7 +951,7 @@ mod tests {
             id
         };
 
-        assert_eq!(ctx.heaps.flush(id, &ctx), Ok(()));
+        assert_eq!(ctx.heaps.flush(id, &ctx, None), Ok(()));
         assert!(ctx.heaps.get(id).is_none());
         THREAD_HEAPS.unbind(&ctx);
     }
