@@ -2,7 +2,7 @@
 
 Runic is a correctness-first Rust allocator with a small auditable unsafe core, out-of-line metadata, and explicit allocation invariants.
 
-The current release is an experimental v0.6 owner-local heap allocator for Linux x86_64. It requires Rust nightly (`#[thread_local]` `THREAD_HEAPS`). It is useful for allocator development, threaded performance work, remote-free protocol experiments, tests, and architecture iteration; it is not yet a production allocator.
+The current release is an experimental v0.7 owner-local heap allocator for Linux x86_64. It requires Rust nightly (`#[thread_local]` `THREAD_HEAPS`). It is useful for allocator development, threaded performance work, remote-free protocol experiments, tests, and architecture iteration; it is not yet a production allocator.
 
 ## Install
 
@@ -32,16 +32,19 @@ fn main() {
 
 ## Status
 
-Runic v0.6 implements:
+Runic v0.7 implements:
 
 - `GlobalAlloc`
 - owner-local heaps via `Heaps` / `ThreadHeaps`
+- two equal TLS heaps; a third Draining adopt stays on `Heaps::free`
 - lockless TLS current run on the owner-local hit (`Run::allocate` is pop only; `extend` on miss)
-- `HeapId` ownership on runs and extents
+- process-lifetime `&Heap` on runs and immortal extent slots
 - lock-free remote-free run/extent inboxes with claim → enqueue → flush/`accept`
 - private run claim-bitmap remote admission (owner free is locate + push)
 - one process-wide payload; `Allocator::ctx()` is the handle
-- Free | Active | Draining heap-slot lifecycle after thread exit
+- Free | Active | Draining heap-slot lifecycle after thread exit; first remote freer may `adopt`
+- lock-free `Heaps::get`; draining `admit` / `flush` take optional `owner`
+- `Heap` live atomics (reclaim confirms with arena scans)
 - mmap-backed runs for small size classes
 - mmap-backed extents for dedicated allocations (heap-local)
 - out-of-line metadata
@@ -54,6 +57,7 @@ Runic v0.6 implements:
 - basic `realloc`
 - basic `alloc_zeroed`
 - randomized allocation trace tests
+- real-workload Criterion corpus (`global_*`)
 
 Correctness comes before speed. See `ROADMAP.md` for the project thesis, current scope, architecture, and follow-up plan. Measurement history lives in `diary.md`.
 
@@ -93,7 +97,7 @@ scripts/profile.sh --compare target/runic-profiles/run-before target/runic-profi
 
 ## Release
 
-Release tags use plain semver, for example `0.6.0`.
+Release tags use plain semver, for example `0.7.0`.
 
 Release `runic-core` before `runic-alloc`, because `runic-alloc` depends on the published `runic-core` version during package verification.
 
