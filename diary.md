@@ -461,3 +461,95 @@ Cycles/elem moved more than 1% on some 2s samples (`hashmap_grow` +4.5% cpe with
 −0.2% instructions); treat as the same host noise as earlier screens, not a
 protocol change.
 
+## Post-#165 deep screen (`21b20ed`, CPUs 24–27)
+
+Pinned Criterion, 20 samples × 2 s, all five `global_*` allocators. Geomean of
+runic / best competitor = **1.050×**. Runic is best on 6/20 workloads
+(`arc_broadcast`, `buffer_pool`, `json_api`, `records_sort`, `vec_growth_log`,
+`vecdeque_events`). Hit-ish `word_count` is 1.00× snmalloc.
+
+Criterion mean time vs best (only ≥5% gaps):
+
+```text
+                    runic     best     vs
+log_pipeline       13.308   10.888 sn  1.22×
+thread_pool_jobs    1.026    0.876 sn  1.17×
+lru_cache          10.170    8.694 mi  1.17×
+shard_aggregator    0.518    0.456 sn  1.13×
+http_parse          2.934    2.655 sn  1.11×
+hashmap_grow       10.555   10.095 sn  1.05×
+text_index         50.379   48.011 sn  1.05×
+```
+
+Paired `profile.sh` (3×2 s stat + 5 s `cycles:u` record), cycles/elem runic vs
+competitor (after = competitor, so ratio < 1 means competitor cheaper):
+
+```text
+                   runic cpe    other cpe    insn/elem
+word_count           263.7     261.4 sn     741.6 vs 706.5
+log_pipeline       16796.4   14168.1 sn   21555 vs 19740
+thread_pool_jobs    5896.7    5443.3 sn   10046 vs 9182
+lru_cache           1141.0     945.7 mi    2787 vs 2783
+shard_aggregator     536.9     483.5 sn    1403 vs 1118
+http_parse          2628.5    2339.1 sn    7152 vs 6760
+```
+
+Where (flat `cycles:u`):
+
+- `word_count`: workload 48%, then fmt/string; `__rust_realloc` 6.9%,
+  `__rust_alloc` 2.7%. No `ThreadHeaps` / `free_remote` in the top 15. Hit is
+  already off the profile.
+- `thread_pool_jobs`: `Allocator::free_remote` 10.7%, `Heap::flush` 3.7%,
+  `free_slow` 2.1%, `free_owner` 1.6%, `dealloc_slow` 1.6%. snmalloc's
+  `dealloc_remote` is 3.3% on the same workload. Remaining allocator time is
+  remote free, not the owner hit.
+- `shard_aggregator`: `Heaps::admit` 12.9%, `free_remote` 6.8%, `free_owner`
+  5.4%, `Heaps::free` 5.0%, `dealloc_slow` 4.8%, `HeapInner::free` 4.3%,
+  `ThreadHeaps::adopt` 3.1%. Third-heap adopt staying on `Heaps::free` is
+  visible here.
+- `log_pipeline`: regex 27%; `__rust_realloc` 7.3%, `__rust_alloc` 4.3%,
+  `free_remote` 2.8%. snmalloc's top allocator symbol is `sn_rust_alloc` 1.7%.
+- `lru_cache` vs mimalloc: instruction counts match (−0.13%); mimalloc IPC
+  2.94 vs runic 2.44. Not an instruction-diet miss. `__rust_realloc` is 8.8%
+  on runic; mimalloc spreads realloc across `mi_free` / `_mi_theap_realloc_zero`.
+
+Not squeezed by another hit-path fold. The remaining Cost is remote
+admission/`Heaps::admit`/adopt on the threaded corpus, and realloc of growing
+`String`s. Those sit on already-declined or scoped-out levers (`multi-slot
+adopt`, `realloc known-owner reuse`, `BatchIt-on-Inbox`). No A/B this pass.
+
+## Diet `free_remote` / `Heaps::admit` (vs `21b20ed`)
+
+Hypothesis: extra `HeapState` loads, an arena `get` on a heap already in
+`owner.heap()`, and two Inner locks for claimed draining. Protocol unchanged
+(no claim before adopt / `Heaps::free`; no third TLS slot).
+
+Change: `Heap::active_id` (one load for Active routing); `Heap::admit_draining`
+on `owner.heap()` for `Heaps::free` / `Heap::flush_claimed`; `Heaps::flush`
+still `get`s (unbind has no owner); claimed draining queues+accepts+reclaims
+under one Inner lock. `Heaps::enqueue` deleted. `Heap::enqueue` admits only
+via `acquire_lease`.
+
+Pinned `profile.sh` CPUs 24–27, 3×2 s stat. Repeat Cost used the rebuilt ELF.
+
+```text
+                    before     after     insn/elem
+thread_pool_jobs    5896.7    5902.8    10046 → 10009   (~flat)
+shard_aggregator     536.9    506.8     1403 → 1289    (repeat; −5.6% cpe / −8.1% insn)
+word_count           263.7    267.7      742 → 735     (+1.5% cpe, −0.9% insn)
+```
+
+A second shard window printed 453.5 cpe / 1159 insn (−15%/−17%); treat that as
+the same threaded noise as earlier screens. The repeat (506.8 / 1289) is the
+number to keep. `Heaps::admit` is gone from Where (inlined into
+`admit_draining` / `free`). dwarf `cycles:u` on shard: `free_remote` 18.9%,
+`free_owner` 5.6%, `HeapInner::free` 5.0%, `dealloc_slow` 4.4%, `adopt` 3.4%.
+LBR record still SIGABRTs that workload.
+
+Active remote (`thread_pool_jobs`) did not move: `free_remote` 10.7% → 9.5%.
+Hit (`word_count`) still has no `ThreadHeaps` / `free_remote` in the top 15;
+the cpe bump is IPC, not extra instructions.
+
+Keep: draining admit diet is visible. Do not chase another hit micro-opt from
+this pass.
+

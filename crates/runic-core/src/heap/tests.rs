@@ -146,7 +146,7 @@ fn extent_alloc_preserves_flush_error() {
         Err(HeapError::InvalidExtentPointer)
     );
     extent.claim(ptr).unwrap();
-    assert_eq!(heap.flush(&mut inner, &ctx), Ok(()));
+    assert_eq!(heap.flush(&mut inner, &ctx, None), Ok(()));
     drop(inner);
     assert_eq!(heaps.unbind(heap.id(), &ctx), Ok(()));
 }

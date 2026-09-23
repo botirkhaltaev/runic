@@ -36,10 +36,10 @@ pub(crate) use thread::{THREAD_HEAPS, ThreadFreeError, ThreadHeaps};
 
 /// Indexed heap entry: lifecycle, remote-free inboxes, and owner-local run/extent metadata.
 ///
-/// Shared (`get`): atomics only — `id`, `enqueue`, mode, live counts.
+/// Shared (`get`): atomics only — `id`, `active_id`, `enqueue`, mode, live counts.
 /// Active exclusive metadata: [`ThreadHeaps`](thread::ThreadHeaps) via [`Heap::require_inner`]
 /// (any TLS heap or the remote freer that [`Heap::adopt`]ed a Draining heap).
-/// Draining exclusive metadata: [`Heaps::{enqueue,free,flush}`](Heaps).
+/// Draining exclusive metadata: [`Heaps::{free,flush}`](Heaps).
 pub(crate) struct Heap {
     /// Lifecycle word — `pub(super)` so `Heaps` can close / wait / reactivate without a
     /// public `&HeapState` projection.
@@ -189,10 +189,11 @@ impl Heap {
     ///
     /// Already-queued claims coalesce with no lease. A new queue win takes a lease
     /// **before** `Inbox::queue` so close cannot observe Queued without a link.
+    /// [`HeapState::acquire_lease`] is the Active admit; callers pass the `HeapId`
+    /// captured from this heap.
     pub(crate) fn enqueue(&self, id: HeapId, owner: PageOwner) -> Result<(), HeapError> {
-        if !self.matches(id) || self != owner.heap() {
-            return Err(HeapError::InvalidHeap);
-        }
+        debug_assert!(self == owner.heap());
+        debug_assert_eq!(self.slot, id.slot());
         match owner {
             PageOwner::Run(run) => self.enqueue_node(id, &self.run_inbox, run),
             PageOwner::Extent(extent) => self.enqueue_node(id, &self.extent_inbox, extent),
@@ -213,28 +214,43 @@ impl Heap {
         Ok(())
     }
 
-    /// Inbox push without an Active lease. Draining only.
-    pub(super) fn drain_enqueue(&self, owner: PageOwner) {
-        match owner {
-            PageOwner::Run(run) => {
-                self.run_inbox.queue(run);
-            }
-            PageOwner::Extent(extent) => {
-                self.extent_inbox.queue(extent);
-            }
-        }
-    }
-
     pub(super) fn inboxes_empty(&self) -> bool {
         self.run_inbox.is_empty() && self.extent_inbox.is_empty()
     }
 
-    pub(crate) fn is_active(&self) -> bool {
-        self.state.is_active()
+    /// Current id when Active, from one Acquire load. Remote routing uses this
+    /// instead of `id` then a second mode load.
+    pub(crate) fn active_id(&self) -> Option<HeapId> {
+        let snap = self.state.load();
+        match snap.mode {
+            HeapMode::Active => Some(HeapId::from_slot(self.slot, snap.generation)),
+            HeapMode::Free | HeapMode::Draining | HeapMode::Retired => None,
+        }
     }
 
     pub(crate) fn matches(&self, id: HeapId) -> bool {
         self.slot == id.slot() && self.state.matches(id)
+    }
+
+    /// Exclusive Inner while Draining for `id`. `owner` is the page when the
+    /// caller already holds it (`Heaps::free` / claimed `flush`); `None` after `get`.
+    pub(super) fn admit(
+        &self,
+        id: HeapId,
+        owner: Option<PageOwner>,
+    ) -> Result<spin::MutexGuard<'_, HeapInner>, HeapError> {
+        if self.slot != id.slot() || self.mode() != HeapMode::Draining {
+            return Err(HeapError::InvalidHeap);
+        }
+        if owner.is_some_and(|owner| self != owner.heap()) {
+            return Err(HeapError::InvalidHeap);
+        }
+        let inner = self.lock_inner();
+        let snap = self.state.load();
+        if snap.mode != HeapMode::Draining || snap.generation != id.generation() {
+            return Err(HeapError::InvalidHeap);
+        }
+        Ok(inner)
     }
 
     pub(crate) fn mode(&self) -> HeapMode {
@@ -306,7 +322,25 @@ impl Heap {
     }
 
     /// Drain both inboxes into run/extent metadata (accept).
-    pub(super) fn flush(&self, inner: &mut HeapInner, ctx: &AllocatorCtx) -> Result<(), HeapError> {
+    ///
+    /// `owner` queues a claimed remote before accept so queue+flush share Inner.
+    pub(super) fn flush(
+        &self,
+        inner: &mut HeapInner,
+        ctx: &AllocatorCtx,
+        owner: Option<PageOwner>,
+    ) -> Result<(), HeapError> {
+        if let Some(owner) = owner {
+            debug_assert!(self == owner.heap());
+            match owner {
+                PageOwner::Run(run) => {
+                    self.run_inbox.queue(run);
+                }
+                PageOwner::Extent(extent) => {
+                    self.extent_inbox.queue(extent);
+                }
+            }
+        }
         while let Some(chain) = self.run_inbox.drain() {
             for run in chain {
                 if inner.runs.accept(run)? == Accept::Requeue {
@@ -331,7 +365,7 @@ impl Heap {
         ctx: &AllocatorCtx,
     ) -> Result<Option<NonNull<u8>>, HeapError> {
         if !self.inboxes_empty() {
-            self.flush(inner, ctx)?;
+            self.flush(inner, ctx, None)?;
         }
         inner.extents.allocate(spec, self, ctx.pages, init)
     }

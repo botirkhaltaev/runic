@@ -129,11 +129,6 @@ impl HeapState {
         snap.mode == HeapMode::Free && snap.leases == 0
     }
 
-    pub(crate) fn is_active(&self) -> bool {
-        let snap = self.load();
-        snap.mode == HeapMode::Active
-    }
-
     pub(super) fn leases(&self) -> u32 {
         self.load().leases
     }

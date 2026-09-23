@@ -18,8 +18,8 @@ Owner-local heap frontend: runs for small size classes, extents for dedicated la
 
 | Entity | May do | Must not |
 |--------|--------|----------|
-| `Heaps` | `acquire` / `get` / `unbind` / `enqueue` / `free` / `flush` | hold arena grow lock across flush/accept |
-| `&Heap` (shared) | `id`, `enqueue`, mode / active queries | body mutation, expose `&HeapState` |
+| `Heaps` | `acquire` / `get` / `unbind` / `free` / `flush` | hold arena grow lock across flush/accept |
+| `&Heap` (shared) | `id`, `active_id`, `enqueue`, mode | body mutation, expose `&HeapState` |
 | `ThreadHeaps` | sole Active body path (`require_inner` + `AllocatorCtx`) | be bypassed via `&Heap` from allocator / tests |
 | `AllocatorCtx` | pass `PageMap` + `Heaps` into Heap / ThreadHeaps / Heaps methods | contain a mutex guard |
 
@@ -28,7 +28,7 @@ Owner-local heap frontend: runs for small size classes, extents for dedicated la
 - Every `Run` and `Extent` stores its process-lifetime owning `&Heap`; `heap().id()` derives the current generation. There is no root/central ownership heap. `Heap` owns lifecycle, inboxes, and run/extent metadata (`RunHeap` / `ExtentHeap`).
 - `Heap`, `Run`, and `Extent` implement identity `Eq`; protocol code compares entities directly. Raw pointer equality stays inside those trait implementations.
 - Small allocations are owned by a heap's runs; large allocations by that heap's extents.
-- Cross-thread frees: `claim` → `Heap::enqueue` (Active: lease before a new `try_queue`) or `Heaps::{enqueue,free,flush}` (Draining). A claimed free retries when close/adopt changes the mode; if reclamation advances the generation, the old owner necessarily accepted that claim. The first remote freer into a Draining heap may `adopt` it (`Draining` → `Active`); adoption locks `HeapInner` before its lifecycle CAS and keeps that guard for the first flush, so reclaim cannot overwrite a winner. Later frees from that thread are owner-local. TLS `ThreadHeaps` holds two equal `ThreadHeap::{Vacant, Active}` values. `Active` is `&Heap` plus the captured `HeapId`. Bind and adopt take the first vacant slot; alloc uses the first active heap. A third Draining heap stays on `Heaps::free` until a slot is unbound (two-heap cap lost on `channel_pipeline`). Coalescing is by owner. Owner `flush` drains via `accept`.
+- Cross-thread frees: `claim` → `Heap::enqueue` (Active: lease is the admit) or `Heaps::{free,flush}` (Draining). `Heaps::admit` / `flush` take `owner: Option` — `Some` admits on `owner.heap()` and queues that claim under the same Inner lock; `None` `get`s (unbind). A claimed free retries when close/adopt changes the mode; if reclamation advances the generation, the old owner necessarily accepted that claim. The first remote freer into a Draining heap may `adopt` it (`Draining` → `Active`); adoption locks `HeapInner` before its lifecycle CAS and keeps that guard for the first flush, so reclaim cannot overwrite a winner. Later frees from that thread are owner-local. TLS `ThreadHeaps` holds two equal `ThreadHeap::{Vacant, Active}` values. `Active` is `&Heap` plus the captured `HeapId`. Bind and adopt take the first vacant slot; alloc uses the first active heap. A third Draining heap stays on `Heaps::free` until a slot is unbound (two-heap cap lost on `channel_pipeline`). Coalescing is by owner. Owner `flush` drains via `accept`.
 - Run remote admission is a private claim bitmap in the space tail. Owner `Run::free` is locate + pointer push; owner DF is undefined. Extents use byte `Claimed`.
 - Inbox is a Treiber stack of run/extent nodes. `drain` is a single-pass walk.
 - Draining reclaim first observes `Heap` run/extent live atomics, then confirms with arena scans. In-flight claim bits keep the heap live. `Heap::reclaim` returns a Free heap to the table freelist.

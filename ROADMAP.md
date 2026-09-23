@@ -142,7 +142,7 @@ GlobalAlloc
 then `Heap::matches` (slot + generation). Occupied slots never move. Active enqueue uses `HeapState`
 leases (lease before new `try_queue`). Arena grow covers mapping ownership and
 bump insert only. Draining exclusivity is `Mutex<HeapInner>` via
-`Heaps::{enqueue,free,flush,reclaim}` (not the arena grow lock across flush).
+`Heaps::{free,flush}` (not the arena grow lock across flush).
 Adoption takes that mutex before its Draining→Active CAS; reclaim advances the
 generation with a CAS so it cannot overwrite an adoption winner.
 Shared `&Heap` is atomics-only; Active body mutation is `ThreadHeaps` +
