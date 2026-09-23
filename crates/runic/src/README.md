@@ -1,11 +1,5 @@
 # runic/src
 
-Source for the public global allocator wrapper.
-
-## Modules
-
-- `lib`: exports `RunicAlloc`.
-- `global`: implements `core::alloc::GlobalAlloc` for `RunicAlloc` by delegating to `runic_core::Allocator`.
-- `bin/abort_case`: helper executable used by integration tests that expect process aborts.
-
-Allocator policy, metadata, pointer validation, and mmap ownership live in `runic-core`.
+`RunicAlloc` lives in `lib.rs`; `GlobalAlloc` is in `global.rs`. `abort-case`
+is the abort subprocess. Core policy is in `runic-core`. Process-wide design:
+[ARCHITECTURE.md](../../../ARCHITECTURE.md).

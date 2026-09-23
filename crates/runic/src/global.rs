@@ -2,6 +2,9 @@ use core::alloc::{GlobalAlloc, Layout};
 
 use runic_core::{Allocator, AllocatorConfig, Budget, ExtentPolicy, RunPolicy};
 
+/// Process-global Runic allocator.
+///
+/// Construct with [`RunicAlloc::new`] or [`RunicAlloc::builder`].
 pub struct RunicAlloc {
     allocator: Allocator,
 }

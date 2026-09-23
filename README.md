@@ -1,101 +1,51 @@
 # Runic
 
-Runic is a correctness-first Rust allocator with a small auditable unsafe core, out-of-line metadata, and explicit allocation invariants.
+Runic is an owner-local allocator for Linux `x86_64`. Metadata sits outside
+user allocations. Unsafe code is limited to OS and ownership boundaries.
+Invalid and foreign frees abort. Owner double-free is undefined. C
+`free(NULL)` is a no-op.
 
-Runic v0.8 is an experimental owner-local heap allocator for Linux x86_64. It requires Rust nightly (`#[thread_local]` `THREAD_HEAPS`). It is useful for allocator development, threaded performance work, remote-free protocol experiments, C/LD_PRELOAD workloads (mimalloc-bench), tests, and architecture iteration; it is not yet a production allocator.
+Version **0.8.0** provides `GlobalAlloc` and the C malloc family for
+`LD_PRELOAD`. It requires nightly Rust (`#[thread_local]`). Hardening,
+hugepages, NUMA, and background purge are not implemented. See
+[Compatibility](COMPATIBILITY.md).
 
-## Install
-
-The public allocator crate is published as `runic-alloc`:
+## Rust
 
 ```sh
 cargo add runic-alloc
 ```
 
-The Rust library name is `runic`, so code imports `runic::RunicAlloc`.
-
-LD_PRELOAD for C programs and [mimalloc-bench](https://github.com/daanx/mimalloc-bench):
-
-```sh
-cargo build -p runic-cabi --release
-# target/release/librunic.so
-export LD_PRELOAD=$PWD/target/release/librunic.so
-```
-
-In mimalloc-bench, register the same `.so` then run:
-
-```sh
-alloc_lib_add "runic" "/path/to/runic/target/release/librunic.so"
-./bench.sh runic cfrac espresso
-```
-
-`runic-alloc` is rlib-only. The separate `runic-cabi` package produces the interceptor.
-
-## Usage
-
-Use `RunicAlloc` as a Rust global allocator:
+The package is `runic-alloc`; import `runic::RunicAlloc`.
 
 ```rust
 use runic::RunicAlloc;
 
 #[global_allocator]
 static GLOBAL: RunicAlloc = RunicAlloc::new();
-
-fn main() {
-    let values = vec![1, 2, 3, 4];
-    assert_eq!(values.len(), 4);
-}
 ```
 
-## Status
+[runic-alloc API](https://docs.rs/runic-alloc)
 
-Runic v0.8 implements:
+## C / LD_PRELOAD
 
-- `GlobalAlloc`
-- C malloc-family LD_PRELOAD (`cargo build -p runic-cabi --release` produces `librunic.so`)
-- owner-local heaps via `Heaps` / `ThreadHeaps`
-- two equal TLS heaps; a third Draining adopt stays on `Heaps::free`
-- lockless TLS current run on the owner-local hit (`Run::allocate` is pop only; `extend` on miss)
-- process-lifetime `&Heap` on runs and immortal extent slots
-- lock-free remote-free run/extent inboxes with claim → enqueue → flush/`accept`
-- private run claim-bitmap remote admission (owner free is locate + push)
-- one process-wide payload; `Allocator::ctx()` is the handle
-- Free | Active | Draining heap-slot lifecycle after thread exit; first remote freer may `adopt`
-- lock-free `Heaps::get`; draining `admit` / `flush` take optional `owner`
-- `Heap` live atomics (reclaim confirms with arena scans)
-- mmap-backed runs for small size classes
-- mmap-backed extents for dedicated allocations (heap-local)
-- out-of-line metadata
-- page-indexed owner-pointer lookup
-- per-size-class available run lists
-- configurable extent mapping retention and reuse policies
-- runs retained for the heap lifetime (no empty-run OS release)
-- run block-boundary checks
-- extent exact-pointer checks
-- basic `realloc`
-- basic `alloc_zeroed`
-- randomized allocation trace tests
-- real-workload Criterion corpus (`global_*`)
-
-Correctness comes before speed. See `ROADMAP.md` for the project thesis, current scope, architecture, and follow-up plan. Measurement history lives in `diary.md`.
-
-## Crates
-
-```text
-crates/runic-core          allocator mechanics and global state; published as runic-core
-crates/runic               GlobalAlloc wrapper; published as runic-alloc, imported as runic
-crates/runic-cabi          cdylib-only C LD_PRELOAD interceptor; published as runic-cabi
-crates/runic-preload       LD_PRELOAD fixtures and tests; not published
-crates/runic-bench         benchmark harness
+```sh
+cargo build -p runic-cabi --release
+LD_PRELOAD=$PWD/target/release/librunic.so ./program
 ```
 
-Published crates:
+[C ABI contract](crates/runic-cabi/README.md)
 
-- `runic-alloc`: https://crates.io/crates/runic-alloc
-- `runic-cabi`: https://crates.io/crates/runic-cabi
-- `runic-core`: https://crates.io/crates/runic-core
+## Read next
 
-## Development
+| Document | Contents |
+|----------|----------|
+| [Architecture](ARCHITECTURE.md) | Flows, ownership, heap lifecycle, remote free |
+| [Compatibility](COMPATIBILITY.md) | Supported APIs, platforms, and gaps |
+| [Roadmap](ROADMAP.md) | Thesis, releases, next work |
+| [Measurement diary](diary.md) | Experiment results |
+
+## Develop
 
 ```sh
 cargo fmt --all -- --check
@@ -105,25 +55,8 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo bench -p runic-bench --no-run
 ```
 
-Use `scripts/profile.sh` for same-machine allocator profiles (ordinary Criterion
-benches; script wraps the resolved ELF under perf). Cost is `metrics.txt` /
-`--compare`; Where is `perf report` / annotate / samply on `perf.data`:
-
-```sh
-scripts/profile.sh --preflight
-scripts/profile.sh -l baseline global_runic 'global/runic/json_api'
-scripts/profile.sh --compare target/runic-profiles/run-before target/runic-profiles/run-after
-```
-
-## Release
-
-Release tags use plain semver, for example `0.7.0`.
-
-Release `runic-core` before `runic-alloc`, because `runic-alloc` depends on the published `runic-core` version during package verification.
+`cargo test --workspace` builds `librunic.so` and runs the preload tests.
 
 ## License
 
-Licensed under either of:
-
-- Apache License, Version 2.0
-- MIT license
+Apache-2.0 or MIT.

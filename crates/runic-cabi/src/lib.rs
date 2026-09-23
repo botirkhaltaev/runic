@@ -1,9 +1,9 @@
-#![deny(unsafe_op_in_unsafe_fn)]
-
-//! C malloc-family entry points for `LD_PRELOAD`.
+//! C malloc-family entry points for `LD_PRELOAD` (`librunic.so`).
 //!
-//! Each entry point translates its C contract once, then delegates to
-//! [`runic_core::Allocator`]. C `free` carries no layout and accepts null.
+//! Entry points map C arguments to [`runic_core::Allocator`] and return C errno
+//! or null. C `free` carries no layout and accepts null.
+
+#![deny(unsafe_op_in_unsafe_fn)]
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 compile_error!("runic-cabi supports Linux x86_64 only");

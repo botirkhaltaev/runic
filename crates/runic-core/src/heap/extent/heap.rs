@@ -384,24 +384,6 @@ mod tests {
     }
 
     #[test]
-    fn double_free_while_cached_is_rejected() {
-        let mut heap = ExtentHeap::new(ExtentConfig::new());
-        let pages = PageMap::new();
-        let spec = layout_spec(128 * 1024, 4096);
-        let ptr = heap
-            .allocate(spec, &OWNER, &pages, ExtentInit::Uninit)
-            .unwrap()
-            .unwrap();
-        let Some(PageOwner::Extent(extent)) = pages.get(ptr) else {
-            panic!("expected extent owner");
-        };
-        heap.free(extent, ptr, &pages).unwrap();
-
-        assert_eq!(heap.free(extent, ptr, &pages), Err(HeapError::DoubleFree));
-        assert_eq!(pages.get(ptr), Some(PageOwner::Extent(extent)));
-    }
-
-    #[test]
     fn zeroed_allocate_clears_cached_mapping() {
         let mut heap = ExtentHeap::new(ExtentConfig::new());
         let pages = PageMap::new();

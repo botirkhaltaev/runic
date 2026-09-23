@@ -1,21 +1,24 @@
 # runic-core/src
 
-Allocator core organized around entities and invariants.
+Module map for the allocator core. See
+[Architecture](../../../ARCHITECTURE.md) for process-wide flows.
 
 ## Modules
 
-- `allocator`: public core facade (`alloc` / `dealloc` / `free` / `usable_size` / `resize`), abort, and process-lifetime `Allocator::ctx()` (`Process` is private mmap).
-- `arena`: published immovable slots (`get` lock-free; `push` shared; `vacant` / `insert` / `remove` exclusive). Heap/run/extent metadata; growth maps another 256 KiB chunk.
-- `config`: `AllocatorConfig` and `Budget`. Run/extent policy live in `heap/run/config.rs` and `heap/extent/config.rs`.
+- `allocator`: `Allocator`, abort, and process-wide context.
+- `arena`: immovable slots for heap, run, and extent metadata.
+- `config`: `AllocatorConfig` and `Budget`.
 - `heap`: owner-local heaps, TLS current run, run/extent heaps, `Heaps`, and thread binding.
-- `layout`: normalized layout semantics and mapping sizing (`align` as `NonZeroUsize`; `mapping_len` uses `size + align - 1`).
+- `layout`: normalized layout and mapping size.
 - `memory`: address ranges, mmap ownership, and page-indexed owner lookup.
-- `size_class`: one size-class declaration generates lookup tables. `SizeClass` is minted only by `SizeClasses::class_for`. Free-hit geometry lives on `Run` (span + reciprocal).
+- `size_class`: generated size-class lookup tables.
 
 ## Invariant
 
-Every returned pointer must map to exactly one borrowed page-map owner. Runs accept only valid block-boundary frees; extents accept only the exact returned pointer. Raw decoding stays in page-map/run leaves; higher layers operate on `&Run`, `&Extent`, and `&'static Heap`.
+Every live pointer maps to one `PageOwner`. Runs accept block boundaries;
+extents accept the exact returned pointer. Raw decoding stays in page-map and
+run modules.
 
 ## Tests
 
-Unit tests live with the owning module when possible. Cross-entity allocator traces live in `../tests/`.
+Unit tests live with their module. Cross-entity traces live in `../tests/`.

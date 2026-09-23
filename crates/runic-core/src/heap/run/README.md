@@ -1,6 +1,7 @@
 # heap/run
 
-Run metadata owns small size-class allocations.
+Run metadata owns small size-class allocations. Hit/miss:
+[ARCHITECTURE.md](../../../../../ARCHITECTURE.md).
 
 ## Files
 
@@ -10,17 +11,24 @@ Run metadata owns small size-class allocations.
 
 ## Invariants
 
-- A run owns one size class and one range in a heap-owned map (not its own `Mapping`). The base is `RUN_SIZE`-aligned. Payload is `RUN_SIZE` bytes; the `Run` header lives at `base + RUN_SIZE` (`base`/`span`/`recip` next to `RunState`; remote `issued`/`link`/`claims` on the next 64-byte line); claim words follow the header. `Run::range` is the payload span only, and `PageMap::publish` stamps exactly that span. A map holds `MAP_RUNS` spaces (`RUN_SPACE` each). Small free uses `Run::header_of` (`ptr & !(RUN_SIZE-1)`), which checks the raw `base` word before constructing a `Run` pointer; otherwise lookup falls back to `PageMap`.
-- Returned blocks must be valid block boundaries inside the payload span.
-- `locate` is offset from the run base. `Run::header_of` is the small-free / realloc probe.
-- Owner Free/Live **authority** is freelist membership + `live` (+ bump). `allocate` is pop only. Empty freelist → `extend` threads one page of fresh blocks (at least 32, or remaining) and advances `issued` once. Hit free is `free` (`locate` → `live--` → pointer push). Miss / accept `discard` an `is_discardable` run. Owner double-free is undefined.
+- A run owns one size class in a heap-owned map. Its base is
+  `RUN_SIZE`-aligned; the payload is `RUN_SIZE` bytes.
+- The header follows the payload. Claim words follow the header. `PageMap`
+  publishes the payload only.
+- Returned pointers must be block boundaries inside the payload.
+  `Run::header_of` validates the raw base word before constructing `Run`.
+- Freelist membership and `live` decide Free vs Live. `allocate` pops. Empty
+  freelists call `extend`, which adds one page of fresh blocks, at least 32,
+  and advances `issued`. Hit free is `locate` then push. Owner double-free is
+  undefined.
 - Freelist head and intrusive payload links are payload addresses (`0` = end).
-- Remote admission is the private claim bitmap. `claim` is `issued` + `try_set` (second claim is `DoubleFree`). `accept` drains bits onto the freelist.
-- `Run` embeds a `Link<Run>` (see `heap::inbox`) coalescing remote frees by run. Repeat claims while already queued do not re-link.
-- `Run::accept` (owner-only, via `Heap::flush`) clears queued before scanning claim words so a racing claim is never dropped — the racer requeues, or accept asks the owner to push again.
-- Interior / foreign pointers fail closed via `locate` / `PageMap`. Never-issued remote claims are rejected via `issued`.
-- `Run::free` returns `RunFree::{Unchanged, Available}`; `OutOfRange` is current-run miss and `InvalidPointer` is interior. `accept` returns `Accept::{Done, Requeue}`. `RunHeap` calls `push_available` from those named outcomes.
-- `RunHeap` available-list references must refer to live in-space headers. `AvailableLink::{Unlisted,Tail,Next}` is the single membership/link state, so a run is listed at most once and `push_available` is idempotent. The current run may be on the list. `unbind` returns non-full current runs to the list.
-- Alloc miss checks out a run from `available[]` (or take/map), `extend`s if needed, and sets TLS `current`. Each run stores its process-lifetime owning `&Heap`; `heap().id()` derives the current generation.
-- Live small ownership increments/decrements the owning `Heap` atomic on 0↔1 edges in `allocate` / `free` / `accept`; `RunHeap::has_live` confirms by scanning after the atomic check.
-- Runs stay published and arena-resident for the heap lifetime. `RunPolicy::Discard` drops empty-run payload pages via `madvise`; the heap map stays. `Keep` leaves pages resident.
+- Remote admission is `issued` plus `try_set` on the claim bitmap. A second
+  claim is `DoubleFree`. `accept` drains bits onto the freelist.
+- The embedded inbox link coalesces remote frees by run. `accept` clears the
+  queued flag before scanning so racing claims can requeue.
+- Interior and foreign pointers fail closed. Never-issued remote claims fail
+  via `issued`.
+- Available-list membership is unique and `push_available` is idempotent. The
+  current run may also be listed.
+- Runs remain published for the heap lifetime. `Discard` releases empty payload
+  pages with `madvise`; `Keep` leaves them resident.

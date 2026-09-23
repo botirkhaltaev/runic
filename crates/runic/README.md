@@ -1,16 +1,10 @@
 # runic-alloc
 
-`runic-alloc` is Runic's public `GlobalAlloc` wrapper crate.
-
-The package name on crates.io is `runic-alloc`; the Rust library name is `runic`.
-
-## Install
+Public `GlobalAlloc` wrapper. Package `runic-alloc`, library `runic`.
 
 ```sh
 cargo add runic-alloc
 ```
-
-## Usage
 
 ```rust
 use runic::RunicAlloc;
@@ -19,11 +13,15 @@ use runic::RunicAlloc;
 static GLOBAL: RunicAlloc = RunicAlloc::new();
 ```
 
-Use the const builder for explicit retention policy experiments. Extent policy
-controls free-side retention: `Keep` retains a freed mapping while slot and byte
-budgets allow it, `Discard` retains then `madvise`s the pages, `Unmap` does not
-retain. Allocation-side lookup always reuses a retained mapping by exact length.
-Slot and byte budgets are enforced exactly.
+`dealloc` requires a live pointer this allocator returned. Null aborts
+(`GlobalAlloc` contract). Unknown and interior pointers abort.
+
+## Config
+
+First `init` in the process wins; later configs are ignored. Extent policy
+applies on free: `Keep` retains a mapping while slot and byte budgets allow,
+`Discard` retains then `madvise`s, `Unmap` does not retain. Allocate-side reuse
+is exact mapping length.
 
 ```rust
 use runic::{Budget, ExtentPolicy, RunPolicy, RunicAlloc};
@@ -36,16 +34,9 @@ static GLOBAL: RunicAlloc = RunicAlloc::builder()
     .build();
 ```
 
-`dealloc` requires a live pointer this allocator returned. Null is forbidden (`GlobalAlloc` contract) and aborts; it is not a no-op.
+C `LD_PRELOAD` is the `runic-cabi` package, not a feature of this crate.
 
-For C `LD_PRELOAD`, use the separate `runic-cabi` package. Keeping the cdylib
-separate prevents C symbols from entering Rust dependents.
-
-## Crate Shape
-
-- `src/lib.rs`: public export surface.
-- `src/global.rs`: configured `RunicAlloc` implementation of `GlobalAlloc`.
-- `src/bin/abort_case.rs`: subprocess binary used by abort tests.
-- `tests/`: global allocator smoke and abort-case integration tests.
-
-Most allocator mechanics live in `runic-core`.
+Nightly Rust on Linux `x86_64`. API:
+[docs.rs/runic-alloc](https://docs.rs/runic-alloc). Design:
+[ARCHITECTURE.md](../../ARCHITECTURE.md). Gaps:
+[COMPATIBILITY.md](../../COMPATIBILITY.md).

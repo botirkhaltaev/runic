@@ -1,3 +1,9 @@
+//! Runic allocator mechanics.
+//!
+//! Public type: [`Allocator`]. Most modules are crate-private. Feature `c-abi`
+//! switches thread-exit to a pthread hook for `LD_PRELOAD`; default is
+//! `std::thread_local!`.
+
 #![feature(thread_local)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![cfg_attr(all(feature = "c-abi", not(test)), no_std)]
