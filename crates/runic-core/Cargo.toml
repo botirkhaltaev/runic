@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 description.workspace = true
 
+[features]
+default = []
+c-abi = []
+
 [lints]
 workspace = true
 

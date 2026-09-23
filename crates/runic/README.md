@@ -1,6 +1,6 @@
 # runic-alloc
 
-`runic-alloc` is Runic's public `GlobalAlloc` wrapper crate.
+`runic-alloc` is Runic's public `GlobalAlloc` wrapper crate. The `c-abi` feature exports the C malloc family from its cdylib for `LD_PRELOAD`.
 
 The package name on crates.io is `runic-alloc`; the Rust library name is `runic`.
 
@@ -38,10 +38,34 @@ static GLOBAL: RunicAlloc = RunicAlloc::builder()
 
 `dealloc` requires a live pointer this allocator returned. Null is forbidden (`GlobalAlloc` contract) and aborts; it is not a no-op.
 
+## LD_PRELOAD (C / mimalloc-bench)
+
+Build the interceptor shared object:
+
+```sh
+cargo build -p runic-alloc --release --features c-abi
+```
+
+That produces `target/release/librunic.so` with `malloc` / `free` / `calloc` / `realloc`, `posix_memalign` / `aligned_alloc` / `memalign`, `malloc_usable_size`, `valloc` / `reallocarray` / `cfree`, and glibc `__libc_*` aliases. `free(NULL)` is a no-op. Unknown pointers abort.
+
+```sh
+LD_PRELOAD=/path/to/target/release/librunic.so ./my_c_program
+```
+
+[mimalloc-bench](https://github.com/daanx/mimalloc-bench):
+
+```sh
+alloc_lib_add "runic" "/path/to/runic/target/release/librunic.so"
+./bench.sh runic cfrac espresso
+```
+
+Do not enable `c-abi` on ordinary `runic-alloc` dependents: `#[no_mangle] malloc` would replace libc in that binary. Workspace `cargo test` stays on the default features.
+
 ## Crate Shape
 
 - `src/lib.rs`: public export surface.
 - `src/global.rs`: configured `RunicAlloc` implementation of `GlobalAlloc`.
+- `src/cabi.rs`: C malloc-family intercepts; `#[no_mangle]` only with `c-abi`.
 - `src/bin/abort_case.rs`: subprocess binary used by abort tests.
 - `tests/`: global allocator smoke and abort-case integration tests.
 

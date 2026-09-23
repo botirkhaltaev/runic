@@ -8,9 +8,15 @@ description.workspace = true
 
 [lib]
 name = "runic"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+c-abi = ["runic-core/c-abi"]
 
 [lints]
 workspace = true
 
 [dependencies]
-runic-core = { version = "0.7.0", path = "../runic-core" }
+libc = "0.2"
+runic-core = { version = "0.8.0", path = "../runic-core" }

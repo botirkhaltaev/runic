@@ -63,6 +63,13 @@ impl PageOwner {
         }
     }
 
+    pub(crate) fn usable(self) -> usize {
+        match self {
+            Self::Run(run) => run.class().size(),
+            Self::Extent(extent) => extent.len(),
+        }
+    }
+
     pub(crate) fn resize_in_place(
         self,
         ptr: NonNull<u8>,

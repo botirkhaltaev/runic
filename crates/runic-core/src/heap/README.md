@@ -37,7 +37,7 @@ Owner-local heap frontend: runs for small size classes, extents for dedicated la
 - Current-run empty: `extend`; accept inbox if nonempty; then local/OS `acquire_run`. Unbound: `bind` then `flush` then alloc. Hit: current pop / `Run::free`. Inbox `flush` is remote `accept`. `lookup` is miss / realloc.
 - `HeapState` packs generation, mode (`Free` / `Active` / `Draining` / terminal `Retired`), and in-flight lease count for Active enqueue admits. `adopt` is Draining→Active (leases unchanged). Inbox depth stays live via claim bits / `has_live`.
 - `Heaps` is `Arena<Heap>`. `get` is lock-free `Arena` then `Heap::matches` (slot + generation). Arena grow covers mapping ownership and bump insert only. Free heaps sit on an intrusive index freelist. Reclaim uses a lifecycle CAS, never an unconditional store. Fail only when the OS will not map more, or the arena is full.
-- `THREAD_HEAPS` is a `#[thread_local]` `!Drop` value (`%fs` load). Each active `ThreadHeap` captures `&Heap` plus the generation token at bind/adopt so unbind cannot close a later incarnation. `UnbindGuard` is the only `LocalKey` (touched in `bind`; `Drop` unbinds every slot).
+- `THREAD_HEAPS` is a `#[thread_local]` `!Drop` value (`%fs` load). Each active `ThreadHeap` captures `&Heap` plus the generation token at bind/adopt so unbind cannot close a later incarnation. Default builds use the fast Rust TLS `UnbindGuard`. The `c-abi` feature uses `UnbindHook`, a once-per-thread `pthread` key; glibc registers Rust TLS destructors through `__cxa_thread_atexit_impl`, which `calloc`s and re-enters `bind` under `LD_PRELOAD`.
 
 ## Current run (hit)
 
@@ -50,4 +50,4 @@ A small block is on exactly one of: user, run freelist, or remote-claimed.
 
 `current[class]` is a hint, not ownership. Available list is the reservoir; a run may be both current and listed. Frees never touch `current`. Interior pointers abort on `locate`. Owner DF is undefined.
 
-Miss / realloc use `lookup` (`header_of` for small, else `PageMap`). `ExtentCache` is heap-level mapping reuse, not a TLS free probe.
+Miss / realloc use `lookup` (`header_of` for a small layout, else `PageMap`). Pointer-only C `free` / `resize` use `PageMap` only: `header_of` can fault on an extent. C `free` still tries the current-run hit after PageMap names a run. `ExtentCache` is heap-level mapping reuse, not a TLS free probe.

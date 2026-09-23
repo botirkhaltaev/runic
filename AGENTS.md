@@ -36,6 +36,7 @@
 | Lint | `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
 | Bench build | `cargo bench -p runic-bench --no-run` |
 | Profile | `scripts/profile.sh` |
+| Preload `.so` | `cargo build -p runic-alloc --release --features c-abi` |
 
 ## External References
 
@@ -51,9 +52,9 @@
 
 ## Scope
 
-- v0.7 in: Linux x86_64, Rust nightly, `#[thread_local]` `THREAD_HEAPS`, `GlobalAlloc`, owner-local heaps, two equal TLS heaps, TLS current run, immortal extent slots, `Heap` live atomics, lock-free `Heaps::get`, draining `admit`/`flush` with optional `owner`, run/extent retention, remote-free, `realloc` / `alloc_zeroed`, tests, real-workload benches.
-- v0.7 out: quarantine, canaries, hugepages, NUMA, C ABI, ML placement, dashboards, background purge.
-- Next: C bindings after the crates.io 0.7.0 cut. Retain only when the real-workload Criterion corpus improves and no workload regresses >1%. Hit free is `Run::free` (`__rust_dealloc` has no callee-saved). `header_of` checks raw `base` before constructing `Run`. `issued` / `link` / claims live on `RemoteLine`. Live counts are `Heap` atomics; reclaim scans after. Zeroed Keep reuse ≥64 KiB discards pages without the Discard-insert clean flag; below that, memset. `ExtentPolicy::Discard` matches snmalloc — not a medium class. `Heaps::get` is a lock-free `Arena` read. Two equal TLS heaps; a third adopt stays on `Heaps::free` (lost on `channel_pipeline`). Do not compact `CLASS_FOR_SIZE`, retry first-fit extent reuse, identity, batch take, O(1) TLS steal, `#135` RSEQ, per-CPU heaps on rseq-rs, locate-offset dual free, a third TLS slot, reclaim live-scan elimination, realloc known-owner reuse, or the `spawn_churn` fault package. Do not port snmalloc. Claimed remote frees retry Active/Draining transitions; a generation advance proves the owner accepted the claim.
+- v0.8 in: Linux x86_64, Rust nightly, `#[thread_local]` `THREAD_HEAPS`, `GlobalAlloc`, C malloc-family LD_PRELOAD (`runic-alloc` feature `c-abi`), owner-local heaps, two equal TLS heaps, TLS current run, immortal extent slots, `Heap` live atomics, lock-free `Heaps::get`, draining `admit`/`flush` with optional `owner`, run/extent retention, remote-free, `realloc` / `alloc_zeroed`, tests, real-workload benches.
+- v0.8 out: quarantine, canaries, hugepages, NUMA, ML placement, dashboards, background purge.
+- Next: Retain only when the real-workload Criterion corpus improves and no workload regresses >1%. Hit free is `Run::free` (`__rust_dealloc` has no callee-saved). C `free` recovers the owner via `PageMap` (`header_of` is not safe on extents); `free(NULL)` is a C no-op. `header_of` checks raw `base` before constructing `Run`. `issued` / `link` / claims live on `RemoteLine`. Live counts are `Heap` atomics; reclaim scans after. Zeroed Keep reuse ≥64 KiB discards pages without the Discard-insert clean flag; below that, memset. `ExtentPolicy::Discard` matches snmalloc — not a medium class. `Heaps::get` is a lock-free `Arena` read. Two equal TLS heaps; a third adopt stays on `Heaps::free` (lost on `channel_pipeline`). Do not compact `CLASS_FOR_SIZE`, retry first-fit extent reuse, identity, batch take, O(1) TLS steal, `#135` RSEQ, per-CPU heaps on rseq-rs, locate-offset dual free, a third TLS slot, reclaim live-scan elimination, realloc known-owner reuse, or the `spawn_churn` fault package. Do not port snmalloc. Claimed remote frees retry Active/Draining transitions; a generation advance proves the owner accepted the claim.
 
 ## Learned User Preferences
 
