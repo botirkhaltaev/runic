@@ -20,7 +20,7 @@ Most users should depend on `runic-alloc`, not `runic-core` directly.
 
 ```toml
 [dependencies]
-runic-alloc = "0.6.0"
+runic-alloc = "0.7.0"
 ```
 
 ## Development

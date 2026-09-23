@@ -40,9 +40,9 @@ scope.
 
 ## Current Status
 
-Latest published release: `0.6.0`.
+Latest published release: `0.7.0`.
 
-The tree ships the v0.6 owner-local heap frontend: TLS heaps own runs and
+The tree ships the v0.7 owner-local heap frontend: TLS heaps own runs and
 extents that store their process-lifetime `&Heap` owner and derive `HeapId`,
 private run claim-bitmap remote admission,
 run/extent `Inbox` coalesced by owner, and Draining lifecycle after thread exit,
@@ -298,6 +298,21 @@ remote-free remain fail-closed
 ```
 
 `tag: 0.6.0` — `runic-core` / `runic-alloc` 0.6.0.
+
+### v0.7 Released: Two TLS Heaps and Draining Admit Diet
+
+```text
+two equal TLS heaps; third Draining adopt stays on Heaps::free
+immortal extent slots; PageOwner is &'static Run / Extent
+Heap live atomics; reclaim scans after
+lock-free Heaps::get
+draining admit / flush take optional owner (claimed queue+accept, one Inner lock)
+Heaps::enqueue deleted; Active enqueue admits via acquire_lease
+real-workload Criterion corpus is the retain gate
+rseq-rs is a separate crate; not wired into the hit
+```
+
+`tag: 0.7.0` — `runic-core` / `runic-alloc` 0.7.0.
 
 ### Next: Hardening
 
