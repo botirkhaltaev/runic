@@ -273,8 +273,7 @@ impl Extent {
     /// undefined. Remote admission is `claim` / `accept`.
     pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<(), ExtentError> {
         self.validate_exact(ptr)?;
-        self.state
-            .store(ExtentState::Free.raw(), Ordering::Relaxed);
+        self.state.store(ExtentState::Free.raw(), Ordering::Relaxed);
         Ok(())
     }
 
