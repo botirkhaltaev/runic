@@ -43,7 +43,9 @@
 
 | Need | File |
 |------|------|
-| Thesis, milestones, architecture | `ROADMAP.md` |
+| Thesis, milestones | `ROADMAP.md` |
+| Architecture | `ARCHITECTURE.md` |
+| Compatibility | `COMPATIBILITY.md` |
 | Measurement log | `diary.md` |
 | librseq-in-Rust word ops (not a runic hit) | https://github.com/botirkhaltaev/rseq-rs |
 | Install / usage | `README.md` |

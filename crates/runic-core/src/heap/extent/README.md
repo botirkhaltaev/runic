@@ -1,6 +1,7 @@
 # heap/extent
 
-Extent metadata owns dedicated large allocations.
+Extent metadata owns dedicated large allocations. Retention:
+[ARCHITECTURE.md](../../../../../ARCHITECTURE.md).
 
 ## Files
 
@@ -16,7 +17,8 @@ Extent metadata owns dedicated large allocations.
 ## Invariants
 
 - An extent owns at most one mapping dedicated to one returned allocation and stores its process-lifetime owning `&Heap`; `heap().id()` derives the current generation. Its arena slot is immortal; unmap drops only the mapping and reuses the slot later.
-- Frees must use the exact returned pointer, not an interior pointer; `Extent` validates before any state CAS.
+- Frees must use the exact returned pointer, not an interior pointer. Owner
+  double-free is undefined. Remote `claim` / `accept` still fail closed.
 - Remote frees `claim` then enqueue; the owning heap completes with `accept` (`Claimed → Free`) before shared `cache_or_unmap`.
 - **Published-while-cached:** Keep and Discard leave the arena entry and page-map stamp in place; the cache is an intrusive `head` list of `ExtentId` values into the owning arena. Cache-hit allocate calls `Extent::reuse(init)` and does not re-publish the mapping. True release (Unmap policy / over budget) calls `unmap`, which unpublishes and drops the mapping while retaining the immortal slot. Discard then `madvise(MADV_DONTNEED)`s the mapping.
 - Live large ownership increments/decrements the owning `Heap` atomic; `ExtentHeap::has_live` confirms by scanning Allocated/Claimed slots. Cached Free extents do not block reclaim.

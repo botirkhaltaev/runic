@@ -269,20 +269,12 @@ impl Extent {
         Some(user_ptr)
     }
 
-    /// Owner-local free: exact pointer, then `Allocated → Free`.
+    /// Owner-local free: exact pointer, then `Allocated → Free`. Owner DF is
+    /// undefined. Remote admission is `claim` / `accept`.
     pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<(), ExtentError> {
         self.validate_exact(ptr)?;
-        match self.state.compare_exchange(
-            ExtentState::Allocated.raw(),
-            ExtentState::Free.raw(),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => Ok(()),
-            Err(value) if value == ExtentState::Claimed.raw() => Err(ExtentError::DoubleFree),
-            Err(value) if value == ExtentState::Free.raw() => Err(ExtentError::DoubleFree),
-            Err(_) => Err(ExtentError::InvalidPointer),
-        }
+        self.state.store(ExtentState::Free.raw(), Ordering::Relaxed);
+        Ok(())
     }
 
     /// Freer: exact pointer, then `Allocated → Claimed`.

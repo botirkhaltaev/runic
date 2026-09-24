@@ -1,33 +1,30 @@
 # runic-core
 
-`runic-core` contains Runic's allocator mechanics and global allocator state.
+Allocator mechanics. Most modules are crate-private. The public type is
+`runic_core::Allocator`.
 
-This crate is published for the public `runic-alloc` crate, but most modules are internal. The main public entry point is `runic_core::Allocator`. It requires Rust nightly (`#![feature(thread_local)]`).
-
-## Responsibilities
-
-- Normalize allocation layouts.
-- Select size classes.
-- Manage heap-owned run maps and dedicated extents.
-- Store run headers in the run space (`base + RUN_SIZE`) and extent metadata in an arena.
-- Map returned pointers back to borrowed run/extent owners.
-- Keep raw pointer decoding and intrusive traversal inside page-map, run-heap, and inbox leaves.
-- Enforce run block-boundary checks and extent exact-pointer checks.
-
-## Usage
-
-Most users should depend on `runic-alloc`, not `runic-core` directly.
+Depend on `runic-alloc` unless you are embedding the core (as `runic-cabi`
+does).
 
 ```toml
 [dependencies]
-runic-alloc = "0.8.0"
+runic-alloc = "0.8"
 ```
 
-## Development
+## Contract
 
-```sh
-cargo test -p runic-core
-cargo clippy -p runic-core --all-targets --all-features -- -D warnings
-```
+- `alloc` / `dealloc` / `alloc_zeroed` take `Layout`. `dealloc` null aborts.
+- `free` / `resize` / `usable_size` are pointer-only. Owner comes from
+  `PageMap`. `header_of` is not used here (extent mappings may omit the run
+  header page). `free` null aborts. C `free(NULL)` is handled in `runic-cabi`.
+- First `Allocator::with_config` that initializes the process wins.
+- Feature `c-abi`: pthread `UnbindHook` for thread-exit under `LD_PRELOAD`.
+  Default is `std::thread_local!` `UnbindGuard`.
 
-See `src/README.md` for module responsibilities.
+Safety: returned memory is uninitialized unless `alloc_zeroed`. The caller must
+pass a live pointer back. Invalid domain state after lifecycle retries calls
+`Allocator::abort`.
+
+Modules: [src/README.md](src/README.md). API:
+[docs.rs/runic-core](https://docs.rs/runic-core). Design:
+[ARCHITECTURE.md](../../ARCHITECTURE.md).

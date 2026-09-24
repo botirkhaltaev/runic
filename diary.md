@@ -1,7 +1,8 @@
 # Runic Measurement Diary
 
-Session-local Cost, Where, RSS, and experiment verdicts. Not current scope —
-see [`ROADMAP.md`](ROADMAP.md) for architecture and milestones.
+Session-local Cost, Where, RSS, and experiment verdicts. Not current scope.
+See [ROADMAP.md](ROADMAP.md) for milestones and [ARCHITECTURE.md](ARCHITECTURE.md)
+for design.
 
 Host notes below are one Linux x86_64 box unless said otherwise. Cycles are
 `scripts/profile.sh` user cycles unless a table says Criterion midpoint.
@@ -64,7 +65,7 @@ Hit reshape vs that diet:
 ```text
                 diet    singleton    folds    aligned     snmalloc
 owner_free/64   11.9         11.0    10.4       9.4         11.5
-freelist/64     20.4         20.4    20.0        —          19.0
+freelist/64     20.4         20.4    20.0       n/a         19.0
 churn/64        29.4         28.2    28.0      27.5         28.0
 ```
 
@@ -513,8 +514,8 @@ Where (flat `cycles:u`):
   2.94 vs runic 2.44. Not an instruction-diet miss. `__rust_realloc` is 8.8%
   on runic; mimalloc spreads realloc across `mi_free` / `_mi_theap_realloc_zero`.
 
-Not squeezed by another hit-path fold. The remaining Cost is remote
-admission/`Heaps::admit`/adopt on the threaded corpus, and realloc of growing
+No further hit-path fold is supported by this profile. The remaining cost is
+remote admission/`Heaps::admit`/adopt on the threaded corpus, and realloc of growing
 `String`s. Those sit on already-declined or scoped-out levers (`multi-slot
 adopt`, `realloc known-owner reuse`, `BatchIt-on-Inbox`). No A/B this pass.
 
@@ -550,6 +551,41 @@ Active remote (`thread_pool_jobs`) did not move: `free_remote` 10.7% → 9.5%.
 Hit (`word_count`) still has no `ThreadHeaps` / `free_remote` in the top 15;
 the cpe bump is IPC, not extra instructions.
 
-Keep: draining admit diet is visible. Do not chase another hit micro-opt from
-this pass.
+The draining admission change is measurable. This profile does not justify
+more hit-path changes.
+
+## Checked owner double-free (declined)
+
+Tried out-of-band per-block `Allocated` / `Reusable` / `Claimed` state so
+owner-local small double-free would abort, matching the remote `claim` and
+extent paths. Immediate detection needs a hit-path load/store on every
+allocate and free.
+
+Pinned `profile.sh` CPU 0, `global/runic/hashmap_grow`, 3×3 s stat:
+
+```text
+                         cycles/elem   instructions/elem
+unchecked owner free        1171.983            3689.651
+locked bitmap               1498.913            4184.283
+compact tri-state bytes     1226.616            3783.236
+```
+
+The cheapest fail-closed map was still +4.7% cycles per element and +2.5%
+instructions per element. Leave owner double-free undefined for runs and
+extents, as snmalloc and mimalloc do on the default owner hit. Remote `claim`
+still detects duplicate frees. Revisit only as optional hardening.
+
+After restoring store-not-CAS owner extent free and the original `Run::free`,
+the same pin compared to `owner-df-before` is noise:
+
+```text
+                         cycles/elem   insn/elem   elem/s
+owner-df-before             1171.983     3689.651  3.2471e6
+owner-df-removed            1174.871     3681.067  3.2315e6
+delta                          +0.25%      -0.23%    -0.48%
+```
+
+Criterion on `hashmap_grow` reported no change (p > 0.05) across the three
+3s samples. Cache-misses/elem doubled in the ratio table (0.0007 to 0.0014)
+on a near-zero count; ignore.
 

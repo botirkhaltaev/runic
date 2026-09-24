@@ -1,17 +1,14 @@
 # runic-preload
 
-`runic-preload` tests `librunic.so` the way it is actually deployed: loaded
-ahead of libc, serving a process it did not compile with.
-
-The package is internal to the workspace and is not published.
+`runic-preload` starts child processes with `librunic.so` ahead of libc. It is
+an internal test crate and is not published.
 
 ```sh
 cargo test -p runic-preload
 ```
 
-Cargo builds the interceptor as a cdylib artifact dependency, so `LIBRARY`
-points at the `librunic.so` of the current profile with no path guessing and
-no separate build step.
+Cargo builds the interceptor as a cdylib artifact dependency and provides its
+path through `LIBRARY`.
 
 ## Layout
 
@@ -19,12 +16,12 @@ no separate build step.
 - `src/bin/preload-case.rs`: one case per process.
 - `tests/preload.rs`: runs each case preloaded and checks the exported symbols.
 
-## Why a separate binary
+## Child process
 
-`LD_PRELOAD` applies at `exec`, so the interceptor can never replace the test
-harness's own allocator, and the invalid-pointer cases end in `abort`. Both
-need a child process. Contract coverage for the entry points themselves is in
-the `runic-cabi` unit tests, which call them directly.
+`LD_PRELOAD` applies at `exec`, so it cannot replace the running test harness's
+allocator. Invalid-pointer cases also abort the process. One fixture binary
+runs both kinds of case. `runic-cabi` unit tests cover entry-point contracts
+directly.
 
 ## Cases
 
