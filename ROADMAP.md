@@ -101,16 +101,59 @@ header_of is not used on unknown pointers
 
 Released as `0.8.0`.
 
-## Next: hardening
+## Next
 
-Planned:
+0.8 is experimental. Production means Fast stays competitive on the real-workload
+corpus, Safe makes owner mistakes defined, Hardened is opt-in integrity, RSS
+can be given back, C programs can trim and inspect, and Linux is not the only
+`Memory` impl. Fast stays free of Safe and Hardened work.
 
-```text
-checked or encoded reusable-block metadata
-metadata cookies
-optional delayed reuse
-guard pages for selected large allocations
-randomized placement only after deterministic paths are stable
-```
+Any Fast-path default (hugepage, NUMA, reclaim) needs a real-workload screen
+and the 1% retain gate. Safe and Hardened are measured as their own columns.
 
-Later work: backend region ownership, decay, purge, and hugepage-aware mapping.
+### Modes (planned)
+
+`RunicAlloc::new().with_x()` / `with_mode`, const, no separate builder type.
+`Mode::{Fast, Safe, Hardened}`. Preload reads `RUNIC_*`, including `RUNIC_MODE`.
+Do not ship a Safe or Hardened label that is Fast underneath.
+
+### 0.9 Mapping and config
+
+Leaf `Memory` trait, Linux impl; `Mapping` owns the region. Hugepage is off,
+THP hint (`madvise(MADV_HUGEPAGE)`), or force (`MAP_HUGETLB`). Force fails the
+map when the kernel cannot give huge pages (no silent 4 KiB fallback). THP hint
+keeps the 4 KiB map if pages never collapse. NUMA preferred-local is a separate
+knob. Defaults come from a Fast screen. Fast is fully implemented; Safe and
+Hardened fail closed until their milestones.
+
+### 0.10 Safe
+
+Owner-local double-free aborts on runs and extents (remote `claim` already
+does). C `realloc` keeps the original alignment from `posix_memalign`,
+`aligned_alloc`, and `memalign`.
+
+### 0.11 Hardened
+
+Cookies, canaries, extent guard pages, delayed reuse / quarantine, metadata
+checksums. Randomized placement only after Safe is stable. Nothing on Fast.
+
+### 0.12 Reclaim
+
+Decay, idle unmap, `malloc_trim`, optional background purge off Fast.
+
+### 0.13 Ops and process
+
+`mallinfo` / `mallinfo2`, `malloc_stats`, `malloc_info`. Rust counters from
+existing live atomics plus RSS. `pthread_atfork`. Late `dlopen` tested. No
+glibc hooks, mallopt, or `MALLOC_*` aliases.
+
+### 0.14 Platforms
+
+Linux aarch64, then macOS and Windows as new `Memory` leaves. Cabi per OS only
+when an interceptor is worth shipping. Stable Rust only if Fast does not
+regress.
+
+### Declined
+
+Unless a new screen reverses them: per-CPU heaps, RSEQ on the hit, extra TLS
+slots, signal-safe malloc, WASI, ML placement, stats dashboards.

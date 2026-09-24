@@ -8,7 +8,8 @@ Invalid and foreign frees abort. Owner double-free is undefined. C
 Version **0.8.0** provides `GlobalAlloc` and the C malloc family for
 `LD_PRELOAD`. It requires nightly Rust (`#[thread_local]`). Hardening,
 hugepages, NUMA, and background purge are not implemented. See
-[Compatibility](COMPATIBILITY.md).
+[Compatibility](COMPATIBILITY.md). Planned work is the
+[Roadmap](ROADMAP.md).
 
 ## Rust
 
