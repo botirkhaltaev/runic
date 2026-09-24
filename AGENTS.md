@@ -57,8 +57,8 @@
 ## Scope
 
 - v0.8 in: Linux x86_64, Rust nightly, `#[thread_local]` `THREAD_HEAPS`, `GlobalAlloc`, C malloc-family LD_PRELOAD (`runic-cabi`), owner-local heaps, two equal TLS heaps, TLS current run, immortal extent slots, `Heap` live atomics, lock-free `Heaps::get`, draining `admit`/`flush` with optional `owner`, run/extent retention, remote-free, `realloc` / `alloc_zeroed`, tests, real-workload benches.
-- v0.8 out: quarantine, canaries, hugepages, NUMA, ML placement, dashboards, background purge.
-- Next: Retain only when the real-workload Criterion corpus improves and no workload regresses >1%. Hit free is `Run::free` (`__rust_dealloc` has no callee-saved). C `free` recovers the owner via `PageMap` (`header_of` is not safe on extents); `free(NULL)` is a C no-op. `header_of` checks raw `base` before constructing `Run`. `issued` / `link` / claims live on `RemoteLine`. Live counts are `Heap` atomics; reclaim scans after. Zeroed Keep reuse ≥64 KiB discards pages without the Discard-insert clean flag; below that, memset. `ExtentPolicy::Discard` matches snmalloc — not a medium class. `Heaps::get` is a lock-free `Arena` read. Two equal TLS heaps; a third adopt stays on `Heaps::free` (lost on `channel_pipeline`). Do not compact `CLASS_FOR_SIZE`, retry first-fit extent reuse, identity, batch take, O(1) TLS steal, `#135` RSEQ, per-CPU heaps on rseq-rs, locate-offset dual free, a third TLS slot, reclaim live-scan elimination, realloc known-owner reuse, or the `spawn_churn` fault package. Do not port snmalloc. Claimed remote frees retry Active/Draining transitions; a generation advance proves the owner accepted the claim.
+- v0.8 out: quarantine, canaries, hugepages, NUMA, ML placement, dashboards, background purge, Safe/Hardened modes. Production sequence: `ROADMAP.md` 0.9–0.14.
+- Next: `ROADMAP.md` (0.9 mapping/config through 0.14 platforms). Fast defaults only after a real-workload screen and the 1% retain gate; do not mix Safe/Hardened into Fast. Hit free is `Run::free` (`__rust_dealloc` has no callee-saved). C `free` recovers the owner via `PageMap` (`header_of` is not safe on extents); `free(NULL)` is a C no-op. `header_of` checks raw `base` before constructing `Run`. `issued` / `link` / claims live on `RemoteLine`. Live counts are `Heap` atomics; reclaim scans after. Zeroed Keep reuse ≥64 KiB discards pages without the Discard-insert clean flag; below that, memset. `ExtentPolicy::Discard` matches snmalloc — not a medium class. `Heaps::get` is a lock-free `Arena` read. Two equal TLS heaps; a third adopt stays on `Heaps::free` (lost on `channel_pipeline`). Do not compact `CLASS_FOR_SIZE`, retry first-fit extent reuse, identity, batch take, O(1) TLS steal, `#135` RSEQ, per-CPU heaps on rseq-rs, locate-offset dual free, a third TLS slot, reclaim live-scan elimination, realloc known-owner reuse, or the `spawn_churn` fault package. Do not port snmalloc. Claimed remote frees retry Active/Draining transitions; a generation advance proves the owner accepted the claim.
 
 ## Learned User Preferences
 
@@ -77,7 +77,7 @@
 
 ## Learned Workspace Facts
 
-- `ROADMAP.md` is thesis, milestones, and architecture only; profiling notes and tried experiments go in `diary.md`.
+- `ROADMAP.md` is thesis and milestones only; architecture is `ARCHITECTURE.md`; compatibility is `COMPATIBILITY.md`; profiling notes and tried experiments go in `diary.md`.
 - RSEQ experiments use the separate `rseq-rs` crate, not an in-tree rseq implementation.
 - C malloc-family LD_PRELOAD is the published `runic-cabi` crate (cdylib `librunic.so`), not a `runic-alloc` feature. `runic-core`'s `c-abi` feature is pthread TLS for thread-exit under preload; default is `std::thread_local!`.
 - Publish with `cargo publish --workspace`; do not wait-loop on crates.io.

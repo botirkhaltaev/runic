@@ -2,8 +2,8 @@
 
 On Linux `x86_64`, Runic implements `GlobalAlloc` and the malloc-family entry
 points listed below. It supports remote free and thread exit and requires
-nightly Rust. It does not implement hardening, NUMA, hugepages, background
-purge, or telemetry.
+nightly Rust. It does not implement Fast/Safe/Hardened modes, NUMA, hugepages,
+background purge, or telemetry. Planned work is [ROADMAP.md](ROADMAP.md).
 
 ## Platform
 
@@ -20,7 +20,7 @@ purge, or telemetry.
 |------------|--------|
 | Implemented | `alloc`, `dealloc`, `alloc_zeroed`, `realloc` via `RunicAlloc` |
 | Contract | Null `dealloc` aborts. Layout must match what was used to allocate. Unknown and interior pointers abort |
-| Double free | Remote `claim` rejects a second free. Owner-local double-free is undefined |
+| Double free | Remote `claim` rejects a second free. Owner-local double-free is undefined (roadmap 0.10 Safe) |
 | `realloc` | Preserves the prefix; may move; uses the new `Layout` alignment |
 | Config | `ExtentPolicy::{Keep,Discard,Unmap}`, `RunPolicy::{Keep,Discard}`, extent slot/byte `Budget`. First `init` in the process wins |
 
@@ -42,8 +42,8 @@ __libc_cfree __libc_posix_memalign
 |------------|--------|
 | Implemented | Symbols above; `free(NULL)` is a no-op; overflowing `calloc` / `reallocarray` return null and set `ENOMEM` |
 | Errno | Pointer-returning failures set `ENOMEM` or `EINVAL`. `posix_memalign` returns the code and does not change errno |
-| `realloc` | Preserves the prefix but not alignment from `posix_memalign`, `aligned_alloc`, or `memalign`; new alignment is `max_align_t` (16) |
-| Missing | `mallinfo`, `malloc_stats`, `malloc_trim`, `malloc_info`, hooks, per-arena glibc knobs, `dlopen` after startup |
+| `realloc` | Preserves the prefix but not alignment from `posix_memalign`, `aligned_alloc`, or `memalign`; new alignment is `max_align_t` (16). Roadmap 0.10 keeps the original alignment |
+| Missing | `mallinfo`, `malloc_stats`, `malloc_trim`, `malloc_info`, hooks, per-arena glibc knobs, `dlopen` after startup (roadmap 0.13; hooks stay out) |
 | Deploy | `LD_PRELOAD` at process start. Do not combine with `#[global_allocator]` `RunicAlloc` in the same process |
 
 `runic-cabi` tests entry-point contracts. `runic-preload` tests interposition,
@@ -62,9 +62,11 @@ thread exit, aborts, and the exact export set.
 | Capability | Status |
 |------------|--------|
 | Implemented | Runs retained for the heap lifetime; `RunPolicy::Discard` is `madvise` on empty payload. Extent Keep / Discard / Unmap with exact-length reuse |
-| Missing | Background purge, decay, idle-time unmap, hugepage backing, NUMA bind |
+| Missing | Background purge, decay, idle-time unmap (roadmap 0.12). Hugepage off/THP/force and NUMA bind (roadmap 0.9) |
 
 ## Hardening and ops
 
-Missing: quarantine, canaries, guard pages, cookies, checksums, delayed reuse,
-stats dashboard, env/runtime profiles, `MALLOC_*` compatibility.
+Missing in 0.8: quarantine, canaries, guard pages, cookies, checksums, delayed
+reuse, env/runtime profiles. Safe is roadmap 0.10; Hardened is 0.11; env and
+`with_mode` are 0.9. Stats dashboards and `MALLOC_*` compatibility stay
+declined. See [ROADMAP.md](ROADMAP.md).
