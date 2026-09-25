@@ -398,14 +398,14 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "runic-alloc"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "runic-core",
 ]
 
 [[package]]
 name = "runic-bench"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "bytes",
  "criterion",
@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "runic-cabi"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "libc",
  "runic-core",
@@ -432,7 +432,7 @@ dependencies = [
 
 [[package]]
 name = "runic-core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "libc",
  "spin",
@@ -440,7 +440,7 @@ dependencies = [
 
 [[package]]
 name = "runic-preload"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "libc",
  "object",

@@ -5,12 +5,12 @@ user allocations. Unsafe code is limited to OS and ownership boundaries.
 Invalid and foreign frees abort. Owner double-free is undefined. C
 `free(NULL)` is a no-op.
 
-Published version **0.8.0** provides `GlobalAlloc` and the C malloc family for
-`LD_PRELOAD`. The current tree adds the 0.9 mapping/config surface: payload
-hugepage and NUMA knobs, const `RunicAlloc::new().with_*`, and `RUNIC_*` for
-preload. It requires nightly Rust (`#[thread_local]`). Safe/Hardened behavior
-and background purge are not implemented. See
-[Compatibility](COMPATIBILITY.md) and the [Roadmap](ROADMAP.md).
+Published version **0.9.0** provides `GlobalAlloc`, the C malloc family for
+`LD_PRELOAD`, payload hugepage and NUMA knobs, and const
+`RunicAlloc::new().with_*` with `RUNIC_*` for preload. It requires nightly
+Rust (`#[thread_local]`). Safe/Hardened behavior and background purge are
+not implemented. See [Compatibility](COMPATIBILITY.md) and the
+[Roadmap](ROADMAP.md).
 
 ## Rust
 

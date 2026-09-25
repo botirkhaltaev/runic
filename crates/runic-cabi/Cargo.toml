@@ -15,4 +15,4 @@ workspace = true
 
 [dependencies]
 libc = "0.2"
-runic-core = { version = "0.8.0", path = "../runic-core", features = ["c-abi"] }
+runic-core = { version = "0.9.0", path = "../runic-core", features = ["c-abi"] }

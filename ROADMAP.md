@@ -13,11 +13,12 @@ concurrency and performance work depend on them.
 
 ## Current status
 
-Runic **0.8.0** is published: `runic-core`, `runic-alloc`, `runic-cabi`.
+Runic **0.9.0** is published: `runic-core`, `runic-alloc`, `runic-cabi`.
 
 The release includes owner-local heaps, two TLS heap slots, remote free,
-thread-exit draining, run and extent retention, pointer-only C free/realloc,
-and a malloc-family `LD_PRELOAD` library.
+thread-exit draining, run and extent retention, a malloc-family `LD_PRELOAD`
+library, a `Memory` leaf, payload hugepage and NUMA hints, and const
+allocator config. Fast defaults are Off/Off.
 
 ## Milestones
 
@@ -101,13 +102,23 @@ header_of is not used on unknown pointers
 
 Released as `0.8.0`.
 
+### v0.9: Mapping and config
+
+```text
+Memory trait behind the Os alias; Linux is the only impl
+Mapping owns the mmap; prefer applies THP and NUMA-local hints
+HugePage Off or Thp; Numa Off or Local; defaults Off/Off
+AllocatorConfig with const with_* and no builder
+RUNIC_* overlay at preload; non-Fast Mode aborts at init
+```
+
+Released as `0.9.0`.
+
 ## Next
 
-0.8 is published. 0.9 mapping and config is in-tree: `Memory` leaf, payload
-hugepage/NUMA knobs, `RunicAlloc::new().with_*`, cabi `RUNIC_*`. Fast defaults
-are Off/Off after the corpus screen. Production still means Safe owner mistakes,
-Hardened integrity, reclaim, C trim/inspect, and other `Memory` impls. Fast
-stays free of Safe and Hardened work.
+0.9 is published. Production still means Safe owner mistakes, Hardened
+integrity, reclaim, C trim/inspect, and other `Memory` impls. Fast stays free
+of Safe and Hardened work.
 
 Any further Fast-path default (reclaim) needs a pinned real-workload screen.
 Weight the representative production workloads; investigate every regression
@@ -119,15 +130,6 @@ Safe and Hardened are measured as their own columns.
 `RunicAlloc::new().with_x()` / `with_mode`, const, no separate builder type.
 `Mode::{Fast, Safe, Hardened}`. Preload reads `RUNIC_*`, including `RUNIC_MODE`.
 Safe and Hardened abort at first `init` until 0.10 / 0.11.
-
-### 0.9 Mapping and config
-
-Done. Leaf `Memory` trait behind the `Os` alias, `Linux` impl; `Mapping` owns
-the region. Hugepage is off or a THP hint (`madvise(MADV_HUGEPAGE)`). Dedicated
-hugetlb (`MAP_HUGETLB`) is not an allocator knob: it is a kernel reservation
-and a second mapping grain. THP keeps the 4 KiB map if pages never collapse.
-NUMA preferred-local is a separate knob. Fast screen kept Off/Off as `Hints`
-default. Safe and Hardened fail closed until their milestones.
 
 ### 0.10 Safe
 

@@ -13,7 +13,7 @@ name = "runic"
 workspace = true
 
 [dependencies]
-runic-core = { version = "0.8.0", path = "../runic-core" }
+runic-core = { version = "0.9.0", path = "../runic-core" }
 
 [[bin]]
 name = "abort-case"
