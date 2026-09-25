@@ -650,3 +650,31 @@ establish a placement-caused win. It does reject Local as a default and does
 not overturn Off/Off: Off remains the balanced, explicit baseline while Thp
 and Local stay opt-in.
 
+## Inbox list split and policy folds
+
+`List` split out of `Inbox`, `RunHeap::release` on the slow free, lookup and
+the realloc copy fallback on `Allocator`, and both miss paths calling
+`Heap::flush`. Criterion `global_runic` on CPUs 24-27, suite defaults, branch
+against a saved `master` (0.9.0) baseline:
+
+```text
+workload              change    p
+word_count            +1.57%    0.03
+vec_growth_log        -2.02%    0.00
+hashmap_grow          -0.51%    0.12
+vecdeque_events       -0.56%    0.04
+text_index            +0.92%    0.00
+graph_shortest_path   -1.77%    0.00
+json_api              +3.21%    0.00
+http_parse            -0.82%    0.00
+thread_pool_jobs      -3.16%    0.00
+others                within noise (p > 0.05)
+```
+
+Paired 5 s, 20 sample reruns: `json_api` -1.16%, `word_count` +1.74%. The
+1 s `json_api` swing was noise. `word_count` under `profile.sh` on CPU 24
+(three 2 s repeats): cycles per element 271.41 to 271.20 (-0.08%),
+instructions per element 734.98 to 735.88 (+0.12%), elements per second
++0.26%. No regression in the counters; the Criterion delta is run-to-run
+timing noise. Retained.
+
