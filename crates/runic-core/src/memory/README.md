@@ -10,7 +10,7 @@ Address ranges, OS mappings, and page-indexed lookup. See
   payload defaults), the `Linux` impl, and owning `Mapping` (`prefer` /
   `prefer_huge` / `prefer_local`).
 - `page_map/`: page-indexed lookup from user pointers to process-lifetime `PageOwner` metadata.
-  - `mod.rs`: `PageMap::{publish,unpublish,get}` and `PageOwner`.
+  - `mod.rs`: `PageMap::{publish,unpublish,get}` and the `PageOwner` stamp. `usable` and `resize_in_place` live on the heap.
   - `entry.rs`: `MapEntry` / `AtomicMapEntry` tagged-pointer encoding (`load` / `store`).
   - `page.rs`: page/index arithmetic and per-L1-table range segmentation.
   - `table.rs`: hot lookup tables, cold write state, and L2 page stamps.

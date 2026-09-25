@@ -3,6 +3,7 @@ pub(crate) mod extent;
 mod heaps;
 pub(crate) mod id;
 pub(crate) mod inbox;
+mod list;
 pub(crate) mod run;
 mod state;
 pub(crate) mod thread;
@@ -32,7 +33,7 @@ pub(crate) use heaps::Heaps;
 pub(crate) use id::HeapId;
 pub(crate) use run::{Accept, Run, RunError, RunFree, RunHeap, RunId};
 pub(crate) use state::HeapMode;
-pub(crate) use thread::{THREAD_HEAPS, ThreadFreeError, ThreadHeaps};
+pub(crate) use thread::{THREAD_HEAPS, ThreadFreeError};
 
 /// Indexed heap entry: lifecycle, remote-free inboxes, and owner-local run/extent metadata.
 ///
@@ -71,6 +72,26 @@ pub(super) struct HeapInner {
     extents: ExtentHeap,
 }
 
+impl PageOwner {
+    pub(crate) fn usable(self) -> usize {
+        match self {
+            Self::Run(run) => run.class().size(),
+            Self::Extent(extent) => extent.len(),
+        }
+    }
+
+    pub(crate) fn resize_in_place(
+        self,
+        ptr: NonNull<u8>,
+        spec: LayoutSpec,
+    ) -> Result<bool, HeapError> {
+        match self {
+            Self::Run(run) => run.resize_in_place(ptr, spec).map_err(HeapError::from),
+            Self::Extent(extent) => extent.resize_in_place(ptr, spec).map_err(HeapError::from),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum OwnerState {
     Live,
@@ -103,6 +124,10 @@ impl HeapInner {
         self.runs.push_available(run)
     }
 
+    pub(super) fn release(&mut self, run: &'static Run, outcome: RunFree) -> Result<(), HeapError> {
+        self.runs.release(run, outcome)
+    }
+
     pub(super) fn acquire_run(
         &mut self,
         class: SizeClass,
@@ -124,12 +149,8 @@ impl HeapInner {
     ) -> Result<OwnerState, HeapError> {
         match owner {
             PageOwner::Run(run) => {
-                if run.free(ptr).map_err(HeapError::from)? == RunFree::Available {
-                    self.runs.push_available(run)?;
-                }
-                if run.is_discardable() {
-                    run.discard();
-                }
+                let outcome = run.free(ptr).map_err(HeapError::from)?;
+                self.runs.release(run, outcome)?;
                 Ok(if run.is_live() {
                     OwnerState::Live
                 } else {
@@ -324,6 +345,8 @@ impl Heap {
     /// Drain both inboxes into run/extent metadata (accept).
     ///
     /// `owner` queues a claimed remote before accept so queue+flush share Inner.
+    /// A miss calls this before mapping: claimed-full runs must be accepted first
+    /// or `acquire` returns null. Empty inboxes return immediately.
     pub(super) fn flush(
         &self,
         inner: &mut HeapInner,
@@ -341,15 +364,15 @@ impl Heap {
                 }
             }
         }
-        while let Some(chain) = self.run_inbox.drain() {
-            for run in chain {
+        while !self.run_inbox.is_empty() {
+            for run in self.run_inbox.drain() {
                 if inner.runs.accept(run)? == Accept::Requeue {
                     self.run_inbox.queue(run);
                 }
             }
         }
-        while let Some(chain) = self.extent_inbox.drain() {
-            for extent in chain {
+        while !self.extent_inbox.is_empty() {
+            for extent in self.extent_inbox.drain() {
                 inner.extents.accept(extent, extent.ptr(), ctx.pages)?;
             }
         }
@@ -364,9 +387,7 @@ impl Heap {
         init: ExtentInit,
         ctx: &AllocatorCtx,
     ) -> Result<Option<NonNull<u8>>, HeapError> {
-        if !self.inboxes_empty() {
-            self.flush(inner, ctx, None)?;
-        }
+        self.flush(inner, ctx, None)?;
         inner.extents.allocate(spec, self, ctx.pages, init)
     }
 }

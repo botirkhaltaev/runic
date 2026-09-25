@@ -7,7 +7,7 @@ use core::{
 use crate::{
     config::{AllocatorConfig, HugePage, Mode, Numa},
     heap::{
-        AllocatorCtx, ExtentInit, HeapError, Heaps, THREAD_HEAPS, ThreadFreeError, ThreadHeaps,
+        AllocatorCtx, ExtentInit, HeapError, Heaps, Run, THREAD_HEAPS, ThreadFreeError,
         extent::config::ExtentConfig, run::config::RunConfig,
     },
     layout::LayoutSpec,
@@ -194,6 +194,19 @@ impl Allocator {
         }
     }
 
+    /// Layout-known owner: in-page header for a size class, else `PageMap`.
+    ///
+    /// Pointer-only free and resize must not call this. `header_of` loads the
+    /// run-header page, which an extent mapping may omit.
+    pub(crate) fn lookup(pages: &PageMap, ptr: NonNull<u8>, spec: LayoutSpec) -> Option<PageOwner> {
+        if SizeClasses::class_for(spec).is_some()
+            && let Some(run) = Run::header_of(ptr)
+        {
+            return Some(PageOwner::Run(run));
+        }
+        pages.get(ptr)
+    }
+
     /// Pointer-only realloc. Owner from `PageMap`, never `Run::header_of`.
     ///
     /// `new` is the requested layout of the replacement (`max_align_t` at the C
@@ -222,16 +235,7 @@ impl Allocator {
             Err(_) => Self::abort(),
         }
 
-        // SAFETY: `new` is well-formed.
-        let new_ptr = unsafe { self.alloc(new) };
-        if new_ptr.is_null() {
-            return null_mut();
-        }
-        // SAFETY: `new_ptr` is fresh; `ptr` is live for `old_len` bytes.
-        unsafe { copy_nonoverlapping(ptr, new_ptr, old_len.min(new.size())) };
-        // SAFETY: `ptr` is still the live original.
-        unsafe { self.free(ptr) };
-        new_ptr
+        self.replace(ptr, old_len, new, OldFree::Pointer)
     }
 
     /// Changes the size of an allocation using allocate-copy-free semantics.
@@ -269,7 +273,7 @@ impl Allocator {
         let new_spec = LayoutSpec::from_layout(new_layout);
         let old_spec = LayoutSpec::from_layout(old);
 
-        let resized = match ThreadHeaps::lookup(ctx.pages, old_ptr, old_spec) {
+        let resized = match Self::lookup(ctx.pages, old_ptr, old_spec) {
             Some(owner) => owner.resize_in_place(old_ptr, new_spec),
             None => Self::abort(),
         };
@@ -279,18 +283,24 @@ impl Allocator {
             Err(_) => Self::abort(),
         }
 
-        // SAFETY: alloc returns a valid pointer for new_layout or null; we only use it if non-null.
+        self.replace(ptr, old.size(), new_layout, OldFree::Layout(old))
+    }
+
+    /// Allocate `new_layout`, copy `old_len` bytes, then free `ptr`.
+    fn replace(&self, ptr: *mut u8, old_len: usize, new_layout: Layout, free: OldFree) -> *mut u8 {
+        // SAFETY: `new_layout` is well-formed. The pointer is used only when non-null.
         let new_ptr = unsafe { self.alloc(new_layout) };
         if new_ptr.is_null() {
             return null_mut();
         }
-
-        // SAFETY: new_ptr is freshly allocated for at least new_layout.size() bytes; ptr is
-        // valid for old.size() bytes.
-        unsafe { copy_nonoverlapping(ptr, new_ptr, old.size().min(new_layout.size())) };
-        // SAFETY: ptr was validated above as a pointer this allocator owns.
-        unsafe { self.dealloc(ptr, old) };
-
+        // SAFETY: `new_ptr` is fresh for `new_layout`. `ptr` is live for `old_len` bytes.
+        unsafe { copy_nonoverlapping(ptr, new_ptr, old_len.min(new_layout.size())) };
+        match free {
+            // SAFETY: `ptr` is still the live original.
+            OldFree::Pointer => unsafe { self.free(ptr) },
+            // SAFETY: `ptr` was allocated with `old`.
+            OldFree::Layout(old) => unsafe { self.dealloc(ptr, old) },
+        }
         new_ptr
     }
 
@@ -502,6 +512,13 @@ impl Allocator {
             }
         }
     }
+}
+
+/// How [`Allocator::replace`] frees the old block.
+#[derive(Clone, Copy)]
+enum OldFree {
+    Pointer,
+    Layout(Layout),
 }
 
 /// Cold unbound alloc request — one bind/Active path for run and extent.
@@ -753,7 +770,7 @@ mod tests {
             let _id = tls.bind(&ctx).unwrap();
             let ptr = alloc_small(tls, &ctx, layout);
             let spec = LayoutSpec::from_layout(layout);
-            let Some(PageOwner::Run(run)) = ThreadHeaps::lookup(ctx.pages, ptr, spec) else {
+            let Some(PageOwner::Run(run)) = Allocator::lookup(ctx.pages, ptr, spec) else {
                 panic!("alloc should publish a run");
             };
             assert!(Run::header_of(ptr).unwrap() == run);
@@ -764,7 +781,7 @@ mod tests {
             assert_eq!(tls.free_run(run, again), Ok(()));
             tls.unbind(&ctx);
             assert_eq!(
-                ThreadHeaps::lookup(ctx.pages, ptr, spec),
+                Allocator::lookup(ctx.pages, ptr, spec),
                 Some(PageOwner::Run(run))
             );
         };
@@ -1287,7 +1304,7 @@ mod tests {
         {
             let tls = &THREAD_HEAPS;
             assert_eq!(
-                ThreadHeaps::lookup(pages, first0, LayoutSpec::from_layout(layout)),
+                Allocator::lookup(pages, first0, LayoutSpec::from_layout(layout)),
                 Some(PageOwner::Run(run_a))
             );
             assert_eq!(tls.free_run(run_b, extra), Ok(()));

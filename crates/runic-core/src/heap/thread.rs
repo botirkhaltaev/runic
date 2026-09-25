@@ -9,7 +9,7 @@ use crate::{
     allocator::Allocator,
     heap::{Extent, ExtentInit, HeapError, HeapId, Run, RunError, RunFree},
     layout::LayoutSpec,
-    memory::{PageMap, PageOwner},
+    memory::PageOwner,
     size_class::{SizeClass, SizeClasses},
 };
 
@@ -130,19 +130,6 @@ impl ThreadHeaps {
         })
     }
 
-    /// Small layout: in-page header. Else `PageMap` (extents / fallback).
-    ///
-    /// Pointer-only C free must not call this with a guessed small spec:
-    /// `header_of` loads the run-header page, which an extent mapping may omit.
-    pub(crate) fn lookup(pages: &PageMap, ptr: NonNull<u8>, spec: LayoutSpec) -> Option<PageOwner> {
-        if SizeClasses::class_for(spec).is_some()
-            && let Some(run) = Run::header_of(ptr)
-        {
-            return Some(PageOwner::Run(run));
-        }
-        pages.get(ptr)
-    }
-
     /// Owner-local small allocation via the current run for `class`.
     ///
     /// Hit is pop. Empty / unbound → caller miss.
@@ -179,11 +166,7 @@ impl ThreadHeaps {
             return Ok(Some(ptr));
         }
         let mut inner = heap.require_inner();
-        // Same as `Heap::alloc_extent`: accept remote claims before mapping another run.
-        // Mapping first fills the run arena with claimed-full runs and `alloc` returns null.
-        if !heap.inboxes_empty() {
-            heap.flush(&mut inner, ctx, None)?;
-        }
+        heap.flush(&mut inner, ctx, None)?;
         let Some(run) = inner.acquire_run(class, ctx.pages, heap) else {
             return Ok(None);
         };
@@ -218,8 +201,9 @@ impl ThreadHeaps {
 
     /// Owner-local free for a run owned by a TLS heap.
     ///
-    /// `Run::free` is lock-free. `push_available` only when the run was full.
-    /// Heap-id stays: `lookup` can still return a foreign run.
+    /// `Run::free` is lock-free. `RunHeap::release` runs when the run left full
+    /// or its payload is discardable. Heap-id stays: lookup can still return a
+    /// foreign run.
     pub(crate) fn free_run(
         &self,
         run: &'static Run,
@@ -231,14 +215,11 @@ impl ThreadHeaps {
         let Ok(outcome) = run.free(ptr) else {
             Allocator::abort()
         };
-        if outcome == RunFree::Available {
+        if outcome == RunFree::Available || run.is_discardable() {
             let mut inner = run.heap().require_inner();
-            if inner.push_available(run).is_err() {
+            if inner.release(run, outcome).is_err() {
                 Allocator::abort();
             }
-        }
-        if run.is_discardable() {
-            run.discard();
         }
         Ok(())
     }
@@ -363,7 +344,7 @@ impl ThreadHeaps {
         spec: LayoutSpec,
         ctx: &AllocatorCtx,
     ) -> Result<(), ThreadFreeError> {
-        let Some(owner) = Self::lookup(ctx.pages, ptr, spec) else {
+        let Some(owner) = Allocator::lookup(ctx.pages, ptr, spec) else {
             let error = if SizeClasses::class_for(spec).is_some() {
                 HeapError::InvalidRunPointer
             } else {

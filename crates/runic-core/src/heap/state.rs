@@ -57,7 +57,7 @@ pub(super) struct Snapshot {
 ///
 /// Linearization / ordering:
 /// - Active enqueue admit: successful `acquire_lease` `AcqRel` CAS
-/// - Inbox link: head CAS in [`super::inbox::Inbox::link`] (after lease admit)
+/// - Inbox link: head CAS in [`super::list::List::push`] (after lease admit)
 /// - Active→Draining close: `close` `AcqRel` CAS (preserves lease count)
 /// - Draining→Active adopt: Inner lock, then `adopt` `AcqRel` CAS (preserves lease count)
 /// - Lease release: `Release` `fetch_sub`; unbind observes zero with `Acquire` loads
