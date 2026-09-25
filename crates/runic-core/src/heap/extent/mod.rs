@@ -12,7 +12,7 @@ pub(crate) mod heap;
 use crate::{
     allocator::Allocator,
     layout::LayoutSpec,
-    memory::{AddressRange, Mapping, OsMemory},
+    memory::{AddressRange, Mapping, Memory, Os},
     size_class::SizeClasses,
 };
 
@@ -177,7 +177,7 @@ impl Extent {
     /// `MADV_DONTNEED` the mapping. Owner-exclusive; records whether advise succeeded.
     #[cold]
     pub(crate) fn discard(&self) {
-        self.clean.set(OsMemory::discard(self.mapping().range()));
+        self.clean.set(Os::discard(self.mapping().range()));
     }
 
     pub(crate) fn ptr(&self) -> NonNull<u8> {
@@ -342,7 +342,7 @@ impl Extent {
     }
 
     fn zero_user(&self, spec: LayoutSpec) {
-        let zeroed = spec.size() >= LAZY_ZERO && OsMemory::discard(self.mapping().range());
+        let zeroed = spec.size() >= LAZY_ZERO && Os::discard(self.mapping().range());
         if !zeroed {
             // SAFETY: `reuse` just allocated this user range for `spec`.
             unsafe { write_bytes(self.ptr().as_ptr(), 0, spec.size()) };
@@ -370,7 +370,6 @@ mod tests {
         config::AllocatorConfig,
         heap::{Heap, HeapId},
         layout::LayoutSpec,
-        memory::OsMemory,
     };
 
     use super::*;
@@ -390,14 +389,14 @@ mod tests {
         let first = Extent::new(
             ExtentId::from_index(0).unwrap(),
             &OWNER,
-            OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap(),
+            Os::map(spec.mapping_len(Os::page_size()).unwrap()).unwrap(),
             spec,
         )
         .unwrap();
         let second = Extent::new(
             ExtentId::from_index(1).unwrap(),
             &OWNER,
-            OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap(),
+            Os::map(spec.mapping_len(Os::page_size()).unwrap()).unwrap(),
             spec,
         )
         .unwrap();
@@ -409,7 +408,7 @@ mod tests {
     #[test]
     fn extent_aligns_user_pointer_inside_mapping() {
         let spec = layout_spec(128 * 1024, 4096);
-        let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
+        let mapping = Os::map(spec.mapping_len(Os::page_size()).unwrap()).unwrap();
         let mapping_range = mapping.range();
         let extent = Extent::new(ExtentId::from_index(0).unwrap(), &OWNER, mapping, spec).unwrap();
 
@@ -421,7 +420,7 @@ mod tests {
     #[test]
     fn extent_rejects_interior_pointer() {
         let spec = layout_spec(128 * 1024, 4096);
-        let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
+        let mapping = Os::map(spec.mapping_len(Os::page_size()).unwrap()).unwrap();
         let extent = Extent::new(ExtentId::from_index(1).unwrap(), &OWNER, mapping, spec).unwrap();
         // SAFETY: adding one stays within the mapped extent for this non-zero allocation.
         let interior = unsafe { NonNull::new_unchecked(extent.ptr().as_ptr().add(1)) };
@@ -433,7 +432,7 @@ mod tests {
     #[test]
     fn extent_accepts_exact_pointer() {
         let spec = layout_spec(128 * 1024, 4096);
-        let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
+        let mapping = Os::map(spec.mapping_len(Os::page_size()).unwrap()).unwrap();
         let extent = Extent::new(ExtentId::from_index(2).unwrap(), &OWNER, mapping, spec).unwrap();
 
         assert!(extent.starts_at(extent.ptr()));
@@ -443,7 +442,7 @@ mod tests {
     #[test]
     fn extent_rejects_interior_claim_without_state_change() {
         let spec = layout_spec(128 * 1024, 4096);
-        let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
+        let mapping = Os::map(spec.mapping_len(Os::page_size()).unwrap()).unwrap();
         let extent = Extent::new(ExtentId::from_index(8).unwrap(), &OWNER, mapping, spec).unwrap();
         // SAFETY: adding one stays within the mapped extent for this non-zero allocation.
         let interior = unsafe { NonNull::new_unchecked(extent.ptr().as_ptr().add(1)) };
@@ -455,7 +454,7 @@ mod tests {
     #[test]
     fn extent_resizes_in_place_for_smaller_layout() {
         let spec = layout_spec(128 * 1024, 4096);
-        let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
+        let mapping = Os::map(spec.mapping_len(Os::page_size()).unwrap()).unwrap();
         let extent = Extent::new(ExtentId::from_index(3).unwrap(), &OWNER, mapping, spec).unwrap();
         let smaller = layout_spec(64 * 1024, 4096);
 
@@ -465,7 +464,7 @@ mod tests {
     #[test]
     fn extent_does_not_resize_in_place_beyond_mapping() {
         let spec = layout_spec(128 * 1024, 4096);
-        let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
+        let mapping = Os::map(spec.mapping_len(Os::page_size()).unwrap()).unwrap();
         let extent = Extent::new(ExtentId::from_index(4).unwrap(), &OWNER, mapping, spec).unwrap();
         let larger = layout_spec(256 * 1024, 4096);
 
@@ -475,7 +474,7 @@ mod tests {
     #[test]
     fn extent_grows_in_place_within_larger_mapping() {
         let spec = layout_spec(128 * 1024, 4096);
-        let mapping = OsMemory::map(512 * 1024).unwrap();
+        let mapping = Os::map(512 * 1024).unwrap();
         let extent = Extent::new(ExtentId::from_index(5).unwrap(), &OWNER, mapping, spec).unwrap();
         let larger = layout_spec(256 * 1024, 4096);
 
@@ -486,7 +485,7 @@ mod tests {
     #[test]
     fn extent_grows_in_place_when_page_range_does_not_change() {
         let spec = layout_spec(33 * 1024, 8);
-        let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
+        let mapping = Os::map(spec.mapping_len(Os::page_size()).unwrap()).unwrap();
         let extent = Extent::new(ExtentId::from_index(6).unwrap(), &OWNER, mapping, spec).unwrap();
         let larger = layout_spec(36 * 1024, 8);
 
@@ -497,7 +496,7 @@ mod tests {
     #[test]
     fn extent_does_not_resize_in_place_to_size_class() {
         let spec = layout_spec(64 * 1024, 8);
-        let mapping = OsMemory::map(spec.mapping_len(OsMemory::page_size()).unwrap()).unwrap();
+        let mapping = Os::map(spec.mapping_len(Os::page_size()).unwrap()).unwrap();
         let extent = Extent::new(ExtentId::from_index(7).unwrap(), &OWNER, mapping, spec).unwrap();
         let small = layout_spec(4096, 8);
 

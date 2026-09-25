@@ -5,7 +5,7 @@ use core::{
     sync::atomic::{AtomicBool, AtomicPtr, Ordering},
 };
 
-use crate::memory::{Mapping, OsMemory};
+use crate::memory::{Mapping, Memory, Os};
 
 use super::{
     L1_ENTRIES, L2_ENTRIES, PageMapError, PageOwner,
@@ -70,8 +70,7 @@ impl L1Table {
             return Ok(table);
         }
 
-        let mapping =
-            OsMemory::map(size_of::<L2Table>()).ok_or(PageMapError::MetadataAllocFailed)?;
+        let mapping = Os::map(size_of::<L2Table>()).ok_or(PageMapError::MetadataAllocFailed)?;
         let ptr = mapping.base().cast::<L2Table>().as_ptr();
         let slot = self.table_slot(index);
 

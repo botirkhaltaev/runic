@@ -17,7 +17,8 @@ runic-alloc = "0.8"
 - `free` / `resize` / `usable_size` are pointer-only. Owner comes from
   `PageMap`. `header_of` is not used here (extent mappings may omit the run
   header page). `free` null aborts. C `free(NULL)` is handled in `runic-cabi`.
-- First `Allocator::with_config` that initializes the process wins.
+- First `init` in the process wins. `Allocator::preload()` overlays `RUNIC_*` at
+  that init (cabi). `RunicAlloc::new().with_*` does not read env.
 - Feature `c-abi`: pthread `UnbindHook` for thread-exit under `LD_PRELOAD`.
   Default is `std::thread_local!` `UnbindGuard`.
 

@@ -90,8 +90,8 @@ pub(crate) struct AllocatorCtx<'a> {
 impl HeapInner {
     const fn new(config: AllocatorConfig) -> Self {
         Self {
-            runs: RunHeap::new(config.run()),
-            extents: ExtentHeap::new(config.extent()),
+            runs: RunHeap::new(config.run(), config.hints()),
+            extents: ExtentHeap::new(config.extent(), config.hints()),
         }
     }
 

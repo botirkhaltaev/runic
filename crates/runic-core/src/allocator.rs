@@ -5,17 +5,19 @@ use core::{
 };
 
 use crate::{
-    config::AllocatorConfig,
+    config::{AllocatorConfig, HugePage, Mode, Numa},
     heap::{
         AllocatorCtx, ExtentInit, HeapError, Heaps, THREAD_HEAPS, ThreadFreeError, ThreadHeaps,
+        extent::config::ExtentConfig, run::config::RunConfig,
     },
     layout::LayoutSpec,
-    memory::{OsMemory, PageMap, PageOwner},
+    memory::{Memory, Os, PageMap, PageOwner},
     size_class::{SizeClass, SizeClasses},
 };
 
 pub struct Allocator {
     config: AllocatorConfig,
+    from_env: bool,
 }
 
 /// mmap payload for [`AllocatorCtx`]. Not returned to callers.
@@ -29,13 +31,61 @@ static PROCESS: AtomicPtr<Process> = AtomicPtr::new(core::ptr::null_mut());
 impl Allocator {
     #[must_use]
     pub const fn new() -> Self {
-        Self::with_config(AllocatorConfig::new())
+        Self {
+            config: AllocatorConfig::new(),
+            from_env: false,
+        }
+    }
+
+    /// Construct the C-preload entry that overlays `RUNIC_*` at first `init`.
+    ///
+    /// Const `with_*` calls set the baseline; recognized environment values
+    /// override that setting. Regular [`Self::new`] never reads the environment.
+    #[must_use]
+    pub const fn preload() -> Self {
+        Self {
+            config: AllocatorConfig::new(),
+            from_env: true,
+        }
     }
 
     /// First `init` in the process wins; later configs are ignored.
     #[must_use]
     pub const fn with_config(config: AllocatorConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            from_env: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_mode(mut self, mode: Mode) -> Self {
+        self.config = self.config.with_mode(mode);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_hugepage(mut self, hugepage: HugePage) -> Self {
+        self.config = self.config.with_hugepage(hugepage);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_numa(mut self, numa: Numa) -> Self {
+        self.config = self.config.with_numa(numa);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_extent_config(mut self, extent: ExtentConfig) -> Self {
+        self.config = self.config.with_extent_config(extent);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_run_config(mut self, run: RunConfig) -> Self {
+        self.config = self.config.with_run_config(run);
+        self
     }
 
     /// Installed pages and heaps, or `None` before first `init`.
@@ -98,7 +148,7 @@ impl Allocator {
 
     /// Pointer-only free for callers without a `Layout` (the C ABI).
     ///
-    /// The owner comes from `PageMap`, never [`Run::header_of`]: an extent
+    /// The owner comes from `PageMap`, never `Run::header_of`: an extent
     /// mapping need not cover the run-header address, so that probe can fault
     /// on a pointer whose size class is unknown. Null is forbidden here; the C
     /// boundary no-ops `free(NULL)`. Unknown pointers abort.
@@ -144,7 +194,7 @@ impl Allocator {
         }
     }
 
-    /// Pointer-only realloc. Owner from `PageMap`, never [`Run::header_of`].
+    /// Pointer-only realloc. Owner from `PageMap`, never `Run::header_of`.
     ///
     /// `new` is the requested layout of the replacement (`max_align_t` at the C
     /// boundary). Null `ptr` is forbidden here; the C boundary maps
@@ -284,14 +334,22 @@ impl Allocator {
 
     #[cold]
     fn init(&self) -> Option<AllocatorCtx<'static>> {
-        let mapping = OsMemory::map(core::mem::size_of::<Process>())?;
+        let config = if self.from_env {
+            self.config.overlay_env()
+        } else {
+            self.config
+        };
+        if config.mode() != Mode::Fast {
+            Self::abort();
+        }
+        let mapping = Os::map(core::mem::size_of::<Process>())?;
         let process = mapping.base().cast::<Process>();
         // SAFETY: `process` is uniquely owned page-aligned mmap. Fields are
         // written before the CAS publishes the pointer.
         unsafe {
             process.as_ptr().write(Process {
                 pages: PageMap::new(),
-                heaps: Heaps::new(self.config),
+                heaps: Heaps::new(config),
             });
         }
         if PROCESS

@@ -6,7 +6,9 @@ Address ranges, OS mappings, and page-indexed lookup. See
 ## Files
 
 - `address.rs`: ownership-free `AddressRange` geometry and pointer offset checks.
-- `os.rs`: `OsMemory::{map,map_aligned,discard}` and owning `Mapping`.
+- `os.rs`: `Memory` trait (`page_size`, map / map_aligned, discard, and
+  payload defaults), the `Linux` impl, and owning `Mapping` (`prefer` /
+  `prefer_huge` / `prefer_local`).
 - `page_map/`: page-indexed lookup from user pointers to process-lifetime `PageOwner` metadata.
   - `mod.rs`: `PageMap::{publish,unpublish,get}` and `PageOwner`.
   - `entry.rs`: `MapEntry` / `AtomicMapEntry` tagged-pointer encoding (`load` / `store`).
@@ -17,8 +19,13 @@ Address ranges, OS mappings, and page-indexed lookup. See
 
 ## Invariants
 
-- `OsMemory::{map,map_aligned}` creates every `Mapping`: nonzero page-multiple
-  length, page-aligned base, unique ownership until `Drop`.
+- Callers map through the `Os` alias (`mod.rs`), never a named OS. `Linux` is
+  the only impl; all OS calls stay in `os.rs` (`Mapping::drop` owns `munmap`).
+- `Os::{map,map_aligned}` creates metadata `Mapping`s (process, arena, page-map
+  tables): nonzero page-multiple length, page-aligned base, unique ownership
+  until `Drop`. Payload maps go through `map_payload` / `map_aligned_payload`,
+  which map ordinary pages then `Mapping::prefer`. Hints are independent
+  best-effort THP and NUMA-local preferences on the mapping.
 - `AddressRange` does not own mmap lifecycle; it is copyable geometry only.
 - Every returned pointer maps to exactly one `PageOwner` while allocated.
 - Layout-known miss/realloc may probe `Run::header_of`; pointer-only operations

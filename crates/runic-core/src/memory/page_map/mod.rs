@@ -8,7 +8,7 @@ use core::{
 use crate::{
     heap::{Extent, Heap, HeapError, Run},
     layout::LayoutSpec,
-    memory::{Mapping, OsMemory, PAGE_SIZE},
+    memory::{Mapping, Memory, Os, PAGE_SIZE},
 };
 
 mod entry;
@@ -171,8 +171,7 @@ impl PageMap {
             return Ok(l1);
         }
 
-        let mapping =
-            OsMemory::map(size_of::<L1Table>()).ok_or(PageMapError::MetadataAllocFailed)?;
+        let mapping = Os::map(size_of::<L1Table>()).ok_or(PageMapError::MetadataAllocFailed)?;
         let ptr = mapping.base().cast::<L1Table>().as_ptr();
 
         match self.l1.compare_exchange(

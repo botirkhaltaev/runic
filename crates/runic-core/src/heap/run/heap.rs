@@ -3,7 +3,7 @@ use core::ptr::NonNull;
 use crate::{
     arena::Arena,
     heap::{Heap, HeapError, Run, RunId},
-    memory::{Mapping, OsMemory, PageMap, PageOwner},
+    memory::{Mapping, Memory, Os, PageMap, PageOwner},
     size_class::{SizeClass, SizeClasses},
 };
 
@@ -11,6 +11,7 @@ use super::{
     Accept, MAP_RUNS, MAP_SIZE, RUN_SIZE, RUN_SPACE,
     config::{RunConfig, RunPolicy},
 };
+use crate::config::Hints;
 
 /// Owner-local run directory and available lists.
 ///
@@ -24,10 +25,11 @@ pub(crate) struct RunHeap {
     used: usize,
     available: [Option<&'static Run>; SizeClasses::COUNT],
     policy: RunPolicy,
+    hints: Hints,
 }
 
 impl RunHeap {
-    pub(crate) const fn new(config: RunConfig) -> Self {
+    pub(crate) const fn new(config: RunConfig, hints: Hints) -> Self {
         Self {
             runs: Arena::new(),
             maps: Arena::new(),
@@ -35,6 +37,7 @@ impl RunHeap {
             used: 0,
             available: [None; SizeClasses::COUNT],
             policy: config.policy(),
+            hints,
         }
     }
 
@@ -81,7 +84,7 @@ impl RunHeap {
 
     fn map(&mut self) -> Option<NonNull<u8>> {
         let index = self.maps.vacant()?;
-        let mapping = OsMemory::map_aligned(MAP_SIZE, RUN_SIZE)?;
+        let mapping = Os::map_aligned_payload(MAP_SIZE, RUN_SIZE, self.hints)?;
         let inserted = self.maps.insert(index, mapping)?;
         self.map_index = Some(index);
         self.used = 0;
@@ -173,7 +176,7 @@ mod tests {
     use core::alloc::Layout;
 
     use crate::{
-        config::AllocatorConfig,
+        config::{AllocatorConfig, Hints},
         heap::{Heap, HeapId, Run, RunId},
         layout::LayoutSpec,
         memory::{PageMap, PageOwner},
@@ -217,7 +220,7 @@ mod tests {
 
     #[test]
     fn run_heap_relinks_previously_full_run_after_free() {
-        let mut heap = RunHeap::new(RunConfig::new());
+        let mut heap = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let class = class_id(64, 8);
         let class_index = class.index();
@@ -248,11 +251,11 @@ mod tests {
 
     #[test]
     fn failed_run_page_publication_leaves_range_reusable() {
-        let mut heap = RunHeap::new(RunConfig::new());
+        let mut heap = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let class = class_id(64, 8);
         // Occupy the range first; `insert_run` must fail closed rather than steal it.
-        let mut occupant = RunHeap::new(RunConfig::new());
+        let mut occupant = RunHeap::new(RunConfig::new(), Hints::new());
         let taken = occupant.acquire(class, &OWNER, &pages).unwrap();
         let base = taken.range().base();
 
@@ -269,7 +272,7 @@ mod tests {
 
     #[test]
     fn push_available_is_idempotent_and_keeps_tail() {
-        let mut heap = RunHeap::new(RunConfig::new());
+        let mut heap = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let class = class_id(64, 8);
         let class_index = class.index();
@@ -293,7 +296,7 @@ mod tests {
 
     #[test]
     fn push_available_returns_stranded_current() {
-        let mut heap = RunHeap::new(RunConfig::new());
+        let mut heap = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let class = class_id(64, 8);
         let class_index = class.index();
@@ -319,7 +322,7 @@ mod tests {
 
     #[test]
     fn publish_run_covers_payload_not_claim_tail() {
-        let mut heap = RunHeap::new(RunConfig::new());
+        let mut heap = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let class = class_id(64, 8);
         let run = heap.acquire(class, &OWNER, &pages).unwrap();
@@ -331,7 +334,7 @@ mod tests {
 
     #[test]
     fn sixteen_runs_share_one_map() {
-        let mut heap = RunHeap::new(RunConfig::new());
+        let mut heap = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let class = class_id(64, 8);
         for _ in 0..MAP_RUNS {

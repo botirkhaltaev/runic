@@ -38,8 +38,22 @@ __libc_cfree __libc_posix_memalign
 | `aligned_alloc` | Alignment power of two; size a multiple of alignment (C11) |
 
 Load at process start; late `dlopen` is unsupported. Do not combine it with
-`#[global_allocator]` `RunicAlloc` in one process: each would create its own
-allocator payload.
+`#[global_allocator]` `RunicAlloc` in one process. They share Runic's
+process-global allocator state, so whichever boundary initializes it first
+fixes the configuration for both.
+
+At first `init`, cabi overlays `RUNIC_*` (`libc` getenv). Unknown values leave
+that key at the Fast default. `RunicAlloc::new().with_*` does not read env.
+
+```text
+RUNIC_MODE           fast | safe | hardened   (only fast runs; others abort)
+RUNIC_HUGEPAGE       off | thp
+RUNIC_NUMA           off | local
+RUNIC_EXTENT_POLICY  keep | discard | unmap
+RUNIC_EXTENT_SLOTS   usize
+RUNIC_EXTENT_BYTES   usize
+RUNIC_RUN_POLICY     keep | discard
+```
 
 This package builds a cdylib, not a Rust library dependency. It enables
 `runic-core`'s `c-abi` feature for pthread thread exit.

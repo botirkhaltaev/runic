@@ -31,7 +31,7 @@ fn heap(raw: u32) -> &'static Heap {
 fn run(raw: u32) -> PageOwner {
     let i = usize::try_from(raw).unwrap();
     PageOwner::Run(RUNS[i].get_or_init(|| {
-        let mapping = OsMemory::map_aligned(RUN_SPACE, RUN_SIZE).unwrap();
+        let mapping = Os::map_aligned(RUN_SPACE, RUN_SIZE).unwrap();
         let base = mapping.base();
         let _ = RUN_MAPS[i].set(mapping);
         let spec = LayoutSpec::from_layout(Layout::from_size_align(64, 8).unwrap());
@@ -55,7 +55,7 @@ fn run(raw: u32) -> PageOwner {
 fn extent(raw: u32) -> PageOwner {
     PageOwner::Extent(EXTENTS[usize::try_from(raw).unwrap()].get_or_init(|| {
         let spec = LayoutSpec::from_layout(Layout::from_size_align(PAGE_SIZE, 8).unwrap());
-        let mapping = OsMemory::map(PAGE_SIZE).unwrap();
+        let mapping = Os::map(PAGE_SIZE).unwrap();
         Extent::new(ExtentId::from_index(raw).unwrap(), heap(raw), mapping, spec).unwrap()
     }))
 }
@@ -112,7 +112,7 @@ fn page_map_get_rejects_out_of_addressable_page() {
 
 #[test]
 fn page_map_insert_range_maps_interior_pointer() {
-    let mapping = OsMemory::map(PAGE_SIZE * 2).unwrap();
+    let mapping = Os::map(PAGE_SIZE * 2).unwrap();
     let map = PageMap::new();
     let range = PageRange::from_mapping(&mapping).unwrap();
 
@@ -124,7 +124,7 @@ fn page_map_insert_range_maps_interior_pointer() {
 
 #[test]
 fn page_map_insert_range_maps_extent_entry() {
-    let mapping = OsMemory::map(PAGE_SIZE * 2).unwrap();
+    let mapping = Os::map(PAGE_SIZE * 2).unwrap();
     let map = PageMap::new();
     let range = PageRange::from_mapping(&mapping).unwrap();
 
@@ -136,7 +136,7 @@ fn page_map_insert_range_maps_extent_entry() {
 
 #[test]
 fn page_map_insert_extent_range_uses_direct_entries() {
-    let mapping = OsMemory::map(PAGE_SIZE * 2).unwrap();
+    let mapping = Os::map(PAGE_SIZE * 2).unwrap();
     let map = PageMap::new();
     let range = PageRange::from_mapping(&mapping).unwrap();
 
@@ -154,7 +154,7 @@ fn page_map_insert_extent_range_uses_direct_entries() {
 
 #[test]
 fn page_map_insert_run_range_uses_direct_entries() {
-    let mapping = OsMemory::map(PAGE_SIZE * 2).unwrap();
+    let mapping = Os::map(PAGE_SIZE * 2).unwrap();
     let map = PageMap::new();
     let range = PageRange::from_mapping(&mapping).unwrap();
 
@@ -172,7 +172,7 @@ fn page_map_insert_run_range_uses_direct_entries() {
 
 #[test]
 fn page_map_remove_range_clears_mapped_pages() {
-    let mapping = OsMemory::map(PAGE_SIZE * 2).unwrap();
+    let mapping = Os::map(PAGE_SIZE * 2).unwrap();
     let map = PageMap::new();
     let range = PageRange::from_mapping(&mapping).unwrap();
 
@@ -186,7 +186,7 @@ fn page_map_remove_range_clears_mapped_pages() {
 
 #[test]
 fn page_map_remove_range_retains_empty_l2_table_for_stable_reads() {
-    let mapping = OsMemory::map(PAGE_SIZE).unwrap();
+    let mapping = Os::map(PAGE_SIZE).unwrap();
     let map = PageMap::new();
     let range = PageRange::from_mapping(&mapping).unwrap();
 
@@ -201,14 +201,14 @@ fn page_map_remove_range_retains_empty_l2_table_for_stable_reads() {
 
 #[test]
 fn page_map_remove_rejects_never_published_range_and_keeps_existing() {
-    let published = OsMemory::map(PAGE_SIZE).unwrap();
+    let published = Os::map(PAGE_SIZE).unwrap();
     let map = PageMap::new();
     assert!(
         map.insert(PageRange::from_mapping(&published).unwrap(), extent(1))
             .is_ok()
     );
 
-    let stranger = OsMemory::map(PAGE_SIZE).unwrap();
+    let stranger = Os::map(PAGE_SIZE).unwrap();
     assert_eq!(
         map.remove(PageRange::from_mapping(&stranger).unwrap(), extent(2)),
         Err(PageMapError::UnexpectedEntry)
@@ -219,7 +219,7 @@ fn page_map_remove_rejects_never_published_range_and_keeps_existing() {
 
 #[test]
 fn page_map_remove_range_keeps_non_empty_l2_table() {
-    let mapping = OsMemory::map(PAGE_SIZE * 2).unwrap();
+    let mapping = Os::map(PAGE_SIZE * 2).unwrap();
     let map = PageMap::new();
     let first = mapping.base();
     let second = page_at(&mapping, PAGE_SIZE);
@@ -245,7 +245,7 @@ fn page_map_remove_range_keeps_non_empty_l2_table() {
 
 #[test]
 fn page_map_remove_range_preserves_neighboring_page() {
-    let mapping = OsMemory::map(PAGE_SIZE * 3).unwrap();
+    let mapping = Os::map(PAGE_SIZE * 3).unwrap();
     let map = PageMap::new();
     let first = mapping.base();
     let second = page_at(&mapping, PAGE_SIZE);
@@ -276,7 +276,7 @@ fn page_map_remove_range_preserves_neighboring_page() {
 
 #[test]
 fn page_map_remove_range_rejects_wrong_owner_without_clearing() {
-    let mapping = OsMemory::map(PAGE_SIZE).unwrap();
+    let mapping = Os::map(PAGE_SIZE).unwrap();
     let map = PageMap::new();
     let range = PageRange::from_mapping(&mapping).unwrap();
 
@@ -291,7 +291,7 @@ fn page_map_remove_range_rejects_wrong_owner_without_clearing() {
 
 #[test]
 fn page_map_remove_range_rejects_missing_entry_without_clearing() {
-    let mapping = OsMemory::map(PAGE_SIZE * 2).unwrap();
+    let mapping = Os::map(PAGE_SIZE * 2).unwrap();
     let map = PageMap::new();
     let first = mapping.base();
     let second = page_at(&mapping, PAGE_SIZE);
@@ -311,7 +311,7 @@ fn page_map_remove_range_rejects_missing_entry_without_clearing() {
 
 #[test]
 fn page_map_remove_range_rejects_partial_mismatch_without_clearing() {
-    let mapping = OsMemory::map(PAGE_SIZE * 2).unwrap();
+    let mapping = Os::map(PAGE_SIZE * 2).unwrap();
     let map = PageMap::new();
     let first = mapping.base();
     let second = page_at(&mapping, PAGE_SIZE);
@@ -335,7 +335,7 @@ fn page_map_remove_range_rejects_partial_mismatch_without_clearing() {
 
 #[test]
 fn page_map_remove_range_rejects_cross_l2_partial_mismatch_without_clearing() {
-    let mapping = OsMemory::map((L2_ENTRIES + 2) * PAGE_SIZE).unwrap();
+    let mapping = Os::map((L2_ENTRIES + 2) * PAGE_SIZE).unwrap();
     let map = PageMap::new();
     let boundary = l2_boundary_offset(&mapping);
     let before_boundary = page_at(&mapping, boundary - PAGE_SIZE);
@@ -370,7 +370,7 @@ fn page_map_remove_range_rejects_cross_l2_partial_mismatch_without_clearing() {
 
 #[test]
 fn page_map_insert_range_rejects_overlapping_different_run() {
-    let mapping = OsMemory::map(PAGE_SIZE * 2).unwrap();
+    let mapping = Os::map(PAGE_SIZE * 2).unwrap();
     let map = PageMap::new();
     let second = page_at(&mapping, PAGE_SIZE);
 
@@ -390,7 +390,7 @@ fn page_map_insert_range_rejects_overlapping_different_run() {
 
 #[test]
 fn page_map_insert_range_rejects_existing_same_entry() {
-    let mapping = OsMemory::map(PAGE_SIZE).unwrap();
+    let mapping = Os::map(PAGE_SIZE).unwrap();
     let map = PageMap::new();
     let range = PageRange::from_mapping(&mapping).unwrap();
 
@@ -401,7 +401,7 @@ fn page_map_insert_range_rejects_existing_same_entry() {
 
 #[test]
 fn page_map_overlap_rejects_under_write_exclusion_and_retains_l2() {
-    let mapping = OsMemory::map((L2_ENTRIES * 2 + 2) * PAGE_SIZE).unwrap();
+    let mapping = Os::map((L2_ENTRIES * 2 + 2) * PAGE_SIZE).unwrap();
     let map = PageMap::new();
     let pages_to_next_l2 = l2_boundary_offset(&mapping) / PAGE_SIZE;
     let overlap = page_at(&mapping, pages_to_next_l2 * PAGE_SIZE);
@@ -432,7 +432,7 @@ fn page_map_overlap_rejects_under_write_exclusion_and_retains_l2() {
 
 #[test]
 fn page_map_insert_range_rejects_zero_len() {
-    let mapping = OsMemory::map(PAGE_SIZE).unwrap();
+    let mapping = Os::map(PAGE_SIZE).unwrap();
 
     assert!(PageRange::from_aligned(mapping.base(), 0).is_none());
     assert!(PageRange::from_aligned(mapping.base(), PAGE_SIZE / 2).is_none());
@@ -442,7 +442,7 @@ fn page_map_insert_range_rejects_zero_len() {
 
 #[test]
 fn page_map_insert_range_crosses_l2_boundary() {
-    let mapping = OsMemory::map((L2_ENTRIES + 2) * PAGE_SIZE).unwrap();
+    let mapping = Os::map((L2_ENTRIES + 2) * PAGE_SIZE).unwrap();
     let map = PageMap::new();
     let range = PageRange::from_mapping(&mapping).unwrap();
 
@@ -455,7 +455,7 @@ fn page_map_insert_range_crosses_l2_boundary() {
 
 #[test]
 fn page_map_insert_extent_range_crosses_l2_boundary() {
-    let mapping = OsMemory::map((L2_ENTRIES + 2) * PAGE_SIZE).unwrap();
+    let mapping = Os::map((L2_ENTRIES + 2) * PAGE_SIZE).unwrap();
     let map = PageMap::new();
     let range = PageRange::from_mapping(&mapping).unwrap();
     let boundary = page_at(&mapping, l2_boundary_offset(&mapping));
@@ -472,7 +472,7 @@ fn page_map_insert_extent_range_crosses_l2_boundary() {
 #[test]
 fn page_map_many_single_page_extents_share_one_l2_table_without_exhaustion() {
     const EXTENT_COUNT: usize = 200;
-    let mapping = OsMemory::map(EXTENT_COUNT * PAGE_SIZE).unwrap();
+    let mapping = Os::map(EXTENT_COUNT * PAGE_SIZE).unwrap();
     let map = PageMap::new();
 
     for index in 0..EXTENT_COUNT {
@@ -526,7 +526,7 @@ fn page_map_publish_unpublish_round_trip() {
 
 #[test]
 fn page_map_remove_range_crosses_l2_boundary() {
-    let mapping = OsMemory::map((L2_ENTRIES + 2) * PAGE_SIZE).unwrap();
+    let mapping = Os::map((L2_ENTRIES + 2) * PAGE_SIZE).unwrap();
     let map = PageMap::new();
     let range = PageRange::from_mapping(&mapping).unwrap();
     let boundary = page_at(&mapping, l2_boundary_offset(&mapping));
@@ -542,8 +542,8 @@ fn page_map_remove_range_crosses_l2_boundary() {
 
 #[test]
 fn page_map_concurrent_disjoint_publish() {
-    let left = OsMemory::map(PAGE_SIZE).unwrap();
-    let right = OsMemory::map(PAGE_SIZE).unwrap();
+    let left = Os::map(PAGE_SIZE).unwrap();
+    let right = Os::map(PAGE_SIZE).unwrap();
     let map = PageMap::new();
     // Copy ranges/bases: `Mapping` is `Send` but not `Sync`, so threads must not borrow it.
     let left_range = PageRange::from_mapping(&left).unwrap();
@@ -566,7 +566,7 @@ fn page_map_concurrent_disjoint_publish() {
 
 #[test]
 fn page_map_concurrent_same_l2_disjoint_pages() {
-    let mapping = OsMemory::map(PAGE_SIZE * 2).unwrap();
+    let mapping = Os::map(PAGE_SIZE * 2).unwrap();
     let map = PageMap::new();
     let start = Barrier::new(2);
     let first_base = mapping.base();
@@ -591,7 +591,7 @@ fn page_map_concurrent_same_l2_disjoint_pages() {
 
 #[test]
 fn page_map_concurrent_overlap_exactly_one_wins() {
-    let mapping = OsMemory::map(PAGE_SIZE).unwrap();
+    let mapping = Os::map(PAGE_SIZE).unwrap();
     let map = PageMap::new();
     let range = PageRange::from_mapping(&mapping).unwrap();
     let base = mapping.base();

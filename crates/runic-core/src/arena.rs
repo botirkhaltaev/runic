@@ -16,9 +16,9 @@ use core::{
 
 use spin::Mutex;
 
-use crate::memory::{Mapping, OsMemory, PAGE_SIZE};
+use crate::memory::{Mapping, Memory, Os, PAGE_SIZE};
 
-/// Target bytes of slot storage per mmap growth step (page-rounded by [`OsMemory::map`]).
+/// Target bytes of slot storage per mmap growth step (page-rounded by [`Os::map`]).
 const CHUNK_BYTES: usize = 256 * 1024;
 const MAX_CHUNKS: usize = 256;
 const VACANT_END: u32 = u32::MAX;
@@ -123,7 +123,7 @@ impl<T> Arena<T> {
             let byte_len = usize::try_from(Self::slots_per_chunk())
                 .ok()?
                 .checked_mul(size_of::<Slot<T>>())?;
-            let mapping = OsMemory::map(byte_len)?;
+            let mapping = Os::map(byte_len)?;
             let base = mapping.base().cast::<Slot<T>>();
             *grow.mappings.get_mut(chunk_i)? = Some(mapping);
             self.ptrs

@@ -589,3 +589,64 @@ Criterion on `hashmap_grow` reported no change (p > 0.05) across the three
 3s samples. Cache-misses/elem doubled in the ratio table (0.0007 to 0.0014)
 on a near-zero count; ignore.
 
+## 0.9 Fast placement screen
+
+Payload `Hints` knobs only (run + extent maps). Metadata maps stay anonymous
+4 KiB. Criterion `global_runic`, suite defaults (10 samples, 1 s), ns/iter.
+This host has two NUMA nodes and THP `always`; `HugePages_Total=0`.
+
+```text
+workload                 Off       Thp     Local      Both
+word_count           1164422   1167215   1161976   1163173
+vec_growth_log       1647241   1639752   1629748   1648350
+hashmap_grow        10068877  10037096  10129765  10457669
+vecdeque_events       823269    824844    815696    840138
+text_index          48150455  48210456  47664937  50008542
+lru_cache            9656773   9582597   9610668   9696549
+records_sort         4551331   4536499   4530817   4623067
+graph_shortest_path   449534    447336    446511    451966
+json_api             1205472   1213705   1220768   1244191
+regex_search         2568405   2557656   2580940   2572531
+http_parse           2654727   2678254   2671017   2712777
+csv_pipeline         1658883   1660820   1665192   1680694
+compress_roundtrip  12303137  12273311  12389654  12264971
+toml_config          5431844   5423002   5449957   5489331
+async_server         1212434   1915124   1201785   1215093
+thread_pool_jobs     1005970   2106344   1019692   1005858
+log_pipeline        12539889  13443353  12324351  12498771
+shard_aggregator      432376    627031    430230    429618
+buffer_pool          1089557   1841532   1816710   1085823
+arc_broadcast        4139237   9029394   8922181   4211523
+```
+
+Thp and Local each more than double important threaded workloads vs Off
+(`thread_pool_jobs`, `arc_broadcast`, `buffer_pool`). Both recovers those
+losses but gives back 3.9% on `hashmap_grow`, 3.2% on `json_api`, 3.9% on
+`text_index`, and 1.7% on `arc_broadcast`, without a material win on the
+priority threaded set. Off/Off is the strongest balanced default. This is a
+weighted production-workload decision, not a requirement to win every row.
+Force was not a default candidate (no reserved huge pages). `MAP_HUGETLB` was
+then dropped from the knobs: reserved hugetlb is a kernel deployment choice,
+not a heap policy. Thp remains the hint.
+
+A follow-up priority screen used `profile.sh` on CPUs 24–27 with three perf
+stat repeats and 2-second windows. Cycles per element:
+
+```text
+workload                 Off       Thp     Local      Both
+thread_pool_jobs       6043.8    5976.0    5974.5    6081.7
+log_pipeline          16810.6   15135.8   16898.6   16532.3
+shard_aggregator        513.3     535.5     539.3     494.8
+buffer_pool           17529.5   17257.6   17189.0   17349.8
+arc_broadcast          9580.6    9500.6    9485.8    9630.7
+```
+
+Thp's equal-weight geomean was 1.94% below Off, led by `log_pipeline`, but it
+regressed `shard_aggregator` by 4.33%. Local regressed the geomean by 0.27%;
+Both improved it by 1.04% while regressing `thread_pool_jobs`. Instruction
+counts moved with the Criterion element-rate denominator, including the large
+`log_pipeline` and `shard_aggregator` swings, so this short screen does not
+establish a placement-caused win. It does reject Local as a default and does
+not overturn Off/Off: Off remains the balanced, explicit baseline while Thp
+and Local stay opt-in.
+

@@ -103,28 +103,31 @@ Released as `0.8.0`.
 
 ## Next
 
-0.8 is experimental. Production means Fast stays competitive on the real-workload
-corpus, Safe makes owner mistakes defined, Hardened is opt-in integrity, RSS
-can be given back, C programs can trim and inspect, and Linux is not the only
-`Memory` impl. Fast stays free of Safe and Hardened work.
+0.8 is published. 0.9 mapping and config is in-tree: `Memory` leaf, payload
+hugepage/NUMA knobs, `RunicAlloc::new().with_*`, cabi `RUNIC_*`. Fast defaults
+are Off/Off after the corpus screen. Production still means Safe owner mistakes,
+Hardened integrity, reclaim, C trim/inspect, and other `Memory` impls. Fast
+stays free of Safe and Hardened work.
 
-Any Fast-path default (hugepage, NUMA, reclaim) needs a real-workload screen
-and the 1% retain gate. Safe and Hardened are measured as their own columns.
+Any further Fast-path default (reclaim) needs a pinned real-workload screen.
+Weight the representative production workloads; investigate every regression
+over 1%, but do not require one candidate to win every secondary workload.
+Safe and Hardened are measured as their own columns.
 
-### Modes (planned)
+### Modes
 
 `RunicAlloc::new().with_x()` / `with_mode`, const, no separate builder type.
 `Mode::{Fast, Safe, Hardened}`. Preload reads `RUNIC_*`, including `RUNIC_MODE`.
-Do not ship a Safe or Hardened label that is Fast underneath.
+Safe and Hardened abort at first `init` until 0.10 / 0.11.
 
 ### 0.9 Mapping and config
 
-Leaf `Memory` trait, Linux impl; `Mapping` owns the region. Hugepage is off,
-THP hint (`madvise(MADV_HUGEPAGE)`), or force (`MAP_HUGETLB`). Force fails the
-map when the kernel cannot give huge pages (no silent 4 KiB fallback). THP hint
-keeps the 4 KiB map if pages never collapse. NUMA preferred-local is a separate
-knob. Defaults come from a Fast screen. Fast is fully implemented; Safe and
-Hardened fail closed until their milestones.
+Done. Leaf `Memory` trait behind the `Os` alias, `Linux` impl; `Mapping` owns
+the region. Hugepage is off or a THP hint (`madvise(MADV_HUGEPAGE)`). Dedicated
+hugetlb (`MAP_HUGETLB`) is not an allocator knob: it is a kernel reservation
+and a second mapping grain. THP keeps the 4 KiB map if pages never collapse.
+NUMA preferred-local is a separate knob. Fast screen kept Off/Off as `Hints`
+default. Safe and Hardened fail closed until their milestones.
 
 ### 0.10 Safe
 
