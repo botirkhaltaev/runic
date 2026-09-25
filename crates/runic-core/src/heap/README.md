@@ -10,7 +10,8 @@ process-wide flows.
 - `mod.rs`: `Heap`, `HeapInner`, `AllocatorCtx`, and re-exports.
 - `heaps.rs`: `Heaps` (`Arena<Heap>` + Free-heap freelist).
 - `state.rs`: `HeapMode`, `HeapState`, `Lease`.
-- `inbox.rs`: intrusive `Inbox`, `Node`, `Link`, and `Chain`.
+- `list.rs`: intrusive lock-free `List` (push onto the head, `drain` takes all).
+- `inbox.rs`: coalescing `Inbox`, `Node`, and `Link` over `List`.
 - `thread.rs`: `ThreadHeaps` / `ThreadHeap`.
 - `run/`: fixed-block runs and heap-owned run maps.
 - `extent/`: dedicated mappings (`Extent`, `ExtentHeap` with `Arena<Extent>`, `ExtentCache`).

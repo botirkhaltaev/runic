@@ -8,7 +8,7 @@ use crate::{
 };
 
 use super::{
-    Accept, MAP_RUNS, MAP_SIZE, RUN_SIZE, RUN_SPACE,
+    Accept, MAP_RUNS, MAP_SIZE, RUN_SIZE, RUN_SPACE, RunFree,
     config::{RunConfig, RunPolicy},
 };
 use crate::config::Hints;
@@ -124,6 +124,17 @@ impl RunHeap {
         };
         run.list_available(*available);
         *available = Some(run);
+        Ok(())
+    }
+
+    /// Slow-path owner free: list a run that left full, then Discard an empty payload.
+    pub(crate) fn release(&mut self, run: &'static Run, outcome: RunFree) -> Result<(), HeapError> {
+        if outcome == RunFree::Available {
+            self.push_available(run)?;
+        }
+        if run.is_discardable() {
+            run.discard();
+        }
         Ok(())
     }
 

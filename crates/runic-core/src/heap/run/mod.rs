@@ -1018,7 +1018,7 @@ mod tests {
         assert!(!inbox.queue(run));
 
         // accept coalesces both claims from the single queued entry.
-        let _ = inbox.drain();
+        assert_eq!(inbox.drain().count(), 1);
         assert_eq!(run.accept(), Accept::Done);
         assert_eq!(run.allocate(), Some(b));
         assert_eq!(run.allocate(), Some(a));
@@ -1064,8 +1064,8 @@ mod tests {
             let mut spins = 0u32;
             loop {
                 let finished = done.load(Ordering::Acquire);
-                while let Some(chain) = inbox.drain() {
-                    for run in chain {
+                while !inbox.is_empty() {
+                    for run in inbox.drain() {
                         if run.accept() == Accept::Requeue {
                             inbox.queue(run);
                         }

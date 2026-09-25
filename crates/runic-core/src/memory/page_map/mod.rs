@@ -6,8 +6,7 @@ use core::{
 };
 
 use crate::{
-    heap::{Extent, Heap, HeapError, Run},
-    layout::LayoutSpec,
+    heap::{Extent, Heap, Run},
     memory::{Mapping, Memory, Os, PAGE_SIZE},
 };
 
@@ -60,24 +59,6 @@ impl PageOwner {
         match self {
             Self::Run(run) => run.heap(),
             Self::Extent(extent) => extent.heap(),
-        }
-    }
-
-    pub(crate) fn usable(self) -> usize {
-        match self {
-            Self::Run(run) => run.class().size(),
-            Self::Extent(extent) => extent.len(),
-        }
-    }
-
-    pub(crate) fn resize_in_place(
-        self,
-        ptr: NonNull<u8>,
-        spec: LayoutSpec,
-    ) -> Result<bool, HeapError> {
-        match self {
-            Self::Run(run) => run.resize_in_place(ptr, spec).map_err(HeapError::from),
-            Self::Extent(extent) => extent.resize_in_place(ptr, spec).map_err(HeapError::from),
         }
     }
 
