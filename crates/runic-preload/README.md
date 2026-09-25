@@ -28,3 +28,6 @@ directly.
 - `interposed`: `malloc` resolves to `librunic.so`, and blocks survive growth.
 - `threads`: threads exit while still bound to a heap.
 - `unknown`, `small-interior`, `large-interior`, `realloc-interior`: abort.
+
+The harness also verifies `RUNIC_MODE`: Fast runs, Safe/Hardened abort at
+allocator init, and unknown values leave defaults unchanged.

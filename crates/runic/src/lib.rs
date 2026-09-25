@@ -7,5 +7,7 @@
 
 mod global;
 
-pub use global::{RunicAlloc, RunicAllocBuilder};
-pub use runic_core::{AllocatorConfig, Budget, ExtentPolicy, RunPolicy};
+pub use global::RunicAlloc;
+pub use runic_core::{
+    AllocatorConfig, Budget, ExtentConfig, ExtentPolicy, HugePage, Mode, Numa, RunConfig, RunPolicy,
+};

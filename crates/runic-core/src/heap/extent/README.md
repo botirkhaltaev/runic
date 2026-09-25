@@ -8,7 +8,7 @@ Extent metadata owns dedicated large allocations. Retention:
 - `mod.rs`: `Extent`, `ExtentId`, exact-pointer checks, reuse, and resize-in-place rules.
 - `config.rs`: `ExtentConfig` / `ExtentPolicy::{Keep, Discard, Unmap}` and `Budget`.
 - `cache.rs`: intrusive `head` list of published Free extents (`ExtentPolicy::{Keep, Discard, Unmap}`, exact-length reuse only). Discard `madvise`s on insert.
-- `heap.rs`: dedicated allocation via `ExtentInit`, `Arena<Extent>`, page-map publication, and `cache_or_unmap` / `unmap`.
+- `heap.rs`: dedicated allocation via `ExtentInit`, `Arena<Extent>`, `Hints` on payload maps, page-map publication, and `cache_or_unmap` / `unmap`.
 
 ## Same-thread path
 

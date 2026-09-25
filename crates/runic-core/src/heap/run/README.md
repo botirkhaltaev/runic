@@ -7,7 +7,7 @@ Run metadata owns small size-class allocations. Hit/miss:
 
 - `mod.rs`: `Run`, `RunId`, pointer freelist + `extend`, in-page header at `base + RUN_SIZE`, and a private claim bitmap after the header.
 - `config.rs`: `RunConfig` / `RunPolicy::{Keep,Discard}`.
-- `heap.rs`: `RunHeap` with `Arena<&'static Run>` (in-space headers) then `Arena<Mapping>`, available-run lists, and payload-only page-map publication.
+- `heap.rs`: `RunHeap` with `Arena<&'static Run>` (in-space headers) then `Arena<Mapping>`, available-run lists, `Hints` on payload maps, and payload-only page-map publication.
 
 ## Invariants
 
@@ -31,4 +31,6 @@ Run metadata owns small size-class allocations. Hit/miss:
 - Available-list membership is unique and `push_available` is idempotent. The
   current run may also be listed.
 - Runs remain published for the heap lifetime. `Discard` releases empty payload
-  pages with `madvise`; `Keep` leaves them resident.
+  pages with `madvise`; `Keep` leaves them resident. There is no run cache
+  budget because maps remain heap-owned; whole-map budget/reclaim belongs to
+  the 0.12 reclaim milestone.

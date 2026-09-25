@@ -18,7 +18,7 @@ use runic_core::Allocator;
 const MAX_ALIGN: usize = 16;
 const PAGE: usize = 4096;
 
-static ALLOC: Allocator = Allocator::new();
+static ALLOC: Allocator = Allocator::preload();
 
 #[cold]
 fn errno_null(code: c_int) -> *mut c_void {

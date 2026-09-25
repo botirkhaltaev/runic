@@ -32,10 +32,27 @@ const EXPORTS: [&str; 21] = [
     "valloc",
 ];
 
+const RUNIC_ENV: [&str; 7] = [
+    "RUNIC_MODE",
+    "RUNIC_HUGEPAGE",
+    "RUNIC_NUMA",
+    "RUNIC_EXTENT_POLICY",
+    "RUNIC_EXTENT_SLOTS",
+    "RUNIC_EXTENT_BYTES",
+    "RUNIC_RUN_POLICY",
+];
+
+fn command(case: &str) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_preload-case"));
+    command.arg(case).env("LD_PRELOAD", LIBRARY);
+    for key in RUNIC_ENV {
+        command.env_remove(key);
+    }
+    command
+}
+
 fn preloaded(case: &str) -> ExitStatus {
-    Command::new(env!("CARGO_BIN_EXE_preload-case"))
-        .arg(case)
-        .env("LD_PRELOAD", LIBRARY)
+    command(case)
         .status()
         .expect("failed to run the preload fixture")
 }
@@ -70,6 +87,45 @@ fn invalid_pointers_abort() {
             "{case} exited with {status} instead of aborting"
         );
     }
+}
+
+#[test]
+fn unimplemented_modes_abort_at_init() {
+    for mode in ["safe", "hardened"] {
+        let status = command("interposed")
+            .env("RUNIC_MODE", mode)
+            .status()
+            .expect("failed to run the preload fixture");
+
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGABRT),
+            "{mode} exited with {status} instead of aborting"
+        );
+    }
+}
+
+#[test]
+fn fast_mode_runs() {
+    let status = command("interposed")
+        .env("RUNIC_MODE", "fast")
+        .status()
+        .expect("failed to run the preload fixture");
+
+    assert!(status.success(), "fast exited with {status}");
+}
+
+#[test]
+fn unknown_env_values_are_ignored() {
+    let status = command("interposed")
+        .env("RUNIC_MODE", "turbo")
+        .env("RUNIC_HUGEPAGE", "huge")
+        .env("RUNIC_NUMA", "bind")
+        .env("RUNIC_EXTENT_SLOTS", "-1")
+        .status()
+        .expect("failed to run the preload fixture");
+
+    assert!(status.success(), "unknown env values exited with {status}");
 }
 
 #[test]

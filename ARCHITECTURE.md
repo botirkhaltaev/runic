@@ -45,6 +45,9 @@ the payload pages only.
 `current[class]` is a hint, not ownership. A run may also be on the available
 list. Free does not rewrite `current`. `push_available` and Discard stay off
 the owner-free hit. Heap live counters change only at zero/nonzero boundaries.
+Runs have no independent cache budget: a heap's 2 MiB maps remain owned until
+the heap is reclaimed, and empty-run Discard only drops resident payload pages.
+A meaningful run byte budget requires whole-map reclaim, planned for 0.12.
 
 `Run::header_of` is the small miss and realloc probe: mask to the run base,
 check the raw `base` word, then construct `Run`. Pointer-only C `free` / `resize`
@@ -107,6 +110,21 @@ After lifecycle retries, invalid state reaches `Allocator::abort`.
 `HeapError` preserves `InvalidRunPointer`, `InvalidExtentPointer`, and
 `MissingExtent`.
 
+## Memory
+
+`Memory` is the leaf virtual-memory surface (`page_size`, `map`,
+`map_aligned`, `discard`, and payload defaults). Callers
+use the `Os` alias, so no layer names an operating system; `Linux` is the only
+impl and holds every libc mmap, madvise, and mbind. `Mapping` uniquely owns a
+live region and applies payload hints on itself (`prefer_huge` /
+`prefer_local`). Extent-cache lookup uses the page-rounded mapping length.
+
+Process, arena growth, and page-map tables use plain anonymous maps. Run and
+extent payload maps call `Mapping::prefer` with `Hints`: hugepage Off / Thp
+(`MADV_HUGEPAGE`) and NUMA Off / Local (`mbind` `MPOL_PREFERRED` to the
+allocating thread's node). Advise or preference failure keeps a successful
+map. `Hints` is copied onto `RunHeap` / `ExtentHeap` at heap construction.
+
 ## Entities
 
 | Entity | Owns |
@@ -122,6 +140,6 @@ After lifecycle retries, invalid state reaches `Allocator::abort`.
 | `Run` | In-page header, `&Heap`, freelist, claim bitmap |
 | `Extent` | Dedicated mapping metadata, `&Heap`, Claimed byte |
 | `PageMap` | Page-indexed lookup |
-| `OsMemory` / `Mapping` | mmap; `Drop` unmaps |
+| `Os` / `Mapping` | Platform `Memory` impl; `Drop` unmaps |
 
 Directory READMEs under `crates/runic-core/src/` document local invariants.

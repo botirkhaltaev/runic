@@ -11,7 +11,7 @@ pub(crate) mod heap;
 
 use crate::{
     layout::LayoutSpec,
-    memory::{AddressRange, OsMemory, PAGE_SIZE},
+    memory::{AddressRange, Memory, Os, PAGE_SIZE},
     size_class::SizeClass,
 };
 
@@ -546,7 +546,7 @@ impl Run {
         self.state.bump.set(0);
         self.state.free.set(FREE_END);
         self.remote.issued.store(0, Ordering::Relaxed);
-        OsMemory::discard(self.range());
+        Os::discard(self.range());
     }
 
     pub(crate) fn allocated(&self, ptr: NonNull<u8>) -> Result<Block, RunError> {
@@ -650,10 +650,10 @@ mod tests {
     use core::alloc::Layout;
 
     use crate::{
-        config::AllocatorConfig,
+        config::{AllocatorConfig, Hints},
         heap::{Heap, HeapId},
         layout::LayoutSpec,
-        memory::{OsMemory, PageMap, PageOwner},
+        memory::{PageMap, PageOwner},
         size_class::SizeClasses,
     };
 
@@ -683,7 +683,7 @@ mod tests {
 
     #[test]
     fn run_equality_is_identity() {
-        let mut runs = RunHeap::new(RunConfig::new());
+        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let class = class_id(64, 8);
         let first = runs.acquire(class, &OWNER, &pages).unwrap();
@@ -697,7 +697,7 @@ mod tests {
 
     #[test]
     fn header_of_rejects_zeroed_unused_map_slot() {
-        let map = OsMemory::map_aligned(RUN_SPACE * 2, RUN_SIZE).unwrap();
+        let map = Os::map_aligned(RUN_SPACE * 2, RUN_SIZE).unwrap();
         let unused = NonNull::new(map.base().as_ptr().wrapping_byte_add(RUN_SPACE)).unwrap();
 
         assert!(Run::header_of(unused).is_none());
@@ -705,7 +705,7 @@ mod tests {
 
     #[test]
     fn reusable_run_takes_each_block_once() {
-        let mut runs = RunHeap::new(RunConfig::new());
+        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let class = class_id(64, 8);
         let run = runs.acquire(class, &OWNER, &pages).unwrap();
@@ -730,7 +730,7 @@ mod tests {
 
     #[test]
     fn extend_threads_fresh_blocks_onto_freelist() {
-        let mut runs = RunHeap::new(RunConfig::new());
+        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let class = class_id(64, 8);
         let run = runs.acquire(class, &OWNER, &pages).unwrap();
@@ -749,7 +749,7 @@ mod tests {
 
     #[test]
     fn reusable_run_reuses_returned_block() {
-        let mut runs = RunHeap::new(RunConfig::new());
+        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let run = runs.acquire(class_id(128, 8), &OWNER, &pages).unwrap();
 
@@ -762,7 +762,7 @@ mod tests {
 
     #[test]
     fn reusable_run_resizes_block_in_place_for_same_class_layout() {
-        let mut runs = RunHeap::new(RunConfig::new());
+        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
         let new = layout_spec(64, 8);
@@ -773,7 +773,7 @@ mod tests {
 
     #[test]
     fn reusable_run_rejects_allocated_block_that_needs_larger_class() {
-        let mut runs = RunHeap::new(RunConfig::new());
+        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
         let new = layout_spec(80, 8);
@@ -815,7 +815,7 @@ mod tests {
 
     #[test]
     fn reusable_run_rejects_interior_pointer() {
-        let mut runs = RunHeap::new(RunConfig::new());
+        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
         let ptr = alloc_block(run).unwrap();
@@ -826,7 +826,7 @@ mod tests {
 
     #[test]
     fn reusable_run_locate_covers_all_classes_boundaries_and_tail_slack() {
-        let mut runs = RunHeap::new(RunConfig::new());
+        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         for &size in &SizeClasses::SIZES {
             let run = runs.acquire(class_id(size, 8), &OWNER, &pages).unwrap();
@@ -856,7 +856,7 @@ mod tests {
 
     #[test]
     fn reusable_run_rejects_interior_pointer_for_non_power_of_two_class() {
-        let mut runs = RunHeap::new(RunConfig::new());
+        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let run = runs.acquire(class_id(24, 8), &OWNER, &pages).unwrap();
         let ptr = alloc_block(run).unwrap();
@@ -868,7 +868,7 @@ mod tests {
 
     #[test]
     fn reusable_run_round_trips_hotspot_non_power_of_two_classes() {
-        let mut runs = RunHeap::new(RunConfig::new());
+        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         for size in [80, 96] {
             let run = runs.acquire(class_id(size, 8), &OWNER, &pages).unwrap();
@@ -882,7 +882,7 @@ mod tests {
 
     #[test]
     fn reusable_run_rejects_claim_tail() {
-        let mut runs = RunHeap::new(RunConfig::new());
+        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
         let claim_tail =
@@ -893,7 +893,7 @@ mod tests {
 
     #[test]
     fn reusable_run_rejects_foreign_run_same_offset() {
-        let mut runs = RunHeap::new(RunConfig::new());
+        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let class = class_id(64, 8);
         let base_a = runs.acquire(class, &OWNER, &pages).unwrap().range().base();
@@ -911,7 +911,7 @@ mod tests {
 
     #[test]
     fn reusable_run_rejects_aligned_tail_slack() {
-        let mut runs = RunHeap::new(RunConfig::new());
+        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         for size in [80, 96] {
             let class = class_id(size, 8);
@@ -928,7 +928,7 @@ mod tests {
 
     #[test]
     fn claim_run_reports_duplicate_remote_free() {
-        let mut runs = RunHeap::new(RunConfig::new());
+        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
         let ptr = alloc_block(run).unwrap();
@@ -939,7 +939,7 @@ mod tests {
 
     #[test]
     fn claim_run_completes_to_reusable() {
-        let mut runs = RunHeap::new(RunConfig::new());
+        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
         let ptr = alloc_block(run).unwrap();
@@ -951,7 +951,7 @@ mod tests {
 
     #[test]
     fn accept_without_any_claim_is_a_noop() {
-        let mut runs = RunHeap::new(RunConfig::new());
+        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
         let ptr = alloc_block(run).unwrap();
@@ -962,7 +962,7 @@ mod tests {
 
     #[test]
     fn claim_accept_works_for_all_size_classes() {
-        let mut runs = RunHeap::new(RunConfig::new());
+        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         for &size in &SizeClasses::SIZES {
             let run = runs.acquire(class_id(size, 8), &OWNER, &pages).unwrap();
@@ -975,7 +975,7 @@ mod tests {
 
     #[test]
     fn reusable_run_returns_aligned_blocks_for_alignment_sensitive_layout() {
-        let mut runs = RunHeap::new(RunConfig::new());
+        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let class = class_id(17, 16);
         let run = runs.acquire(class, &OWNER, &pages).unwrap();
@@ -989,7 +989,7 @@ mod tests {
 
     #[test]
     fn run_range_reports_payload_span() {
-        let mut runs = RunHeap::new(RunConfig::new());
+        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let run = runs.acquire(class_id(8, 8), &OWNER, &pages).unwrap();
         let base = run.range().base();
@@ -1002,7 +1002,7 @@ mod tests {
     fn try_queue_wins_once_until_cleared() {
         use super::super::inbox::Inbox;
 
-        let mut runs = RunHeap::new(RunConfig::new());
+        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
         let a = alloc_block(run).unwrap();
@@ -1037,7 +1037,7 @@ mod tests {
 
         use super::super::inbox::Inbox;
 
-        let mut runs = RunHeap::new(RunConfig::new());
+        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let class = class_id(64, 8);
         let run = runs.acquire(class, &OWNER, &pages).unwrap();
@@ -1085,7 +1085,10 @@ mod tests {
 
     #[test]
     fn discarded_run_resets_then_extend_reuses() {
-        let mut runs = RunHeap::new(RunConfig::new().with_policy(RunPolicy::Discard));
+        let mut runs = RunHeap::new(
+            RunConfig::new().with_policy(RunPolicy::Discard),
+            Hints::new(),
+        );
         let pages = PageMap::new();
         let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
         let ptr = alloc_block(run).unwrap();
@@ -1100,7 +1103,7 @@ mod tests {
 
     #[test]
     fn keep_empty_run_leaves_freelist() {
-        let mut runs = RunHeap::new(RunConfig::new());
+        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
         let ptr = alloc_block(run).unwrap();
@@ -1111,7 +1114,10 @@ mod tests {
 
     #[test]
     fn discard_after_accept_resets() {
-        let mut runs = RunHeap::new(RunConfig::new().with_policy(RunPolicy::Discard));
+        let mut runs = RunHeap::new(
+            RunConfig::new().with_policy(RunPolicy::Discard),
+            Hints::new(),
+        );
         let pages = PageMap::new();
         let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
         let ptr = alloc_block(run).unwrap();
@@ -1126,7 +1132,10 @@ mod tests {
 
     #[test]
     fn discard_does_not_unmap_space() {
-        let mut runs = RunHeap::new(RunConfig::new().with_policy(RunPolicy::Discard));
+        let mut runs = RunHeap::new(
+            RunConfig::new().with_policy(RunPolicy::Discard),
+            Hints::new(),
+        );
         let pages = PageMap::new();
         let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
         let base = run.range().base();

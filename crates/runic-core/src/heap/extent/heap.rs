@@ -2,10 +2,11 @@ use core::ptr::NonNull;
 
 use crate::{
     arena::Arena,
+    config::Hints,
     heap::extent::config::ExtentConfig,
     heap::{Extent, Heap, HeapError},
     layout::LayoutSpec,
-    memory::{Mapping, OsMemory, PageMap, PageOwner},
+    memory::{Mapping, Memory, Os, PageMap, PageOwner},
 };
 
 use super::{ExtentId, ExtentInit, cache::ExtentCache};
@@ -15,14 +16,16 @@ pub(crate) struct ExtentHeap {
     cache: ExtentCache,
     /// Unmapped immortal slots, linked through [`Extent::next`].
     unmapped: Option<ExtentId>,
+    hints: Hints,
 }
 
 impl ExtentHeap {
-    pub(crate) const fn new(config: ExtentConfig) -> Self {
+    pub(crate) const fn new(config: ExtentConfig, hints: Hints) -> Self {
         Self {
             extents: Arena::new(),
             cache: ExtentCache::new(config),
             unmapped: None,
+            hints,
         }
     }
 
@@ -52,7 +55,7 @@ impl ExtentHeap {
         pages: &PageMap,
         init: ExtentInit,
     ) -> Result<Option<NonNull<u8>>, HeapError> {
-        let Some(len) = spec.mapping_len(OsMemory::page_size()) else {
+        let Some(len) = spec.mapping_len(Os::page_size()) else {
             return Ok(None);
         };
         if let Some(id) = self.cache.acquire(&self.extents, len)? {
@@ -66,7 +69,7 @@ impl ExtentHeap {
             self.unmap(extent, pages)?;
         }
 
-        let Some(mapping) = OsMemory::map(len) else {
+        let Some(mapping) = Os::map_payload(len, self.hints) else {
             return Ok(None);
         };
         let Some(ptr) = self.allocate_mapping(spec, heap, mapping, pages) else {
@@ -178,11 +181,11 @@ mod tests {
     use core::{alloc::Layout, ptr::write_bytes};
 
     use crate::{
-        config::{AllocatorConfig, Budget},
+        config::{AllocatorConfig, Budget, Hints},
         heap::extent::config::{ExtentConfig, ExtentPolicy},
         heap::{Extent, Heap, HeapId, extent::ExtentId},
         layout::LayoutSpec,
-        memory::{OsMemory, PageMap, PageOwner},
+        memory::{PageMap, PageOwner},
     };
 
     use super::super::LAZY_ZERO;
@@ -199,15 +202,15 @@ mod tests {
 
     fn reusable_extent(id: ExtentId) -> Extent {
         let spec = layout_spec(65_536, 8);
-        let len = spec.mapping_len(OsMemory::page_size()).unwrap();
-        let mapping = OsMemory::map(len).unwrap();
+        let len = spec.mapping_len(Os::page_size()).unwrap();
+        let mapping = Os::map(len).unwrap();
 
         Extent::new(id, &OWNER, mapping, spec).unwrap()
     }
 
     #[test]
     fn failed_extent_page_publication_keeps_immortal_slot_unmapped() {
-        let mut heap = ExtentHeap::new(ExtentConfig::new());
+        let mut heap = ExtentHeap::new(ExtentConfig::new(), Hints::new());
         let pages = PageMap::new();
         let index = heap.extents.vacant().unwrap();
         let id = ExtentId::from_index(index).unwrap();
@@ -227,7 +230,7 @@ mod tests {
 
     #[test]
     fn keep_free_leaves_page_map_entry_published() {
-        let mut heap = ExtentHeap::new(ExtentConfig::new());
+        let mut heap = ExtentHeap::new(ExtentConfig::new(), Hints::new());
         let pages = PageMap::new();
         let spec = layout_spec(128 * 1024, 4096);
         let ptr = heap
@@ -245,7 +248,7 @@ mod tests {
 
     #[test]
     fn keep_cache_hit_reuses_the_exact_length_from_the_middle() {
-        let mut heap = ExtentHeap::new(ExtentConfig::new());
+        let mut heap = ExtentHeap::new(ExtentConfig::new(), Hints::new());
         let pages = PageMap::new();
         let small = layout_spec(64 * 1024, 4096);
         let medium = layout_spec(128 * 1024, 4096);
@@ -287,8 +290,10 @@ mod tests {
 
     #[test]
     fn keep_slot_budget_unmaps_the_free_that_does_not_fit() {
-        let mut heap =
-            ExtentHeap::new(ExtentConfig::new().with_budget(Budget::new(2, 64 * 1024 * 1024)));
+        let mut heap = ExtentHeap::new(
+            ExtentConfig::new().with_budget(Budget::new(2, 64 * 1024 * 1024)),
+            Hints::new(),
+        );
         let pages = PageMap::new();
         let spec = layout_spec(128 * 1024, 4096);
         let ptrs = [
@@ -317,8 +322,11 @@ mod tests {
     #[test]
     fn keep_byte_budget_unmaps_the_free_that_does_not_fit() {
         let spec = layout_spec(128 * 1024, 4096);
-        let len = spec.mapping_len(OsMemory::page_size()).unwrap();
-        let mut heap = ExtentHeap::new(ExtentConfig::new().with_budget(Budget::new(64, 2 * len)));
+        let len = spec.mapping_len(Os::page_size()).unwrap();
+        let mut heap = ExtentHeap::new(
+            ExtentConfig::new().with_budget(Budget::new(64, 2 * len)),
+            Hints::new(),
+        );
         let pages = PageMap::new();
         let ptrs = [
             heap.allocate(spec, &OWNER, &pages, ExtentInit::Uninit)
@@ -345,7 +353,7 @@ mod tests {
 
     #[test]
     fn keep_cache_hit_reuses_without_republish() {
-        let mut heap = ExtentHeap::new(ExtentConfig::new());
+        let mut heap = ExtentHeap::new(ExtentConfig::new(), Hints::new());
         let pages = PageMap::new();
         let spec = layout_spec(128 * 1024, 4096);
         let first = heap
@@ -367,7 +375,10 @@ mod tests {
 
     #[test]
     fn unmap_policy_unpublishes_on_free() {
-        let mut heap = ExtentHeap::new(ExtentConfig::new().with_policy(ExtentPolicy::Unmap));
+        let mut heap = ExtentHeap::new(
+            ExtentConfig::new().with_policy(ExtentPolicy::Unmap),
+            Hints::new(),
+        );
         let pages = PageMap::new();
         let spec = layout_spec(128 * 1024, 4096);
         let ptr = heap
@@ -385,7 +396,7 @@ mod tests {
 
     #[test]
     fn zeroed_allocate_clears_cached_mapping() {
-        let mut heap = ExtentHeap::new(ExtentConfig::new());
+        let mut heap = ExtentHeap::new(ExtentConfig::new(), Hints::new());
         let pages = PageMap::new();
         let spec = layout_spec(128 * 1024, 4096);
         let size = 128 * 1024;
@@ -421,7 +432,7 @@ mod tests {
 
     #[test]
     fn keep_lazy_zero_second_reuse_is_clean() {
-        let mut heap = ExtentHeap::new(ExtentConfig::new());
+        let mut heap = ExtentHeap::new(ExtentConfig::new(), Hints::new());
         let pages = PageMap::new();
         let spec = layout_spec(LAZY_ZERO, 4096);
         let first = heap
@@ -466,7 +477,10 @@ mod tests {
 
     #[test]
     fn discard_zeroed_allocate_is_clean_after_dirty_reuse() {
-        let mut heap = ExtentHeap::new(ExtentConfig::new().with_policy(ExtentPolicy::Discard));
+        let mut heap = ExtentHeap::new(
+            ExtentConfig::new().with_policy(ExtentPolicy::Discard),
+            Hints::new(),
+        );
         let pages = PageMap::new();
         let spec = layout_spec(128 * 1024, 4096);
         let size = 128 * 1024;
@@ -503,7 +517,7 @@ mod tests {
 
     #[test]
     fn uninit_allocate_preserves_cached_bytes() {
-        let mut heap = ExtentHeap::new(ExtentConfig::new());
+        let mut heap = ExtentHeap::new(ExtentConfig::new(), Hints::new());
         let pages = PageMap::new();
         let spec = layout_spec(128 * 1024, 4096);
         let size = 128 * 1024;

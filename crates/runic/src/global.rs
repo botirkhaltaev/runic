@@ -1,10 +1,10 @@
 use core::alloc::{GlobalAlloc, Layout};
 
-use runic_core::{Allocator, AllocatorConfig, Budget, ExtentPolicy, RunPolicy};
+use runic_core::{Allocator, AllocatorConfig, ExtentConfig, HugePage, Mode, Numa, RunConfig};
 
 /// Process-global Runic allocator.
 ///
-/// Construct with [`RunicAlloc::new`] or [`RunicAlloc::builder`].
+/// Construct with [`RunicAlloc::new`] and optional `with_*` methods.
 pub struct RunicAlloc {
     allocator: Allocator,
 }
@@ -12,7 +12,9 @@ pub struct RunicAlloc {
 impl RunicAlloc {
     #[must_use]
     pub const fn new() -> Self {
-        Self::with_config(AllocatorConfig::new())
+        Self {
+            allocator: Allocator::new(),
+        }
     }
 
     /// First `init` in the process wins; later configs are ignored.
@@ -24,54 +26,42 @@ impl RunicAlloc {
     }
 
     #[must_use]
-    pub const fn builder() -> RunicAllocBuilder {
-        RunicAllocBuilder::new()
-    }
-}
-
-impl Default for RunicAlloc {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub struct RunicAllocBuilder {
-    config: AllocatorConfig,
-}
-
-impl RunicAllocBuilder {
-    #[must_use]
-    pub const fn new() -> Self {
+    pub const fn with_mode(self, mode: Mode) -> Self {
         Self {
-            config: AllocatorConfig::new(),
+            allocator: self.allocator.with_mode(mode),
         }
     }
 
     #[must_use]
-    pub const fn extent_policy(mut self, policy: ExtentPolicy) -> Self {
-        self.config = self.config.with_extent_policy(policy);
-        self
+    pub const fn with_hugepage(self, hugepage: HugePage) -> Self {
+        Self {
+            allocator: self.allocator.with_hugepage(hugepage),
+        }
     }
 
     #[must_use]
-    pub const fn extent_budget(mut self, budget: Budget) -> Self {
-        self.config = self.config.with_extent_budget(budget);
-        self
+    pub const fn with_numa(self, numa: Numa) -> Self {
+        Self {
+            allocator: self.allocator.with_numa(numa),
+        }
     }
 
     #[must_use]
-    pub const fn run_policy(mut self, policy: RunPolicy) -> Self {
-        self.config = self.config.with_run_policy(policy);
-        self
+    pub const fn with_extent_config(self, extent: ExtentConfig) -> Self {
+        Self {
+            allocator: self.allocator.with_extent_config(extent),
+        }
     }
 
     #[must_use]
-    pub const fn build(self) -> RunicAlloc {
-        RunicAlloc::with_config(self.config)
+    pub const fn with_run_config(self, run: RunConfig) -> Self {
+        Self {
+            allocator: self.allocator.with_run_config(run),
+        }
     }
 }
 
-impl Default for RunicAllocBuilder {
+impl Default for RunicAlloc {
     fn default() -> Self {
         Self::new()
     }
