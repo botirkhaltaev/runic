@@ -38,6 +38,7 @@ impl ExtentHeap {
         self.extents.iter().any(Extent::is_live)
     }
 
+    /// Cached reuse, else a fresh mapping. Fresh pages are zero.
     pub(crate) fn allocate(
         &mut self,
         spec: LayoutSpec,
@@ -45,17 +46,12 @@ impl ExtentHeap {
         pages: &PageMap,
         init: ExtentInit,
     ) -> Result<Option<NonNull<u8>>, HeapError> {
+        if let Some(ptr) = self.reuse_cached(spec, heap, pages, init)? {
+            return Ok(Some(ptr));
+        }
         let Some(len) = spec.mapping_len(Os::page_size()) else {
             return Ok(None);
         };
-        if let Some(extent) = self.cache.acquire(len) {
-            if let Some(ptr) = extent.reuse(spec, init) {
-                heap.add_extent_live();
-                return Ok(Some(ptr));
-            }
-            self.unmap(extent, pages)?;
-        }
-
         let Some(mapping) = Os::map_payload(len, self.hints) else {
             return Ok(None);
         };
@@ -74,31 +70,52 @@ impl ExtentHeap {
         pages: &PageMap,
     ) -> Option<NonNull<u8>> {
         if let Some(extent) = self.unmapped.pop_front() {
-            let Some(ptr) = extent.remount(mapping, spec) else {
-                self.unmapped.push_front(extent);
-                return None;
-            };
-            if pages.publish(PageOwner::Extent(extent)).is_err() {
-                drop(extent.unmount());
+            if extent.remount(mapping, spec).is_none() {
                 self.unmapped.push_front(extent);
                 return None;
             }
-            return Some(ptr);
+            return self.publish(extent, pages);
         }
 
         let index = self.extents.vacant()?;
         let extent = Extent::new(heap, mapping, spec)?;
-        let ptr = extent.ptr();
         let inserted = self.extents.insert(index, extent)?;
         // SAFETY: extent slots are never removed and their arena is never unmapped,
         // so a published page-map stamp stays valid for the process lifetime.
         let inserted = unsafe { &*core::ptr::from_mut(inserted).cast_const() };
-        if pages.publish(PageOwner::Extent(inserted)).is_err() {
-            drop(inserted.unmount());
-            self.unmapped.push_front(inserted);
+        self.publish(inserted, pages)
+    }
+
+    /// Stamp the page map. On failure drop the mapping and keep the immortal slot.
+    fn publish(&mut self, extent: &'static Extent, pages: &PageMap) -> Option<NonNull<u8>> {
+        if pages.publish(PageOwner::Extent(extent)).is_err() {
+            drop(extent.unmount());
+            self.unmapped.push_front(extent);
             return None;
         }
-        Some(ptr)
+        Some(extent.ptr())
+    }
+
+    /// Exact-length cache hit. Does not map. A reuse failure unmaps that slot.
+    pub(crate) fn reuse_cached(
+        &mut self,
+        spec: LayoutSpec,
+        heap: &'static Heap,
+        pages: &PageMap,
+        init: ExtentInit,
+    ) -> Result<Option<NonNull<u8>>, HeapError> {
+        let Some(len) = spec.mapping_len(Os::page_size()) else {
+            return Ok(None);
+        };
+        let Some(extent) = self.cache.acquire(len) else {
+            return Ok(None);
+        };
+        if let Some(ptr) = extent.reuse(spec, init) {
+            heap.add_extent_live();
+            return Ok(Some(ptr));
+        }
+        self.unmap(extent, pages)?;
+        Ok(None)
     }
 
     pub(crate) fn free(
@@ -180,10 +197,7 @@ mod tests {
         // Occupy the pages first; publication must fail closed.
         pages.publish(PageOwner::Extent(slot)).unwrap();
 
-        assert!(pages.publish(PageOwner::Extent(slot)).is_err());
-        // Same close as `allocate_mapping`: drop the mapping, keep the slot.
-        drop(slot.unmount());
-        heap.unmapped.push_front(slot);
+        assert!(heap.publish(slot, &pages).is_none());
 
         // Slots are immortal: only the mapping is dropped.
         assert!(heap.extents.get(index).is_some());

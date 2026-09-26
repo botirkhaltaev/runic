@@ -1438,6 +1438,59 @@ mod tests {
     }
 
     #[test]
+    fn alloc_miss_reuses_a_run_the_adopted_heap_holds() {
+        let allocator = Allocator::new();
+        let ctx = ctx(&allocator);
+        let pages = ctx.pages;
+        let layout = Layout::from_size_align(128, 8).unwrap();
+        let class = SizeClasses::class_for(LayoutSpec::from_layout(layout)).unwrap();
+        let tls = &THREAD_HEAPS;
+        tls.unbind(&ctx);
+        let bound = tls.bind(&ctx).unwrap();
+
+        let (id, first, second) = thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let remote = &THREAD_HEAPS;
+                    remote.unbind(&ctx);
+                    let id = remote.bind(&ctx).unwrap();
+                    let first = alloc_small(remote, &ctx, layout);
+                    let second = alloc_small(remote, &ctx, layout);
+                    remote.unbind(&ctx);
+                    (
+                        id,
+                        first.as_ptr().expose_provenance(),
+                        second.as_ptr().expose_provenance(),
+                    )
+                })
+                .join()
+                .unwrap()
+        });
+        let first = NonNull::new(core::ptr::with_exposed_provenance_mut(first)).unwrap();
+        let second = NonNull::new(core::ptr::with_exposed_provenance_mut(second)).unwrap();
+        let run = run_of(pages, first);
+
+        assert_eq!(
+            Allocator::free_remote(&ctx, PageOwner::Run(run), first),
+            Ok(())
+        );
+        assert_eq!(ctx.heaps.get(id).map(Heap::mode), Some(HeapMode::Active));
+
+        // This thread never touched the class, so the miss walks the list and
+        // takes the adopted heap's run instead of mapping on the bound heap.
+        assert_eq!(tls.alloc(class), None);
+        let reused = tls.alloc_miss(class, &ctx).unwrap().unwrap();
+        assert!(run_of(pages, reused) == run);
+        assert_eq!(run.heap().id(), id);
+
+        assert_eq!(tls.free_owner(PageOwner::Run(run), reused, &ctx), Ok(()));
+        assert_eq!(tls.free_owner(PageOwner::Run(run), second, &ctx), Ok(()));
+        assert!(ctx.heaps.get(id).is_none());
+        assert_eq!(tls.bind(&ctx), Some(bound));
+        tls.unbind(&ctx);
+    }
+
+    #[test]
     fn concurrent_frees_complete_across_adoption() {
         let allocator = Allocator::new();
         let ctx = ctx(&allocator);

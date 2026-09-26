@@ -40,6 +40,11 @@ process-wide flows.
   locks only to `push_available` or `cache_or_unmap` that node. Draining
   `Heap::flush` does the same walk under the caller's guard so reclaim cannot
   race `accept`.
+- Alloc miss flushes each adopted heap and takes a run it already holds
+  (`take_available`), then the front heap `acquire`s (own list, then a new
+  run). Large allocation reuses adopted heaps' cached extents, then the front
+  heap `allocate`s. Adopted heaps never map, so draining them first moves them
+  toward idle. One guard at a time.
 - Reclaim checks run/extent live atomics, confirms with arena scans, then uses a
   lifecycle CAS to return the slot to the Free list.
 - `HeapState` packs generation, mode, and Active lease count. A linked heap

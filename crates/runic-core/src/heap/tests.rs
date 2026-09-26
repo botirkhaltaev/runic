@@ -120,7 +120,7 @@ fn lifecycle_rejects_id_from_another_slot() {
 }
 
 #[test]
-fn extent_alloc_preserves_flush_error() {
+fn flush_owner_preserves_extent_accept_error() {
     static HEAPS: OnceLock<Heaps> = OnceLock::new();
 
     let heaps = HEAPS.get_or_init(|| Heaps::new(AllocatorConfig::new()));
@@ -140,10 +140,7 @@ fn extent_alloc_preserves_flush_error() {
     assert!(heap.extent_inbox.queue(extent));
 
     drop(inner);
-    assert_eq!(
-        heap.alloc_extent(spec, ExtentInit::Uninit, &ctx),
-        Err(HeapError::InvalidExtentPointer)
-    );
+    assert_eq!(heap.flush_owner(&ctx), Err(HeapError::InvalidExtentPointer));
     let mut inner = heap.require_inner();
     extent.claim(ptr).unwrap();
     assert_eq!(heap.flush(&mut inner, &ctx, None), Ok(()));

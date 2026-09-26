@@ -36,7 +36,7 @@ the payload pages only.
 | Path | Work |
 |------|------|
 | Alloc hit | `class_for` then `current[class]` then `Run::allocate` |
-| Alloc miss | `extend` if the current run is empty; inbox `accept` if nonempty; then local or OS `acquire_run` |
+| Alloc miss | `extend` if the current run is empty; flush each adopted heap and take a run it already holds; then front heap `acquire` (own list, then a new run) |
 | Unbound alloc | `bind`, flush, then alloc |
 | Owner free hit | `Run::free`: `locate` then push |
 | Owner double-free | Undefined on Fast; `--features safe` filters the first word, then walks the freelist |

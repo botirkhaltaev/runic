@@ -125,26 +125,44 @@ impl ThreadHeaps {
         }
     }
 
-    /// Freelist empty: `extend`, accept inbox if needed, then local/OS `acquire_run`.
+    /// Freelist empty: `extend`, then a run an attached heap already holds, then
+    /// `acquire` on the front heap.
     #[inline(never)]
     pub(crate) fn alloc_miss(
         &self,
         class: SizeClass,
         ctx: &AllocatorCtx,
     ) -> Result<Option<NonNull<u8>>, HeapError> {
-        let Some(heap) = self.heap() else {
+        let Some(front) = self.heap() else {
             return Ok(None);
         };
         if let Some(ptr) = self.extend_current(class) {
             return Ok(Some(ptr));
         }
-        heap.flush_owner(ctx)?;
-        let mut inner = heap.require_inner();
-        let Some(run) = inner.acquire_run(class, ctx.pages, heap) else {
+        let Some(run) = self.take_run(front, class, ctx)? else {
             return Ok(None);
         };
         self.set_current(class, Some(run));
         Ok(self.extend_current(class))
+    }
+
+    /// Flush each attached heap and take a run for `class`. Adopted heaps only
+    /// hand over a run they already hold, which drains them toward idle. The
+    /// front heap `acquire`s: its own list, then a new run. One guard at a time.
+    fn take_run(
+        &self,
+        front: &'static Heap,
+        class: SizeClass,
+        ctx: &AllocatorCtx,
+    ) -> Result<Option<&'static Run>, HeapError> {
+        for heap in self.heaps().iter().skip(1) {
+            heap.flush_owner(ctx)?;
+            if let Some(run) = heap.require_inner().runs.take_available(class) {
+                return Ok(Some(run));
+            }
+        }
+        front.flush_owner(ctx)?;
+        Ok(front.require_inner().runs.acquire(class, front, ctx.pages))
     }
 
     fn extend_current(&self, class: SizeClass) -> Option<NonNull<u8>> {
@@ -155,7 +173,8 @@ impl ThreadHeaps {
         })
     }
 
-    /// Owner-local large allocation via an attached heap.
+    /// Owner-local large allocation. Cached extents on any attached heap, then a
+    /// new mapping on the front heap.
     ///
     /// Returns `None` when this thread has no attached heap (caller should `bind`).
     #[inline(never)]
@@ -165,10 +184,26 @@ impl ThreadHeaps {
         init: ExtentInit,
         ctx: &AllocatorCtx,
     ) -> Result<Option<NonNull<u8>>, HeapError> {
-        let Some(heap) = self.heap() else {
+        let Some(front) = self.heap() else {
             return Ok(None);
         };
-        heap.alloc_extent(spec, init, ctx)
+        // Same order as `take_run`: adopted heaps only reuse; the front heap
+        // reuses, then maps.
+        for heap in self.heaps().iter().skip(1) {
+            heap.flush_owner(ctx)?;
+            if let Some(ptr) = heap
+                .require_inner()
+                .extents
+                .reuse_cached(spec, heap, ctx.pages, init)?
+            {
+                return Ok(Some(ptr));
+            }
+        }
+        front.flush_owner(ctx)?;
+        front
+            .require_inner()
+            .extents
+            .allocate(spec, front, ctx.pages, init)
     }
 
     /// Owner-local free for a run owned by a TLS heap.

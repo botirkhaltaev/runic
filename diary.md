@@ -771,3 +771,22 @@ shard locks           12,536,156,566   4,832,695,591   (-5.2% insn, -4.8% cycles
 17,219,028,412). This lock is not on the hit. `shard_aggregator` stayed in
 the list's band (12,348,385,474 instructions). One shard sample with a 17%
 spread was discarded; the repeat above is ±0.75%. Retained.
+
+### Reuse from every attached heap
+
+Alloc miss then flushes each adopted heap and takes a run it already holds
+(`take_available`), then the front heap `acquire`s (own list, then a new run).
+Large allocation tries `reuse_cached` on each adopted heap, then the front heap
+`allocate`s (own cache, then a fresh mapping). Adopted heaps come first so
+they never map and drain toward idle. One guard per heap, dropped before the
+next. Before this the miss only ever looked at the front heap, so adopted
+heaps' runs and cached extents waited for their freer.
+
+```text
+                      instructions        cycles
+hashmap_grow reuse    17,219,188,627   5,560,091,921   (flat vs locks)
+shard reuse           12,447,273,275   4,793,154,670   (-0.7% insn, -0.8% cycles vs locks)
+```
+
+`hashmap_grow` is flat (one heap, an empty adopted walk). `shard_aggregator`
+is inside its band (12.3 to 12.5B). Retained.

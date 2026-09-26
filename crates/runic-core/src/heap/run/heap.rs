@@ -125,7 +125,8 @@ impl RunHeap {
         Ok(())
     }
 
-    fn take_available(&mut self, class: SizeClass) -> Option<&'static Run> {
+    /// A non-full run already on this class's available list. Does not map.
+    pub(crate) fn take_available(&mut self, class: SizeClass) -> Option<&'static Run> {
         let available = self.available.get_mut(class.index())?;
         loop {
             let run = available.pop()?;

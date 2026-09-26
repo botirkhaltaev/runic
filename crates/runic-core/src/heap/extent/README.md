@@ -12,7 +12,7 @@ Extent metadata owns dedicated large allocations. Retention:
 
 ## Same-thread path
 
-`ThreadHeaps::alloc_extent` / `free_extent` call `Heap` on an owned TLS heap. Large reuse is `ExtentCache` (exact mapping length). Unbound cold path is `Allocator::bind_alloc`.
+`ThreadHeaps::alloc_extent` tries `reuse_cached` on each adopted heap, then `allocate` on the front heap (its own cache, then a fresh mapping). `free_extent` frees on the owning attached heap. Large reuse is `ExtentCache` (exact mapping length). Unbound cold path is `Allocator::bind_alloc`.
 
 ## Invariants
 

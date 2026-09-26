@@ -24,7 +24,6 @@ use crate::{
     config::AllocatorConfig,
     layout::LayoutSpec,
     memory::{PageMap, PageOwner},
-    size_class::SizeClass,
 };
 
 use inbox::{Inbox, Node};
@@ -157,15 +156,6 @@ impl HeapInner {
 
     pub(super) fn release(&mut self, run: &'static Run, outcome: RunFree) -> Result<(), HeapError> {
         self.runs.release(run, outcome)
-    }
-
-    pub(super) fn acquire_run(
-        &mut self,
-        class: SizeClass,
-        pages: &PageMap,
-        heap: &'static Heap,
-    ) -> Option<&'static Run> {
-        self.runs.acquire(class, heap, pages)
     }
 
     /// Owner-local free. `Empty` when this owner is no longer live.
@@ -436,19 +426,6 @@ impl Heap {
             }
         }
         Ok(())
-    }
-
-    /// Flush, then allocate one large block under a fresh guard.
-    pub(super) fn alloc_extent(
-        &'static self,
-        spec: LayoutSpec,
-        init: ExtentInit,
-        ctx: &AllocatorCtx,
-    ) -> Result<Option<NonNull<u8>>, HeapError> {
-        self.flush_owner(ctx)?;
-        self.require_inner()
-            .extents
-            .allocate(spec, self, ctx.pages, init)
     }
 }
 
