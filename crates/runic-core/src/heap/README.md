@@ -36,10 +36,10 @@ process-wide flows.
   `Heaps`.
 - Remote free is `claim`, enqueue, then `accept`. Runs use a claim bitmap;
   extents use a `Claimed` byte. Inbox nodes are intrusive and coalesce by owner.
-- `Heap::accept` drains both inboxes with no `HeapInner` held and returns
-  `Accepted`; `Accepted::publish` lists runs and caches extents under one guard.
-  Active owners lock only to publish. Draining `Heap::flush` runs both under the
-  caller's guard so reclaim cannot race `accept`.
+- Active `Heap::flush_owner` accepts each inbox node outside `HeapInner` and
+  locks only to `push_available` or `cache_or_unmap` that node. Draining
+  `Heap::flush` does the same walk under the caller's guard so reclaim cannot
+  race `accept`.
 - Reclaim checks run/extent live atomics, confirms with arena scans, then uses a
   lifecycle CAS to return the slot to the Free list.
 - `HeapState` packs generation, mode, and Active lease count. A linked heap

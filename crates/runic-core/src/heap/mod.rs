@@ -382,112 +382,73 @@ impl Heap {
                 PageOwner::Extent(extent) => self.extent_inbox.queue(extent),
             };
         }
-        self.accept().publish(inner, ctx)
-    }
-
-    /// Active owner flush: accept outside the lock, one guard per published node.
-    pub(super) fn flush_owner(&self, ctx: &AllocatorCtx) -> Result<(), HeapError> {
-        let mut accepted = self.accept();
-        while let Some(run) = accepted.runs.pop() {
-            self.require_inner().push_available(run)?;
-        }
-        while let Some(extent) = accepted.extents.pop_front() {
-            self.require_inner()
-                .extents
-                .cache_or_unmap(extent, ctx.pages)?;
-        }
-        accepted.result()
-    }
-
-    /// Drain both inboxes with no `HeapInner` held.
-    ///
-    /// `Run::accept` and `Extent::accept` are owner-exclusive on the node. Runs that
-    /// left full and extents now `Free` wait on [`Accepted`] for the metadata publish.
-    /// A miss accepts before mapping: claimed-full runs must be accepted first or
-    /// `acquire` returns null. An extent accept error is stored on [`Accepted`]
-    /// and returned after publish, so earlier nodes are not dropped.
-    pub(super) fn accept(&self) -> Accepted {
-        let mut accepted = Accepted {
-            runs: queue::Queue::new(),
-            extents: list::LinkedList::new(),
-            error: None,
-        };
         while !self.run_inbox.is_empty() {
             for run in self.run_inbox.drain() {
                 let was_full = run.is_full();
                 let accept = run.accept();
-                if was_full && !run.is_full() && !run.listed() {
-                    accepted.runs.push(run);
-                }
+                let published = if was_full && !run.is_full() && !run.listed() {
+                    inner.push_available(run)
+                } else {
+                    Ok(())
+                };
                 if accept == Accept::Requeue {
                     self.run_inbox.queue(run);
                 }
+                published?;
             }
         }
         while !self.extent_inbox.is_empty() {
             for extent in self.extent_inbox.drain() {
-                match extent.accept(extent.ptr()) {
-                    Ok(()) => accepted.extents.push_front(extent),
-                    Err(error) => {
-                        accepted.error.get_or_insert(HeapError::from(error));
-                    }
-                }
+                extent.accept(extent.ptr())?;
+                inner.extents.cache_or_unmap(extent, ctx.pages)?;
             }
         }
-        accepted
+        Ok(())
     }
 
-    /// Accept, then one guard covers publish and the extent allocate.
+    /// Active owner flush. Accept each node outside the lock, then take a guard
+    /// only to publish that node. Drop it before the next one.
+    ///
+    /// A miss flushes before mapping: claimed-full runs must be accepted first or
+    /// `acquire` returns null.
+    pub(super) fn flush_owner(&self, ctx: &AllocatorCtx) -> Result<(), HeapError> {
+        while !self.run_inbox.is_empty() {
+            for run in self.run_inbox.drain() {
+                let was_full = run.is_full();
+                let accept = run.accept();
+                let published = if was_full && !run.is_full() && !run.listed() {
+                    self.require_inner().push_available(run)
+                } else {
+                    Ok(())
+                };
+                if accept == Accept::Requeue {
+                    self.run_inbox.queue(run);
+                }
+                published?;
+            }
+        }
+        while !self.extent_inbox.is_empty() {
+            for extent in self.extent_inbox.drain() {
+                extent.accept(extent.ptr())?;
+                self.require_inner()
+                    .extents
+                    .cache_or_unmap(extent, ctx.pages)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Flush, then allocate one large block under a fresh guard.
     pub(super) fn alloc_extent(
         &'static self,
         spec: LayoutSpec,
         init: ExtentInit,
         ctx: &AllocatorCtx,
     ) -> Result<Option<NonNull<u8>>, HeapError> {
-        let accepted = self.accept();
-        let mut inner = self.require_inner();
-        accepted.publish(&mut inner, ctx)?;
-        inner.extents.allocate(spec, self, ctx.pages, init)
-    }
-}
-
-/// Runs and extents accepted off the lock, waiting for the metadata publish.
-pub(super) struct Accepted {
-    runs: queue::Queue<'static, Run>,
-    extents: list::LinkedList<'static, Extent>,
-    /// First extent `accept` failure. Publish still runs; this is returned after.
-    error: Option<HeapError>,
-}
-
-impl Accepted {
-    /// List every run and cache or unmap every extent under the caller's guard.
-    pub(super) fn publish(
-        mut self,
-        inner: &mut HeapInner,
-        ctx: &AllocatorCtx,
-    ) -> Result<(), HeapError> {
-        while let Some(run) = self.runs.pop() {
-            inner.push_available(run)?;
-        }
-        while let Some(extent) = self.extents.pop_front() {
-            inner.extents.cache_or_unmap(extent, ctx.pages)?;
-        }
-        self.result()
-    }
-
-    fn result(self) -> Result<(), HeapError> {
-        match self.error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    }
-}
-
-/// Unlink whatever an error left unpublished so the nodes can be queued again.
-impl Drop for Accepted {
-    fn drop(&mut self) {
-        while self.runs.pop().is_some() {}
-        while self.extents.pop_front().is_some() {}
+        self.flush_owner(ctx)?;
+        self.require_inner()
+            .extents
+            .allocate(spec, self, ctx.pages, init)
     }
 }
 

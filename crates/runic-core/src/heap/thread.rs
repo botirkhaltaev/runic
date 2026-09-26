@@ -138,9 +138,8 @@ impl ThreadHeaps {
         if let Some(ptr) = self.extend_current(class) {
             return Ok(Some(ptr));
         }
-        let accepted = heap.accept();
+        heap.flush_owner(ctx)?;
         let mut inner = heap.require_inner();
-        accepted.publish(&mut inner, ctx)?;
         let Some(run) = inner.acquire_run(class, ctx.pages, heap) else {
             return Ok(None);
         };

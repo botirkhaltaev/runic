@@ -75,10 +75,9 @@ A block is held by the user, the owner freelist, or a remote claim.
 2. Active owner: `Heap::enqueue` (lease before a new `try_queue`).
 3. Draining owner: `Heaps::{free,flush}`. The first remote thread may `adopt`
    the heap onto the back of its TLS list and complete an owner free.
-4. Owner `flush` calls `accept` outside `HeapInner`. Runs drain claim bits onto
-   the freelist. Extents go `Claimed` to `Free`. The guard is taken again only
-   to `push_available` or `cache_or_unmap`. Draining `Heaps::flush` keeps one
-   guard around accept, publish, and reclaim.
+4. Owner `flush` calls `accept` outside `HeapInner`, then takes a guard only to
+   `push_available` or `cache_or_unmap` that node. Draining `Heaps::flush` keeps
+   one guard around accept, publish, and reclaim.
 
 `Inbox` coalesces by owner. Claimed frees retry Active/Draining transitions.
 If the generation advances, the old owner already accepted the claim.

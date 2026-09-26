@@ -748,14 +748,13 @@ This list does not. Retained.
 
 ## Shorter locks on adopted heaps
 
-`Heap::accept` drains both inboxes with no `HeapInner` and returns `Accepted`.
-`Accepted::publish` lists runs and caches extents under the caller's guard.
-Active owners lock only to publish: `adopt` holds the guard for the lifecycle
-CAS, drops it, then publishes one node per guard. `alloc_miss` and
-`alloc_extent` accept first, then one guard covers publish and the acquire.
-Draining `Heap::flush` calls the same two under the admit guard so accept,
-publish, and reclaim stay one section. The locked `RunHeap::accept` and
-`ExtentHeap::accept` are gone. `idle` no longer `try_lock`s or scans
+Active `flush_owner` accepts each inbox node with no `HeapInner`, then takes a
+guard only to `push_available` or `cache_or_unmap` that node. `adopt` holds the
+guard for the lifecycle CAS and drops it before the flush. `alloc_miss` and
+`alloc_extent` flush first, then take their own guard for `acquire_run` or
+`allocate`. Draining `Heap::flush` walks the same nodes under the admit guard
+so accept, publish, and reclaim stay one section. The locked `RunHeap::accept`
+and `ExtentHeap::accept` are gone. `idle` no longer `try_lock`s or scans
 `has_live`.
 
 Same pin as above, same `daee6e9` baseline, after the list change.
@@ -763,12 +762,12 @@ Same pin as above, same `daee6e9` baseline, after the list change.
 ```text
                     instructions        cycles
 hashmap_grow master   17,117,934,851   5,501,844,899
-hashmap_grow locks    17,219,185,818   5,566,139,363   (+0.59% insn, +1.2% cycles)
+hashmap_grow locks    17,219,028,412   5,591,458,222   (+0.59% insn, +1.6% cycles)
 shard master          13,220,823,032   5,074,932,177
-shard locks           12,449,988,735   4,854,792,593   (-5.8% insn, -4.3% cycles)
+shard locks           12,536,156,566   4,832,695,591   (-5.2% insn, -4.8% cycles)
 ```
 
 `hashmap_grow` instructions match the list measurement (17,219,219,744 vs
-17,219,185,818). This lock is not on the hit. `shard_aggregator` stayed in
-the list's band (12,348,385,474 instructions, run spread about 0.75%).
-Retained.
+17,219,028,412). This lock is not on the hit. `shard_aggregator` stayed in
+the list's band (12,348,385,474 instructions). One shard sample with a 17%
+spread was discarded; the repeat above is ±0.75%. Retained.
