@@ -2,7 +2,9 @@
 
 On Linux `x86_64`, Runic implements `GlobalAlloc` and the malloc-family entry
 points listed below. It supports remote free and thread exit and requires
-nightly Rust. Mode Fast is implemented; Safe and Hardened abort at `init`.
+nightly Rust. The default build is Fast. Extent owner double-free aborts in
+both builds. `--features safe` also aborts an owner double-free of a small
+block. Hardened is not implemented.
 Hugepage and NUMA knobs exist on payload maps (default Off). Background purge
 and telemetry are not implemented. Planned work is [ROADMAP.md](ROADMAP.md).
 
@@ -21,9 +23,9 @@ and telemetry are not implemented. Planned work is [ROADMAP.md](ROADMAP.md).
 |------------|--------|
 | Implemented | `alloc`, `dealloc`, `alloc_zeroed`, `realloc` via `RunicAlloc` |
 | Contract | Null `dealloc` aborts. Layout must match what was used to allocate. Unknown and interior pointers abort |
-| Double free | Remote `claim` rejects a second free. Owner-local double-free is undefined (roadmap 0.10 Safe) |
-| `realloc` | Preserves the prefix; may move; uses the new `Layout` alignment |
-| Config | `RunicAlloc::new().with_*` (`Mode`, hugepage, NUMA, `ExtentConfig`, `RunConfig`). First `init` in the process wins. Non-Fast `Mode` aborts at init |
+| Double free | Remote `claim` rejects a second free. Extent owner double-free aborts. Small owner double-free is undefined on Fast and aborts with `--features safe` |
+| `realloc` | Preserves the prefix; may move. Uses the new `Layout` alignment in both builds |
+| Config | `RunicAlloc::new().with_*` (hugepage, NUMA, `ExtentConfig`, `RunConfig`). First `init` in the process wins. Safe is the `safe` Cargo feature, not a config field |
 
 ## C malloc family (`runic-cabi`)
 
@@ -43,9 +45,9 @@ __libc_cfree __libc_posix_memalign
 |------------|--------|
 | Implemented | Symbols above; `free(NULL)` is a no-op; overflowing `calloc` / `reallocarray` return null and set `ENOMEM` |
 | Errno | Pointer-returning failures set `ENOMEM` or `EINVAL`. `posix_memalign` returns the code and does not change errno |
-| `realloc` | Preserves the prefix but not alignment from `posix_memalign`, `aligned_alloc`, or `memalign`; new alignment is `max_align_t` (16). Roadmap 0.10 keeps the original alignment |
+| `realloc` | Preserves the prefix. Returns `max_align_t` (16) alignment in both builds, like glibc and mimalloc; `posix_memalign` alignment is not kept |
 | Missing | `mallinfo`, `malloc_stats`, `malloc_trim`, `malloc_info`, hooks, per-arena glibc knobs, `dlopen` after startup (roadmap 0.13; hooks stay out) |
-| Env | `RUNIC_MODE`, `RUNIC_HUGEPAGE`, `RUNIC_NUMA`, `RUNIC_EXTENT_POLICY`, `RUNIC_EXTENT_SLOTS`, `RUNIC_EXTENT_BYTES`, `RUNIC_RUN_POLICY` at first init |
+| Env | `RUNIC_HUGEPAGE`, `RUNIC_NUMA`, `RUNIC_EXTENT_POLICY`, `RUNIC_EXTENT_SLOTS`, `RUNIC_EXTENT_BYTES`, `RUNIC_RUN_POLICY` at first init |
 | Deploy | `LD_PRELOAD` at process start. Do not combine with `#[global_allocator]` `RunicAlloc` in the same process |
 
 `runic-cabi` tests entry-point contracts. `runic-preload` tests interposition,
@@ -68,7 +70,6 @@ thread exit, aborts, and the exact export set.
 
 ## Hardening and ops
 
-Missing in 0.9: quarantine, canaries, guard pages, cookies, checksums, delayed
-reuse. Safe is roadmap 0.10; Hardened is 0.11. Env and `with_mode` shipped in
-0.9 (non-Fast aborts). Stats dashboards and `MALLOC_*` compatibility stay
-declined. See [ROADMAP.md](ROADMAP.md).
+Missing: quarantine, canaries, guard pages, cookies, checksums, delayed
+reuse. Hardened is roadmap 0.11. Stats dashboards and `MALLOC_*` compatibility
+stay declined. See [ROADMAP.md](ROADMAP.md).

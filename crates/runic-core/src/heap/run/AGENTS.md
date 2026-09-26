@@ -2,7 +2,7 @@
 
 Scope: `crates/runic-core/src/heap/run/`.
 
-- Freelist + `live` own Free/Live. `allocate` is pop only. `extend` threads one page (min 32) onto the freelist; `issued` advances once.
+- `Freelist` + `live` own Free/Live. `allocate` pops. `extend` pushes one page (min 32) of fresh blocks; `issued` advances once. Safe free asks `Freelist::ensure_absent`.
 - Remote admission: private claim bitmap after the in-page header (`issued` on `RemoteLine` + `try_set`).
 - Domain ops on `Run`: `allocate` / `extend` / `free` (locate + push) / `claim` / `accept`. Hit ignores the `RunFree` outcome / Discard. Slow free uses `RunHeap::release` for the available list and Discard. Owner DF undefined.
 - Embedded `Link<Run>` coalesces by run (one inbox entry for many claims).

@@ -190,19 +190,19 @@ impl L1Table {
 
     #[inline]
     fn table_slot(&self, index: L1Index) -> &AtomicPtr<L2Table> {
-        // SAFETY: `L1Index` is only constructed for values `< L1_ENTRIES`.
+        // SAFETY: trusted constructor. `L1Index` is only built for values `< L1_ENTRIES`.
         unsafe { self.tables.get_unchecked(index.get()) }
     }
 
     #[inline]
     fn write_slot(&self, index: L1Index) -> &AtomicBool {
-        // SAFETY: `L1Index` is only constructed for values `< L1_ENTRIES`.
+        // SAFETY: trusted constructor. `L1Index` is only built for values `< L1_ENTRIES`.
         unsafe { self.writes.get_unchecked(index.get()) }
     }
 
     #[inline]
     fn mapping_slot(&self, index: L1Index) -> &UnsafeCell<Option<Mapping>> {
-        // SAFETY: `L1Index` is only constructed for values `< L1_ENTRIES`.
+        // SAFETY: trusted constructor. `L1Index` is only built for values `< L1_ENTRIES`.
         unsafe { self.mappings.get_unchecked(index.get()) }
     }
 }
@@ -227,7 +227,7 @@ const _: () = assert!(size_of::<L2Table>() == 0x8000);
 impl L2Table {
     #[inline]
     pub(super) fn entry(&self, index: L2Index) -> &AtomicMapEntry {
-        // SAFETY: `L2Index` is only constructed for values `< L2_ENTRIES`.
+        // SAFETY: trusted constructor. `L2Index` is only built for values `< L2_ENTRIES`.
         unsafe { self.pages.get_unchecked(index.get()) }
     }
 

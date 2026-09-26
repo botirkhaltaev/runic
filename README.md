@@ -2,14 +2,14 @@
 
 Runic is an owner-local allocator for Linux `x86_64`. Metadata sits outside
 user allocations. Unsafe code is limited to OS and ownership boundaries.
-Invalid and foreign frees abort. Owner double-free is undefined. C
-`free(NULL)` is a no-op.
+Invalid and foreign frees abort. Small owner double-free is undefined on the
+default build and aborts with `--features safe`. C `free(NULL)` is a no-op.
 
 Published version **0.9.0** provides `GlobalAlloc`, the C malloc family for
 `LD_PRELOAD`, payload hugepage and NUMA knobs, and const
 `RunicAlloc::new().with_*` with `RUNIC_*` for preload. It requires nightly
-Rust (`#[thread_local]`). Safe/Hardened behavior and background purge are
-not implemented. See [Compatibility](COMPATIBILITY.md) and the
+Rust (`#[thread_local]`). Hardened behavior and background purge are not
+implemented. See [Compatibility](COMPATIBILITY.md) and the
 [Roadmap](ROADMAP.md).
 
 ## Rust
@@ -53,7 +53,7 @@ LD_PRELOAD=$PWD/target/release/librunic.so ./program
 cargo fmt --all -- --check
 cargo check --workspace
 cargo test --workspace
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 cargo bench -p runic-bench --no-run
 ```
 

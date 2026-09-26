@@ -29,5 +29,4 @@ directly.
 - `threads`: threads exit while still bound to a heap.
 - `unknown`, `small-interior`, `large-interior`, `realloc-interior`: abort.
 
-The harness also verifies `RUNIC_MODE`: Fast runs, Safe/Hardened abort at
-allocator init, and unknown values leave defaults unchanged.
+Unknown `RUNIC_*` values leave that setting at its default.

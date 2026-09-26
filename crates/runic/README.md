@@ -18,11 +18,11 @@ static GLOBAL: RunicAlloc = RunicAlloc::new();
 
 ## Config
 
-First `init` in the process wins; later configs are ignored. `new()` is Fast
-with hugepage and NUMA off. `with_mode` other than Fast aborts at init (Safe
-and Hardened are not shipped). Extent policy applies on free: `Keep` retains a
-mapping while slot and byte budgets allow, `Discard` retains then `madvise`s,
-`Unmap` does not retain. Allocate-side reuse is exact mapping length. Payload
+First `init` in the process wins; later configs are ignored. `new()` is the
+default Fast build with hugepage and NUMA off. `--features safe` also aborts an
+owner double-free of a small block. Extent policy
+applies on free: `Keep` retains a mapping while slot and byte budgets allow,
+`Discard` retains then `madvise`s, and `Unmap` does not retain. Allocate-side reuse is exact mapping length. Payload
 maps honor hugepage (`Off` / `Thp`) and NUMA (`Off` / `Local`).
 
 ```rust

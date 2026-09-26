@@ -678,3 +678,42 @@ instructions per element 734.98 to 735.88 (+0.12%), elements per second
 +0.26%. No regression in the counters; the Criterion delta is run-to-run
 timing noise. Retained.
 
+
+## 0.10 Safe split and the run `Freelist`
+
+Extent owner free became a CAS `Allocated -> Free` in both builds (glibc
+checks large chunks in its default build; mimalloc and snmalloc do not check
+small owner double-free by default, so Fast leaves that undefined). The Safe
+small check follows mimalloc `MI_SECURE=4`: read the block's first word, and
+walk the freelist only when it is `0` or a block address of this run. The
+run free-block stack moved into `heap/run/freelist.rs` as `Freelist`.
+
+Criterion `global_runic`, CPUs 0-3, `buffer_pool` and `hashmap_grow` against
+a saved baseline taken before the CAS and the `Freelist` move:
+
+```text
+                          hashmap_grow   buffer_pool
+CAS + Freelist                 +5.73%        +1.24%
+CAS reverted, Freelist         +6.34%        +0.27%
+CAS, Freelist reverted         +0.49%        -0.11%
+```
+
+The CAS is not the cost. `objdump` of `__rust_alloc` and `__rust_dealloc` is
+identical between the `Freelist` and inline variants apart from relocations.
+`Run::extend` differed: the first `push_contiguous` multiplied
+`step * stride` per block and LLVM unrolled it 8x with six callee-saved
+pushes and stack spills. Rewriting it as a pointer walk (`byte_add(stride)`)
+gave a tight 8x loop and cut `hashmap_grow` to +3.27%.
+
+Pinned CPU 2, `perf stat`, `hashmap_grow`: instructions 17.113e9 (inline)
+vs 17.118e9 (`Freelist`), +0.03%; cycles +0.94%. Paired A/B on the same
+core, two rounds: +0.57% (p 0.49), +1.57% (p 0.07). Full suite A/B on CPU 2
+moved both ways: `lru_cache` +16.7%, `vec_growth_log` +5.6%,
+`regex_search` -6.5%, `arc_broadcast` -4.5%, `records_sort` -3.8%,
+`vecdeque_events` -3.6%. `perf record` on `lru_cache`: 66% (inline) vs 70%
+(`Freelist`) of cycles are the workload's own `recency.iter().position` scan;
+`__rust_realloc` is 9.7% vs 8.8%. The allocator code is the same, so the
+swings are code placement of the benchmark under fat LTO with one codegen
+unit; the extra module shifts every later function by 0x30 bytes. Retained.
+Placement swings of this size mean single-workload Criterion deltas below
+the `perf stat` instruction check are not evidence on their own.

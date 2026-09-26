@@ -269,12 +269,22 @@ impl Extent {
         Some(user_ptr)
     }
 
-    /// Owner-local free: exact pointer, then `Allocated → Free`. Owner DF is
-    /// undefined. Remote admission is `claim` / `accept`.
+    /// Owner-local free: exact pointer, then `Allocated → Free`.
+    ///
+    /// Aborts unless the state byte is `Allocated`, so an owner double free of
+    /// a live cached extent cannot corrupt the cache. Remote admission is
+    /// `claim` / `accept`.
     pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<(), ExtentError> {
         self.validate_exact(ptr)?;
-        self.state.store(ExtentState::Free.raw(), Ordering::Relaxed);
-        Ok(())
+        match self.state.compare_exchange(
+            ExtentState::Allocated.raw(),
+            ExtentState::Free.raw(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => Ok(()),
+            Err(_) => Allocator::abort(),
+        }
     }
 
     /// Freer: exact pointer, then `Allocated → Claimed`.
@@ -422,8 +432,7 @@ mod tests {
         let spec = layout_spec(128 * 1024, 4096);
         let mapping = Os::map(spec.mapping_len(Os::page_size()).unwrap()).unwrap();
         let extent = Extent::new(ExtentId::from_index(1).unwrap(), &OWNER, mapping, spec).unwrap();
-        // SAFETY: adding one stays within the mapped extent for this non-zero allocation.
-        let interior = unsafe { NonNull::new_unchecked(extent.ptr().as_ptr().add(1)) };
+        let interior = NonNull::new(extent.ptr().as_ptr().wrapping_add(1)).unwrap();
 
         assert!(!extent.starts_at(interior));
         assert_eq!(extent.free(interior), Err(ExtentError::InvalidPointer));
@@ -444,8 +453,7 @@ mod tests {
         let spec = layout_spec(128 * 1024, 4096);
         let mapping = Os::map(spec.mapping_len(Os::page_size()).unwrap()).unwrap();
         let extent = Extent::new(ExtentId::from_index(8).unwrap(), &OWNER, mapping, spec).unwrap();
-        // SAFETY: adding one stays within the mapped extent for this non-zero allocation.
-        let interior = unsafe { NonNull::new_unchecked(extent.ptr().as_ptr().add(1)) };
+        let interior = NonNull::new(extent.ptr().as_ptr().wrapping_add(1)).unwrap();
 
         assert_eq!(extent.claim(interior), Err(ExtentError::InvalidPointer));
         assert_eq!(extent.free(extent.ptr()), Ok(()));

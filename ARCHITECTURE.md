@@ -39,7 +39,7 @@ the payload pages only.
 | Alloc miss | `extend` if the current run is empty; inbox `accept` if nonempty; then local or OS `acquire_run` |
 | Unbound alloc | `bind`, flush, then alloc |
 | Owner free hit | `Run::free`: `locate` then push |
-| Owner double-free | Undefined |
+| Owner double-free | Undefined on Fast; `--features safe` filters the first word, then walks the freelist |
 | Interior pointer | `locate` aborts |
 
 `current[class]` is a hint, not ownership. A run may also be on the available
@@ -59,7 +59,7 @@ the current-run hit.
 
 Layouts that do not fit a size class get a dedicated mapping. The `Extent`
 slot is immortal; unmap drops `Mapping` only. Frees must be the exact returned
-pointer. Owner double-free is undefined.
+pointer. Owner double-free aborts: `free` requires the state byte `Allocated`.
 
 The default `Keep` policy retains mappings within slot and byte budgets and
 reuses an exact length. `Discard` retains the mapping after `madvise`;

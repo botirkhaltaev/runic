@@ -51,7 +51,22 @@ jobs:
         run: cargo test --workspace
 
       - name: Lint workspace
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Lint c-abi
+        run: cargo clippy -p runic-core --all-targets --features c-abi -- -D warnings
+
+      - name: Test safe feature
+        run: |
+          cargo test -p runic-core --features safe
+          cargo test -p runic-alloc --features safe
+          cargo test -p runic-cabi --features safe
+
+      - name: Lint safe feature
+        run: |
+          cargo clippy -p runic-core --all-targets --features safe -- -D warnings
+          cargo clippy -p runic-alloc --all-targets --features safe -- -D warnings
+          cargo clippy -p runic-cabi --all-targets --features safe -- -D warnings
 
       - name: Build benchmarks
         run: cargo bench -p runic-bench --no-run

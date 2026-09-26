@@ -1,6 +1,6 @@
 use core::alloc::{GlobalAlloc, Layout};
 
-use runic_core::{Allocator, AllocatorConfig, ExtentConfig, HugePage, Mode, Numa, RunConfig};
+use runic_core::{Allocator, AllocatorConfig, ExtentConfig, HugePage, Numa, RunConfig};
 
 /// Process-global Runic allocator.
 ///
@@ -22,13 +22,6 @@ impl RunicAlloc {
     pub const fn with_config(config: AllocatorConfig) -> Self {
         Self {
             allocator: Allocator::with_config(config),
-        }
-    }
-
-    #[must_use]
-    pub const fn with_mode(self, mode: Mode) -> Self {
-        Self {
-            allocator: self.allocator.with_mode(mode),
         }
     }
 
@@ -67,24 +60,31 @@ impl Default for RunicAlloc {
     }
 }
 
+// SAFETY: `RunicAlloc` forwards to its `Allocator`. `alloc` / `alloc_zeroed`
+// receive a `GlobalAlloc` layout. `dealloc` receives a pointer this allocator
+// returned for that layout. `realloc` receives null or that pointer.
 unsafe impl GlobalAlloc for RunicAlloc {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: `layout` is the caller's `GlobalAlloc` contract.
         unsafe { self.allocator.alloc(layout) }
     }
 
     #[inline]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: `ptr` was returned by this allocator for `layout`.
         unsafe { self.allocator.dealloc(ptr, layout) };
     }
 
     #[inline]
     unsafe fn realloc(&self, ptr: *mut u8, old: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: `ptr` is null or was returned by this allocator for `old`.
         unsafe { self.allocator.realloc(ptr, old, new_size) }
     }
 
     #[inline]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: `layout` is the caller's `GlobalAlloc` contract.
         unsafe { self.allocator.alloc_zeroed(layout) }
     }
 }

@@ -96,7 +96,7 @@ impl ThreadHeaps {
     }
 
     #[cfg(not(feature = "c-abi"))]
-    fn arm_exit(&self) {
+    fn arm_exit() {
         UNBIND_GUARD.with(|_| {});
     }
 
@@ -248,6 +248,9 @@ impl ThreadHeaps {
     /// vacant slot (Heaps locks internally).
     #[cold]
     pub(crate) fn bind(&self, ctx: &AllocatorCtx<'static>) -> Option<HeapId> {
+        #[cfg(not(feature = "c-abi"))]
+        Self::arm_exit();
+        #[cfg(feature = "c-abi")]
         self.arm_exit();
         if let Some(id) = self.active().and_then(ThreadHeap::id) {
             return Some(id);
@@ -265,6 +268,9 @@ impl ThreadHeaps {
     /// `Heaps::free` until a slot is unbound.
     #[cold]
     pub(crate) fn adopt(&self, heap: &'static Heap, ctx: &AllocatorCtx) -> bool {
+        #[cfg(not(feature = "c-abi"))]
+        Self::arm_exit();
+        #[cfg(feature = "c-abi")]
         self.arm_exit();
         if self.owns(heap) {
             return true;
@@ -357,14 +363,14 @@ impl ThreadHeaps {
 
     fn current(&self, class: SizeClass) -> Option<&Run> {
         debug_assert!(class.index() < self.current.len());
-        // SAFETY: SizeClass values are created only by SizeClasses for indexes in this array.
+        // SAFETY: trusted constructor. `SizeClass` index is `< SizeClasses::COUNT`, and `current.len()` is that count.
         let cell = unsafe { self.current.get_unchecked(class.index()) };
         cell.get()
     }
 
     fn set_current(&self, class: SizeClass, run: Option<&'static Run>) {
         debug_assert!(class.index() < self.current.len());
-        // SAFETY: SizeClass values are created only by SizeClasses for indexes in this array.
+        // SAFETY: trusted constructor. `SizeClass` index is `< SizeClasses::COUNT`, and `current.len()` is that count.
         unsafe { self.current.get_unchecked(class.index()) }.set(run);
     }
 

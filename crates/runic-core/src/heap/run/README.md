@@ -5,7 +5,8 @@ Run metadata owns small size-class allocations. Hit/miss:
 
 ## Files
 
-- `mod.rs`: `Run`, `RunId`, pointer freelist + `extend`, in-page header at `base + RUN_SIZE`, and a private claim bitmap after the header.
+- `mod.rs`: `Run`, `RunId`, `extend`, in-page header at `base + RUN_SIZE`, and a private claim bitmap after the header.
+- `freelist.rs`: owner-exclusive free-block stack. The head and each free block's first word are payload addresses (`0` = end).
 - `config.rs`: `RunConfig` / `RunPolicy::{Keep,Discard}`.
 - `heap.rs`: `RunHeap` with `Arena<&'static Run>` (in-space headers) then `Arena<Mapping>`, available-run lists, `Hints` on payload maps, and payload-only page-map publication.
 
@@ -20,7 +21,8 @@ Run metadata owns small size-class allocations. Hit/miss:
 - Freelist membership and `live` decide Free vs Live. `allocate` pops. Empty
   freelists call `extend`, which adds one page of fresh blocks, at least 32,
   and advances `issued`. Hit free is `locate` then push. Owner double-free is
-  undefined.
+  undefined on Fast. `--features safe` aborts it: `Freelist::ensure_absent`
+  walks the stack only when the block's first word is `0` or a block address.
 - Freelist head and intrusive payload links are payload addresses (`0` = end).
 - Remote admission is `issued` plus `try_set` on the claim bitmap. A second
   claim is `DoubleFree`. `accept` drains bits onto the freelist.

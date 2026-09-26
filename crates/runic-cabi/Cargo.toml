@@ -10,6 +10,9 @@ description = "Runic malloc-family interceptor for LD_PRELOAD"
 name = "runic"
 crate-type = ["cdylib"]
 
+[features]
+safe = ["runic-core/safe"]
+
 [lints]
 workspace = true
 

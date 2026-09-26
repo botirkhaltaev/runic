@@ -156,16 +156,13 @@ impl RunHeap {
 
     fn insert_run(&mut self, run: Run, pages: &PageMap) -> Option<&'static Run> {
         let index = run.id().index();
-        // SAFETY: payload base is `RUN_SIZE`-aligned in a mapped `RUN_SPACE`.
-        let header: NonNull<Run> = unsafe {
-            NonNull::new_unchecked(
-                run.range()
-                    .base()
-                    .as_ptr()
-                    .wrapping_byte_add(RUN_SIZE)
-                    .cast(),
-            )
-        };
+        let header: NonNull<Run> = NonNull::new(
+            run.range()
+                .base()
+                .as_ptr()
+                .wrapping_byte_add(RUN_SIZE)
+                .cast(),
+        )?;
         // SAFETY: `header` is in this run's mapped tail; first write to this space.
         unsafe { header.as_ptr().write(run) };
         // SAFETY: header was just written. Run mappings stay live for the process.
