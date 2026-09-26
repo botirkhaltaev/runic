@@ -116,7 +116,7 @@ Released as `0.9.0`.
 
 ## Next
 
-0.9 is published. Production still means Safe owner mistakes, Hardened
+0.9 is published. Production still means Safe mode in safe Rust, Hardened
 integrity, reclaim, C trim/inspect, and other `Memory` impls. Fast stays free
 of Safe and Hardened work.
 
@@ -132,6 +132,10 @@ Safe and Hardened are measured as their own columns.
 Safe and Hardened abort at first `init` until 0.10 / 0.11.
 
 ### 0.10 Safe
+
+Safe mode is safe Rust only. That build contains no `unsafe`, so memory safety
+is the compiler's guarantee. Fast keeps `unsafe` for OS and ownership contracts
+and for measured hot paths. Hardened does not run on Safe.
 
 Owner-local double-free aborts on runs and extents (remote `claim` already
 does). C `realloc` keeps the original alignment from `posix_memalign`,
