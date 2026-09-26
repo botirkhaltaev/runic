@@ -109,14 +109,14 @@ Memory trait behind the Os alias; Linux is the only impl
 Mapping owns the mmap; prefer applies THP and NUMA-local hints
 HugePage Off or Thp; Numa Off or Local; defaults Off/Off
 AllocatorConfig with const with_* and no builder
-RUNIC_* overlay at preload; non-Fast Mode aborts at init
+RUNIC_* overlay at preload for hugepage, NUMA, and run/extent policy
 ```
 
 Released as `0.9.0`.
 
 ## Next
 
-0.9 is published. Production still means Safe mode in safe Rust, Hardened
+0.9 is published. Production still means the Safe feature, Hardened
 integrity, reclaim, C trim/inspect, and other `Memory` impls. Fast stays free
 of Safe and Hardened work.
 
@@ -127,19 +127,26 @@ Safe and Hardened are measured as their own columns.
 
 ### Modes
 
-`RunicAlloc::new().with_x()` / `with_mode`, const, no separate builder type.
-`Mode::{Fast, Safe, Hardened}`. Preload reads `RUNIC_*`, including `RUNIC_MODE`.
-Safe and Hardened abort at first `init` until 0.10 / 0.11.
+`RunicAlloc::new().with_x()`, const, no separate builder type. The build is
+the mode: default is Fast, `--features safe` is Safe. There is no `Mode`,
+`with_mode`, or `RUNIC_MODE`. Preload reads `RUNIC_*` for hugepage, NUMA, and
+run/extent policy. Hardened is its own feature in 0.11 and is not combined
+with Safe.
 
 ### 0.10 Safe
 
-Safe mode is safe Rust only. That build contains no `unsafe`, so memory safety
-is the compiler's guarantee. Fast keeps `unsafe` for OS and ownership contracts
-and for measured hot paths. Hardened does not run on Safe.
+Safe Rust is best-effort in both builds. A site becomes safe only when it is
+off the hit, adds no helper or second API, and keeps the same behavior. Every
+remaining `unsafe` names the invariant it relies on. Fast hit `unsafe` stays.
+Hardened does not run on Safe.
 
-Owner-local double-free aborts on runs and extents (remote `claim` already
-does). C `realloc` keeps the original alignment from `posix_memalign`,
-`aligned_alloc`, and `memalign`.
+Fast is the malloc baseline: extent owner double-free aborts (the state byte
+must be `Allocated`, as glibc checks large chunks), and small owner
+double-free is undefined, as mimalloc and snmalloc leave it by default. Safe
+adds the small check the way mimalloc `MI_SECURE=4` does: a cheap filter on
+the block's first word, then a capped freelist walk only when that word looks
+like a link. `realloc` uses the caller's alignment in both builds; no
+researched allocator keeps `memalign` alignment across `realloc`.
 
 ### 0.11 Hardened
 

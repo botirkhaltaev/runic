@@ -9,6 +9,9 @@ description.workspace = true
 [lib]
 name = "runic"
 
+[features]
+safe = ["runic-core/safe"]
+
 [lints]
 workspace = true
 

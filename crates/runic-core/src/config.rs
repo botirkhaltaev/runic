@@ -3,18 +3,6 @@ use core::ffi::CStr;
 use crate::heap::extent::config::{ExtentConfig, ExtentPolicy};
 use crate::heap::run::config::{RunConfig, RunPolicy};
 
-/// Process mode. 0.9 implements [`Mode::Fast`] only.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum Mode {
-    /// Fast allocator path. The only implemented mode in 0.9.
-    #[default]
-    Fast,
-    /// Defined owner-error handling. Reserved for 0.10; aborts at init in 0.9.
-    Safe,
-    /// Integrity checks and quarantine. Reserved for 0.11; aborts at init in 0.9.
-    Hardened,
-}
-
 /// Payload hugepage policy.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum HugePage {
@@ -83,7 +71,6 @@ impl Default for Hints {
 /// Immutable allocator configuration for tunable allocator behavior.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AllocatorConfig {
-    mode: Mode,
     extent: ExtentConfig,
     run: RunConfig,
     hints: Hints,
@@ -93,16 +80,10 @@ impl AllocatorConfig {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            mode: Mode::Fast,
             extent: ExtentConfig::new(),
             run: RunConfig::new(),
             hints: Hints::new(),
         }
-    }
-
-    #[must_use]
-    pub const fn mode(self) -> Mode {
-        self.mode
     }
 
     #[must_use]
@@ -118,12 +99,6 @@ impl AllocatorConfig {
     #[must_use]
     pub(crate) const fn hints(self) -> Hints {
         self.hints
-    }
-
-    #[must_use]
-    pub const fn with_mode(mut self, mode: Mode) -> Self {
-        self.mode = mode;
-        self
     }
 
     #[must_use]
@@ -162,7 +137,6 @@ impl AllocatorConfig {
     #[must_use]
     pub(crate) fn overlay_env(self) -> Self {
         let mut config = self;
-        config = overlay_var(config, c"RUNIC_MODE");
         config = overlay_var(config, c"RUNIC_HUGEPAGE");
         config = overlay_var(config, c"RUNIC_NUMA");
         config = overlay_var(config, c"RUNIC_EXTENT_POLICY");
@@ -175,12 +149,6 @@ impl AllocatorConfig {
     #[must_use]
     pub(crate) fn overlay(self, name: &[u8], value: &[u8]) -> Self {
         match name {
-            b"RUNIC_MODE" => match value {
-                b"fast" => self.with_mode(Mode::Fast),
-                b"safe" => self.with_mode(Mode::Safe),
-                b"hardened" => self.with_mode(Mode::Hardened),
-                _ => self,
-            },
             b"RUNIC_HUGEPAGE" => match value {
                 b"off" => self.with_hugepage(HugePage::Off),
                 b"thp" => self.with_hugepage(HugePage::Thp),
@@ -277,7 +245,6 @@ mod tests {
     #[test]
     fn overlay_ignores_unknown_values() {
         let base = AllocatorConfig::new();
-        assert_eq!(base.overlay(b"RUNIC_MODE", b"nope"), base);
         assert_eq!(base.overlay(b"RUNIC_HUGEPAGE", b"huge"), base);
         assert_eq!(base.overlay(b"RUNIC_HUGEPAGE", b"force"), base);
         assert_eq!(base.overlay(b"RUNIC_NUMA", b"bind"), base);
@@ -296,14 +263,12 @@ mod tests {
     #[test]
     fn overlay_sets_known_keys() {
         let config = AllocatorConfig::new()
-            .overlay(b"RUNIC_MODE", b"safe")
             .overlay(b"RUNIC_HUGEPAGE", b"thp")
             .overlay(b"RUNIC_NUMA", b"local")
             .overlay(b"RUNIC_EXTENT_POLICY", b"unmap")
             .overlay(b"RUNIC_RUN_POLICY", b"discard")
             .overlay(b"RUNIC_EXTENT_SLOTS", b"4")
             .overlay(b"RUNIC_EXTENT_BYTES", b"1024");
-        assert_eq!(config.mode(), Mode::Safe);
         assert_eq!(config.hints().hugepage(), HugePage::Thp);
         assert_eq!(config.hints().numa(), Numa::Local);
         assert_eq!(config.extent().policy(), ExtentPolicy::Unmap);

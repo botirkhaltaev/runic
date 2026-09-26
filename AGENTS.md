@@ -5,7 +5,7 @@
 - Performance is the top priority on hot paths — but **data-driven only**: profile before and after (`scripts/profile.sh`); never infer micro-opts, inlining, or layout “wins” without measurements.
 - Clean, idiomatic, readable Rust. No hacks at code or architecture level (no clever dual paths, kludges, or “temporary” shims that become permanent).
 - Safe Rust first; `unsafe` only for OS/ownership contracts or **measured** hot paths (narrow + SAFETY).
-- Explicit ownership entities, fail-closed remote admission and interior/foreign pointers, auditable invariants — not line-for-line ports. Owner double-free is undefined.
+- Explicit ownership entities, fail-closed remote admission and interior/foreign pointers, auditable invariants — not line-for-line ports. Small owner double-free is undefined on Fast.
 - Composable APIs: behavior on the owning entity; no one-caller shims, pass-throughs, dual APIs, or `*_v2` / `*_nonlocal` names. `#[inline(never)]` outlines only (`alloc_miss` / `dealloc_slow` / `push_available`); `#[cold]` is abort / bind / map / remote / unbind / discard / adopt.
 
 ## Conventions
@@ -33,7 +33,7 @@
 | Test | `cargo test --workspace` |
 | Test crate | `cargo test -p <crate>` |
 | Format | `cargo fmt --all` |
-| Lint | `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
+| Lint | `cargo clippy --workspace --all-targets -- -D warnings` |
 | Bench build | `cargo bench -p runic-bench --no-run` |
 | Profile | `scripts/profile.sh` |
 | Preload `.so` | `cargo build -p runic-cabi --release` |
@@ -57,17 +57,17 @@
 ## Scope
 
 - v0.8 in: Linux x86_64, Rust nightly, `#[thread_local]` `THREAD_HEAPS`, `GlobalAlloc`, C malloc-family LD_PRELOAD (`runic-cabi`), owner-local heaps, two equal TLS heaps, TLS current run, immortal extent slots, `Heap` live atomics, lock-free `Heaps::get`, draining `admit`/`flush` with optional `owner`, run/extent retention, remote-free, `realloc` / `alloc_zeroed`, tests, real-workload benches.
-- v0.9 in: `Memory` trait behind the `Os` alias (`Linux` impl owns `libc`), payload hugepage Off/Thp and NUMA Off/Local, `RunicAlloc::new().with_*` (no builder), cabi `Allocator::preload` + `RUNIC_*`, Fast only (Safe/Hardened abort at init). `Hints` default Off/Off after the Fast screen.
+- v0.9 in: `Memory` trait behind the `Os` alias (`Linux` impl owns `libc`), payload hugepage Off/Thp and NUMA Off/Local, `RunicAlloc::new().with_*` (no builder), cabi `Allocator::preload` + `RUNIC_*`. `Hints` default Off/Off after the Fast screen.
 - v0.9 out: quarantine, canaries, Safe owner-DF, Hardened, reclaim, mallinfo, fork, extra OS, `MAP_HUGETLB` / `MAP_HUGE_1GB`. Production sequence: `ROADMAP.md` 0.10–0.14.
-- Next: `ROADMAP.md` 0.10 Safe (safe Rust only, no `unsafe`). Hit free is `Run::free` (`__rust_dealloc` has no callee-saved). C `free` recovers the owner via `PageMap` (`header_of` is not safe on extents); `free(NULL)` is a C no-op. `header_of` checks raw `base` before constructing `Run`. `issued` / `link` / claims live on `RemoteLine`. Live counts are `Heap` atomics; reclaim scans after. Zeroed Keep reuse ≥64 KiB discards pages without the Discard-insert clean flag; below that, memset. `ExtentPolicy::Discard` matches snmalloc — not a medium class. `Heaps::get` is a lock-free `Arena` read. Two equal TLS heaps; a third adopt stays on `Heaps::free` (lost on `channel_pipeline`). Do not compact `CLASS_FOR_SIZE`, retry first-fit extent reuse, identity, batch take, O(1) TLS steal, `#135` RSEQ, per-CPU heaps on rseq-rs, locate-offset dual free, a third TLS slot, reclaim live-scan elimination, realloc known-owner reuse, or the `spawn_churn` fault package. Do not port snmalloc. Claimed remote frees retry Active/Draining transitions; a generation advance proves the owner accepted the claim.
+- Next: `ROADMAP.md` 0.10 Safe (Cargo feature `safe`: small owner double-free aborts via `Freelist::ensure_absent`, mimalloc `MI_SECURE=4` filter then capped walk). Fast is the malloc baseline: extent owner double-free aborts in both builds (glibc large-chunk check); realloc uses the caller's alignment in both builds (no allocator keeps `memalign` alignment). Safe Rust elsewhere is best-effort and off the hit. Every remaining `unsafe` names its invariant. Fast hit `unsafe` stays. Hit free is `Run::free` (`__rust_dealloc` has no callee-saved). C `free` recovers the owner via `PageMap` (`header_of` is not safe on extents); `free(NULL)` is a C no-op. `header_of` checks raw `base` before constructing `Run`. `issued` / `link` / claims live on `RemoteLine`. Live counts are `Heap` atomics; reclaim scans after. Zeroed Keep reuse ≥64 KiB discards pages without the Discard-insert clean flag; below that, memset. `ExtentPolicy::Discard` matches snmalloc — not a medium class. `Heaps::get` is a lock-free `Arena` read. Two equal TLS heaps; a third adopt stays on `Heaps::free` (lost on `channel_pipeline`). Do not compact `CLASS_FOR_SIZE`, retry first-fit extent reuse, identity, batch take, O(1) TLS steal, `#135` RSEQ, per-CPU heaps on rseq-rs, locate-offset dual free, a third TLS slot, reclaim live-scan elimination, realloc known-owner reuse, or the `spawn_churn` fault package. Do not port snmalloc. Claimed remote frees retry Active/Draining transitions; a generation advance proves the owner accepted the claim.
 
 ## Learned User Preferences
 
 - Keep Criterion benches as real workloads: one file per workload, simple layout, no adhoc scripts or synthetic-only suites. Tests stay Cargo-native: no extra fixture binaries or polling waits when `cargo test` suffices.
 - Never merge dead code or `#[allow(clippy)]`; fix the lint instead.
 - Prefer isolating `unsafe` in leaf entities so it can be tested; do not leave it on higher layers when a leaf boundary works.
-- Tests must exercise production types: no test-only structs, entities, or helpers that shadow real owners. Generic type-parameter stubs (`TestNode` for `Inbox<T>`, `DropCounter`/`Large` for `Arena<T>`) are OK.
-- Do not invent fake entities; model real ownership.
+- Tests must exercise production types and real ownership: no test-only structs, entities, or helpers that shadow real owners. Generic type-parameter stubs (`TestNode` for `Inbox<T>`, `DropCounter`/`Large` for `Arena<T>`) are OK.
+- Prefer stdlib or existing dependencies over hand-rolled parsers and helpers.
 - Prefer `const` constructors and `static`/`OnceLock` for test fixtures over `Box::leak`.
 - Do not shadow or add redundant reassignments (e.g. `let start = bump`).
 - Compare owners with entity methods/traits (`owns`), not `ptr::eq` or other raw pointer ops.
@@ -83,4 +83,5 @@
 - C malloc-family LD_PRELOAD is the published `runic-cabi` crate (cdylib `librunic.so`), not a `runic-alloc` feature. `runic-core`'s `c-abi` feature is pthread TLS for thread-exit under preload; default is `std::thread_local!`.
 - Publish with `cargo publish --workspace`; do not wait-loop on crates.io.
 - Default branch is `master`, not `main`.
-- Config lives on the allocator: `RunicAlloc::new().with_x()` / `with_mode`, no separate builder type. Do not invent crate README samples for unshipped `with_mode`.
+- Config lives on the allocator (`RunicAlloc::new().with_extent_config` / `with_run_config` / `with_hugepage` / `with_numa`), no separate builder type. Safe is a Cargo feature, not `Mode` / `RUNIC_MODE` / `with_mode`: the build is the mode. Safe Rust is best-effort in both builds and stays off the hit. Every remaining `unsafe` names the invariant it relies on.
+- The intrusive remote-free structure is a `List` (push head, `drain` walks). `Inbox` only coalesces. Do not reintroduce a separate `Chain` type. The run free-block stack is its own `Freelist`, not `List`.

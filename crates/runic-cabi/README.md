@@ -34,7 +34,7 @@ __libc_cfree __libc_posix_memalign
 | Unknown or interior pointer | Abort |
 | `malloc` / `calloc` / `realloc` failure | Null, `errno = ENOMEM` (or `EINVAL` for bad align) |
 | `posix_memalign` failure | Returns `EINVAL` / `ENOMEM`; errno unchanged |
-| `realloc` | Prefix preserved. Alignment from `posix_memalign` / `aligned_alloc` / `memalign` is not preserved (new align is 16) |
+| `realloc` | Prefix preserved. Alignment 16 in both builds; `posix_memalign` alignment is not kept |
 | `aligned_alloc` | Alignment power of two; size a multiple of alignment (C11) |
 
 Load at process start; late `dlopen` is unsupported. Do not combine it with
@@ -43,10 +43,9 @@ process-global allocator state, so whichever boundary initializes it first
 fixes the configuration for both.
 
 At first `init`, cabi overlays `RUNIC_*` (`libc` getenv). Unknown values leave
-that key at the Fast default. `RunicAlloc::new().with_*` does not read env.
+that key at its default. `RunicAlloc::new().with_*` does not read env.
 
 ```text
-RUNIC_MODE           fast | safe | hardened   (only fast runs; others abort)
 RUNIC_HUGEPAGE       off | thp
 RUNIC_NUMA           off | local
 RUNIC_EXTENT_POLICY  keep | discard | unmap

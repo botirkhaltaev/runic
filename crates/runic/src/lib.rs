@@ -9,5 +9,5 @@ mod global;
 
 pub use global::RunicAlloc;
 pub use runic_core::{
-    AllocatorConfig, Budget, ExtentConfig, ExtentPolicy, HugePage, Mode, Numa, RunConfig, RunPolicy,
+    AllocatorConfig, Budget, ExtentConfig, ExtentPolicy, HugePage, Numa, RunConfig, RunPolicy,
 };

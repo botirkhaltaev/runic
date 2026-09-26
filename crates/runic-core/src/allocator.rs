@@ -5,7 +5,7 @@ use core::{
 };
 
 use crate::{
-    config::{AllocatorConfig, HugePage, Mode, Numa},
+    config::{AllocatorConfig, HugePage, Numa},
     heap::{
         AllocatorCtx, ExtentInit, HeapError, Heaps, Run, THREAD_HEAPS, ThreadFreeError,
         extent::config::ExtentConfig, run::config::RunConfig,
@@ -56,12 +56,6 @@ impl Allocator {
             config,
             from_env: false,
         }
-    }
-
-    #[must_use]
-    pub const fn with_mode(mut self, mode: Mode) -> Self {
-        self.config = self.config.with_mode(mode);
-        self
     }
 
     #[must_use]
@@ -265,19 +259,18 @@ impl Allocator {
         let Some(ctx) = Self::ctx() else {
             Self::abort();
         };
-        // SAFETY: `ptr` is non-null after the early return above.
-        let old_ptr = unsafe { NonNull::new_unchecked(ptr) };
         let Ok(new_layout) = Layout::from_size_align(new_size, old.align()) else {
             return null_mut();
         };
-        let new_spec = LayoutSpec::from_layout(new_layout);
-        let old_spec = LayoutSpec::from_layout(old);
-
-        let resized = match Self::lookup(ctx.pages, old_ptr, old_spec) {
-            Some(owner) => owner.resize_in_place(old_ptr, new_spec),
-            None => Self::abort(),
+        let Some(old_ptr) = NonNull::new(ptr) else {
+            Self::abort();
         };
-        match resized {
+        let old_spec = LayoutSpec::from_layout(old);
+        let Some(owner) = Self::lookup(ctx.pages, old_ptr, old_spec) else {
+            Self::abort();
+        };
+
+        match owner.resize_in_place(old_ptr, LayoutSpec::from_layout(new_layout)) {
             Ok(true) => return ptr,
             Ok(false) => {}
             Err(_) => Self::abort(),
@@ -349,9 +342,6 @@ impl Allocator {
         } else {
             self.config
         };
-        if config.mode() != Mode::Fast {
-            Self::abort();
-        }
         let mapping = Os::map(core::mem::size_of::<Process>())?;
         let process = mapping.base().cast::<Process>();
         // SAFETY: `process` is uniquely owned page-aligned mmap. Fields are
@@ -1519,5 +1509,23 @@ mod tests {
         assert_eq!(unsafe { grown.read() }, 0xa5);
         // SAFETY: grown is live.
         unsafe { allocator.free(grown) };
+    }
+
+    #[cfg(feature = "safe")]
+    #[test]
+    fn free_accepts_live_blocks_whose_first_word_looks_like_a_link() {
+        let allocator = Allocator::new();
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        // SAFETY: valid layout.
+        let (first, second) = unsafe { (allocator.alloc(layout), allocator.alloc(layout)) };
+        assert!(!first.is_null() && !second.is_null());
+        // SAFETY: both blocks are live and at least one word long.
+        unsafe {
+            let link = second.addr().to_ne_bytes();
+            first.copy_from_nonoverlapping(link.as_ptr(), link.len());
+            second.write_bytes(0, link.len());
+            allocator.free(first);
+            allocator.free(second);
+        }
     }
 }

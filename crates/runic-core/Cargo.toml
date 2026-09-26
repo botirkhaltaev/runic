@@ -9,6 +9,7 @@ description.workspace = true
 [features]
 default = []
 c-abi = []
+safe = []
 
 [lints]
 workspace = true

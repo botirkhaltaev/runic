@@ -24,7 +24,9 @@ impl SizeClass {
         }
     }
 
-    /// `index` must be in `0..SizeClasses::COUNT` (e.g. from `CLASS_FOR_SIZE`).
+    /// # Safety
+    ///
+    /// Trusted caller. `index` must be `< SizeClasses::COUNT` (the `CLASS_FOR_SIZE` path).
     const unsafe fn new_unchecked(index: usize) -> Self {
         debug_assert!(index < SizeClasses::COUNT);
         Self { index }
@@ -33,7 +35,7 @@ impl SizeClass {
     /// Byte size of blocks in this class.
     #[inline]
     pub(crate) fn size(self) -> usize {
-        // SAFETY: `SizeClass` is only constructed for indexes in `SIZES`.
+        // SAFETY: trusted constructor. Every `SizeClass` index is `< COUNT`, and `COUNT == SIZES.len()`.
         unsafe { *SizeClasses::SIZES.get_unchecked(self.index()) }
     }
 }
@@ -41,8 +43,7 @@ impl SizeClass {
 pub(crate) struct SizeClasses;
 
 /// One hand-authored size list. Indexes, `SIZES`, and `COUNT` are generated
-/// together so they cannot drift. `index_of` is test-only; the free hit uses
-/// `Run` span + reciprocal.
+/// together so they cannot drift. The free hit uses `Run` span + reciprocal.
 macro_rules! define_size_classes {
     ($($size:literal),+ $(,)?) => {
         define_size_classes!(@zip
@@ -72,56 +73,11 @@ macro_rules! define_size_classes {
     };
 
     (@go [$(($i:literal, $size:literal))+] [] []) => {
-        impl SizeClass {
-            /// Block index of a payload offset for this class; rejects non-boundary offsets.
-            #[cfg(test)]
-            pub(crate) fn index_of(self, offset: usize) -> Option<usize> {
-                // SAFETY: `SizeClass` is only minted for indexes in `0..COUNT`.
-                let shift = unsafe { *SizeClasses::SHIFTS.get_unchecked(self.index()) };
-                if shift != 0 {
-                    let mask = (1_usize << shift) - 1;
-                    (offset & mask == 0).then_some(offset >> shift)
-                } else {
-                    // Separate method so the power-of-two path stays a shift-table load
-                    // after inlining; the match is large enough to be its own unit.
-                    Self::index_match(self.index(), offset)
-                }
-            }
-
-            #[cfg(test)]
-            fn index_match(index: usize, offset: usize) -> Option<usize> {
-                match index {
-                    $(
-                        $i => offset.is_multiple_of($size).then_some(offset / $size),
-                    )+
-                    // SAFETY: `SizeClass` is only minted for indexes in `0..COUNT`.
-                    _ => unsafe { core::hint::unreachable_unchecked() },
-                }
-            }
-        }
-
         impl SizeClasses {
             /// The one hand-authored size-class declaration. Constant-divisor
             /// indexing and derived lookup tables are generated from this list.
             pub(crate) const SIZES: [usize; [$($size),+].len()] = [$($size),+];
             pub(crate) const COUNT: usize = Self::SIZES.len();
-            /// `trailing_zeros(size)` for power-of-two classes; `0` means use the
-            /// const-divisor match in [`SizeClass::index_of`] (minimum power-of-two class is 8).
-            #[cfg(test)]
-            #[allow(clippy::indexing_slicing)]
-            const SHIFTS: [u32; Self::COUNT] = {
-                let mut table = [0u32; Self::COUNT];
-                let sizes = Self::SIZES;
-                let mut i = 0;
-                while i < Self::COUNT {
-                    let size = sizes[i];
-                    if size.is_power_of_two() {
-                        table[i] = size.trailing_zeros();
-                    }
-                    i += 1;
-                }
-                table
-            };
         }
     };
 }
@@ -258,18 +214,6 @@ impl SizeClasses {
         Self::aligned_class_from(lower_bound, align)
     }
 
-    #[cfg(test)]
-    fn lower_bound_index(required: usize) -> Option<usize> {
-        if required > Self::SMALL_MAX {
-            return None;
-        }
-
-        // SAFETY: bounds checked above.
-        Some(usize::from(unsafe {
-            *Self::CLASS_FOR_SIZE.get_unchecked(required)
-        }))
-    }
-
     /// Smallest class index at or after `start` whose block size is a multiple
     /// of `align`, looked up in the const-generated align map.
     fn aligned_class_from(start: usize, align: usize) -> Option<SizeClass> {
@@ -382,7 +326,7 @@ mod tests {
     #[test]
     fn size_class_lower_bounds_match_declared_sizes() {
         for size in 0..=SizeClasses::SMALL_MAX {
-            let index = SizeClasses::lower_bound_index(size).unwrap();
+            let index = usize::from(*SizeClasses::CLASS_FOR_SIZE.get(size).unwrap());
             let block_size = SizeClasses::SIZES.get(index).copied();
             let reference = SizeClasses::SIZES
                 .iter()
@@ -418,24 +362,5 @@ mod tests {
         assert!(SizeClass::new(SizeClasses::COUNT).is_none());
         assert!(SizeClass::new(0).is_some());
         assert!(SizeClass::new(SizeClasses::COUNT - 1).is_some());
-    }
-
-    #[test]
-    fn index_of_matches_linear_oracle_for_all_classes() {
-        for class_index in 0..SizeClasses::COUNT {
-            let class = SizeClass::new(class_index).unwrap();
-            let size = class.size();
-
-            for offset in 0..=size * 2 {
-                let reference = offset
-                    .is_multiple_of(size)
-                    .then_some(offset.checked_div(size).unwrap());
-                assert_eq!(
-                    class.index_of(offset),
-                    reference,
-                    "class={class_index} size={size} offset={offset}"
-                );
-            }
-        }
     }
 }

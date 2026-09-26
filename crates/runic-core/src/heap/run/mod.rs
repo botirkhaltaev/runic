@@ -7,6 +7,7 @@ use core::{
 };
 
 pub(crate) mod config;
+mod freelist;
 pub(crate) mod heap;
 
 use crate::{
@@ -15,12 +16,16 @@ use crate::{
     size_class::SizeClass,
 };
 
+#[cfg(feature = "safe")]
+use crate::allocator::Allocator;
+
 use super::{
     Heap,
     inbox::{Link, Node},
 };
 
 use config::RunPolicy;
+use freelist::Freelist;
 
 pub(crate) use heap::RunHeap;
 
@@ -180,8 +185,8 @@ impl ClaimBits {
 
     fn word_unchecked(&self, word: usize) -> &AtomicU64 {
         debug_assert!(word < self.words.len());
-        // SAFETY: `word < words.len()`; `words` points at the claim span in this
-        // run's space tail and aligned for `AtomicU64`.
+        // SAFETY: `word < words.len()`. Callers pass a word from a `BlockIndex`
+        // inside this run's capacity. `words` is the aligned claim span in the space tail.
         unsafe { &*self.words.as_ptr().cast::<AtomicU64>().add(word) }
     }
 }
@@ -241,9 +246,6 @@ impl Node for Run {
     }
 }
 
-/// Empty freelist head / end-of-list link. Payload address `0` is never a block.
-const FREE_END: usize = 0;
-
 /// Intrusive membership on this class's `RunHeap` available list.
 ///
 /// `Unlisted` is off the list. `Tail` is listed with no successor — the same `None`
@@ -276,8 +278,8 @@ impl AvailableLink {
 }
 
 struct RunState {
-    /// `FREE_END` or a payload address of a free block.
-    free: Cell<usize>,
+    /// Free-block stack. Payload address, or 0 when empty.
+    free: Freelist,
     live: Cell<usize>,
     capacity: usize,
     bump: Cell<usize>,
@@ -344,9 +346,9 @@ impl Run {
         let masked = ptr.as_ptr().addr() & !(RUN_SIZE - 1);
         let header = masked.wrapping_add(RUN_SIZE);
         let base_ptr = core::ptr::with_exposed_provenance::<usize>(header);
-        // SAFETY: run spaces map this aligned address and `base` is the first
-        // `repr(C)` field. Reading it as `usize` is valid even for a zeroed,
-        // unused run slot; only a matching initialized header is returned.
+        // SAFETY: loads one aligned word at `base + RUN_SIZE`. This faults when
+        // that address is not a run mapping, so pointer-only free must not call
+        // `header_of`. A zeroed unused slot reads as 0 and fails the `base` check.
         if unsafe { base_ptr.read() } != masked {
             return None;
         }
@@ -412,7 +414,7 @@ impl Run {
     /// Hit: pop one block from the pointer freelist. Empty → caller `extend`.
     #[inline]
     pub(crate) fn allocate(&self) -> Option<NonNull<u8>> {
-        let ptr = Self::pop_free(&self.state)?;
+        let ptr = self.state.free.pop()?;
         let live = self.state.live.get();
         debug_assert!(live < self.state.capacity);
         if live == 0 {
@@ -437,19 +439,9 @@ impl Run {
             return false;
         }
         let end = bump + n;
-        for index in bump..end - 1 {
-            Self::write_link(
-                self.address(BlockIndex::new(index)),
-                self.address(BlockIndex::new(index + 1)).as_ptr().addr(),
-            );
-        }
-        Self::write_link(
-            self.address(BlockIndex::new(end - 1)),
-            self.state.free.get(),
-        );
         self.state
             .free
-            .set(self.address(BlockIndex::new(bump)).as_ptr().addr());
+            .push_contiguous(self.address(BlockIndex::new(bump)), n, self.stride);
         self.state.bump.set(end);
         self.remote.issued.store(end, Ordering::Relaxed);
         true
@@ -458,16 +450,37 @@ impl Run {
     /// Owner-local: live → pointer freelist. `Available` when the run was full.
     ///
     /// Hit ignores the outcome and does not discard. Miss / slow / unbind call
-    /// [`Self::discard`] and `push_available` from the outcome. Owner DF is
-    /// undefined. Remote admission is `claim` / `accept`.
+    /// [`Self::discard`] and `push_available` from the outcome. Owner double-free
+    /// is undefined on Fast. The `safe` feature aborts when the block is past
+    /// `bump`, its claim bit is set, the address is already on this freelist, or
+    /// `live` is 0. Remote admission is `claim` / `accept`.
     #[inline]
     pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<RunFree, RunError> {
         let block = self.locate(ptr)?;
         let live = self.state.live.get();
+        #[cfg(feature = "safe")]
+        {
+            if live == 0
+                || block.index().get() >= self.state.bump.get()
+                || self.remote.claims.is_set(block.index())
+            {
+                Allocator::abort();
+            }
+            if self
+                .state
+                .free
+                .ensure_absent(block.ptr(), self.state.capacity, |link| {
+                    self.locate(link).is_ok()
+                })
+                .is_err()
+            {
+                Allocator::abort();
+            }
+        }
         let was_full = live == self.state.capacity;
         debug_assert!(live > 0);
         self.state.live.set(live - 1);
-        Self::push_free(&self.state, block.ptr());
+        self.state.free.push(block.ptr());
         if live == 1 {
             self.sub_live();
         }
@@ -512,7 +525,7 @@ impl Run {
                 let live = self.state.live.get();
                 debug_assert!(live > 0);
                 self.state.live.set(live - 1);
-                Self::push_free(&self.state, self.address(index));
+                self.state.free.push(self.address(index));
             }
         }
 
@@ -544,7 +557,7 @@ impl Run {
     pub(crate) fn discard(&self) {
         debug_assert!(self.is_discardable());
         self.state.bump.set(0);
-        self.state.free.set(FREE_END);
+        self.state.free.clear();
         self.remote.issued.store(0, Ordering::Relaxed);
         Os::discard(self.range());
     }
@@ -599,38 +612,6 @@ impl Run {
         // `byte_offset < RUN_SIZE` inside the payload span.
         unsafe { NonNull::new_unchecked(self.base.as_ptr().add(byte_offset)) }
     }
-
-    #[inline]
-    fn pop_free(state: &RunState) -> Option<NonNull<u8>> {
-        let raw = state.free.get();
-        if raw == FREE_END {
-            return None;
-        }
-        let ptr = NonNull::new(core::ptr::without_provenance_mut(raw))?;
-        state.free.set(Self::read_link(ptr));
-        Some(ptr)
-    }
-
-    /// Push using the payload pointer already proven by `locate` / `address`.
-    #[inline]
-    fn push_free(state: &RunState, ptr: NonNull<u8>) {
-        Self::write_link(ptr, state.free.get());
-        state.free.set(ptr.as_ptr().addr());
-    }
-
-    #[inline]
-    fn read_link(ptr: NonNull<u8>) -> usize {
-        // SAFETY: free-list links are stored only in reusable blocks owned by this run.
-        unsafe { ptr.cast::<usize>().as_ptr().read() }
-    }
-
-    #[inline]
-    fn write_link(ptr: NonNull<u8>, word: usize) {
-        // SAFETY: free-list links are stored only in reusable blocks owned by this run.
-        unsafe {
-            ptr.cast::<usize>().as_ptr().write(word);
-        }
-    }
 }
 
 impl RunState {
@@ -640,7 +621,7 @@ impl RunState {
             capacity,
             bump: Cell::new(0),
             available: Cell::new(AvailableLink::Unlisted),
-            free: Cell::new(FREE_END),
+            free: Freelist::new(),
         }
     }
 }
@@ -783,7 +764,7 @@ mod tests {
     }
 
     #[test]
-    fn recip_matches_index_of_for_all_classes() {
+    fn recip_matches_block_index_for_all_classes() {
         for &size in &SizeClasses::SIZES {
             let stride = u32::try_from(size).unwrap();
             let recip = Run::recip(stride).unwrap();
@@ -803,10 +784,9 @@ mod tests {
                 let ok = index.wrapping_mul(u64::try_from(size).unwrap())
                     == u64::try_from(offset).unwrap();
                 assert_eq!(ok, divisible, "product size={size} offset={offset}");
-                let class = class_id(size, 8);
                 assert_eq!(
                     ok.then_some(usize::try_from(index).unwrap()),
-                    class.index_of(offset),
+                    offset.is_multiple_of(size).then_some(offset / size),
                     "size={size} offset={offset}"
                 );
             }
@@ -819,7 +799,7 @@ mod tests {
         let pages = PageMap::new();
         let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
         let ptr = alloc_block(run).unwrap();
-        let interior = unsafe { NonNull::new_unchecked(ptr.as_ptr().add(1)) };
+        let interior = NonNull::new(ptr.as_ptr().wrapping_add(1)).unwrap();
 
         assert_eq!(run.locate(interior), Err(RunError::InvalidPointer));
     }
@@ -835,16 +815,15 @@ mod tests {
             let first = alloc_block(run).unwrap();
             assert!(run.locate(first).is_ok(), "size={size}");
             assert_eq!(
-                run.locate(unsafe { NonNull::new_unchecked(first.as_ptr().add(1)) }),
+                run.locate(NonNull::new(first.as_ptr().wrapping_add(1)).unwrap()),
                 Err(RunError::InvalidPointer),
                 "size={size}"
             );
 
             let slack_offset = capacity * size;
             if slack_offset < RUN_SIZE {
-                let slack = unsafe {
-                    NonNull::new_unchecked(run.range().base().as_ptr().add(slack_offset))
-                };
+                let slack =
+                    NonNull::new(run.range().base().as_ptr().wrapping_add(slack_offset)).unwrap();
                 assert_eq!(
                     run.locate(slack),
                     Err(RunError::OutOfRange),
@@ -860,7 +839,7 @@ mod tests {
         let pages = PageMap::new();
         let run = runs.acquire(class_id(24, 8), &OWNER, &pages).unwrap();
         let ptr = alloc_block(run).unwrap();
-        let interior = unsafe { NonNull::new_unchecked(ptr.as_ptr().add(1)) };
+        let interior = NonNull::new(ptr.as_ptr().wrapping_add(1)).unwrap();
 
         assert!(run.locate(ptr).is_ok());
         assert_eq!(run.locate(interior), Err(RunError::InvalidPointer));
@@ -885,8 +864,7 @@ mod tests {
         let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
-        let claim_tail =
-            unsafe { NonNull::new_unchecked(run.range().base().as_ptr().add(RUN_SIZE)) };
+        let claim_tail = NonNull::new(run.range().base().as_ptr().wrapping_add(RUN_SIZE)).unwrap();
 
         assert_eq!(run.locate(claim_tail), Err(RunError::OutOfRange));
     }
@@ -920,7 +898,7 @@ mod tests {
             let slack_offset = capacity * class.size();
             assert!(slack_offset < RUN_SIZE, "size={size}");
             let slack =
-                unsafe { NonNull::new_unchecked(run.range().base().as_ptr().add(slack_offset)) };
+                NonNull::new(run.range().base().as_ptr().wrapping_add(slack_offset)).unwrap();
 
             assert_eq!(run.locate(slack), Err(RunError::OutOfRange), "size={size}");
         }

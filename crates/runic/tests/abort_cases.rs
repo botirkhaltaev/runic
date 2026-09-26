@@ -25,6 +25,17 @@ fn large_interior_pointer_realloc_aborts() {
     AbortCase::new("large-interior-realloc").assert_aborts();
 }
 
+#[cfg(feature = "safe")]
+#[test]
+fn small_double_free_aborts() {
+    AbortCase::new("small-double-free").assert_aborts();
+}
+
+#[test]
+fn large_double_free_aborts() {
+    AbortCase::new("large-double-free").assert_aborts();
+}
+
 struct AbortCase {
     name: &'static str,
 }

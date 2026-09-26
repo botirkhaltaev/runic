@@ -11,9 +11,45 @@ permissions:
   contents: read
 
 jobs:
-  verify:
-    name: Verify
+  fmt:
+    name: Format
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-09-08
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  verify:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Fast
+            check: true
+            test: cargo test --workspace
+            clippy: cargo clippy --workspace --all-targets -- -D warnings
+            bench: true
+          - name: c-abi
+            clippy: cargo clippy -p runic-core --all-targets --features c-abi -- -D warnings
+          - name: Safe
+            test: |
+              cargo test -p runic-core --features safe
+              cargo test -p runic-alloc --features safe
+              cargo test -p runic-cabi --features safe
+            clippy: |
+              cargo clippy -p runic-core --all-targets --features safe -- -D warnings
+              cargo clippy -p runic-alloc --all-targets --features safe -- -D warnings
+              cargo clippy -p runic-cabi --all-targets --features safe -- -D warnings
 
     steps:
       - name: Checkout
@@ -23,22 +59,24 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-09-08
-          components: rustfmt, clippy
+          components: clippy
 
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@v2
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+        with:
+          key: ${{ matrix.name }}
 
       - name: Check workspace
+        if: matrix.check
         run: cargo check --workspace
 
-      - name: Test workspace
-        run: cargo test --workspace
+      - name: Test
+        if: matrix.test
+        run: ${{ matrix.test }}
 
-      - name: Lint workspace
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Lint
+        run: ${{ matrix.clippy }}
 
       - name: Build benchmarks
+        if: matrix.bench
         run: cargo bench -p runic-bench --no-run

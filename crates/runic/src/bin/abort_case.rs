@@ -19,6 +19,9 @@ fn main() {
         "large-interior-free" => large_interior_free(),
         "small-interior-realloc" => small_interior_realloc(),
         "large-interior-realloc" => large_interior_realloc(),
+        #[cfg(feature = "safe")]
+        "small-double-free" => small_double_free(),
+        "large-double-free" => large_double_free(),
         _ => std::process::abort(),
     }
 }
@@ -56,6 +59,23 @@ fn large_interior_realloc() {
     let ptr = allocate(layout);
 
     let _ = unsafe { realloc(ptr.add(4096), layout, 256 * 1024) };
+}
+
+#[cfg(feature = "safe")]
+fn small_double_free() {
+    let layout = Layout::from_size_align(64, 8).unwrap();
+    let ptr = allocate(layout);
+
+    unsafe { dealloc(ptr, layout) };
+    unsafe { dealloc(ptr, layout) };
+}
+
+fn large_double_free() {
+    let layout = Layout::from_size_align(128 * 1024, 4096).unwrap();
+    let ptr = allocate(layout);
+
+    unsafe { dealloc(ptr, layout) };
+    unsafe { dealloc(ptr, layout) };
 }
 
 fn allocate(layout: Layout) -> *mut u8 {
