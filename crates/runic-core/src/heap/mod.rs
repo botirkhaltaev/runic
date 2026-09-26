@@ -312,15 +312,18 @@ impl Heap {
         self.state.close(id)
     }
 
-    /// Draining → Active. The metadata lock covers the lifecycle CAS only, so it
-    /// still serializes adoption with Draining reclaim. The caller flushes after.
+    /// Draining → Active. `try_lock` so a losing adopter never blocks into the
+    /// winner's flush: `require_inner` aborts when this mutex is held. The
+    /// returned guard stays with the caller through that flush, which also
+    /// keeps Draining reclaim off the slot until accept finishes.
     #[cold]
-    pub(crate) fn adopt(&self, id: HeapId) -> Result<(), HeapError> {
+    pub(crate) fn adopt(&self, id: HeapId) -> Result<spin::MutexGuard<'_, HeapInner>, HeapError> {
         if self.slot != id.slot() {
             return Err(HeapError::InvalidHeap);
         }
-        let _inner = self.inner.lock();
-        self.state.adopt(id)
+        let inner = self.inner.try_lock().ok_or(HeapError::InvalidHeap)?;
+        self.state.adopt(id)?;
+        Ok(inner)
     }
 
     /// Active exclusive. Fail → abort.

@@ -68,7 +68,7 @@ fn adopt_promotes_draining_to_active() {
     let heap = heaps.get(id).unwrap();
     assert_eq!(heap.close(id), Ok(()));
     assert_eq!(heap.mode(), HeapMode::Draining);
-    assert_eq!(heap.adopt(id), Ok(()));
+    assert!(heap.adopt(id).is_ok());
     assert_eq!(heap.mode(), HeapMode::Active);
     assert!(matches!(heap.adopt(id), Err(HeapError::InvalidHeap)));
     unbind(&heaps, id);

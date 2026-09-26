@@ -278,11 +278,13 @@ impl ThreadHeaps {
         if self.owns(heap) {
             return true;
         }
-        if heap.adopt(heap.id()).is_err() {
+        let Ok(mut inner) = heap.adopt(heap.id()) else {
             return false;
-        }
+        };
         self.link_back(heap);
-        if heap.flush_owner(ctx).is_err() {
+        // Same guard as the CAS. `flush_owner` would `try_lock` and abort if a
+        // losing adopter or Draining admit still held the mutex.
+        if heap.flush(&mut inner, ctx, None).is_err() {
             Allocator::abort();
         }
         true

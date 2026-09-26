@@ -750,9 +750,9 @@ This list does not. Retained.
 
 Active `flush_owner` accepts each inbox node with no `HeapInner`, then takes a
 guard only to `push_available` or `cache_or_unmap` that node. `adopt` holds the
-guard for the lifecycle CAS and drops it before the flush. `alloc_miss` and
-`alloc_extent` flush first, then take their own guard for `acquire_run` or
-`allocate`. Draining `Heap::flush` walks the same nodes under the admit guard
+guard through its own flush: dropping it and publishing with `require_inner`
+let a losing adopter abort the new owner. `alloc_miss` and `alloc_extent` flush
+one heap at a time and take that heap's guard only to reuse or map. Draining `Heap::flush` walks the same nodes under the admit guard
 so accept, publish, and reclaim stay one section. The locked `RunHeap::accept`
 and `ExtentHeap::accept` are gone. `idle` no longer `try_lock`s or scans
 `has_live`.
