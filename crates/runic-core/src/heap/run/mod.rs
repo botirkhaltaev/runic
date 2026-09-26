@@ -22,6 +22,7 @@ use crate::allocator::Allocator;
 use super::{
     Heap,
     inbox::{Link, Node},
+    queue::{self, Linked as QueueLinked},
 };
 
 use config::RunPolicy;
@@ -246,34 +247,9 @@ impl Node for Run {
     }
 }
 
-/// Intrusive membership on this class's `RunHeap` available list.
-///
-/// `Unlisted` is off the list. `Tail` is listed with no successor — the same `None`
-/// next pointer as `Unlisted`, which is why membership is not a separate bool.
-#[derive(Clone, Copy)]
-enum AvailableLink {
-    Unlisted,
-    Tail,
-    Next(&'static Run),
-}
-
-impl AvailableLink {
-    fn is_unlisted(self) -> bool {
-        matches!(self, Self::Unlisted)
-    }
-
-    fn from_next(next: Option<&'static Run>) -> Self {
-        match next {
-            None => Self::Tail,
-            Some(run) => Self::Next(run),
-        }
-    }
-
-    fn successor(self) -> Option<&'static Run> {
-        match self {
-            Self::Unlisted | Self::Tail => None,
-            Self::Next(run) => Some(run),
-        }
+impl QueueLinked for Run {
+    fn links(&self) -> &queue::Link<Self> {
+        &self.state.available
     }
 }
 
@@ -283,7 +259,7 @@ struct RunState {
     live: Cell<usize>,
     capacity: usize,
     bump: Cell<usize>,
-    available: Cell<AvailableLink>,
+    available: queue::Link<Run>,
 }
 
 impl Run {
@@ -389,22 +365,7 @@ impl Run {
     }
 
     pub(super) fn listed(&self) -> bool {
-        !self.state.available.get().is_unlisted()
-    }
-
-    /// Link onto the available list. Caller already checked `!listed()`.
-    pub(super) fn list_available(&self, next: Option<&'static Run>) {
-        debug_assert!(!self.listed());
-        self.state.available.set(AvailableLink::from_next(next));
-    }
-
-    /// Unlink from the available list. Returns the previous successor.
-    pub(super) fn unlist_available(&self) -> Option<&'static Run> {
-        debug_assert!(self.listed());
-        self.state
-            .available
-            .replace(AvailableLink::Unlisted)
-            .successor()
+        self.state.available.is_linked()
     }
 
     pub(crate) fn range(&self) -> AddressRange {
@@ -620,7 +581,7 @@ impl RunState {
             live: Cell::new(0),
             capacity,
             bump: Cell::new(0),
-            available: Cell::new(AvailableLink::Unlisted),
+            available: queue::Link::new(),
             free: Freelist::new(),
         }
     }

@@ -4,13 +4,18 @@ mod heaps;
 pub(crate) mod id;
 pub(crate) mod inbox;
 mod list;
+mod queue;
 pub(crate) mod run;
 mod state;
 pub(crate) mod thread;
 
+use core::cell::Cell;
 use core::num::NonZeroU32;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+use list::Linked as ListLinked;
+use queue::stack::Linked as StackLinked;
 
 use spin::Mutex;
 
@@ -54,9 +59,35 @@ pub(crate) struct Heap {
     run_inbox: Inbox<'static, Run>,
     extent_inbox: Inbox<'static, Extent>,
     inner: Mutex<HeapInner>,
-    /// Next Free heap index for [`Heaps`] (`u32::MAX` = end).
-    pub(super) free_next: AtomicU32,
+    /// Free-heap stack link. Concurrent with other `Heaps` pop/push.
+    free: queue::stack::Link<Heap>,
+    /// Owner-thread [`list::LinkedList`] membership. Remote threads do not read this.
+    thread: list::Link<Heap>,
+    /// Generation captured when this heap was linked onto a thread. Zero when unlinked.
+    thread_gen: Cell<u32>,
 }
+
+impl ListLinked for Heap {
+    fn links(&self) -> &list::Link<Self> {
+        &self.thread
+    }
+}
+
+impl StackLinked for Heap {
+    fn links(&self) -> &queue::stack::Link<Self> {
+        &self.free
+    }
+}
+
+// SAFETY: arena slots are never moved. `thread` and `thread_gen` are written only by
+// the thread that has this heap on its list, and that thread unlinks it before the
+// slot can be bound again. Remote threads use `state`, the live counts, the inboxes,
+// and `free`. `NonNull<Heap>` inside the thread link does not carry `Send` by itself.
+unsafe impl Send for Heap {}
+// SAFETY: remote threads share `&Heap` and only touch atomics: `state`, the live
+// counts, the inboxes, and `free`. `thread` and `thread_gen` belong to the thread
+// that has this heap on its list.
+unsafe impl Sync for Heap {}
 
 impl PartialEq for Heap {
     fn eq(&self, other: &Self) -> bool {
@@ -175,7 +206,9 @@ impl Heap {
             run_inbox: Inbox::new(),
             extent_inbox: Inbox::new(),
             inner: Mutex::new(HeapInner::new(config)),
-            free_next: AtomicU32::new(u32::MAX),
+            free: queue::stack::Link::new(),
+            thread: list::Link::new(),
+            thread_gen: Cell::new(0),
         }
     }
 
@@ -266,7 +299,7 @@ impl Heap {
         if owner.is_some_and(|owner| self != owner.heap()) {
             return Err(HeapError::InvalidHeap);
         }
-        let inner = self.lock_inner();
+        let inner = self.inner.lock();
         let snap = self.state.load();
         if snap.mode != HeapMode::Draining || snap.generation != id.generation() {
             return Err(HeapError::InvalidHeap);
@@ -289,34 +322,23 @@ impl Heap {
         self.state.close(id)
     }
 
-    /// Draining → Active under the exclusive metadata lock.
-    ///
-    /// The winner keeps the returned guard for its first flush. Taking the lock
-    /// before the lifecycle CAS serializes adoption with Draining reclaim.
+    /// Draining → Active. The metadata lock covers the lifecycle CAS only, so it
+    /// still serializes adoption with Draining reclaim. The caller flushes after.
     #[cold]
-    pub(crate) fn adopt(&self, id: HeapId) -> Result<spin::MutexGuard<'_, HeapInner>, HeapError> {
+    pub(crate) fn adopt(&self, id: HeapId) -> Result<(), HeapError> {
         if self.slot != id.slot() {
             return Err(HeapError::InvalidHeap);
         }
-        let inner = self.lock_inner();
-        self.state.adopt(id)?;
-        Ok(inner)
-    }
-
-    pub(super) fn try_inner(&self) -> Option<spin::MutexGuard<'_, HeapInner>> {
-        self.inner.try_lock()
+        let _inner = self.inner.lock();
+        self.state.adopt(id)
     }
 
     /// Active exclusive. Fail → abort.
     pub(super) fn require_inner(&self) -> spin::MutexGuard<'_, HeapInner> {
-        let Some(inner) = self.try_inner() else {
+        let Some(inner) = self.inner.try_lock() else {
             Allocator::abort();
         };
         inner
-    }
-
-    pub(super) fn lock_inner(&self) -> spin::MutexGuard<'_, HeapInner> {
-        self.inner.lock()
     }
 
     pub(super) fn reactivate(&self) {
@@ -342,11 +364,11 @@ impl Heap {
         true
     }
 
-    /// Drain both inboxes into run/extent metadata (accept).
+    /// Draining flush while the caller holds `inner`.
     ///
-    /// `owner` queues a claimed remote before accept so queue+flush share Inner.
-    /// A miss calls this before mapping: claimed-full runs must be accepted first
-    /// or `acquire` returns null. Empty inboxes return immediately.
+    /// [`Heaps::flush`](Heaps::flush) / [`Heaps::free`](Heaps::free) keep accept,
+    /// publish, and reclaim one critical section. `owner` queues a claimed remote
+    /// before accept so queue and flush share the guard.
     pub(super) fn flush(
         &self,
         inner: &mut HeapInner,
@@ -356,39 +378,116 @@ impl Heap {
         if let Some(owner) = owner {
             debug_assert!(self == owner.heap());
             match owner {
-                PageOwner::Run(run) => {
-                    self.run_inbox.queue(run);
-                }
-                PageOwner::Extent(extent) => {
-                    self.extent_inbox.queue(extent);
-                }
-            }
+                PageOwner::Run(run) => self.run_inbox.queue(run),
+                PageOwner::Extent(extent) => self.extent_inbox.queue(extent),
+            };
         }
+        self.accept().publish(inner, ctx)
+    }
+
+    /// Active owner flush: accept outside the lock, one guard per published node.
+    pub(super) fn flush_owner(&self, ctx: &AllocatorCtx) -> Result<(), HeapError> {
+        let mut accepted = self.accept();
+        while let Some(run) = accepted.runs.pop() {
+            self.require_inner().push_available(run)?;
+        }
+        while let Some(extent) = accepted.extents.pop_front() {
+            self.require_inner()
+                .extents
+                .cache_or_unmap(extent, ctx.pages)?;
+        }
+        accepted.result()
+    }
+
+    /// Drain both inboxes with no `HeapInner` held.
+    ///
+    /// `Run::accept` and `Extent::accept` are owner-exclusive on the node. Runs that
+    /// left full and extents now `Free` wait on [`Accepted`] for the metadata publish.
+    /// A miss accepts before mapping: claimed-full runs must be accepted first or
+    /// `acquire` returns null. An extent accept error is stored on [`Accepted`]
+    /// and returned after publish, so earlier nodes are not dropped.
+    pub(super) fn accept(&self) -> Accepted {
+        let mut accepted = Accepted {
+            runs: queue::Queue::new(),
+            extents: list::LinkedList::new(),
+            error: None,
+        };
         while !self.run_inbox.is_empty() {
             for run in self.run_inbox.drain() {
-                if inner.runs.accept(run)? == Accept::Requeue {
+                let was_full = run.is_full();
+                let accept = run.accept();
+                if was_full && !run.is_full() && !run.listed() {
+                    accepted.runs.push(run);
+                }
+                if accept == Accept::Requeue {
                     self.run_inbox.queue(run);
                 }
             }
         }
         while !self.extent_inbox.is_empty() {
             for extent in self.extent_inbox.drain() {
-                inner.extents.accept(extent, extent.ptr(), ctx.pages)?;
+                match extent.accept(extent.ptr()) {
+                    Ok(()) => accepted.extents.push_front(extent),
+                    Err(error) => {
+                        accepted.error.get_or_insert(HeapError::from(error));
+                    }
+                }
             }
         }
-        Ok(())
+        accepted
     }
 
-    /// Flush inboxes if needed, then allocate one large block.
+    /// Accept, then one guard covers publish and the extent allocate.
     pub(super) fn alloc_extent(
         &'static self,
-        inner: &mut HeapInner,
         spec: LayoutSpec,
         init: ExtentInit,
         ctx: &AllocatorCtx,
     ) -> Result<Option<NonNull<u8>>, HeapError> {
-        self.flush(inner, ctx, None)?;
+        let accepted = self.accept();
+        let mut inner = self.require_inner();
+        accepted.publish(&mut inner, ctx)?;
         inner.extents.allocate(spec, self, ctx.pages, init)
+    }
+}
+
+/// Runs and extents accepted off the lock, waiting for the metadata publish.
+pub(super) struct Accepted {
+    runs: queue::Queue<'static, Run>,
+    extents: list::LinkedList<'static, Extent>,
+    /// First extent `accept` failure. Publish still runs; this is returned after.
+    error: Option<HeapError>,
+}
+
+impl Accepted {
+    /// List every run and cache or unmap every extent under the caller's guard.
+    pub(super) fn publish(
+        mut self,
+        inner: &mut HeapInner,
+        ctx: &AllocatorCtx,
+    ) -> Result<(), HeapError> {
+        while let Some(run) = self.runs.pop() {
+            inner.push_available(run)?;
+        }
+        while let Some(extent) = self.extents.pop_front() {
+            inner.extents.cache_or_unmap(extent, ctx.pages)?;
+        }
+        self.result()
+    }
+
+    fn result(self) -> Result<(), HeapError> {
+        match self.error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Unlink whatever an error left unpublished so the nodes can be queued again.
+impl Drop for Accepted {
+    fn drop(&mut self) {
+        while self.runs.pop().is_some() {}
+        while self.extents.pop_front().is_some() {}
     }
 }
 

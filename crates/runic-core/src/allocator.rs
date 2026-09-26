@@ -1356,6 +1356,61 @@ mod tests {
     }
 
     #[test]
+    fn adopt_keeps_every_draining_heap_until_it_goes_idle() {
+        let allocator = Allocator::new();
+        let ctx = ctx(&allocator);
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        let class = SizeClasses::class_for(LayoutSpec::from_layout(layout)).unwrap();
+        let tls = &THREAD_HEAPS;
+        tls.unbind(&ctx);
+        let bound = tls.bind(&ctx).unwrap();
+        let local = alloc_small(tls, &ctx, layout);
+
+        let remotes: Vec<_> = (0..3)
+            .map(|_| {
+                thread::scope(|scope| {
+                    scope
+                        .spawn(|| {
+                            let remote = &THREAD_HEAPS;
+                            remote.unbind(&ctx);
+                            let id = remote.bind(&ctx).unwrap();
+                            let first = alloc_small(remote, &ctx, layout);
+                            let second = alloc_small(remote, &ctx, layout);
+                            remote.unbind(&ctx);
+                            (
+                                id,
+                                first.as_ptr().expose_provenance(),
+                                second.as_ptr().expose_provenance(),
+                            )
+                        })
+                        .join()
+                        .unwrap()
+                })
+            })
+            .collect();
+
+        for &(_, first, _) in &remotes {
+            let ptr = NonNull::new(core::ptr::with_exposed_provenance_mut(first)).unwrap();
+            let owner = ctx.pages.get(ptr).unwrap();
+            assert_eq!(Allocator::free_remote(&ctx, owner, ptr), Ok(()));
+        }
+        for &(id, _, _) in &remotes {
+            assert_eq!(ctx.heaps.get(id).map(Heap::mode), Some(HeapMode::Active));
+        }
+        for &(_, _, second) in &remotes {
+            let ptr = NonNull::new(core::ptr::with_exposed_provenance_mut(second)).unwrap();
+            let owner = ctx.pages.get(ptr).unwrap();
+            assert_eq!(tls.free_owner(owner, ptr, &ctx), Ok(()));
+        }
+        for &(id, _, _) in &remotes {
+            assert!(ctx.heaps.get(id).is_none());
+        }
+        assert_eq!(tls.bind(&ctx), Some(bound));
+        assert_eq!(tls.free(local, class), Some(()));
+        tls.unbind(&ctx);
+    }
+
+    #[test]
     fn adopt_then_owner_local_free() {
         let allocator = Allocator::new();
         let ctx = ctx(&allocator);

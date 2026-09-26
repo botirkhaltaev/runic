@@ -2,6 +2,7 @@ use core::{num::NonZeroUsize, ptr::NonNull};
 
 use crate::{
     config::{Hints, HugePage, Numa},
+    layout::LayoutSpec,
     memory::AddressRange,
 };
 
@@ -48,6 +49,14 @@ impl Mapping {
 
     pub(crate) const fn range(&self) -> AddressRange {
         AddressRange::new(self.base, self.len.get())
+    }
+
+    /// User range for `spec` inside this mapping, aligned up from the base.
+    pub(crate) fn place(&self, spec: LayoutSpec) -> Option<AddressRange> {
+        let addr = spec.align_addr(self.base.as_ptr().addr())?;
+        let base = NonNull::new(core::ptr::with_exposed_provenance_mut(addr))?;
+        let range = AddressRange::new(base, spec.size().max(1));
+        self.range().contains(range).then_some(range)
     }
 
     /// Apply payload hints. Each hint is independent and best effort.

@@ -717,3 +717,58 @@ swings are code placement of the benchmark under fat LTO with one codegen
 unit; the extra module shifts every later function by 0x30 bytes. Retained.
 Placement swings of this size mean single-workload Criterion deltas below
 the `perf stat` instruction check are not evidence on their own.
+
+## List, queue, and N adopted heaps
+
+Owner-exclusive linkage is `LinkedList` and `Queue` (`Cell` links). Lock-free
+chains are `Mpsc` (inbox `drain`) and `Mpmc` (free-heap stack), both on one
+Treiber stack. Available runs moved onto `Queue`. The extent cache and
+unmapped slots share one `LinkedList`. TLS heaps are that list too: bind
+`push_front`, adopt `push_back`. The last heap stays attached.
+
+Pinned `perf stat -r 3`, `instructions:u` / `cycles:u`, Criterion 1 s x 10
+samples. `hashmap_grow` on CPU 0, `shard_aggregator` on CPUs 0-3. Baseline is
+`daee6e9`.
+
+```text
+                    instructions        cycles
+hashmap_grow master   17,117,893,470   5,528,103,242
+hashmap_grow list     17,219,219,744   5,559,447,517   (+0.59% insn, +0.57% cycles)
+shard master          13,233,470,567   5,054,808,738
+shard list            12,348,385,474   4,784,770,294   (-6.7% insn, -5.3% cycles)
+```
+
+`hashmap_grow::run` differs from master only by nop padding (1914 vs 1913
+instructions). The current-run hit did not grow. The process-wide instruction
+increase is the slow owner free walking the heap list. Criterion time on
+`hashmap_grow` stayed inside the master's own repeat spread (~10.7 ms).
+`shard_aggregator` is the threaded remote-free workload and got faster.
+A fixed four-slot TLS array previously lost about 18% on `channel_pipeline`.
+This list does not. Retained.
+
+## Shorter locks on adopted heaps
+
+`Heap::accept` drains both inboxes with no `HeapInner` and returns `Accepted`.
+`Accepted::publish` lists runs and caches extents under the caller's guard.
+Active owners lock only to publish: `adopt` holds the guard for the lifecycle
+CAS, drops it, then publishes one node per guard. `alloc_miss` and
+`alloc_extent` accept first, then one guard covers publish and the acquire.
+Draining `Heap::flush` calls the same two under the admit guard so accept,
+publish, and reclaim stay one section. The locked `RunHeap::accept` and
+`ExtentHeap::accept` are gone. `idle` no longer `try_lock`s or scans
+`has_live`.
+
+Same pin as above, same `daee6e9` baseline, after the list change.
+
+```text
+                    instructions        cycles
+hashmap_grow master   17,117,934,851   5,501,844,899
+hashmap_grow locks    17,219,185,818   5,566,139,363   (+0.59% insn, +1.2% cycles)
+shard master          13,220,823,032   5,074,932,177
+shard locks           12,449,988,735   4,854,792,593   (-5.8% insn, -4.3% cycles)
+```
+
+`hashmap_grow` instructions match the list measurement (17,219,219,744 vs
+17,219,185,818). This lock is not on the hit. `shard_aggregator` stayed in
+the list's band (12,348,385,474 instructions, run spread about 0.75%).
+Retained.

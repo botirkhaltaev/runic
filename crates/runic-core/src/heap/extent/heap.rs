@@ -9,13 +9,14 @@ use crate::{
     memory::{Mapping, Memory, Os, PageMap, PageOwner},
 };
 
-use super::{ExtentId, ExtentInit, cache::ExtentCache};
+use super::super::list::LinkedList;
+use super::{ExtentInit, cache::ExtentCache};
 
 pub(crate) struct ExtentHeap {
     extents: Arena<Extent>,
     cache: ExtentCache,
-    /// Unmapped immortal slots, linked through [`Extent::next`].
-    unmapped: Option<ExtentId>,
+    /// Unmapped immortal slots. Shares [`Extent`]'s list link with the cache.
+    unmapped: LinkedList<'static, Extent>,
     hints: Hints,
 }
 
@@ -24,20 +25,9 @@ impl ExtentHeap {
         Self {
             extents: Arena::new(),
             cache: ExtentCache::new(config),
-            unmapped: None,
+            unmapped: LinkedList::new(),
             hints,
         }
-    }
-
-    /// Borrow an extent slot for the process lifetime.
-    ///
-    /// Slots are immortal: [`Self::unmap`] drops only the mapping, the arena never
-    /// removes a slot, and the heap arena backing it is mapped for the process
-    /// lifetime. Page-map entries therefore stay valid for as long as they are stamped.
-    fn slot(&self, id: ExtentId) -> Option<&'static Extent> {
-        let extent = self.extents.get(id.index())?;
-        // SAFETY: extent slots are never removed and their arena is never unmapped.
-        Some(unsafe { &*core::ptr::from_ref(extent) })
     }
 
     /// Any occupied extent that is still Allocated or Claimed.
@@ -58,10 +48,7 @@ impl ExtentHeap {
         let Some(len) = spec.mapping_len(Os::page_size()) else {
             return Ok(None);
         };
-        if let Some(id) = self.cache.acquire(&self.extents, len)? {
-            let Some(extent) = self.slot(id) else {
-                return Err(HeapError::MissingExtent);
-            };
+        if let Some(extent) = self.cache.acquire(len) {
             if let Some(ptr) = extent.reuse(spec, init) {
                 heap.add_extent_live();
                 return Ok(Some(ptr));
@@ -86,25 +73,31 @@ impl ExtentHeap {
         mapping: Mapping,
         pages: &PageMap,
     ) -> Option<NonNull<u8>> {
-        if let Some(extent) = self.pop_unmapped() {
+        if let Some(extent) = self.unmapped.pop_front() {
             let Some(ptr) = extent.remount(mapping, spec) else {
-                self.push_unmapped(extent);
+                self.unmapped.push_front(extent);
                 return None;
             };
             if pages.publish(PageOwner::Extent(extent)).is_err() {
                 drop(extent.unmount());
-                self.push_unmapped(extent);
+                self.unmapped.push_front(extent);
                 return None;
             }
             return Some(ptr);
         }
 
         let index = self.extents.vacant()?;
-        let id = ExtentId::from_index(index)?;
-        let extent = Extent::new(id, heap, mapping, spec)?;
+        let extent = Extent::new(heap, mapping, spec)?;
         let ptr = extent.ptr();
-        self.extents.insert(index, extent)?;
-        self.insert_extent(id, pages)?;
+        let inserted = self.extents.insert(index, extent)?;
+        // SAFETY: extent slots are never removed and their arena is never unmapped,
+        // so a published page-map stamp stays valid for the process lifetime.
+        let inserted = unsafe { &*core::ptr::from_mut(inserted).cast_const() };
+        if pages.publish(PageOwner::Extent(inserted)).is_err() {
+            drop(inserted.unmount());
+            self.unmapped.push_front(inserted);
+            return None;
+        }
         Some(ptr)
     }
 
@@ -118,18 +111,8 @@ impl ExtentHeap {
         self.cache_or_unmap(extent, pages)
     }
 
-    pub(crate) fn accept(
-        &mut self,
-        extent: &'static Extent,
-        ptr: NonNull<u8>,
-        pages: &PageMap,
-    ) -> Result<(), HeapError> {
-        extent.accept(ptr)?;
-        self.cache_or_unmap(extent, pages)
-    }
-
     /// After free/accept: Keep/Discard retain published in cache; Unmap / over-budget unpublish.
-    fn cache_or_unmap(
+    pub(crate) fn cache_or_unmap(
         &mut self,
         extent: &'static Extent,
         pages: &PageMap,
@@ -148,31 +131,8 @@ impl ExtentHeap {
             .unpublish(PageOwner::Extent(extent))
             .map_err(|_| HeapError::InvalidMetadata)?;
         drop(extent.unmount());
-        self.push_unmapped(extent);
+        self.unmapped.push_front(extent);
         Ok(())
-    }
-
-    fn push_unmapped(&mut self, extent: &Extent) {
-        extent.set_next(self.unmapped);
-        self.unmapped = Some(extent.id());
-    }
-
-    fn pop_unmapped(&mut self) -> Option<&'static Extent> {
-        let extent = self.slot(self.unmapped?)?;
-        self.unmapped = extent.next();
-        extent.set_next(None);
-        Some(extent)
-    }
-
-    fn insert_extent(&mut self, id: ExtentId, pages: &PageMap) -> Option<()> {
-        let inserted = self.slot(id)?;
-        debug_assert_eq!(inserted.id(), id);
-        if pages.publish(PageOwner::Extent(inserted)).is_err() {
-            drop(inserted.unmount());
-            self.push_unmapped(inserted);
-            return None;
-        }
-        Some(())
     }
 }
 
@@ -183,7 +143,7 @@ mod tests {
     use crate::{
         config::{AllocatorConfig, Budget, Hints},
         heap::extent::config::{ExtentConfig, ExtentPolicy},
-        heap::{Extent, Heap, HeapId, extent::ExtentId},
+        heap::{Extent, Heap, HeapId},
         layout::LayoutSpec,
         memory::{PageMap, PageOwner},
     };
@@ -200,12 +160,12 @@ mod tests {
         LayoutSpec::from_layout(Layout::from_size_align(size, align).unwrap())
     }
 
-    fn reusable_extent(id: ExtentId) -> Extent {
+    fn reusable_extent() -> Extent {
         let spec = layout_spec(65_536, 8);
         let len = spec.mapping_len(Os::page_size()).unwrap();
         let mapping = Os::map(len).unwrap();
 
-        Extent::new(id, &OWNER, mapping, spec).unwrap()
+        Extent::new(&OWNER, mapping, spec).unwrap()
     }
 
     #[test]
@@ -213,14 +173,17 @@ mod tests {
         let mut heap = ExtentHeap::new(ExtentConfig::new(), Hints::new());
         let pages = PageMap::new();
         let index = heap.extents.vacant().unwrap();
-        let id = ExtentId::from_index(index).unwrap();
-        assert!(heap.extents.insert(index, reusable_extent(id)).is_some());
-        let slot = heap.slot(id).unwrap();
+        let inserted = heap.extents.insert(index, reusable_extent()).unwrap();
+        // SAFETY: the test arena keeps this slot for the test's lifetime.
+        let slot = unsafe { &*core::ptr::from_mut(inserted).cast_const() };
         let base = slot.mapping().range().base();
         // Occupy the pages first; publication must fail closed.
         pages.publish(PageOwner::Extent(slot)).unwrap();
 
-        assert!(heap.insert_extent(id, &pages).is_none());
+        assert!(pages.publish(PageOwner::Extent(slot)).is_err());
+        // Same close as `allocate_mapping`: drop the mapping, keep the slot.
+        drop(slot.unmount());
+        heap.unmapped.push_front(slot);
 
         // Slots are immortal: only the mapping is dropped.
         assert!(heap.extents.get(index).is_some());

@@ -74,10 +74,11 @@ A block is held by the user, the owner freelist, or a remote claim.
    `Claimed` byte). A second claim returns `HeapError::DoubleFree`.
 2. Active owner: `Heap::enqueue` (lease before a new `try_queue`).
 3. Draining owner: `Heaps::{free,flush}`. The first remote thread may `adopt`
-   the heap and complete an owner free. With both TLS slots full, it stays on
-   `Heaps::free`.
-4. Owner `flush` calls `accept`. Runs drain claim bits onto the freelist.
-   Extents go `Claimed` to `Free` then `cache_or_unmap`.
+   the heap onto the back of its TLS list and complete an owner free.
+4. Owner `flush` calls `accept` outside `HeapInner`. Runs drain claim bits onto
+   the freelist. Extents go `Claimed` to `Free`. The guard is taken again only
+   to `push_available` or `cache_or_unmap`. Draining `Heaps::flush` keeps one
+   guard around accept, publish, and reclaim.
 
 `Inbox` coalesces by owner. Claimed frees retry Active/Draining transitions.
 If the generation advances, the old owner already accepted the claim.
@@ -87,7 +88,7 @@ If the generation advances, the old owner already accepted the claim.
 ```text
 Free -> Active  bind
 Active -> Draining  unbind (wait in-flight leases, flush, then close)
-Draining -> Active  adopt (lock HeapInner before the CAS)
+Draining -> Active  adopt (lock HeapInner for the CAS, then drop it)
 Draining -> Free  reclaim (live atomics, then arena scans; CAS the generation)
 ```
 
@@ -95,8 +96,10 @@ Draining -> Free  reclaim (live atomics, then arena scans; CAS the generation)
 `Heap::matches`. Occupied slots never move. The arena grow lock covers mapping
 and insertion only, never flush, accept, or user copies.
 
-`THREAD_HEAPS` has two Active slots. Each captures `&Heap` and its generation
-at bind or adopt so unbind cannot close a later incarnation. Default Rust uses
+`THREAD_HEAPS` is a list of Active heaps. Bind pushes the alloc heap at the
+front. Adopt pushes at the back. Each heap stores the generation captured when
+it was linked, so unbind cannot close a later incarnation. The last heap stays
+attached. Default Rust uses
 a `std::thread_local!` guard for thread exit. Feature `c-abi` uses a pthread
 key to avoid allocator re-entry during glibc TLS teardown under `LD_PRELOAD`.
 
@@ -136,7 +139,7 @@ map. `Hints` is copied onto `RunHeap` / `ExtentHeap` at heap construction.
 | `Process` | mmap payload; not returned |
 | `Heaps` | `Arena<Heap>`, Free list, unbind, Draining `free` / `flush` / `reclaim` |
 | `Heap` | `HeapState`, `Inbox`, `Mutex<HeapInner>` |
-| `ThreadHeaps` | Two TLS slots, `current[class]`, Active mutation |
+| `ThreadHeaps` | TLS heap list, `current[class]`, Active mutation |
 | `Run` | In-page header, `&Heap`, freelist, claim bitmap |
 | `Extent` | Dedicated mapping metadata, `&Heap`, Claimed byte |
 | `PageMap` | Page-indexed lookup |

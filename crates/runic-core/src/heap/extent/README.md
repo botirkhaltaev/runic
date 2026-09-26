@@ -5,9 +5,9 @@ Extent metadata owns dedicated large allocations. Retention:
 
 ## Files
 
-- `mod.rs`: `Extent`, `ExtentId`, exact-pointer checks, reuse, and resize-in-place rules.
+- `mod.rs`: `Extent`, exact-pointer checks, reuse, and resize-in-place rules. `Mapping::place` aligns the user range.
 - `config.rs`: `ExtentConfig` / `ExtentPolicy::{Keep, Discard, Unmap}` and `Budget`.
-- `cache.rs`: intrusive `head` list of published Free extents (`ExtentPolicy::{Keep, Discard, Unmap}`, exact-length reuse only). Discard `madvise`s on insert.
+- `cache.rs`: `LinkedList` of published Free extents (`ExtentPolicy::{Keep, Discard, Unmap}`, exact-length reuse only). Discard `madvise`s on insert.
 - `heap.rs`: dedicated allocation via `ExtentInit`, `Arena<Extent>`, `Hints` on payload maps, page-map publication, and `cache_or_unmap` / `unmap`.
 
 ## Same-thread path
@@ -20,7 +20,7 @@ Extent metadata owns dedicated large allocations. Retention:
 - Frees must use the exact returned pointer, not an interior pointer. Owner
   double-free is undefined. Remote `claim` / `accept` still fail closed.
 - Remote frees `claim` then enqueue; the owning heap completes with `accept` (`Claimed → Free`) before shared `cache_or_unmap`.
-- **Published-while-cached:** Keep and Discard leave the arena entry and page-map stamp in place; the cache is an intrusive `head` list of `ExtentId` values into the owning arena. Cache-hit allocate calls `Extent::reuse(init)` and does not re-publish the mapping. True release (Unmap policy / over budget) calls `unmap`, which unpublishes and drops the mapping while retaining the immortal slot. Discard then `madvise(MADV_DONTNEED)`s the mapping.
+- **Published-while-cached:** Keep and Discard leave the arena entry and page-map stamp in place; the cache is a `LinkedList` of those slots. Cache-hit allocate calls `Extent::reuse(init)` and does not re-publish the mapping. True release (Unmap policy / over budget) calls `unmap`, which unpublishes and drops the mapping while retaining the immortal slot. Discard then `madvise(MADV_DONTNEED)`s the mapping.
 - Live large ownership increments/decrements the owning `Heap` atomic; `ExtentHeap::has_live` confirms by scanning Allocated/Claimed slots. Cached Free extents do not block reclaim.
 - `resize_in_place` stays an extent layout (`class_for` is `None`). A size-class spec returns false so later small dealloc probes `Run::header_of` only on runs.
 - `ExtentInit::Zeroed` on dirty Keep reuse: `MADV_DONTNEED` when size ≥ 64 KiB, else memset. That allocate-time discard does not set `clean`; only a successful Discard-insert does. Fresh maps and clean cache hits skip the memset. Uninit never discards.

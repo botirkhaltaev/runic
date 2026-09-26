@@ -68,8 +68,7 @@ fn adopt_promotes_draining_to_active() {
     let heap = heaps.get(id).unwrap();
     assert_eq!(heap.close(id), Ok(()));
     assert_eq!(heap.mode(), HeapMode::Draining);
-    let inner = heap.adopt(id).unwrap();
-    drop(inner);
+    assert_eq!(heap.adopt(id), Ok(()));
     assert_eq!(heap.mode(), HeapMode::Active);
     assert!(matches!(heap.adopt(id), Err(HeapError::InvalidHeap)));
     unbind(&heaps, id);
@@ -86,9 +85,8 @@ fn adopt_race_has_exactly_one_winner() {
     std::thread::scope(|scope| {
         for _ in 0..2 {
             scope.spawn(|| {
-                if let Ok(inner) = heap.adopt(id) {
+                if heap.adopt(id).is_ok() {
                     winners.fetch_add(1, Ordering::Relaxed);
-                    drop(inner);
                 }
             });
         }
@@ -141,10 +139,12 @@ fn extent_alloc_preserves_flush_error() {
     };
     assert!(heap.extent_inbox.queue(extent));
 
+    drop(inner);
     assert_eq!(
-        heap.alloc_extent(&mut inner, spec, ExtentInit::Uninit, &ctx),
+        heap.alloc_extent(spec, ExtentInit::Uninit, &ctx),
         Err(HeapError::InvalidExtentPointer)
     );
+    let mut inner = heap.require_inner();
     extent.claim(ptr).unwrap();
     assert_eq!(heap.flush(&mut inner, &ctx, None), Ok(()));
     drop(inner);
@@ -158,12 +158,12 @@ fn reclaim_rejects_nonzero_leases() {
     let heap = heaps.get(id).unwrap();
     let lease = heap.state.acquire_lease(id).unwrap();
     assert_eq!(heap.state.close(id), Ok(()));
-    let inner = heap.lock_inner();
+    let inner = heap.inner.lock();
     assert!(!heap.reclaim(&inner, &heaps));
     drop(inner);
     assert!(heaps.get(id).is_some());
     drop(lease);
-    let inner = heap.lock_inner();
+    let inner = heap.inner.lock();
     assert!(heap.reclaim(&inner, &heaps));
     drop(inner);
     assert!(heaps.get(id).is_none());

@@ -1,4 +1,8 @@
-use core::{cell::Cell, ptr::NonNull};
+use core::{
+    cell::{Cell, UnsafeCell},
+    num::NonZeroU32,
+    ptr::NonNull,
+};
 
 #[cfg(feature = "c-abi")]
 use core::ffi::c_void;
@@ -13,56 +17,11 @@ use crate::{
     size_class::{SizeClass, SizeClasses},
 };
 
+use super::list::LinkedList;
 use super::{AllocatorCtx, Heap};
 
-/// One process [`Heap`] this thread owns. `Active` captures generation at bind/adopt.
-#[derive(Clone, Copy)]
-enum ThreadHeap {
-    Vacant,
-    Active { heap: &'static Heap, id: HeapId },
-}
-
-impl ThreadHeap {
-    fn active(heap: &'static Heap) -> Self {
-        Self::Active {
-            heap,
-            id: heap.id(),
-        }
-    }
-
-    fn heap(self) -> Option<&'static Heap> {
-        match self {
-            Self::Vacant => None,
-            Self::Active { heap, .. } => Some(heap),
-        }
-    }
-
-    fn id(self) -> Option<HeapId> {
-        match self {
-            Self::Vacant => None,
-            Self::Active { id, .. } => Some(id),
-        }
-    }
-
-    fn owns(self, owner: &Heap) -> bool {
-        match self {
-            Self::Vacant => false,
-            Self::Active { heap, id } => heap == owner && id == owner.id(),
-        }
-    }
-
-    fn is_idle(self) -> bool {
-        let Some(heap) = self.heap() else {
-            return false;
-        };
-        if !heap.inboxes_empty() || heap.occupied() {
-            return false;
-        }
-        let Some(inner) = heap.try_inner() else {
-            return false;
-        };
-        !inner.has_live()
-    }
+fn idle_heap(heap: &Heap) -> bool {
+    heap.inboxes_empty() && !heap.occupied()
 }
 
 /// Owner-local TLS free failure.
@@ -77,9 +36,9 @@ pub(crate) enum ThreadFreeError {
 /// Thread-local frontend: owned heaps and per-class current run.
 ///
 /// Hit is current-run pop / `Run::free`. Miss / bind / unbind / adopt take
-/// [`AllocatorCtx`]. `lookup` is miss / realloc. Alloc uses any active heap.
+/// [`AllocatorCtx`]. `lookup` is miss / realloc. The list front is the alloc heap.
 pub(crate) struct ThreadHeaps {
-    heaps: [Cell<ThreadHeap>; 2],
+    heaps: UnsafeCell<LinkedList<'static, Heap>>,
     current: [Cell<Option<&'static Run>>; SizeClasses::COUNT],
     #[cfg(feature = "c-abi")]
     exit_armed: Cell<bool>,
@@ -88,7 +47,7 @@ pub(crate) struct ThreadHeaps {
 impl ThreadHeaps {
     const fn new() -> Self {
         Self {
-            heaps: [const { Cell::new(ThreadHeap::Vacant) }; 2],
+            heaps: UnsafeCell::new(LinkedList::new()),
             current: [const { Cell::new(None) }; SizeClasses::COUNT],
             #[cfg(feature = "c-abi")]
             exit_armed: Cell::new(false),
@@ -109,25 +68,39 @@ impl ThreadHeaps {
         self.exit_armed.set(true);
     }
 
+    fn heaps(&self) -> &LinkedList<'static, Heap> {
+        // SAFETY: `THREAD_HEAPS` is thread-local. Callers do not overlap list borrows.
+        unsafe { &*self.heaps.get() }
+    }
+
+    fn with_heaps_mut<R>(&self, f: impl FnOnce(&mut LinkedList<'static, Heap>) -> R) -> R {
+        // SAFETY: `THREAD_HEAPS` is thread-local. The closure ends the mutable borrow
+        // before another borrow of the list.
+        f(unsafe { &mut *self.heaps.get() })
+    }
+
+    fn captured_id(heap: &Heap) -> HeapId {
+        let Some(generation) = NonZeroU32::new(heap.thread_gen.get()) else {
+            Allocator::abort();
+        };
+        HeapId::from_slot(heap.slot, generation)
+    }
+
+    fn link_front(&self, heap: &'static Heap) {
+        heap.thread_gen.set(heap.id().generation().get());
+        self.with_heaps_mut(|heaps| heaps.push_front(heap));
+    }
+
+    fn link_back(&self, heap: &'static Heap) {
+        heap.thread_gen.set(heap.id().generation().get());
+        self.with_heaps_mut(|heaps| heaps.push_back(heap));
+    }
+
     fn owns(&self, owner: &Heap) -> bool {
         let id = owner.id();
-        self.heaps.iter().any(|slot| match slot.get() {
-            ThreadHeap::Vacant => false,
-            ThreadHeap::Active { heap, id: bound } => heap == owner && bound == id,
-        })
-    }
-
-    fn vacant(&self) -> Option<&Cell<ThreadHeap>> {
-        self.heaps
+        self.heaps()
             .iter()
-            .find(|slot| matches!(slot.get(), ThreadHeap::Vacant))
-    }
-
-    fn active(&self) -> Option<ThreadHeap> {
-        self.heaps.iter().find_map(|slot| match slot.get() {
-            ThreadHeap::Vacant => None,
-            heap @ ThreadHeap::Active { .. } => Some(heap),
-        })
+            .any(|heap| heap == owner && Self::captured_id(heap) == id)
     }
 
     /// Owner-local small allocation via the current run for `class`.
@@ -165,8 +138,9 @@ impl ThreadHeaps {
         if let Some(ptr) = self.extend_current(class) {
             return Ok(Some(ptr));
         }
+        let accepted = heap.accept();
         let mut inner = heap.require_inner();
-        heap.flush(&mut inner, ctx, None)?;
+        accepted.publish(&mut inner, ctx)?;
         let Some(run) = inner.acquire_run(class, ctx.pages, heap) else {
             return Ok(None);
         };
@@ -195,8 +169,7 @@ impl ThreadHeaps {
         let Some(heap) = self.heap() else {
             return Ok(None);
         };
-        let mut inner = heap.require_inner();
-        heap.alloc_extent(&mut inner, spec, init, ctx)
+        heap.alloc_extent(spec, init, ctx)
     }
 
     /// Owner-local free for a run owned by a TLS heap.
@@ -244,28 +217,24 @@ impl ThreadHeaps {
 
     /// Bind this thread to a heap in `ctx`.
     ///
-    /// Reuses an already attached heap; otherwise acquires into the first
-    /// vacant slot (Heaps locks internally).
+    /// Reuses the alloc heap already at the front of the list; otherwise
+    /// acquires one and links it there.
     #[cold]
     pub(crate) fn bind(&self, ctx: &AllocatorCtx<'static>) -> Option<HeapId> {
         #[cfg(not(feature = "c-abi"))]
         Self::arm_exit();
         #[cfg(feature = "c-abi")]
         self.arm_exit();
-        if let Some(id) = self.active().and_then(ThreadHeap::id) {
-            return Some(id);
+        if let Some(heap) = self.heaps().front() {
+            return Some(Self::captured_id(heap));
         }
 
         let heap = ctx.heaps.acquire()?;
-        let Some(slot) = self.vacant() else {
-            Allocator::abort();
-        };
-        slot.set(ThreadHeap::active(heap));
-        Some(heap.id())
+        self.link_front(heap);
+        Some(Self::captured_id(heap))
     }
 
-    /// First Draining freer becomes Active owner. A third heap stays on
-    /// `Heaps::free` until a slot is unbound.
+    /// First Draining freer becomes Active owner and stays on this thread's list.
     #[cold]
     pub(crate) fn adopt(&self, heap: &'static Heap, ctx: &AllocatorCtx) -> bool {
         #[cfg(not(feature = "c-abi"))]
@@ -275,43 +244,43 @@ impl ThreadHeaps {
         if self.owns(heap) {
             return true;
         }
-        let Some(slot) = self.vacant() else {
+        if heap.adopt(heap.id()).is_err() {
             return false;
-        };
-        let Ok(mut inner) = heap.adopt(heap.id()) else {
-            return false;
-        };
-        slot.set(ThreadHeap::active(heap));
-        if heap.flush(&mut inner, ctx, None).is_err() {
+        }
+        self.link_back(heap);
+        if heap.flush_owner(ctx).is_err() {
             Allocator::abort();
         }
         true
     }
 
-    fn unbind_slot(&self, slot: &Cell<ThreadHeap>, ctx: &AllocatorCtx) {
-        let ThreadHeap::Active { heap, id } = slot.replace(ThreadHeap::Vacant) else {
-            return;
-        };
+    fn unbind_heap(&self, heap: &'static Heap, ctx: &AllocatorCtx) {
+        let id = Self::captured_id(heap);
+        heap.thread_gen.set(0);
         self.release_current(heap);
         if ctx.heaps.unbind(id, ctx).is_err() {
             Allocator::abort();
         }
     }
 
-    /// Idle extra heap: reclaim an attached heap with no live work, but keep the
-    /// last slot so retained empty runs stay on an attached heap.
-    fn idle(&self, owner: &Heap) -> Option<&Cell<ThreadHeap>> {
-        let attached = self
-            .heaps
-            .iter()
-            .filter(|slot| slot.get().heap().is_some())
-            .count();
-        if attached <= 1 {
-            return None;
-        }
-        self.heaps.iter().find(|slot| {
-            let heap = slot.get();
-            heap.owns(owner) && heap.is_idle()
+    /// Unlink an idle heap when another heap is still attached, so the last
+    /// heap keeps its retained empty runs.
+    fn take_idle(&self, owner: &Heap) -> Option<&'static Heap> {
+        self.with_heaps_mut(|heaps| {
+            if heaps.len() <= 1 {
+                return None;
+            }
+            let mut cursor = heaps.cursor_front_mut();
+            loop {
+                let remove = cursor
+                    .current()
+                    .is_some_and(|heap| heap == owner && idle_heap(heap));
+                if remove {
+                    return cursor.remove_current();
+                }
+                cursor.current()?;
+                cursor.move_next();
+            }
         })
     }
 
@@ -326,16 +295,16 @@ impl ThreadHeaps {
             PageOwner::Run(run) => {
                 self.free_run(run, ptr)?;
                 if !run.is_live()
-                    && let Some(slot) = self.idle(run.heap())
+                    && let Some(heap) = self.take_idle(run.heap())
                 {
-                    self.unbind_slot(slot, ctx);
+                    self.unbind_heap(heap, ctx);
                 }
                 Ok(())
             }
             PageOwner::Extent(extent) => {
                 self.free_extent(extent, ptr, ctx)?;
-                if let Some(slot) = self.idle(extent.heap()) {
-                    self.unbind_slot(slot, ctx);
+                if let Some(heap) = self.take_idle(extent.heap()) {
+                    self.unbind_heap(heap, ctx);
                 }
                 Ok(())
             }
@@ -375,7 +344,7 @@ impl ThreadHeaps {
     }
 
     fn heap(&self) -> Option<&'static Heap> {
-        self.active().and_then(ThreadHeap::heap)
+        self.heaps().front()
     }
 
     /// Push this heap's non-full current runs back onto it and clear those cells.
@@ -404,18 +373,14 @@ impl ThreadHeaps {
     /// can reuse them. `push_available` is idempotent if a run is already linked.
     #[cold]
     pub(crate) fn unbind(&self, ctx: &AllocatorCtx) {
-        for slot in &self.heaps {
-            self.unbind_slot(slot, ctx);
+        while let Some(heap) = self.with_heaps_mut(LinkedList::pop_front) {
+            self.unbind_heap(heap, ctx);
         }
     }
 
     fn exit(&self) {
         let Some(ctx) = Allocator::ctx() else {
-            if self
-                .heaps
-                .iter()
-                .any(|slot| !matches!(slot.get(), ThreadHeap::Vacant))
-            {
+            if !self.heaps().is_empty() {
                 Allocator::abort();
             }
             return;
