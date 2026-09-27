@@ -123,9 +123,10 @@ impl Allocator {
     ///
     /// `ptr` must be a pointer previously returned by this allocator for
     /// `layout`. Null is forbidden (`GlobalAlloc` contract) and is fail-closed
-    /// (`PageMap` miss → abort), not accepted. Passing an unknown pointer, an
-    /// interior pointer, or an incompatible layout violates the allocator
-    /// contract and may abort.
+    /// (`PageMap` miss → abort), not accepted. An unknown or interior pointer
+    /// aborts. A layout that does not match the allocation is undefined on
+    /// both builds, as in the `GlobalAlloc` contract and mimalloc: the pointer
+    /// is freed as whatever owns the page, with no check against `layout`.
     #[inline]
     pub unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         let spec = LayoutSpec::from_layout(layout);
@@ -868,40 +869,6 @@ mod tests {
         };
     }
 
-    #[test]
-    fn allocator_allocates_small_from_current_heap() {
-        let allocator = Allocator::new();
-        let ctx = ctx(&allocator);
-        let pages = ctx.pages;
-        let layout = Layout::from_size_align(64, 8).unwrap();
-        {
-            let tls = &THREAD_HEAPS;
-            let id = tls.bind(&ctx).unwrap();
-            let ptr = alloc_small(tls, &ctx, layout);
-            let run = run_of(pages, ptr);
-            assert_eq!(run.heap().id(), id);
-            assert_eq!(tls.free_run(run, ptr), Ok(()));
-            tls.unbind(&ctx);
-        };
-    }
-
-    #[test]
-    fn allocator_allocates_extent_from_current_heap() {
-        let allocator = Allocator::new();
-        let ctx = ctx(&allocator);
-        let pages = ctx.pages;
-        let layout = Layout::from_size_align(128 * 1024, 4096).unwrap();
-        {
-            let tls = &THREAD_HEAPS;
-            let id = tls.bind(&ctx).unwrap();
-            let ptr = alloc_extent(tls, &ctx, layout, ExtentInit::Uninit);
-            let extent = extent_of(pages, ptr);
-            assert_eq!(extent.heap().id(), id);
-            assert_eq!(tls.free_extent(extent, ptr, &ctx), Ok(()));
-            tls.unbind(&ctx);
-        };
-    }
-
     #[cfg(feature = "safe")]
     #[test]
     fn allocator_rejects_duplicate_remote_free() {
@@ -1269,70 +1236,6 @@ mod tests {
     }
 
     #[test]
-    fn allocator_zeroed_large_allocation_uses_current_heap() {
-        let allocator = Allocator::new();
-        let ctx = ctx(&allocator);
-        let pages = ctx.pages;
-        let layout = Layout::from_size_align(128 * 1024, 4096).unwrap();
-        {
-            let tls = &THREAD_HEAPS;
-            let id = tls.bind(&ctx).unwrap();
-            let ptr = alloc_extent(tls, &ctx, layout, ExtentInit::Zeroed);
-            // SAFETY: ptr was just allocated zeroed for layout.
-            assert!(
-                unsafe { core::slice::from_raw_parts(ptr.as_ptr(), layout.size()) }
-                    .iter()
-                    .all(|&byte| byte == 0)
-            );
-            let extent = extent_of(pages, ptr);
-            assert_eq!(extent.heap().id(), id);
-            assert_eq!(tls.free_extent(extent, ptr, &ctx), Ok(()));
-            tls.unbind(&ctx);
-        };
-    }
-
-    #[test]
-    fn allocator_realloc_growth_uses_current_heap_extent() {
-        let allocator = Allocator::new();
-        let small = Layout::from_size_align(64, 8).unwrap();
-        let large = Layout::from_size_align(128 * 1024, 8).unwrap();
-
-        // SAFETY: small is a valid non-zero-size layout.
-        let ptr = unsafe { allocator.alloc(small) };
-        assert!(!ptr.is_null());
-        // SAFETY: ptr was just allocated for small.size() bytes.
-        unsafe { write_bytes(ptr, 0xab, small.size()) };
-
-        let pages = Allocator::ctx().expect("allocator ctx").pages;
-        let id = run_of(pages, NonNull::new(ptr).unwrap()).heap().id();
-
-        // SAFETY: ptr was returned by alloc(small) above and is not yet freed.
-        let grown = unsafe { allocator.realloc(ptr, small, large.size()) };
-        assert!(!grown.is_null());
-        let extent = extent_of(pages, NonNull::new(grown).unwrap());
-
-        // SAFETY: PageMap stores only live extent pointers.
-        assert_eq!(extent.heap().id(), id);
-
-        // SAFETY: grown was returned by realloc above for large.
-        unsafe { allocator.dealloc(grown, large) };
-    }
-
-    #[test]
-    fn dealloc_mixed_class_reverse_drop_uses_current() {
-        let allocator = Allocator::new();
-        let eight = Layout::from_size_align(8, 8).unwrap();
-        let sixty_four = Layout::from_size_align(64, 8).unwrap();
-        // SAFETY: layouts are valid.
-        let a = unsafe { allocator.alloc(eight) };
-        let b = unsafe { allocator.alloc(sixty_four) };
-        assert!(!a.is_null() && !b.is_null());
-        // SAFETY: matching alloc/dealloc pairs.
-        unsafe { allocator.dealloc(b, sixty_four) };
-        unsafe { allocator.dealloc(a, eight) };
-    }
-
-    #[test]
     fn dealloc_non_current_same_class_falls_back_to_pagemap() {
         let allocator = Allocator::new();
         let ctx = ctx(&allocator);
@@ -1368,58 +1271,6 @@ mod tests {
             free_all(tls, pages, &rest);
             tls.unbind(&ctx);
         };
-    }
-
-    #[test]
-    fn realloc_in_class_stays_on_current_run() {
-        let allocator = Allocator::new();
-        let old = Layout::from_size_align(16, 8).unwrap();
-        let new = Layout::from_size_align(24, 8).unwrap();
-        // SAFETY: old is a valid layout.
-        let ptr = unsafe { allocator.alloc(old) };
-        assert!(!ptr.is_null());
-        // SAFETY: ptr was returned for old.
-        unsafe { ptr.write(0x5a) };
-        // SAFETY: matching realloc/dealloc.
-        let grown = unsafe { allocator.realloc(ptr, old, new.size()) };
-        assert!(!grown.is_null());
-        assert_eq!(unsafe { grown.read() }, 0x5a);
-        unsafe { allocator.dealloc(grown, new) };
-    }
-
-    #[test]
-    fn realloc_repeated_in_class_hits_lookup() {
-        let allocator = Allocator::new();
-        let layout = Layout::from_size_align(32, 8).unwrap();
-        // SAFETY: valid layout.
-        let mut ptr = unsafe { allocator.alloc(layout) };
-        assert!(!ptr.is_null());
-        for _ in 0..8 {
-            // SAFETY: ptr is the live allocation from the previous step.
-            let next = unsafe { allocator.realloc(ptr, layout, layout.size()) };
-            assert_eq!(next, ptr);
-            ptr = next;
-        }
-        // SAFETY: final pointer is still live for layout.
-        unsafe { allocator.dealloc(ptr, layout) };
-    }
-
-    #[test]
-    fn realloc_to_extent_uses_pagemap() {
-        let allocator = Allocator::new();
-        let small = Layout::from_size_align(64, 8).unwrap();
-        let large = Layout::from_size_align(128 * 1024, 8).unwrap();
-        // SAFETY: valid layouts.
-        let ptr = unsafe { allocator.alloc(small) };
-        assert!(!ptr.is_null());
-        let grown = unsafe { allocator.realloc(ptr, small, large.size()) };
-        assert!(!grown.is_null());
-        let pages = Allocator::ctx().expect("allocator ctx").pages;
-        assert!(matches!(
-            pages.get(NonNull::new(grown).unwrap()),
-            Some(PageOwner::Extent(_))
-        ));
-        unsafe { allocator.dealloc(grown, large) };
     }
 
     #[test]

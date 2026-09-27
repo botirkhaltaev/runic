@@ -135,9 +135,10 @@ and insertion only, never flush, accept, or user copies.
 `THREAD_HEAPS` is a list of Active heaps. Bind pushes the alloc heap at the
 front. Adopt pushes at the back. Each heap stores the generation captured when
 it was linked, so unbind cannot close a later incarnation. The last heap stays
-attached. Default Rust uses
-a `std::thread_local!` guard for thread exit. Feature `c-abi` uses a pthread
-key to avoid allocator re-entry during glibc TLS teardown under `LD_PRELOAD`.
+attached. `ExitHook` arms once per thread, the first time a heap links or a
+remote chain opens, and unbinds at thread exit. Default Rust registers a
+`std::thread_local!` guard. Feature `c-abi` registers a pthread key to avoid
+allocator re-entry during glibc TLS teardown under `LD_PRELOAD`.
 
 ## Pointer recovery
 

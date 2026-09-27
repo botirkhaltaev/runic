@@ -52,8 +52,10 @@ process-wide flows.
   stores the generation captured at bind or adopt, so unbind cannot close a
   later incarnation. The last attached heap stays.
 - The arena grow lock covers mapping and insertion only.
-- `THREAD_HEAPS` is `#[thread_local]` and `!Drop`. Default builds register
-  `UnbindGuard`; `c-abi` registers a pthread `UnbindHook`.
+- `THREAD_HEAPS` is `#[thread_local]` and `!Drop`. `ExitHook` arms once per
+  thread when a heap links or a chain opens, and unbinds at thread exit. Its
+  `register` leaf is a `thread_local!` guard by default and a pthread key on
+  `c-abi`.
 
 ## Current run (hit)
 

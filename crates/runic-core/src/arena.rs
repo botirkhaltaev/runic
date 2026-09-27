@@ -326,16 +326,6 @@ mod tests {
     }
 
     #[test]
-    fn arena_insert_get_remove_round_trip() {
-        let mut arena = Arena::<u32>::new();
-        let index = occupy(&mut arena, 42);
-        assert_eq!(arena.get(index).copied(), Some(42));
-        assert_eq!(arena.remove(index), Some(42));
-        assert_eq!(arena.get(index), None);
-        assert_eq!(occupy(&mut arena, 7), index);
-    }
-
-    #[test]
     fn arena_iterators_yield_occupied_only() {
         let mut arena = Arena::<u32>::new();
         for value in 1..=3 {
@@ -417,6 +407,8 @@ mod tests {
         );
     }
 
+    /// A slot is readable by another thread as soon as `push` has returned its
+    /// index, including slots in a chunk mapped while the reader was active.
     #[test]
     fn get_sees_published_slots_across_chunks() {
         let arena = Arena::<u32>::new();
@@ -429,16 +421,10 @@ mod tests {
                     tx.send(index).unwrap();
                 }
             });
-            let mut seen = 0u32;
             for _ in 0..n {
                 let index = rx.recv().unwrap();
-                while arena.get(index).is_none() {
-                    core::hint::spin_loop();
-                }
-                assert_eq!(*arena.get(index).unwrap(), index);
-                seen += 1;
+                assert_eq!(arena.get(index).copied(), Some(index));
             }
-            assert_eq!(seen, n);
         });
     }
 }

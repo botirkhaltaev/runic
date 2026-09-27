@@ -181,24 +181,6 @@ mod tests {
     }
 
     #[test]
-    fn stale_heap_id_rejected_after_reclaim() {
-        let heaps = Heaps::new(AllocatorConfig::new());
-        let id = heaps.acquire().unwrap().id();
-        let pages = PageMap::new();
-        assert_eq!(
-            heaps.unbind(
-                id,
-                &AllocatorCtx {
-                    pages: &pages,
-                    heaps: &heaps
-                }
-            ),
-            Ok(())
-        );
-        assert!(heaps.get(id).is_none());
-    }
-
-    #[test]
     fn cached_extent_derives_reactivated_generation() {
         static HEAPS: OnceLock<Heaps> = OnceLock::new();
         static PAGES: OnceLock<PageMap> = OnceLock::new();

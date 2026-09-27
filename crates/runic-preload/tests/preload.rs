@@ -70,6 +70,24 @@ fn threads_exit_while_bound() {
     assert!(status.success(), "threads case exited with {status}");
 }
 
+/// glibc allocates during its own startup, before `main`, and `sh` forks and
+/// execs a child that inherits the preload. Neither path exists in the Rust
+/// fixture, so run real programs.
+#[test]
+fn real_programs_run_preloaded() {
+    let output = Command::new("/bin/sh")
+        .args([
+            "-c",
+            "echo preloaded && ls / > /dev/null && env | grep -c ^LD_PRELOAD=",
+        ])
+        .env("LD_PRELOAD", LIBRARY)
+        .output()
+        .expect("failed to run sh");
+
+    assert!(output.status.success(), "sh exited with {}", output.status);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "preloaded\n1\n");
+}
+
 #[test]
 fn invalid_pointers_abort() {
     for case in [

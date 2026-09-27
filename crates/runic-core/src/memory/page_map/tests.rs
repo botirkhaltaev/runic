@@ -1,4 +1,3 @@
-use super::table::L2Table;
 use super::*;
 use crate::{
     config::AllocatorConfig,
@@ -67,16 +66,6 @@ fn has_l2_table(map: &PageMap, ptr: NonNull<u8>) -> bool {
         .is_some_and(|l1| l1.l2_table_ref(l1_index).is_some())
 }
 
-fn l2_table_for(map: &PageMap, ptr: NonNull<u8>) -> Option<&L2Table> {
-    let (l1_index, _) = Page::split(ptr)?;
-    map.l1()?.l2_table_ref(l1_index)
-}
-
-fn direct_entry(map: &PageMap, ptr: NonNull<u8>) -> Option<MapEntry> {
-    let (_, l2_index) = Page::split(ptr)?;
-    Some(l2_table_for(map, ptr)?.entry(l2_index).load())
-}
-
 /// Page inside `mapping` at `offset` bytes from its base.
 fn page_at(mapping: &Mapping, offset: usize) -> NonNull<u8> {
     assert!(offset < mapping.len().get());
@@ -92,11 +81,12 @@ fn l2_boundary_offset(mapping: &Mapping) -> usize {
 }
 
 #[test]
-fn page_map_new_lookup_returns_none() {
+fn page_map_unpublished_page_resolves_to_none() {
+    let mapping = Os::map(PAGE_SIZE).unwrap();
     let map = PageMap::new();
-    let ptr = NonNull::dangling();
 
-    assert!(map.get(ptr).is_none());
+    assert!(map.get(mapping.base()).is_none());
+    assert!(map.get(page_at(&mapping, PAGE_SIZE - 1)).is_none());
 }
 
 #[test]
@@ -131,42 +121,6 @@ fn page_map_insert_range_maps_extent_entry() {
 
     let interior = page_at(&mapping, PAGE_SIZE + 17);
     assert_eq!(map.get(interior), Some(extent(4)));
-}
-
-#[test]
-fn page_map_insert_extent_range_uses_direct_entries() {
-    let mapping = Os::map(PAGE_SIZE * 2).unwrap();
-    let map = PageMap::new();
-    let range = PageRange::from_mapping(&mapping).unwrap();
-
-    assert!(map.insert(range, extent(4)).is_ok());
-
-    assert_eq!(
-        direct_entry(&map, mapping.base()),
-        MapEntry::from_owner(extent(4))
-    );
-    assert_eq!(
-        direct_entry(&map, page_at(&mapping, PAGE_SIZE)),
-        MapEntry::from_owner(extent(4))
-    );
-}
-
-#[test]
-fn page_map_insert_run_range_uses_direct_entries() {
-    let mapping = Os::map(PAGE_SIZE * 2).unwrap();
-    let map = PageMap::new();
-    let range = PageRange::from_mapping(&mapping).unwrap();
-
-    assert!(map.insert(range, run(4)).is_ok());
-
-    assert_eq!(
-        direct_entry(&map, mapping.base()),
-        MapEntry::from_owner(run(4))
-    );
-    assert_eq!(
-        direct_entry(&map, page_at(&mapping, PAGE_SIZE)),
-        MapEntry::from_owner(run(4))
-    );
 }
 
 #[test]
@@ -444,27 +398,14 @@ fn page_map_insert_range_crosses_l2_boundary() {
     let mapping = Os::map((L2_ENTRIES + 2) * PAGE_SIZE).unwrap();
     let map = PageMap::new();
     let range = PageRange::from_mapping(&mapping).unwrap();
-
-    assert!(map.insert(range, run(10)).is_ok());
-
-    let last = page_at(&mapping, mapping.len().get() - 1);
-    assert_eq!(map.get(mapping.base()), Some(run(10)));
-    assert_eq!(map.get(last), Some(run(10)));
-}
-
-#[test]
-fn page_map_insert_extent_range_crosses_l2_boundary() {
-    let mapping = Os::map((L2_ENTRIES + 2) * PAGE_SIZE).unwrap();
-    let map = PageMap::new();
-    let range = PageRange::from_mapping(&mapping).unwrap();
     let boundary = page_at(&mapping, l2_boundary_offset(&mapping));
     let last = page_at(&mapping, mapping.len().get() - 1);
 
-    assert!(map.insert(range, extent(10)).is_ok());
+    assert!(map.insert(range, run(10)).is_ok());
 
-    assert_eq!(map.get(mapping.base()), Some(extent(10)));
-    assert_eq!(map.get(boundary), Some(extent(10)));
-    assert_eq!(map.get(last), Some(extent(10)));
+    assert_eq!(map.get(mapping.base()), Some(run(10)));
+    assert_eq!(map.get(boundary), Some(run(10)));
+    assert_eq!(map.get(last), Some(run(10)));
 }
 
 /// Many single-page extents share one L2 via direct per-page entries.
@@ -586,6 +527,62 @@ fn page_map_concurrent_same_l2_disjoint_pages() {
 
     assert_eq!(map.get(first_base), Some(run(1)));
     assert_eq!(map.get(second_base), Some(run(2)));
+}
+
+/// `get` is a lock-free read. While a writer churns one page of an L2 table,
+/// readers of that page see only its owner or nothing, and readers of a
+/// neighboring page that stays published never see it flicker.
+#[test]
+fn page_map_get_stays_exact_under_concurrent_insert_and_remove() {
+    const ROUNDS: usize = 2_000;
+    const READERS: usize = 3;
+    let mapping = Os::map(PAGE_SIZE * 2).unwrap();
+    let map = PageMap::new();
+    let stable = mapping.base();
+    let churned = page_at(&mapping, PAGE_SIZE);
+    let churn_range = PageRange::from_aligned(churned, PAGE_SIZE).unwrap();
+    let start = Barrier::new(READERS + 1);
+
+    assert!(
+        map.insert(PageRange::from_aligned(stable, PAGE_SIZE).unwrap(), run(1))
+            .is_ok()
+    );
+
+    // `NonNull` is not `Send`; readers rebuild the pointers from addresses.
+    let (stable_addr, churned_addr) = (stable.addr(), churned.addr());
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            start.wait();
+            for round in 0..ROUNDS {
+                let owner = if round % 2 == 0 { run(2) } else { extent(3) };
+                assert_eq!(map.insert(churn_range, owner), Ok(()));
+                assert_eq!(map.remove(churn_range, owner), Ok(()));
+            }
+        });
+        for _ in 0..READERS {
+            scope.spawn(|| {
+                let stable = NonNull::new(core::ptr::with_exposed_provenance_mut::<u8>(
+                    stable_addr.get(),
+                ))
+                .unwrap();
+                let churned = NonNull::new(core::ptr::with_exposed_provenance_mut::<u8>(
+                    churned_addr.get(),
+                ))
+                .unwrap();
+                start.wait();
+                for _ in 0..ROUNDS {
+                    assert_eq!(map.get(stable), Some(run(1)));
+                    let seen = map.get(churned);
+                    assert!(
+                        seen.is_none() || seen == Some(run(2)) || seen == Some(extent(3)),
+                        "churned page read as {seen:?}"
+                    );
+                }
+            });
+        }
+    });
+
+    assert!(map.get(churned).is_none());
 }
 
 #[test]

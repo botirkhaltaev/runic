@@ -2,7 +2,8 @@
 
 Scope: `crates/runic-core/tests/`.
 
-- Cross-entity behavior only; module-private invariants stay beside the owning module.
+- Public `Allocator` behavior only; module-private invariants stay beside the owning module.
+- One file per behavior area (`api`, `threads`, `stress`); shared helpers in `common/mod.rs` and nothing unused there, since every file is its own crate.
+- Fill and check every block with `Block` before it changes hands; never assert on which internal path ran.
 - Aborting invalid frees → subprocess tests in `crates/runic/tests/`.
 - Do not revive TLS-batch freer narratives; claim→enqueue is immediate.
-- Run-retention traces that initialize process state belong in `run_reuse.rs` (own process).
