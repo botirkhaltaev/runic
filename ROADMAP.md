@@ -13,12 +13,12 @@ concurrency and performance work depend on them.
 
 ## Current status
 
-Runic **0.9.0** is published: `runic-core`, `runic-alloc`, `runic-cabi`.
+Runic **0.10.0** is published: `runic-core`, `runic-alloc`, `runic-cabi`.
 
-The release includes owner-local heaps, two TLS heap slots, remote free,
-thread-exit draining, run and extent retention, a malloc-family `LD_PRELOAD`
-library, a `Memory` leaf, payload hugepage and NUMA hints, and const
-allocator config. Fast defaults are Off/Off.
+The release includes owner-local heaps, a TLS heap list, remote free held on
+thread slots, thread-exit draining, run and extent retention, a malloc-family
+`LD_PRELOAD` library, a `Memory` leaf, payload hugepage and NUMA hints, const
+allocator config, and the `safe` feature. Fast defaults are Off/Off.
 
 ## Milestones
 
@@ -114,11 +114,24 @@ RUNIC_* overlay at preload for hugepage, NUMA, and run/extent policy
 
 Released as `0.9.0`.
 
+### v0.10: Safe
+
+```text
+safe Cargo feature; the build is the mode
+small owner double-free aborts via Freelist::ensure_absent
+extent double-free returns DoubleFree; Fast stores the state byte
+remote claim bits so a second remote claim aborts
+TLS heaps are a list; remote frees held on eight thread slots
+Active flush accepts outside HeapInner; adopt CASes before locking
+```
+
+Released as `0.10.0`.
+
 ## Next
 
-0.9 is published. Production still means the Safe feature, Hardened
-integrity, reclaim, C trim/inspect, and other `Memory` impls. Fast stays free
-of Safe and Hardened work.
+0.10 is published. Production still means Hardened integrity, reclaim, C
+trim/inspect, and other `Memory` impls. Fast stays free of Safe and Hardened
+work.
 
 Any further Fast-path default (reclaim) needs a pinned real-workload screen.
 Weight the representative production workloads; investigate every regression
@@ -133,19 +146,11 @@ the mode: default is Fast, `--features safe` is Safe. There is no `Mode`,
 run/extent policy. Hardened is its own feature in 0.11 and is not combined
 with Safe.
 
-### 0.10 Safe
-
 Safe Rust is best-effort in both builds. A site becomes safe only when it is
 off the hit, adds no helper or second API, and keeps the same behavior. Every
 remaining `unsafe` names the invariant it relies on. Fast hit `unsafe` stays.
-Hardened does not run on Safe.
-
-Fast is the malloc baseline: extent and small owner double-free are
-undefined, as mimalloc and snmalloc leave small double-free by default. Safe
-checks the extent state byte and adds the small check the way mimalloc
-`MI_SECURE=4` does: a cheap filter on the block's first word, then a capped
-freelist walk only when that word looks like a link. `realloc` uses the caller's alignment in both builds; no
-researched allocator keeps `memalign` alignment across `realloc`.
+Hardened does not run on Safe. `realloc` uses the caller's alignment in both
+builds; no researched allocator keeps `memalign` alignment across `realloc`.
 
 ### 0.11 Hardened
 

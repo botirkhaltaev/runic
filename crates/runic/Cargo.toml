@@ -16,7 +16,7 @@ safe = ["runic-core/safe"]
 workspace = true
 
 [dependencies]
-runic-core = { version = "0.9.0", path = "../runic-core" }
+runic-core = { version = "0.10.0", path = "../runic-core" }
 
 [[bin]]
 name = "abort-case"
