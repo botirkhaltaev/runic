@@ -2,9 +2,10 @@
 
 On Linux `x86_64`, Runic implements `GlobalAlloc` and the malloc-family entry
 points listed below. It supports remote free and thread exit and requires
-nightly Rust. The default build is Fast. Extent owner double-free aborts in
-both builds. `--features safe` also aborts an owner double-free of a small
-block. Hardened is not implemented.
+nightly Rust. The default build is Fast, where an owner double-free is
+undefined, as in glibc, mimalloc, and snmalloc. `--features safe` aborts an
+owner double-free of a small block or an extent and a second remote free of
+the same block. Hardened is not implemented.
 Hugepage and NUMA knobs exist on payload maps (default Off). Background purge
 and telemetry are not implemented. Planned work is [ROADMAP.md](ROADMAP.md).
 
@@ -22,8 +23,8 @@ and telemetry are not implemented. Planned work is [ROADMAP.md](ROADMAP.md).
 | Capability | Status |
 |------------|--------|
 | Implemented | `alloc`, `dealloc`, `alloc_zeroed`, `realloc` via `RunicAlloc` |
-| Contract | Null `dealloc` aborts. Layout must match what was used to allocate. Unknown and interior pointers abort |
-| Double free | Remote `claim` rejects a second free. Extent owner double-free aborts. Small owner double-free is undefined on Fast and aborts with `--features safe` |
+| Contract | Null `dealloc` aborts. Layout must match what was used to allocate. Interior pointers abort. A pointer the allocator never issued aborts, or faults on the run-header probe when it arrives with a small layout |
+| Double free | Undefined on Fast. With `--features safe`: a second owner free of a small block or extent aborts, and a second remote free of the same block aborts |
 | `realloc` | Preserves the prefix; may move. Uses the new `Layout` alignment in both builds |
 | Config | `RunicAlloc::new().with_*` (hugepage, NUMA, `ExtentConfig`, `RunConfig`). First `init` in the process wins. Safe is the `safe` Cargo feature, not a config field |
 
@@ -51,7 +52,8 @@ __libc_cfree __libc_posix_memalign
 | Deploy | `LD_PRELOAD` at process start. Do not combine with `#[global_allocator]` `RunicAlloc` in the same process |
 
 `runic-cabi` tests entry-point contracts. `runic-preload` tests interposition,
-thread exit, aborts, and the exact export set.
+thread exit, aborts, the exact export set, and real programs (`sh`, `ls`)
+running under the preload.
 
 ## Threading
 

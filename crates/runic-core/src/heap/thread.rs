@@ -71,8 +71,11 @@ impl ThreadHeaps {
         }
     }
 
+    /// Arm this thread's exit callback. Idempotent; called from every cold
+    /// entry that leaves state on this thread: `bind`, `adopt`, and the first
+    /// remote hold of a run.
     #[cfg(not(feature = "c-abi"))]
-    fn arm_exit() {
+    fn arm_exit(&self) {
         UNBIND_GUARD.with(|_| {});
     }
 
@@ -278,9 +281,6 @@ impl ThreadHeaps {
     /// it at the front.
     #[cold]
     pub(crate) fn bind(&self, ctx: &AllocatorCtx<'static>) -> Option<HeapId> {
-        #[cfg(not(feature = "c-abi"))]
-        Self::arm_exit();
-        #[cfg(feature = "c-abi")]
         self.arm_exit();
         if let Some(heap) = self.heaps().front() {
             return Some(Self::captured_id(heap));
@@ -294,9 +294,6 @@ impl ThreadHeaps {
     /// First Draining freer becomes Active owner and stays on this thread's list.
     #[cold]
     pub(crate) fn adopt(&self, heap: &'static Heap, ctx: &AllocatorCtx) -> bool {
-        #[cfg(not(feature = "c-abi"))]
-        Self::arm_exit();
-        #[cfg(feature = "c-abi")]
         self.arm_exit();
         if self.owns(heap) {
             return true;
@@ -453,9 +450,13 @@ impl ThreadHeaps {
 
     /// Make slot 0 the chain for `run`: promote a hit, or park an empty slot
     /// there, or flush the fullest chain and park that slot there.
+    ///
+    /// A thread that only frees never binds, so this is where its exit
+    /// callback gets armed; otherwise chains left on its slots would be lost.
     #[cold]
     #[inline(never)]
     fn bring_front(&self, run: &'static Run) -> Result<(), HeapError> {
+        self.arm_exit();
         let mut empty = None;
         let mut fullest = 0usize;
         let mut fullest_count = 0u16;

@@ -335,4 +335,100 @@ mod tests {
         assert!(unsafe { reallocarray(null_mut(), usize::MAX, 2) }.is_null());
         assert_eq!(unsafe { *libc::__errno_location() }, libc::ENOMEM);
     }
+
+    #[test]
+    fn unsatisfiable_sizes_return_null_with_enomem() {
+        let huge = isize::MAX as usize;
+        // SAFETY: null results only; the small block is freed.
+        unsafe {
+            *libc::__errno_location() = 0;
+            assert!(malloc(huge).is_null());
+            assert_eq!(*libc::__errno_location(), libc::ENOMEM);
+            *libc::__errno_location() = 0;
+            assert!(malloc(usize::MAX).is_null());
+            assert_eq!(*libc::__errno_location(), libc::ENOMEM);
+            *libc::__errno_location() = 0;
+            assert!(memalign(64, huge).is_null());
+            assert_eq!(*libc::__errno_location(), libc::ENOMEM);
+
+            let ptr = malloc(32);
+            assert!(!ptr.is_null());
+            ptr.cast::<u8>().write(0x77);
+            assert!(realloc(ptr, huge).is_null());
+            assert_eq!(*libc::__errno_location(), libc::ENOMEM);
+            assert_eq!(
+                ptr.cast::<u8>().read(),
+                0x77,
+                "failed realloc lost the block"
+            );
+            free(ptr);
+        }
+    }
+
+    #[test]
+    fn posix_memalign_argument_edges_follow_posix() {
+        let mut ptr = null_mut();
+        // SAFETY: `memptr` is live; results are freed or null.
+        unsafe {
+            assert_eq!(posix_memalign(&raw mut ptr, 0, 64), libc::EINVAL);
+            assert_eq!(posix_memalign(&raw mut ptr, 4, 64), libc::EINVAL);
+            assert_eq!(posix_memalign(&raw mut ptr, 24, 64), libc::EINVAL);
+            assert_eq!(posix_memalign(null_mut(), 16, 64), libc::EINVAL);
+            assert!(ptr.is_null());
+
+            assert_eq!(posix_memalign(&raw mut ptr, 16, 0), 0);
+            assert!(!ptr.is_null());
+            free(ptr);
+
+            assert_eq!(posix_memalign(&raw mut ptr, 1 << 20, 24), 0);
+            assert_eq!(ptr.addr() % (1 << 20), 0);
+            ptr.cast::<u8>().write_bytes(0x33, 24);
+            free(ptr);
+        }
+    }
+
+    #[test]
+    fn aligned_alloc_round_trips_when_size_is_a_multiple_of_alignment() {
+        for (alignment, size) in [(16, 16), (64, 640), (4096, 8192), (65536, 65536)] {
+            // SAFETY: matching aligned_alloc and free.
+            unsafe {
+                let ptr = aligned_alloc(alignment, size);
+                assert!(!ptr.is_null(), "align {alignment} size {size}");
+                assert_eq!(ptr.addr() % alignment, 0, "align {alignment} size {size}");
+                ptr.cast::<u8>().write_bytes(0x44, size);
+                free(ptr);
+            }
+        }
+    }
+
+    #[test]
+    fn usable_size_is_writable_to_the_last_byte() {
+        for size in [1, 24, 100, 4096, 32768, 40_000, 300_000] {
+            // SAFETY: the span is writable up to `malloc_usable_size`.
+            unsafe {
+                let ptr = malloc(size);
+                assert!(!ptr.is_null(), "size {size}");
+                let usable = malloc_usable_size(ptr);
+                assert!(usable >= size, "size {size} usable {usable}");
+                ptr.cast::<u8>().write_bytes(0x55, usable);
+                assert_eq!(ptr.cast::<u8>().add(usable - 1).read(), 0x55);
+                free(ptr);
+            }
+        }
+    }
+
+    #[test]
+    fn realloc_keeps_max_align_but_not_memalign_alignment() {
+        let mut ptr = null_mut();
+        // SAFETY: matching allocation and free.
+        unsafe {
+            assert_eq!(posix_memalign(&raw mut ptr, 4096, 64), 0);
+            ptr.cast::<u8>().write(0x66);
+            let grown = realloc(ptr, 96 * 1024);
+            assert!(!grown.is_null());
+            assert_eq!(grown.addr() % MAX_ALIGN, 0);
+            assert_eq!(grown.cast::<u8>().read(), 0x66);
+            free(grown);
+        }
+    }
 }

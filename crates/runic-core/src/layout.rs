@@ -121,19 +121,11 @@ mod tests {
     }
 
     #[test]
-    fn layout_spec_mapping_len_uses_align_minus_one_headroom() {
-        // size + align would round past one page; size + align - 1 stays exact.
+    fn layout_spec_mapping_len_fits_size_plus_alignment_slack_in_one_page() {
+        // 4089 bytes at align 8 need at most 7 bytes of slack: one page.
         let spec = layout_spec(4089, 8);
 
         assert_eq!(spec.mapping_len(4096), Some(4096));
-        assert_eq!(
-            4089usize.checked_add(8).map(|v| (v + 4095) & !4095),
-            Some(8192)
-        );
-        assert_eq!(
-            4089usize.checked_add(8 - 1).map(|v| (v + 4095) & !4095),
-            Some(4096)
-        );
     }
 
     #[test]

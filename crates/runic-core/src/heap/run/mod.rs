@@ -788,86 +788,39 @@ mod tests {
         assert_eq!(run.resize_in_place(ptr, new), Ok(false));
     }
 
+    /// Every byte of every class's payload: block starts locate to their
+    /// index, interior bytes are invalid, the tail slack past the last whole
+    /// block is out of range, and `header_of` resolves the same run throughout.
     #[test]
-    fn recip_matches_block_index_for_all_classes() {
-        for &size in &SizeClasses::SIZES {
-            let stride = u32::try_from(size).unwrap();
-            let recip = Run::recip(stride).unwrap();
-            let span = (RUN_SIZE / size) * size;
-            for offset in 0..span {
-                let product = u64::try_from(offset)
-                    .unwrap()
-                    .wrapping_mul(u64::from(recip));
-                let [b0, b1, b2, b3, _, _, _, _] = product.to_le_bytes();
-                let divisible = u32::from_le_bytes([b0, b1, b2, b3]) < recip;
-                assert_eq!(
-                    divisible,
-                    offset.is_multiple_of(size),
-                    "divisibility size={size} offset={offset}"
-                );
-                let index = product >> 32;
-                let ok = index.wrapping_mul(u64::try_from(size).unwrap())
-                    == u64::try_from(offset).unwrap();
-                assert_eq!(ok, divisible, "product size={size} offset={offset}");
-                assert_eq!(
-                    ok.then_some(usize::try_from(index).unwrap()),
-                    offset.is_multiple_of(size).then_some(offset / size),
-                    "size={size} offset={offset}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn reusable_run_rejects_interior_pointer() {
-        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
-        let pages = PageMap::new();
-        let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
-        let ptr = alloc_block(run).unwrap();
-        let interior = NonNull::new(ptr.as_ptr().wrapping_add(1)).unwrap();
-
-        assert_eq!(run.locate(interior), Err(RunError::InvalidPointer));
-    }
-
-    #[test]
-    fn reusable_run_locate_covers_all_classes_boundaries_and_tail_slack() {
+    fn locate_and_header_of_classify_every_payload_byte() {
         let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         for &size in &SizeClasses::SIZES {
             let run = runs.acquire(class_id(size, 8), &OWNER, &pages).unwrap();
-            let capacity = RUN_SIZE / size;
+            let base = run.range().base();
+            let span = (RUN_SIZE / size) * size;
 
-            let first = alloc_block(run).unwrap();
-            assert!(run.locate(first).is_ok(), "size={size}");
-            assert_eq!(
-                run.locate(NonNull::new(first.as_ptr().wrapping_add(1)).unwrap()),
-                Err(RunError::InvalidPointer),
-                "size={size}"
-            );
+            for offset in 0..RUN_SIZE {
+                let ptr = NonNull::new(base.as_ptr().wrapping_add(offset)).unwrap();
+                let expected = if offset >= span {
+                    Err(RunError::OutOfRange)
+                } else if offset.is_multiple_of(size) {
+                    Ok(offset / size)
+                } else {
+                    Err(RunError::InvalidPointer)
+                };
 
-            let slack_offset = capacity * size;
-            if slack_offset < RUN_SIZE {
-                let slack =
-                    NonNull::new(run.range().base().as_ptr().wrapping_add(slack_offset)).unwrap();
                 assert_eq!(
-                    run.locate(slack),
-                    Err(RunError::OutOfRange),
-                    "size={size} slack"
+                    run.locate(ptr).map(|block| block.index().get()),
+                    expected,
+                    "size {size} offset {offset}"
+                );
+                assert!(
+                    Run::header_of(ptr).unwrap() == run,
+                    "size {size} offset {offset}"
                 );
             }
         }
-    }
-
-    #[test]
-    fn reusable_run_rejects_interior_pointer_for_non_power_of_two_class() {
-        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
-        let pages = PageMap::new();
-        let run = runs.acquire(class_id(24, 8), &OWNER, &pages).unwrap();
-        let ptr = alloc_block(run).unwrap();
-        let interior = NonNull::new(ptr.as_ptr().wrapping_add(1)).unwrap();
-
-        assert!(run.locate(ptr).is_ok());
-        assert_eq!(run.locate(interior), Err(RunError::InvalidPointer));
     }
 
     #[test]
@@ -912,23 +865,6 @@ mod tests {
         assert_eq!(run_a.locate(ptr), Err(RunError::OutOfRange));
     }
 
-    #[test]
-    fn reusable_run_rejects_aligned_tail_slack() {
-        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
-        let pages = PageMap::new();
-        for size in [80, 96] {
-            let class = class_id(size, 8);
-            let run = runs.acquire(class, &OWNER, &pages).unwrap();
-            let capacity = RUN_SIZE / class.size();
-            let slack_offset = capacity * class.size();
-            assert!(slack_offset < RUN_SIZE, "size={size}");
-            let slack =
-                NonNull::new(run.range().base().as_ptr().wrapping_add(slack_offset)).unwrap();
-
-            assert_eq!(run.locate(slack), Err(RunError::OutOfRange), "size={size}");
-        }
-    }
-
     #[cfg(feature = "safe")]
     #[test]
     fn claim_run_reports_duplicate_remote_free() {
@@ -939,19 +875,6 @@ mod tests {
 
         assert_eq!(run.claim(ptr), Ok(()));
         assert_eq!(run.claim(ptr), Err(RunError::DoubleFree));
-    }
-
-    #[test]
-    fn claim_run_completes_to_reusable() {
-        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
-        let pages = PageMap::new();
-        let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
-        let ptr = alloc_block(run).unwrap();
-
-        assert_eq!(run.claim(ptr), Ok(()));
-        run.push(ptr, ptr);
-        assert_eq!(run.accept(), Accept::Done);
-        assert_eq!(run.allocate(), Some(ptr));
     }
 
     #[test]
@@ -991,17 +914,6 @@ mod tests {
             let ptr = alloc_block(run).unwrap();
             assert_eq!(ptr.as_ptr() as usize % 16, 0);
         }
-    }
-
-    #[test]
-    fn run_range_reports_payload_span() {
-        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
-        let pages = PageMap::new();
-        let run = runs.acquire(class_id(8, 8), &OWNER, &pages).unwrap();
-        let base = run.range().base();
-
-        assert_eq!(run.range().base(), base);
-        assert_eq!(run.range().len(), RUN_SIZE);
     }
 
     #[test]
@@ -1139,22 +1051,32 @@ mod tests {
         assert!(run.allocate().is_some());
     }
 
+    /// Discard returns the payload pages to the OS and hands out the same
+    /// space again, so dirty bytes read back as zero and the space stays writable.
     #[test]
-    fn discard_does_not_unmap_space() {
+    fn discard_zeroes_payload_and_keeps_it_mapped() {
         let mut runs = RunHeap::new(
             RunConfig::new().with_policy(RunPolicy::Discard),
             Hints::new(),
         );
         let pages = PageMap::new();
-        let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
-        let base = run.range().base();
+        let class = class_id(64, 8);
+        let run = runs.acquire(class, &OWNER, &pages).unwrap();
         let ptr = alloc_block(run).unwrap();
+        // SAFETY: `ptr` is a live block of `class.size()` bytes.
+        unsafe { ptr.as_ptr().write_bytes(0x11, class.size()) };
         assert_eq!(run.free(ptr), Ok(RunFree::Unchanged));
         run.discard();
-        // SAFETY: space stays mapped; DONTNEED may zero the page.
+
+        // SAFETY: the payload stays mapped for the process lifetime.
+        let payload = unsafe { core::slice::from_raw_parts(ptr.as_ptr(), class.size()) };
+        assert!(payload.iter().all(|&byte| byte == 0));
+        assert!(run.extend());
+        assert_eq!(run.allocate(), Some(ptr));
+        // SAFETY: the block was just handed out again.
         unsafe {
-            base.as_ptr().write(0x11);
-            assert_eq!(base.as_ptr().read(), 0x11);
+            ptr.as_ptr().write(0x22);
+            assert_eq!(ptr.as_ptr().read(), 0x22);
         }
     }
 }

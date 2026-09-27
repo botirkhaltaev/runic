@@ -18,6 +18,9 @@ workspace = true
 [dependencies]
 runic-core = { version = "0.10.0", path = "../runic-core" }
 
+[dev-dependencies]
+libc = "0.2"
+
 [[bin]]
 name = "abort-case"
 path = "src/bin/abort_case.rs"

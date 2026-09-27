@@ -234,125 +234,26 @@ mod tests {
         LayoutSpec::from_layout(Layout::from_size_align(size, align).unwrap())
     }
 
+    /// `class_for` is the smallest class that holds `size` at `align`, over
+    /// every small size and every power-of-two alignment. Sizes past
+    /// `SMALL_MAX` and alignments past a page are extents.
     #[test]
-    fn size_classes_map_one_byte_to_eight() {
-        let class = SizeClasses::class_for(spec(1, 1)).unwrap();
+    fn class_for_picks_the_smallest_fitting_class() {
+        let aligns = (0..=15).map(|power| 1_usize << power);
 
-        assert_eq!(class.size(), 8);
-    }
-
-    #[test]
-    fn size_classes_normalize_zero_size_via_layout_spec() {
-        let class = SizeClasses::class_for(spec(0, 8)).unwrap();
-
-        assert_eq!(class.size(), 8);
-    }
-
-    #[test]
-    fn size_classes_map_exact_boundaries_to_themselves() {
-        for &size in &SizeClasses::SIZES {
-            let class = SizeClasses::class_for(spec(size, 1)).unwrap();
-
-            assert_eq!(class.size(), size);
-        }
-    }
-
-    #[test]
-    fn size_classes_reject_larger_than_small_max() {
-        assert!(SizeClasses::class_for(spec(SizeClasses::SMALL_MAX + 1, 1)).is_none());
-    }
-
-    #[test]
-    fn size_classes_reject_over_page_alignment() {
-        assert!(SizeClasses::class_for(spec(1, PAGE_SIZE * 2)).is_none());
-    }
-
-    #[test]
-    fn size_classes_choose_naturally_aligned_block() {
-        let class = SizeClasses::class_for(spec(17, 16)).unwrap();
-
-        assert_eq!(class.size(), 32);
-    }
-
-    #[test]
-    fn size_classes_match_linear_reference() {
-        for size in 0..=SizeClasses::SMALL_MAX {
-            for align in [
-                1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
-            ] {
+        for size in 0..=SizeClasses::SMALL_MAX + 1 {
+            for align in aligns.clone() {
                 let class = SizeClasses::class_for(spec(size, align)).map(SizeClass::size);
-                let reference = if align > PAGE_SIZE {
+                let smallest = if align > PAGE_SIZE {
                     None
                 } else {
                     SizeClasses::SIZES
                         .iter()
                         .copied()
-                        .find(|block_size| *block_size >= size && block_size.is_multiple_of(align))
+                        .find(|block| *block >= size && block.is_multiple_of(align))
                 };
 
-                assert_eq!(class, reference);
-            }
-        }
-    }
-
-    #[test]
-    fn size_classes_are_sorted() {
-        for sizes in SizeClasses::SIZES.windows(2) {
-            let [left, right] = sizes else {
-                unreachable!();
-            };
-
-            assert!(left < right);
-        }
-    }
-
-    #[test]
-    fn size_classes_are_minimum_aligned() {
-        for block_size in SizeClasses::SIZES {
-            assert!(block_size.is_multiple_of(SizeClasses::MIN_ALIGNMENT));
-        }
-    }
-
-    #[test]
-    fn size_classes_small_max_is_largest_class() {
-        assert_eq!(SizeClasses::SIZES.last(), Some(&SizeClasses::SMALL_MAX));
-    }
-
-    #[test]
-    fn size_classes_alignment_table_covers_page_alignment() {
-        assert_eq!(1_usize << (SizeClasses::ALIGN_POWER_COUNT - 1), PAGE_SIZE);
-    }
-
-    #[test]
-    fn size_class_lower_bounds_match_declared_sizes() {
-        for size in 0..=SizeClasses::SMALL_MAX {
-            let index = usize::from(*SizeClasses::CLASS_FOR_SIZE.get(size).unwrap());
-            let block_size = SizeClasses::SIZES.get(index).copied();
-            let reference = SizeClasses::SIZES
-                .iter()
-                .copied()
-                .find(|block_size| *block_size >= size);
-
-            assert_eq!(block_size, reference);
-        }
-    }
-
-    #[test]
-    fn aligned_class_map_matches_linear_oracle() {
-        for power in 0..SizeClasses::ALIGN_POWER_COUNT {
-            let align = 1_usize << power;
-
-            for start in 0..SizeClasses::COUNT {
-                let generated = SizeClasses::ALIGNED_CLASS_BY_START
-                    .get(power)
-                    .and_then(|row| row.get(start))
-                    .copied();
-                let reference = (start..SizeClasses::COUNT).find_map(|index| {
-                    let size = *SizeClasses::SIZES.get(index)?;
-                    size.is_multiple_of(align).then_some(index)
-                });
-
-                assert_eq!(generated, reference, "power={power} start={start}");
+                assert_eq!(class, smallest, "size {size} align {align}");
             }
         }
     }

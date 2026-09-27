@@ -173,7 +173,7 @@ mod tests {
         size_class::SizeClasses,
     };
 
-    use super::super::{MAP_RUNS, RUN_SIZE, RunFree, config::RunConfig};
+    use super::super::{RUN_SIZE, RunFree, config::RunConfig};
     use super::*;
 
     static OWNER: Heap = Heap::new(
@@ -323,18 +323,5 @@ mod tests {
         assert!(pages.get(base).is_some());
         let tail = NonNull::new(base.as_ptr().wrapping_byte_add(RUN_SIZE)).unwrap();
         assert!(pages.get(tail).is_none());
-    }
-
-    #[test]
-    fn sixteen_runs_share_one_map() {
-        let mut heap = RunHeap::new(RunConfig::new(), Hints::new());
-        let pages = PageMap::new();
-        let class = class_id(64, 8);
-        for _ in 0..MAP_RUNS {
-            assert!(heap.acquire(class, &OWNER, &pages).is_some());
-        }
-        assert_eq!(heap.maps.iter().count(), 1);
-        assert!(heap.acquire(class, &OWNER, &pages).is_some());
-        assert_eq!(heap.maps.iter().count(), 2);
     }
 }

@@ -78,11 +78,13 @@ fn interposed() {
     assert_eq!(labels, ["0"]);
 }
 
-/// Exercises thread exit, where glibc registers TLS destructors via `malloc`.
+/// Exercises thread exit, where glibc registers TLS destructors via `malloc`,
+/// and frees each worker's last block after the worker is gone.
 fn threads() {
     let workers: Vec<_> = (0..THREADS)
-        .map(|_| {
-            thread::spawn(|| {
+        .map(|index| {
+            let tag = u8::try_from(index).unwrap();
+            thread::spawn(move || {
                 for round in 0..ROUNDS {
                     // SAFETY: each block is freed through the same allocator.
                     unsafe {
@@ -91,12 +93,25 @@ fn threads() {
                         libc::free(ptr);
                     }
                 }
+                // SAFETY: the block outlives this thread; `main` frees it.
+                let survivor = unsafe { libc::malloc(64 + index * 8) }.cast::<u8>();
+                assert!(!survivor.is_null(), "malloc failed on a worker thread");
+                // SAFETY: `survivor` is a live 64+ byte block.
+                unsafe { survivor.write(tag) };
+                survivor.addr()
             })
         })
         .collect();
 
-    for worker in workers {
-        worker.join().expect("worker thread panicked");
+    for (index, worker) in workers.into_iter().enumerate() {
+        let survivor = worker.join().expect("worker thread panicked");
+        let ptr = std::ptr::with_exposed_provenance_mut::<u8>(survivor);
+        let tag = u8::try_from(index).unwrap();
+        // SAFETY: the owner thread has exited; this is the block's only free.
+        unsafe {
+            assert_eq!(ptr.read(), tag, "worker block lost its contents");
+            libc::free(ptr.cast());
+        }
     }
 }
 

@@ -265,36 +265,14 @@ impl L2Table {
 }
 
 #[cfg(test)]
-mod zero_fill_tests {
+mod tests {
     use super::*;
 
+    /// The L1 sideband is a zero-filled mmap read as `Option<Mapping>` slots,
+    /// so all-zero must be the `None` niche. No const assert can state this.
     #[test]
-    fn l2_table_is_exact_eight_pages() {
-        assert_eq!(size_of::<L2Table>(), 0x8000);
-    }
-
-    #[test]
-    fn l1_hot_tables_are_first_field() {
-        assert_eq!(offset_of!(L1Table, tables), 0);
-    }
-
-    #[test]
-    fn l1_table_slot_zeroed_is_null() {
-        // SAFETY: proves mmap zero-fill on hot L2 pointers.
-        let table: AtomicPtr<L2Table> = unsafe { core::mem::zeroed() };
-        assert!(table.load(Ordering::Relaxed).is_null());
-    }
-
-    #[test]
-    fn l1_write_slot_zeroed_is_unlocked() {
-        // SAFETY: proves mmap zero-fill on cold write flags.
-        let write: AtomicBool = unsafe { core::mem::zeroed() };
-        assert!(!write.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn l1_mapping_slot_zeroed_is_none() {
-        // SAFETY: proves `Option<Mapping>` all-zero niche used by L1 sideband mmap.
+    fn zeroed_mapping_slot_is_none() {
+        // SAFETY: probing the niche of a value that is never used.
         let mapping: Option<Mapping> = unsafe { core::mem::zeroed() };
         assert!(mapping.is_none());
     }

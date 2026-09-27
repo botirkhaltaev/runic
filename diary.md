@@ -916,3 +916,25 @@ csv_pipeline          1.725    1.592   1.08×    1.712 / 1.574  1.09×
 interval 0.490 to 0.494). `log_pipeline` was rerun. Both passes have a
 spread above 5% (first 13.230 to 14.007, rerun 12.773 to 13.787), so that
 ratio is not a kept delta.
+
+## Test revamp and the unbound freer exit hook
+
+The new `threads.rs` case `remote_frees_across_many_runs_all_return_to_the_owner`
+found that a thread which only frees never binds, so its exit callback was
+never armed and partial chains left on its slots were lost when it exited.
+The fix arms the callback in `bring_front`, the first remote hold of a run.
+
+`bring_front` is cold but runs on every remote-free slot miss, so it was
+measured. Criterion `global_runic`, CPUs shared, 10 samples x 1 s, warmup
+250 ms, each row paired against one saved baseline of the old code.
+
+```text
+                      old vs baseline   new vs baseline (three runs)
+thread_pool_jobs      -2.4% (p 0.20)    -5.0%  -5.6%  -4.8%
+shard_aggregator     +14.8% (p 0.00)   +10.7%  +5.3%  +3.5% (p 0.11)
+arc_broadcast              -           +2.0% (p 0.52)
+```
+
+The old code against its own baseline moves 14.8% on `shard_aggregator`, so
+the machine noise is larger than any of the new deltas. Not a kept delta in
+either direction.
