@@ -19,8 +19,8 @@ runic-alloc = "0.8"
   header page). `free` null aborts. C `free(NULL)` is handled in `runic-cabi`.
 - First `init` in the process wins. `Allocator::preload()` overlays `RUNIC_*` at
   that init (cabi). `RunicAlloc::new().with_*` does not read env.
-- Feature `c-abi`: pthread `UnbindHook` for thread-exit under `LD_PRELOAD`.
-  Default is `std::thread_local!` `UnbindGuard`.
+- Thread exit is `ExitHook`, armed once per thread. Feature `c-abi` registers
+  it as a pthread key for `LD_PRELOAD`; default is a `std::thread_local!` guard.
 
 Safety: returned memory is uninitialized unless `alloc_zeroed`. The caller must
 pass a live pointer back. Invalid domain state after lifecycle retries calls

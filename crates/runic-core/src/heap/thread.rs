@@ -3,11 +3,6 @@ use core::{
     ptr::NonNull,
 };
 
-#[cfg(feature = "c-abi")]
-use core::ffi::c_void;
-#[cfg(feature = "c-abi")]
-use spin::Once;
-
 use crate::{
     allocator::Allocator,
     heap::{Extent, ExtentInit, HeapError, HeapId, Run, RunError, RunFree},
@@ -56,8 +51,7 @@ pub(crate) struct ThreadHeaps {
     heaps: UnsafeCell<LinkedList<'static, Heap>>,
     current: [Cell<Option<&'static Run>>; SizeClasses::COUNT],
     remote: [RemoteSlot; REMOTE_SLOTS],
-    #[cfg(feature = "c-abi")]
-    exit_armed: Cell<bool>,
+    exit: ExitHook,
 }
 
 impl ThreadHeaps {
@@ -66,26 +60,8 @@ impl ThreadHeaps {
             heaps: UnsafeCell::new(LinkedList::new()),
             current: [const { Cell::new(None) }; SizeClasses::COUNT],
             remote: [const { RemoteSlot::new() }; REMOTE_SLOTS],
-            #[cfg(feature = "c-abi")]
-            exit_armed: Cell::new(false),
+            exit: ExitHook::new(),
         }
-    }
-
-    /// Arm this thread's exit callback. Idempotent; called from every cold
-    /// entry that leaves state on this thread: `bind`, `adopt`, and the first
-    /// remote hold of a run.
-    #[cfg(not(feature = "c-abi"))]
-    fn arm_exit(&self) {
-        UNBIND_GUARD.with(|_| {});
-    }
-
-    #[cfg(feature = "c-abi")]
-    fn arm_exit(&self) {
-        if self.exit_armed.get() {
-            return;
-        }
-        UNBIND_HOOK.arm();
-        self.exit_armed.set(true);
     }
 
     fn heaps(&self) -> &LinkedList<'static, Heap> {
@@ -105,11 +81,13 @@ impl ThreadHeaps {
     }
 
     fn link_front(&self, heap: &'static Heap) {
+        self.exit.arm();
         heap.thread_id.set(Some(heap.id()));
         self.with_heaps_mut(|heaps| heaps.push_front(heap));
     }
 
     fn link_back(&self, heap: &'static Heap) {
+        self.exit.arm();
         heap.thread_id.set(Some(heap.id()));
         self.with_heaps_mut(|heaps| heaps.push_back(heap));
     }
@@ -281,7 +259,6 @@ impl ThreadHeaps {
     /// it at the front.
     #[cold]
     pub(crate) fn bind(&self, ctx: &AllocatorCtx<'static>) -> Option<HeapId> {
-        self.arm_exit();
         if let Some(heap) = self.heaps().front() {
             return Some(Self::captured_id(heap));
         }
@@ -294,7 +271,6 @@ impl ThreadHeaps {
     /// First Draining freer becomes Active owner and stays on this thread's list.
     #[cold]
     pub(crate) fn adopt(&self, heap: &'static Heap, ctx: &AllocatorCtx) -> bool {
-        self.arm_exit();
         if self.owns(heap) {
             return true;
         }
@@ -451,12 +427,12 @@ impl ThreadHeaps {
     /// Make slot 0 the chain for `run`: promote a hit, or park an empty slot
     /// there, or flush the fullest chain and park that slot there.
     ///
-    /// A thread that only frees never binds, so this is where its exit
-    /// callback gets armed; otherwise chains left on its slots would be lost.
+    /// Every new chain starts here, and a thread that only frees never links
+    /// a heap, so this is the other place state first lands on the thread.
     #[cold]
     #[inline(never)]
     fn bring_front(&self, run: &'static Run) -> Result<(), HeapError> {
-        self.arm_exit();
+        self.exit.arm();
         let mut empty = None;
         let mut fullest = 0usize;
         let mut fullest_count = 0u16;
@@ -545,80 +521,84 @@ impl ThreadHeaps {
         }
     }
 
+    /// Thread exit. The hook is armed only once state landed on this thread,
+    /// and state comes from an initialized allocator, so a missing `ctx` is a
+    /// broken invariant.
     fn exit(&self) {
-        if self.push_remote().is_err() {
-            Allocator::abort();
-        }
         let Some(ctx) = Allocator::ctx() else {
-            if !self.heaps().is_empty() {
-                Allocator::abort();
-            }
-            return;
+            Allocator::abort();
         };
         self.unbind(&ctx);
     }
 }
 
-/// Owns the thread-exit callback that unbinds [`THREAD_HEAPS`].
+/// Runs [`ThreadHeaps::exit`] when the thread ends.
 ///
-/// A `pthread` key, not `std::thread_local!`: glibc registers Rust TLS
-/// destructors through `__cxa_thread_atexit_impl`, which allocates. When Runic
-/// is the process allocator (`LD_PRELOAD`), that allocation re-enters
-/// [`ThreadHeaps::bind`] and recurses until the stack is gone.
-#[cfg(feature = "c-abi")]
-struct UnbindHook {
-    key: Once<libc::pthread_key_t>,
+/// Armed once per thread, the first time state lands on `THREAD_HEAPS`: a
+/// heap is linked or a remote chain opens. The registration leaf is the only
+/// build-dependent part.
+struct ExitHook {
+    armed: Cell<bool>,
 }
 
-#[cfg(feature = "c-abi")]
-impl UnbindHook {
+impl ExitHook {
     const fn new() -> Self {
-        Self { key: Once::new() }
+        Self {
+            armed: Cell::new(false),
+        }
     }
 
-    /// Arm this thread's callback. Idempotent; called from `bind` / `adopt`.
     fn arm(&self) {
-        let key = *self.key.call_once(Self::create);
+        if !self.armed.replace(true) {
+            Self::register();
+        }
+    }
+
+    /// A `thread_local!` guard whose drop is the exit.
+    #[cfg(not(feature = "c-abi"))]
+    fn register() {
+        struct Guard;
+
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                THREAD_HEAPS.exit();
+            }
+        }
+
+        std::thread_local! {
+            static GUARD: Guard = const { Guard };
+        }
+
+        GUARD.with(|_| {});
+    }
+
+    /// A `pthread` key, not `thread_local!`: glibc registers Rust TLS
+    /// destructors through `__cxa_thread_atexit_impl`, which allocates. When
+    /// Runic is the process allocator (`LD_PRELOAD`), that allocation re-enters
+    /// [`ThreadHeaps::bind`] and recurses until the stack is gone.
+    #[cfg(feature = "c-abi")]
+    fn register() {
+        static KEY: spin::Once<libc::pthread_key_t> = spin::Once::new();
+
+        extern "C" fn exit(_: *mut core::ffi::c_void) {
+            THREAD_HEAPS.exit();
+        }
+
+        let key = *KEY.call_once(|| {
+            let mut key = 0;
+            // SAFETY: `key` is a live out-parameter and `exit` lives for the process.
+            if unsafe { libc::pthread_key_create(&raw mut key, Some(exit)) } != 0 {
+                Allocator::abort();
+            }
+            key
+        });
         // SAFETY: `key` came from `pthread_key_create`. The value only has to be
         // non-null for the callback to run, and storing it does not allocate.
         if unsafe { libc::pthread_setspecific(key, core::ptr::without_provenance_mut(1)) } != 0 {
             Allocator::abort();
         }
     }
-
-    fn create() -> libc::pthread_key_t {
-        let mut key = 0;
-        // SAFETY: `key` is a live out-parameter and `unbind` lives for the process.
-        if unsafe { libc::pthread_key_create(&raw mut key, Some(Self::unbind)) } != 0 {
-            Allocator::abort();
-        }
-        key
-    }
-
-    extern "C" fn unbind(_: *mut c_void) {
-        THREAD_HEAPS.exit();
-    }
 }
 
 #[thread_local]
 pub(crate) static THREAD_HEAPS: ThreadHeaps = ThreadHeaps::new();
-
-#[cfg(feature = "c-abi")]
-static UNBIND_HOOK: UnbindHook = UnbindHook::new();
-
-/// Rust-mode thread-exit guard. C interposition cannot use this because glibc
-/// allocates while registering its destructor.
-#[cfg(not(feature = "c-abi"))]
-struct UnbindGuard;
-
-#[cfg(not(feature = "c-abi"))]
-impl Drop for UnbindGuard {
-    fn drop(&mut self) {
-        THREAD_HEAPS.exit();
-    }
-}
-
-#[cfg(not(feature = "c-abi"))]
-std::thread_local! {
-    static UNBIND_GUARD: UnbindGuard = const { UnbindGuard };
-}
