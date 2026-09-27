@@ -2,16 +2,17 @@ use core::ptr::NonNull;
 
 use crate::{
     arena::Arena,
+    config::Hints,
     heap::{Heap, HeapError, Run, RunId},
     memory::{Mapping, Memory, Os, PageMap, PageOwner},
     size_class::{SizeClass, SizeClasses},
 };
 
+use super::super::queue::Queue;
 use super::{
-    Accept, MAP_RUNS, MAP_SIZE, RUN_SIZE, RUN_SPACE, RunFree,
+    MAP_RUNS, MAP_SIZE, RUN_SIZE, RUN_SPACE, RunFree,
     config::{RunConfig, RunPolicy},
 };
-use crate::config::Hints;
 
 /// Owner-local run directory and available lists.
 ///
@@ -23,7 +24,7 @@ pub(crate) struct RunHeap {
     maps: Arena<Mapping>,
     map_index: Option<u32>,
     used: usize,
-    available: [Option<&'static Run>; SizeClasses::COUNT],
+    available: [Queue<'static, Run>; SizeClasses::COUNT],
     policy: RunPolicy,
     hints: Hints,
 }
@@ -35,13 +36,13 @@ impl RunHeap {
             maps: Arena::new(),
             map_index: None,
             used: 0,
-            available: [None; SizeClasses::COUNT],
+            available: [const { Queue::new() }; SizeClasses::COUNT],
             policy: config.policy(),
             hints,
         }
     }
 
-    /// Checkout a run for `class`: available list or a new range in a heap map.
+    /// Acquire a run for `class`: available list or a new range in a heap map.
     pub(crate) fn acquire(
         &mut self,
         class: SizeClass,
@@ -91,22 +92,9 @@ impl RunHeap {
         Some(inserted.base())
     }
 
-    /// Owner: drain every claimed bit on `run` and publish the freed blocks.
+    /// Any live run: one with outstanding allocated or claimed blocks.
     ///
-    /// Returns `Requeue` when the caller must queue `run` again because a straggling claim
-    /// raced the scan (see `Run::accept`).
-    pub(crate) fn accept(&mut self, run: &'static Run) -> Result<Accept, HeapError> {
-        let was_full = run.is_full();
-        let accept = run.accept();
-        if was_full && !run.is_full() {
-            self.push_available(run)?;
-        }
-        Ok(accept)
-    }
-
-    /// Any occupied run with outstanding allocated or claimed blocks.
-    ///
-    /// Production reclaim uses [`Heap::occupied`] then this scan.
+    /// Production reclaim uses [`Heap::is_live`] then this scan.
     pub(crate) fn has_live(&self) -> bool {
         self.runs.iter().any(|run| run.is_live())
     }
@@ -122,8 +110,7 @@ impl RunHeap {
         let Some(available) = self.available.get_mut(run.class().index()) else {
             return Err(HeapError::InvalidMetadata);
         };
-        run.list_available(*available);
-        *available = Some(run);
+        available.push(run);
         Ok(())
     }
 
@@ -138,17 +125,12 @@ impl RunHeap {
         Ok(())
     }
 
-    fn take_available(&mut self, class: SizeClass) -> Option<&'static Run> {
-        let class_index = class.index();
+    /// A non-full run already on this class's available list. Does not map.
+    pub(crate) fn take_available(&mut self, class: SizeClass) -> Option<&'static Run> {
+        let available = self.available.get_mut(class.index())?;
         loop {
-            let run = (*self.available.get(class_index)?)?;
-            let next = run.unlist_available();
-            let full = run.is_full();
-
-            let available = self.available.get_mut(class_index)?;
-            *available = next;
-
-            if !full {
+            let run = available.pop()?;
+            if !run.is_full() {
                 return Some(run);
             }
         }
@@ -206,8 +188,11 @@ mod tests {
         .unwrap()
     }
 
-    fn available_run_id(heap: &RunHeap, class_index: usize) -> Option<RunId> {
-        heap.available[class_index].map(Run::id)
+    fn available_run_id(heap: &mut RunHeap, class_index: usize) -> Option<RunId> {
+        let run = heap.available[class_index].pop()?;
+        let id = run.id();
+        heap.available[class_index].push(run);
+        Some(id)
     }
 
     fn alloc_block(
@@ -246,15 +231,15 @@ mod tests {
             assert!(alloc_block(&mut heap, class, &pages).is_some());
         }
 
-        assert_eq!(available_run_id(&heap, class_index), None);
+        assert_eq!(available_run_id(&mut heap, class_index), None);
         assert_eq!(run.free(first), Ok(RunFree::Available));
         assert_eq!(heap.push_available(run), Ok(()));
-        assert_eq!(available_run_id(&heap, class_index), Some(id));
+        assert_eq!(available_run_id(&mut heap, class_index), Some(id));
 
         let (_run, reused) = alloc_block(&mut heap, class, &pages).unwrap();
 
         assert_eq!(reused, first);
-        assert_eq!(available_run_id(&heap, class_index), None);
+        assert_eq!(available_run_id(&mut heap, class_index), None);
     }
 
     #[test]
@@ -299,7 +284,7 @@ mod tests {
         assert_eq!(first.id(), id_b);
         let second = heap.acquire(class, &OWNER, &pages).unwrap();
         assert_eq!(second.id(), id_a);
-        assert_eq!(available_run_id(&heap, class_index), None);
+        assert_eq!(available_run_id(&mut heap, class_index), None);
     }
 
     #[test]
@@ -319,10 +304,10 @@ mod tests {
             .unwrap();
         let id = run.id();
         assert_eq!(run.free(ptr), Ok(RunFree::Unchanged));
-        assert_eq!(available_run_id(&heap, class_index), None);
+        assert_eq!(available_run_id(&mut heap, class_index), None);
 
         assert_eq!(heap.push_available(run), Ok(()));
-        assert_eq!(available_run_id(&heap, class_index), Some(id));
+        assert_eq!(available_run_id(&mut heap, class_index), Some(id));
 
         let (_run, reused) = alloc_block(&mut heap, class, &pages).unwrap();
         assert_eq!(reused, ptr);

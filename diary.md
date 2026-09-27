@@ -717,3 +717,202 @@ swings are code placement of the benchmark under fat LTO with one codegen
 unit; the extra module shifts every later function by 0x30 bytes. Retained.
 Placement swings of this size mean single-workload Criterion deltas below
 the `perf stat` instruction check are not evidence on their own.
+
+## List, queue, and N adopted heaps
+
+Owner-exclusive linkage is `LinkedList` and `Queue` (`Cell` links). Lock-free
+chains are `Mpsc` (inbox `drain`) and `Mpmc` (free-heap stack), both on one
+Treiber stack. Available runs moved onto `Queue`. The extent cache and
+unmapped slots share one `LinkedList`. TLS heaps are that list too: bind
+`push_front`, adopt `push_back`. The last heap stays attached.
+
+Pinned `perf stat -r 3`, `instructions:u` / `cycles:u`, Criterion 1 s x 10
+samples. `hashmap_grow` on CPU 0, `shard_aggregator` on CPUs 0-3. Baseline is
+`daee6e9`.
+
+```text
+                    instructions        cycles
+hashmap_grow master   17,117,893,470   5,528,103,242
+hashmap_grow list     17,219,219,744   5,559,447,517   (+0.59% insn, +0.57% cycles)
+shard master          13,233,470,567   5,054,808,738
+shard list            12,348,385,474   4,784,770,294   (-6.7% insn, -5.3% cycles)
+```
+
+`hashmap_grow::run` differs from master only by nop padding (1914 vs 1913
+instructions). The current-run hit did not grow. The process-wide instruction
+increase is the slow owner free walking the heap list. Criterion time on
+`hashmap_grow` stayed inside the master's own repeat spread (~10.7 ms).
+`shard_aggregator` is the threaded remote-free workload and got faster.
+A fixed four-slot TLS array previously lost about 18% on `channel_pipeline`.
+This list does not. Retained.
+
+## Shorter locks on adopted heaps
+
+Active `flush_owner` accepts each inbox node with no `HeapInner`, then takes a
+guard only to `push_available` or `cache_or_unmap` that node. `adopt` holds the
+guard through its own flush: dropping it and publishing with `require_inner`
+let a losing adopter abort the new owner. `alloc_miss` and `alloc_extent` flush
+one heap at a time and take that heap's guard only to reuse or map. Draining `Heap::flush` walks the same nodes under the admit guard
+so accept, publish, and reclaim stay one section. The locked `RunHeap::accept`
+and `ExtentHeap::accept` are gone. `idle` no longer `try_lock`s or scans
+`has_live`.
+
+Same pin as above, same `daee6e9` baseline, after the list change.
+
+```text
+                    instructions        cycles
+hashmap_grow master   17,117,934,851   5,501,844,899
+hashmap_grow locks    17,219,028,412   5,591,458,222   (+0.59% insn, +1.6% cycles)
+shard master          13,220,823,032   5,074,932,177
+shard locks           12,536,156,566   4,832,695,591   (-5.2% insn, -4.8% cycles)
+```
+
+`hashmap_grow` instructions match the list measurement (17,219,219,744 vs
+17,219,028,412). This lock is not on the hit. `shard_aggregator` stayed in
+the list's band (12,348,385,474 instructions). One shard sample with a 17%
+spread was discarded; the repeat above is ±0.75%. Retained.
+
+### Reuse from every attached heap
+
+Alloc miss then flushes each adopted heap and takes a run it already holds
+(`take_available`), then the front heap `acquire`s (own list, then a new run).
+Large allocation tries `reuse_cached` on each adopted heap, then the front heap
+`allocate`s (own cache, then a fresh mapping). Adopted heaps come first so
+they never map and drain toward idle. One guard per heap, dropped before the
+next. Before this the miss only ever looked at the front heap, so adopted
+heaps' runs and cached extents waited for their freer.
+
+```text
+                      instructions        cycles
+hashmap_grow reuse    17,219,188,627   5,560,091,921   (flat vs locks)
+shard reuse           12,447,273,275   4,793,154,670   (-0.7% insn, -0.8% cycles vs locks)
+```
+
+`hashmap_grow` is flat (one heap, an empty adopted walk). `shard_aggregator`
+is inside its band (12.3 to 12.5B). Retained.
+
+### Every attached heap allocates
+
+The front heap was the only one allowed to map, so an adopted heap could only
+hand over a run it already held and then go idle. That is a second kind of
+heap. Miss now flushes every attached heap and takes a run it already holds,
+then calls `acquire` on each until one maps. Large allocation does the same
+with `reuse_cached`, then `allocate`. List order is unchanged: bind still
+links at the front, adopt at the back, and `idle` still keeps the last heap.
+The head maps when it can because it is first, not because it has a different
+rule. A heap later in the list maps when the ones before it cannot.
+
+```text
+                      instructions        cycles
+hashmap_grow peers    17,219,166,731   5,590,526,764   (flat vs reuse)
+shard peers           12,255,393,847   4,737,322,529   (inside the 12.3 to 12.5B band)
+```
+
+One shard sample with a 17% spread was discarded. The repeat above is ±0.76%.
+Retained.
+
+### Pre-merge screen against `daee6e9`
+
+Pinned `perf stat`, `instructions:u` / `cycles:u`, Criterion 1 s x 10 samples,
+`-r 3`. Single-thread workloads on CPU 0. Threaded workloads (`async_server`,
+`thread_pool_jobs`, `log_pipeline`, `shard_aggregator`, `buffer_pool`,
+`arc_broadcast`) on CPUs 0-3. The new ELF includes the uncommitted peer-heap
+walk. Samples with a spread above 3% were rerun.
+
+Stable against master: `hashmap_grow` 17,219,199,439 instructions (+0.59%),
+the same count as the list and peer measurements. `word_count`, `text_index`,
+`graph_shortest_path`, `json_api`, `csv_pipeline`, `compress_roundtrip`,
+`toml_config`, `buffer_pool`, and `thread_pool_jobs` stay inside 1% of
+instructions. `records_sort`, `regex_search`, and `http_parse` looked large
+on the first pass and came back to 0% on the rerun.
+
+`shard_aggregator` rerun (spread 1.12%): 12,163,672,267 instructions and
+4,773,844,170 cycles, -6.4% instructions and -4.3% cycles versus master
+12,991,119,084 / 4,989,247,572. A first sample at -34% had a 43% spread and
+was discarded. `log_pipeline` is -1.7% instructions. `vecdeque_events` is
+-3.1% instructions with flat cycles.
+
+Cycle profiles, 8 s, `cycles:u`. On master, `shard_aggregator` spends 11.7%
+in `Heaps::admit`, 6.9% in `free_remote`, and 3.4% in `adopt`. On the new
+binary those drop out of the top; `ThreadHeaps::free_owner` is 14% and the
+workload rises from 40% to 53%. The miss path does not show up.
+`free_owner` is the allocator time that remains.
+
+`lru_cache` is repeatable at +39% instructions and +20% cycles (spread 0.2%).
+Instruction samples put 71% in `lru_cache::run` and 9.4% in `__rust_realloc`
+on both binaries. The function is 1613 instructions on master and 1608 on
+the new ELF. Same shape as the earlier fat-LTO placement swing on this
+workload. `async_server` (`-r 5`) is +1.3% instructions and +3.5% cycles.
+`free_remote` stays near 3% and `__rust_alloc` near 2.4%; tokio and httparse
+are the rest.
+
+`__rust_alloc` is 82 instructions on master and 95 on the new ELF.
+`__rust_dealloc` is 71 and 64. `__rust_realloc` is 418 on both.
+`ThreadHeaps::alloc_miss` is 134 and 162. Retained.
+
+### Cross-allocator screen (working tree, CPUs 0 and 0-3)
+
+Pinned Criterion median time, 10 samples x 1 s, warmup 250 ms. Single-thread
+workloads on CPU 0. Threaded workloads on CPUs 0-3. Runic is the peer-heap
+ELF from the pre-merge screen. snmalloc, mimalloc, jemalloc, and glibc were
+built in the same pass. Every confidence-interval spread stayed under 5%.
+
+Geomean of runic / best competitor = **1.029×**. Runic is fastest on 7/20
+(`buffer_pool`, `json_api`, `records_sort`, `text_index`, `toml_config`,
+`vec_growth_log`, `vecdeque_events`). Geomean versus each allocator: snmalloc
+1.025×, mimalloc 0.961×, jemalloc 0.911×, system 0.768×.
+
+Median time in ms, and runic / best:
+
+```text
+                      runic       sn       mi       je      sys   vs
+word_count            1.159    1.125    1.217    1.549    1.408  1.03 sn
+vec_growth_log        1.512    1.660    1.619    1.709    2.362  0.93 mi
+hashmap_grow         10.326    9.716   10.494   12.793   13.478  1.06 sn
+vecdeque_events       0.852    0.880    0.966    0.928    1.395  0.97 sn
+text_index           46.887   48.910   48.120   49.240   55.042  0.97 mi
+lru_cache             8.251    7.953    9.708    9.602   12.714  1.04 sn
+records_sort          4.598    4.745    5.013    5.804    7.543  0.97 sn
+graph_shortest_path   0.462    0.441    0.431    0.473    0.535  1.07 mi
+json_api              1.230    1.267    1.295    1.492    2.103  0.97 sn
+regex_search          2.552    2.446    2.629    2.470    2.558  1.04 sn
+http_parse            2.653    2.570    2.733    2.731    3.273  1.03 sn
+csv_pipeline          1.712    1.574    1.758    1.690    2.017  1.09 sn
+compress_roundtrip   12.350   12.247   12.309   12.712   14.732  1.01 sn
+toml_config           5.396    5.463    5.716    6.172    7.673  0.99 sn
+async_server          1.705    1.667    1.734    1.788    2.593  1.02 sn
+thread_pool_jobs      1.053    0.873    0.949    0.960    1.104  1.21 sn
+log_pipeline         12.858   10.934   13.055   12.664   15.146  1.18 sn
+shard_aggregator      0.470    0.446    0.537    0.642    0.552  1.05 sn
+buffer_pool           1.243    1.295    1.287    1.400    1.723  0.97 mi
+arc_broadcast         5.978    5.897    6.259    5.907    6.421  1.01 sn
+```
+
+The `21b20ed` screen (1.050×, CPUs 24-27, 20 samples x 2 s) is a different
+protocol, so the geomeans are not a paired delta. On this protocol the gaps
+at or above 5% are `thread_pool_jobs` 1.21× snmalloc, `log_pipeline` 1.18×
+snmalloc, `csv_pipeline` 1.09× snmalloc, `graph_shortest_path` 1.07×
+mimalloc, `hashmap_grow` 1.06× snmalloc, and `shard_aggregator` 1.05×
+snmalloc.
+
+### Remote chains and extent state, gap set
+
+Working tree after the thread slots (8 slots, chains of 16, front slot is the
+run just freed) and Fast extent stores. Same protocol as the screen above:
+CPUs 0-3, 10 samples x 1 s, warmup 250 ms. Paired with the snmalloc binary
+from that screen. The extent store is not on these paths. No workload frees
+a large object in the loop. `buffer_pool` retains its 64 KiB vectors.
+
+```text
+                      runic      sn     vs sn    prior runic / sn
+thread_pool_jobs      1.034    0.882   1.17×    1.053 / 0.873  1.21×
+log_pipeline         13.245   10.846   1.22×    12.858 / 10.934 1.18×
+shard_aggregator      0.492    0.443   1.11×    0.470 / 0.446  1.05×
+csv_pipeline          1.725    1.592   1.08×    1.712 / 1.574  1.09×
+```
+
+`thread_pool_jobs` interval is 1.030 to 1.037 ms. `csv_pipeline` is flat.
+`shard_aggregator` is slower than the pre-batch screen (0.470 to 0.492 ms,
+interval 0.490 to 0.494). `log_pipeline` was rerun. Both passes have a
+spread above 5% (first 13.230 to 14.007, rerun 12.773 to 13.787), so that
+ratio is not a kept delta.

@@ -1,22 +1,15 @@
-use core::{
-    hint,
-    num::NonZeroU32,
-    ptr::NonNull,
-    sync::atomic::{AtomicU32, Ordering},
-};
+use core::{hint, num::NonZeroU32, ptr::NonNull};
 
 use crate::{arena::Arena, config::AllocatorConfig, heap::HeapError, memory::PageOwner};
 
+use super::queue::Mpmc;
 use super::{AllocatorCtx, Heap, HeapId, HeapInner, OwnerState};
 
-const FREE_END: u32 = u32::MAX;
-
-/// Indexes heaps. [`Arena<Heap>`] is the published directory; Free heaps are
-/// an intrusive index stack.
+/// Indexes heaps. [`Arena<Heap>`] is the published directory; Free heaps are an
+/// [`Mpmc`] stack. Pushed from [`Heap::reclaim`].
 pub(crate) struct Heaps {
     arena: Arena<Heap>,
-    /// Intrusive Free-heap stack (`Heap::free_next`). Pushed from [`Heap::reclaim`].
-    free_head: AtomicU32,
+    free: Mpmc<'static, Heap>,
     config: AllocatorConfig,
 }
 
@@ -24,7 +17,7 @@ impl Heaps {
     pub(crate) const fn new(config: AllocatorConfig) -> Self {
         Self {
             arena: Arena::new(),
-            free_head: AtomicU32::new(FREE_END),
+            free: Mpmc::new(),
             config,
         }
     }
@@ -43,8 +36,7 @@ impl Heaps {
 
     fn reuse(&self) -> Option<&Heap> {
         loop {
-            let index = self.pop_free()?;
-            let heap = self.arena.get(index)?;
+            let heap = self.free.pop()?;
             if heap.state.is_retired() || !heap.state.is_free() {
                 continue;
             }
@@ -53,42 +45,14 @@ impl Heaps {
         }
     }
 
-    fn pop_free(&self) -> Option<u32> {
-        let mut index = self.free_head.load(Ordering::Acquire);
-        loop {
-            if index == FREE_END {
-                return None;
-            }
-            let heap = self.arena.get(index)?;
-            let next = heap.free_next.load(Ordering::Relaxed);
-            match self.free_head.compare_exchange_weak(
-                index,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Some(index),
-                Err(current) => index = current,
-            }
-        }
-    }
-
     /// Link a just-reclaimed Free heap. Caller holds Inner.
+    ///
+    /// The slot outlives this borrow: arena entries are process-lifetime.
     pub(super) fn push_free(&self, heap: &Heap) {
-        let index = heap.id().index();
-        let mut prev = self.free_head.load(Ordering::Relaxed);
-        loop {
-            heap.free_next.store(prev, Ordering::Relaxed);
-            match self.free_head.compare_exchange_weak(
-                prev,
-                index,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(current) => prev = current,
-            }
-        }
+        // SAFETY: `heap` is an arena slot. Slots are not moved or freed, so the
+        // pointer stays valid until a later `pop` on this stack.
+        let heap = unsafe { &*core::ptr::from_ref(heap) };
+        self.free.push(heap);
     }
 
     /// Generation-checked shared borrow. Lock-free directory read.
@@ -113,7 +77,7 @@ impl Heaps {
         Ok(())
     }
 
-    /// Accept inboxes while Draining. `owner` queues a claimed remote first.
+    /// Accept inboxes while Draining. `owner` enqueues a claimed remote first.
     pub(crate) fn flush(
         &self,
         id: HeapId,
@@ -179,7 +143,7 @@ impl Heaps {
 #[cfg(test)]
 mod tests {
     use core::alloc::Layout;
-    use core::sync::atomic::AtomicBool;
+    use core::sync::atomic::{AtomicBool, Ordering};
     use std::sync::OnceLock;
     use std::sync::{Barrier, mpsc};
     use std::thread;
@@ -278,7 +242,7 @@ mod tests {
         let heap = heaps.get(id).unwrap();
         heap.state.store(max_gen, HeapMode::Draining, 0);
         let id_max = HeapId::new(index, max_gen).unwrap();
-        let inner = heap.lock_inner();
+        let inner = heap.inner.lock();
         assert!(heap.reclaim(&inner, &heaps));
         drop(inner);
         assert!(heaps.get(id).is_none());
@@ -293,7 +257,7 @@ mod tests {
         let heaps = Heaps::new(AllocatorConfig::new());
         let id = heaps.acquire().unwrap().id();
         let heap = heaps.get(id).unwrap();
-        let lease = heap.state.acquire_lease(id).unwrap();
+        let lease = heap.state.lease(id).unwrap();
         let pages = PageMap::new();
         let start = Barrier::new(2);
         let (done_tx, done_rx) = mpsc::channel();
@@ -340,14 +304,13 @@ mod tests {
         thread::scope(|scope| {
             scope.spawn(|| {
                 start.wait();
-                if let Ok(inner) = heap.adopt(id) {
+                if heap.adopt(id).is_ok() {
                     adopted.store(true, Ordering::Release);
-                    drop(inner);
                 }
             });
             scope.spawn(|| {
                 start.wait();
-                let inner = heap.lock_inner();
+                let inner = heap.inner.lock();
                 heap.reclaim(&inner, &heaps);
             });
             start.wait();

@@ -140,12 +140,11 @@ off the hit, adds no helper or second API, and keeps the same behavior. Every
 remaining `unsafe` names the invariant it relies on. Fast hit `unsafe` stays.
 Hardened does not run on Safe.
 
-Fast is the malloc baseline: extent owner double-free aborts (the state byte
-must be `Allocated`, as glibc checks large chunks), and small owner
-double-free is undefined, as mimalloc and snmalloc leave it by default. Safe
-adds the small check the way mimalloc `MI_SECURE=4` does: a cheap filter on
-the block's first word, then a capped freelist walk only when that word looks
-like a link. `realloc` uses the caller's alignment in both builds; no
+Fast is the malloc baseline: extent and small owner double-free are
+undefined, as mimalloc and snmalloc leave small double-free by default. Safe
+checks the extent state byte and adds the small check the way mimalloc
+`MI_SECURE=4` does: a cheap filter on the block's first word, then a capped
+freelist walk only when that word looks like a link. `realloc` uses the caller's alignment in both builds; no
 researched allocator keeps `memalign` alignment across `realloc`.
 
 ### 0.11 Hardened

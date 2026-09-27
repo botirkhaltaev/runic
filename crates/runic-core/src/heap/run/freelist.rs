@@ -11,7 +11,7 @@ const END: usize = 0;
 
 /// Head of the free-block stack. `repr(transparent)` keeps it one word in `RunState`.
 #[repr(transparent)]
-pub(super) struct Freelist {
+pub(crate) struct Freelist {
     head: Cell<usize>,
 }
 
@@ -44,6 +44,27 @@ impl Freelist {
     /// Drop every block. The payload links are left behind.
     pub(super) fn clear(&self) {
         self.head.set(END);
+    }
+
+    /// Write `block`'s link word. Remote chains and the owner stack share this word.
+    #[inline]
+    pub(crate) fn link(block: NonNull<u8>, next: Option<NonNull<u8>>) {
+        Self::write(block, next.map_or(END, |next| next.as_ptr().addr()));
+    }
+
+    /// Read `block`'s link word. `None` is the tail.
+    #[inline]
+    pub(super) fn next(block: NonNull<u8>) -> Option<NonNull<u8>> {
+        NonNull::new(core::ptr::without_provenance_mut(Self::read(block)))
+    }
+
+    /// Prepend the chain `head`…`tail` in front of this stack. Owner only.
+    ///
+    /// `tail`'s link becomes the previous head. Pop order is `head` first.
+    #[inline]
+    pub(super) fn splice(&self, head: NonNull<u8>, tail: NonNull<u8>) {
+        Self::write(tail, self.head.get());
+        self.head.set(head.as_ptr().addr());
     }
 
     /// Link `count` adjacent blocks of `stride` bytes, starting at `first`, in

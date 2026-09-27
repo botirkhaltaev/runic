@@ -57,8 +57,8 @@ thread exit, aborts, and the exact export set.
 
 | Capability | Status |
 |------------|--------|
-| Implemented | Owner-local heaps, two equal TLS heaps, remote free, thread-exit Draining, adopt of one Draining heap |
-| TLS limit | With both slots full, a third Draining heap stays on `Heaps::free` |
+| Implemented | Owner-local heaps, a TLS list of heaps (alloc heap at the front, adopt at the back), remote free, thread-exit Draining |
+| TLS limit | The last attached heap stays, so retained empty runs remain reachable |
 | Not planned | Per-CPU heaps and RSEQ on the hit were measured and declined; see [diary.md](diary.md) |
 
 ## Retention and reuse

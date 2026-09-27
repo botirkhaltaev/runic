@@ -4,7 +4,6 @@ use crate::{
     config::AllocatorConfig,
     heap::{
         Extent, Heap, HeapId, Run, RunId,
-        extent::ExtentId,
         run::{RUN_SIZE, RUN_SPACE, config::RunPolicy},
     },
     layout::LayoutSpec,
@@ -56,7 +55,7 @@ fn extent(raw: u32) -> PageOwner {
     PageOwner::Extent(EXTENTS[usize::try_from(raw).unwrap()].get_or_init(|| {
         let spec = LayoutSpec::from_layout(Layout::from_size_align(PAGE_SIZE, 8).unwrap());
         let mapping = Os::map(PAGE_SIZE).unwrap();
-        Extent::new(ExtentId::from_index(raw).unwrap(), heap(raw), mapping, spec).unwrap()
+        Extent::new(heap(raw), mapping, spec).unwrap()
     }))
 }
 

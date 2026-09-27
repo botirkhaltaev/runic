@@ -5,7 +5,7 @@
 pub enum RunPolicy {
     /// Leave empty-run payload pages resident for reuse.
     Keep,
-    /// Discard empty-run payload pages. The next checkout rebuilds via `extend`.
+    /// Discard empty-run payload pages. The next `acquire` rebuilds via `extend`.
     Discard,
 }
 

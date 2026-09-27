@@ -7,7 +7,7 @@ use core::{
 use crate::{
     config::{AllocatorConfig, HugePage, Numa},
     heap::{
-        AllocatorCtx, ExtentInit, HeapError, Heaps, Run, THREAD_HEAPS, ThreadFreeError,
+        AllocatorCtx, ExtentInit, Heap, HeapError, HeapId, Heaps, Run, THREAD_HEAPS,
         extent::config::ExtentConfig, run::config::RunConfig,
     },
     layout::LayoutSpec,
@@ -132,12 +132,13 @@ impl Allocator {
         let Some(live) = NonNull::new(ptr) else {
             Self::abort();
         };
-        if let Some(class) = SizeClasses::class_for(spec)
+        let class = SizeClasses::class_for(spec);
+        if let Some(class) = class
             && THREAD_HEAPS.free(live, class).is_some()
         {
             return;
         }
-        Self::dealloc_slow(live, spec);
+        Self::dealloc_slow(live, spec, class);
     }
 
     /// Pointer-only free for callers without a `Layout` (the C ABI).
@@ -165,9 +166,8 @@ impl Allocator {
         {
             return;
         }
-        match THREAD_HEAPS.free_owner(owner, live, &ctx) {
-            Ok(()) => {}
-            Err(error) => Self::free_fail(&ctx, live, error),
+        if THREAD_HEAPS.free_owner(owner, live, &ctx).is_err() {
+            Self::abort();
         }
     }
 
@@ -392,48 +392,75 @@ impl Allocator {
         }
     }
 
-    /// Cross-heap free: adopt a Draining heap, else Active claim → enqueue,
-    /// else `Heaps::free` under Draining.
+    /// Remote free: Active claim onto a thread slot, else the Draining path.
     ///
-    /// Coalescing is by owner inbox. `Remote` callers only — heap-domain errors abort
-    /// in `dealloc` before this runs.
-    #[cold]
-    fn free_remote(
+    /// A run claim is held on a thread slot. The slot calls [`Run::push`] and
+    /// [`Self::enqueue_remote`] when its chain fills or is evicted. An extent
+    /// claim enqueues immediately. Coalescing is by owner inbox. The Draining
+    /// path is outlined so this Active arm stays a straight claim and link.
+    pub(crate) fn free_remote(
         ctx: &AllocatorCtx,
         owner: PageOwner,
         ptr: NonNull<u8>,
     ) -> Result<(), HeapError> {
         let heap = owner.heap();
-
-        let heap_id = if let Some(id) = heap.active_id() {
-            id
-        } else {
-            if THREAD_HEAPS.adopt(heap, ctx) {
-                return THREAD_HEAPS
-                    .free_owner(owner, ptr, ctx)
-                    .map_err(|free| match free {
-                        ThreadFreeError::Heap(error) => error,
-                        ThreadFreeError::Remote(_) => HeapError::InvalidMetadata,
-                    });
-            }
-            let heap_id = heap.id();
-            match ctx.heaps.free(heap_id, owner, ptr, ctx) {
-                Ok(()) => return Ok(()),
-                Err(HeapError::InvalidHeap) => {}
-                Err(error) => return Err(error),
-            }
-            heap.active_id().ok_or(HeapError::InvalidMetadata)?
+        let Some(heap_id) = heap.active_id() else {
+            return Self::free_draining(ctx, heap, owner, ptr);
         };
+        Self::claim_active(ctx, heap, heap_id, owner, ptr)
+    }
 
+    /// Active owner: a run claim is held on a thread slot, an extent claim enqueues now.
+    fn claim_active(
+        ctx: &AllocatorCtx,
+        heap: &'static Heap,
+        heap_id: HeapId,
+        owner: PageOwner,
+        ptr: NonNull<u8>,
+    ) -> Result<(), HeapError> {
         match owner {
-            PageOwner::Run(run) => {
-                run.claim(ptr)?;
-            }
+            PageOwner::Run(run) => THREAD_HEAPS.hold(run, ptr),
             PageOwner::Extent(extent) => {
                 extent.claim(ptr)?;
+                Self::enqueue_remote(ctx, heap, heap_id, owner)
             }
         }
+    }
 
+    /// Draining owner: push open chains, adopt and free locally, else `Heaps::free`.
+    #[cold]
+    #[inline(never)]
+    fn free_draining(
+        ctx: &AllocatorCtx,
+        heap: &'static Heap,
+        owner: PageOwner,
+        ptr: NonNull<u8>,
+    ) -> Result<(), HeapError> {
+        THREAD_HEAPS.push_remote()?;
+        if THREAD_HEAPS.adopt(heap, ctx) {
+            return THREAD_HEAPS.free_owner(owner, ptr, ctx);
+        }
+        let heap_id = heap.id();
+        match ctx.heaps.free(heap_id, owner, ptr, ctx) {
+            Ok(()) => return Ok(()),
+            Err(HeapError::InvalidHeap) => {}
+            Err(error) => return Err(error),
+        }
+        let heap_id = heap.active_id().ok_or(HeapError::InvalidMetadata)?;
+        Self::claim_active(ctx, heap, heap_id, owner, ptr)
+    }
+
+    /// Queue `owner`, or flush it when the heap is no longer the captured id.
+    ///
+    /// The run chain is already on the run. This does not push it again.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn enqueue_remote(
+        ctx: &AllocatorCtx,
+        heap: &'static Heap,
+        heap_id: HeapId,
+        owner: PageOwner,
+    ) -> Result<(), HeapError> {
         loop {
             match heap.enqueue(heap_id, owner) {
                 Ok(()) => return Ok(()),
@@ -453,15 +480,33 @@ impl Allocator {
         }
     }
 
-    /// Current-run miss, large, or unbound: `lookup` then typed free.
+    /// Current-run miss, large, or unbound.
+    ///
+    /// An Active remote run is claimed here, without a second size-class
+    /// lookup. Owner-local misses and Draining heaps go to [`Self::dealloc_lookup`].
     #[inline(never)]
-    fn dealloc_slow(ptr: NonNull<u8>, spec: LayoutSpec) {
+    fn dealloc_slow(ptr: NonNull<u8>, spec: LayoutSpec, class: Option<SizeClass>) {
+        if class.is_some()
+            && let Some(run) = Run::header_of(ptr)
+            && run.heap().is_active()
+            && THREAD_HEAPS.is_remote(run.heap())
+        {
+            if THREAD_HEAPS.hold(run, ptr).is_err() {
+                Self::abort();
+            }
+            return;
+        }
         let Some(ctx) = Self::ctx() else {
             Self::abort();
         };
-        match THREAD_HEAPS.free_slow(ptr, spec, &ctx) {
-            Ok(()) => {}
-            Err(error) => Self::free_fail(&ctx, ptr, error),
+        Self::dealloc_lookup(ptr, spec, &ctx);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn dealloc_lookup(ptr: NonNull<u8>, spec: LayoutSpec, ctx: &AllocatorCtx) {
+        if THREAD_HEAPS.free_slow(ptr, spec, ctx).is_err() {
+            Self::abort();
         }
     }
 
@@ -488,19 +533,6 @@ impl Allocator {
             Err(_) => Self::abort(),
         }
         Self::bind_alloc(ctx, AllocKind::Extent(spec, init))
-    }
-
-    /// Cross-heap or domain-error after the TLS hit missed.
-    #[cold]
-    fn free_fail(ctx: &AllocatorCtx, ptr: NonNull<u8>, error: ThreadFreeError) {
-        match error {
-            ThreadFreeError::Heap(_) => Self::abort(),
-            ThreadFreeError::Remote(owner) => {
-                if Self::free_remote(ctx, owner, ptr).is_err() {
-                    Self::abort();
-                }
-            }
-        }
     }
 }
 
@@ -811,6 +843,7 @@ mod tests {
             let run = run_of(pages, ptr);
             // User-held block; claim is the remote admission path.
             assert_eq!(run.claim(ptr), Ok(()));
+            run.push(ptr, ptr);
             assert_eq!(run.accept(), crate::heap::Accept::Done);
             assert_eq!(run.allocate(), Some(ptr));
             assert!(run.free(ptr).is_ok());
@@ -869,6 +902,7 @@ mod tests {
         };
     }
 
+    #[cfg(feature = "safe")]
     #[test]
     fn allocator_rejects_duplicate_remote_free() {
         let allocator = Allocator::new();
@@ -880,7 +914,7 @@ mod tests {
             let _id = tls.bind(&ctx).unwrap();
             let ptr = alloc_small(tls, &ctx, layout);
             let run = run_of(pages, ptr);
-            // Heap stays Active (still bound). free_remote is the cross-thread path —
+            // Heap stays Active (still bound). free_remote is the remote path:
             // claim+enqueue twice must report DoubleFree on the second claim.
             assert_eq!(
                 Allocator::free_remote(&ctx, PageOwner::Run(run), ptr),
@@ -895,6 +929,36 @@ mod tests {
     }
 
     #[test]
+    fn remote_chain_pushes_on_the_sixteenth() {
+        let allocator = Allocator::new();
+        let ctx = ctx(&allocator);
+        let pages = ctx.pages;
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        let tls = &THREAD_HEAPS;
+        let id = tls.bind(&ctx).unwrap();
+        let live = alloc_live(tls, &ctx, layout, 16);
+        let run = run_of(pages, live[0]);
+        let heap = ctx.heaps.get(id).unwrap();
+        for &ptr in &live[..15] {
+            assert_eq!(
+                Allocator::free_remote(&ctx, PageOwner::Run(run), ptr),
+                Ok(())
+            );
+        }
+        assert!(heap.inboxes_empty());
+        assert_eq!(
+            Allocator::free_remote(&ctx, PageOwner::Run(run), live[15]),
+            Ok(())
+        );
+        assert!(!heap.inboxes_empty());
+        let mut inner = heap.require_inner();
+        assert_eq!(heap.flush(&mut inner, &ctx, None), Ok(()));
+        drop(inner);
+        assert!(!run.is_live());
+        tls.unbind(&ctx);
+    }
+
+    #[test]
     fn retained_remote_claim_completes_under_draining() {
         let allocator = Allocator::new();
         let ctx = ctx(&allocator);
@@ -906,6 +970,7 @@ mod tests {
             let ptr = alloc_small(tls, &ctx, layout);
             let run = run_of(pages, ptr);
             assert_eq!(run.claim(ptr), Ok(()));
+            run.push(ptr, ptr);
             tls.unbind(&ctx);
             (id, run)
         };
@@ -917,7 +982,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_frees_to_distinct_heaps_publish_independently_without_batching() {
+    fn remote_frees_to_distinct_heaps_publish_independently() {
         let allocator = Allocator::new();
         let layout = Layout::from_size_align(64, 8).unwrap();
         let ctx = ctx(&allocator);
@@ -934,7 +999,7 @@ mod tests {
                 {
                     let tls = &THREAD_HEAPS;
                     let id = tls.bind(&ctx).unwrap();
-                    let live = alloc_live(tls, &ctx, layout, 8);
+                    let live = alloc_live(tls, &ctx, layout, 16);
                     let run = run_of(pages, live[0]);
                     ready_a
                         .send(
@@ -956,7 +1021,7 @@ mod tests {
                 {
                     let tls = &THREAD_HEAPS;
                     let id = tls.bind(&ctx).unwrap();
-                    let live = alloc_live(tls, &ctx, layout, 8);
+                    let live = alloc_live(tls, &ctx, layout, 16);
                     let run = run_of(pages, live[0]);
                     ready_b
                         .send(
@@ -1044,6 +1109,7 @@ mod tests {
                         let ptr =
                             NonNull::new(core::ptr::with_exposed_provenance_mut(addr)).unwrap();
                         run.claim(ptr).unwrap();
+                        run.push(ptr, ptr);
                         assert_eq!(heap.enqueue(id, PageOwner::Run(run)), Ok(()));
                     }
                 });
@@ -1074,6 +1140,7 @@ mod tests {
             let run = run_of(pages, live[0]);
             for ptr in live {
                 run.claim(ptr).unwrap();
+                run.push(ptr, ptr);
             }
             let heap = ctx.heaps.get(id).unwrap();
             assert_eq!(heap.enqueue(id, PageOwner::Run(run)), Ok(()));
@@ -1356,6 +1423,61 @@ mod tests {
     }
 
     #[test]
+    fn adopt_keeps_every_draining_heap_until_it_goes_idle() {
+        let allocator = Allocator::new();
+        let ctx = ctx(&allocator);
+        let layout = Layout::from_size_align(64, 8).unwrap();
+        let class = SizeClasses::class_for(LayoutSpec::from_layout(layout)).unwrap();
+        let tls = &THREAD_HEAPS;
+        tls.unbind(&ctx);
+        let bound = tls.bind(&ctx).unwrap();
+        let local = alloc_small(tls, &ctx, layout);
+
+        let remotes: Vec<_> = (0..3)
+            .map(|_| {
+                thread::scope(|scope| {
+                    scope
+                        .spawn(|| {
+                            let remote = &THREAD_HEAPS;
+                            remote.unbind(&ctx);
+                            let id = remote.bind(&ctx).unwrap();
+                            let first = alloc_small(remote, &ctx, layout);
+                            let second = alloc_small(remote, &ctx, layout);
+                            remote.unbind(&ctx);
+                            (
+                                id,
+                                first.as_ptr().expose_provenance(),
+                                second.as_ptr().expose_provenance(),
+                            )
+                        })
+                        .join()
+                        .unwrap()
+                })
+            })
+            .collect();
+
+        for &(_, first, _) in &remotes {
+            let ptr = NonNull::new(core::ptr::with_exposed_provenance_mut(first)).unwrap();
+            let owner = ctx.pages.get(ptr).unwrap();
+            assert_eq!(Allocator::free_remote(&ctx, owner, ptr), Ok(()));
+        }
+        for &(id, _, _) in &remotes {
+            assert_eq!(ctx.heaps.get(id).map(Heap::mode), Some(HeapMode::Active));
+        }
+        for &(_, _, second) in &remotes {
+            let ptr = NonNull::new(core::ptr::with_exposed_provenance_mut(second)).unwrap();
+            let owner = ctx.pages.get(ptr).unwrap();
+            assert_eq!(tls.free_owner(owner, ptr, &ctx), Ok(()));
+        }
+        for &(id, _, _) in &remotes {
+            assert!(ctx.heaps.get(id).is_none());
+        }
+        assert_eq!(tls.bind(&ctx), Some(bound));
+        assert_eq!(tls.free(local, class), Some(()));
+        tls.unbind(&ctx);
+    }
+
+    #[test]
     fn adopt_then_owner_local_free() {
         let allocator = Allocator::new();
         let ctx = ctx(&allocator);
@@ -1380,6 +1502,59 @@ mod tests {
         assert_eq!(THREAD_HEAPS.free_run(run, second), Ok(()));
         THREAD_HEAPS.unbind(&ctx);
         assert!(ctx.heaps.get(id).is_none());
+    }
+
+    #[test]
+    fn alloc_miss_reuses_a_run_the_adopted_heap_holds() {
+        let allocator = Allocator::new();
+        let ctx = ctx(&allocator);
+        let pages = ctx.pages;
+        let layout = Layout::from_size_align(128, 8).unwrap();
+        let class = SizeClasses::class_for(LayoutSpec::from_layout(layout)).unwrap();
+        let tls = &THREAD_HEAPS;
+        tls.unbind(&ctx);
+        let bound = tls.bind(&ctx).unwrap();
+
+        let (id, first, second) = thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let remote = &THREAD_HEAPS;
+                    remote.unbind(&ctx);
+                    let id = remote.bind(&ctx).unwrap();
+                    let first = alloc_small(remote, &ctx, layout);
+                    let second = alloc_small(remote, &ctx, layout);
+                    remote.unbind(&ctx);
+                    (
+                        id,
+                        first.as_ptr().expose_provenance(),
+                        second.as_ptr().expose_provenance(),
+                    )
+                })
+                .join()
+                .unwrap()
+        });
+        let first = NonNull::new(core::ptr::with_exposed_provenance_mut(first)).unwrap();
+        let second = NonNull::new(core::ptr::with_exposed_provenance_mut(second)).unwrap();
+        let run = run_of(pages, first);
+
+        assert_eq!(
+            Allocator::free_remote(&ctx, PageOwner::Run(run), first),
+            Ok(())
+        );
+        assert_eq!(ctx.heaps.get(id).map(Heap::mode), Some(HeapMode::Active));
+
+        // This thread never touched the class, so the miss walks the list and
+        // takes the adopted heap's run instead of mapping on the bound heap.
+        assert_eq!(tls.alloc(class), None);
+        let reused = tls.alloc_miss(class, &ctx).unwrap().unwrap();
+        assert!(run_of(pages, reused) == run);
+        assert_eq!(run.heap().id(), id);
+
+        assert_eq!(tls.free_owner(PageOwner::Run(run), reused, &ctx), Ok(()));
+        assert_eq!(tls.free_owner(PageOwner::Run(run), second, &ctx), Ok(()));
+        assert!(ctx.heaps.get(id).is_none());
+        assert_eq!(tls.bind(&ctx), Some(bound));
+        tls.unbind(&ctx);
     }
 
     #[test]

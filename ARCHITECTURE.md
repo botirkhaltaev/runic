@@ -27,6 +27,34 @@ flowchart TD
 `Allocator::ctx()` is the only handle to it. Shared `&Heap` methods use
 atomics; `ThreadHeaps` owns Active mutation, and `Heaps` owns Draining work.
 
+## Vocabulary
+
+One word per concept. Code, comments, and docs use these and no synonyms.
+
+| Word | Meaning |
+|------|---------|
+| owner | The thread that has a heap on its `ThreadHeaps` list. Owner-local means that thread. |
+| freer | A thread freeing into a heap it does not own. Remote means from a freer. |
+| attached | A heap on a thread's list. `bind` links at the front, `adopt` at the back, `unbind` unlinks. |
+| current | The run `ThreadHeaps` pops from for a size class. |
+| hit / miss / slow | Hit is the current run. Miss is `alloc_miss`. Slow is `dealloc_slow` and `free_slow`. |
+| alloc / allocate / acquire | Frontend `alloc`. A block or extent is `allocate`d. A run or heap is `acquire`d. |
+| extend | Thread fresh blocks of the current run onto its freelist. |
+| free | Owner returns a block or extent. |
+| claim | Freer reserves a block or extent for remote admission. |
+| hold | Freer links a claimed block on one of its slots. |
+| slot / chain | A slot is one of the eight `ThreadHeaps` cells. Its chain is the linked claimed blocks, up to `CHAIN_LIMIT`. |
+| push | `Run::push` moves a chain onto the run. |
+| enqueue | Put a run or extent on the owner inbox once; the link coalesces repeats. |
+| flush | Owner drains an inbox and `accept`s every node. |
+| accept | Owner takes a pushed chain or a claimed extent. |
+| release | After an owner free, list a run that left full and discard an empty payload. |
+| list / cache | `push_available` lists a run. `cache_or_unmap` caches an extent. |
+| live | Outstanding blocks or extents, allocated or claimed. `is_live` on `Run`, `Extent`, and `Heap`. |
+| lease | An Active enqueue in flight. `close` waits for zero. |
+| admit | Draining exclusive access to `HeapInner`. |
+| reclaim | Draining, empty, no leases: mark Free and bump the generation. |
+
 ## Small allocation
 
 Size-classed blocks live in 64 KiB runs inside heap-owned 2 MiB maps. Each map
@@ -36,7 +64,7 @@ the payload pages only.
 | Path | Work |
 |------|------|
 | Alloc hit | `class_for` then `current[class]` then `Run::allocate` |
-| Alloc miss | `extend` if the current run is empty; inbox `accept` if nonempty; then local or OS `acquire_run` |
+| Alloc miss | `extend` if the current run is empty; flush every attached heap and take a run it already holds; if none has one, `acquire` on the first heap that can map |
 | Unbound alloc | `bind`, flush, then alloc |
 | Owner free hit | `Run::free`: `locate` then push |
 | Owner double-free | Undefined on Fast; `--features safe` filters the first word, then walks the freelist |
@@ -59,7 +87,8 @@ the current-run hit.
 
 Layouts that do not fit a size class get a dedicated mapping. The `Extent`
 slot is immortal; unmap drops `Mapping` only. Frees must be the exact returned
-pointer. Owner double-free aborts: `free` requires the state byte `Allocated`.
+pointer. Fast stores the state byte; a second free is undefined. `safe`
+requires `Allocated` on owner `free` and aborts otherwise.
 
 The default `Keep` policy retains mappings within slot and byte budgets and
 reuses an exact length. `Discard` retains the mapping after `madvise`;
@@ -70,14 +99,22 @@ smaller mappings use memset.
 
 A block is held by the user, the owner freelist, or a remote claim.
 
-1. The remote thread calls `claim` (run: issued plus claim bit; extent:
-   `Claimed` byte). A second claim returns `HeapError::DoubleFree`.
-2. Active owner: `Heap::enqueue` (lease before a new `try_queue`).
-3. Draining owner: `Heaps::{free,flush}`. The first remote thread may `adopt`
-   the heap and complete an owner free. With both TLS slots full, it stays on
-   `Heaps::free`.
-4. Owner `flush` calls `accept`. Runs drain claim bits onto the freelist.
-   Extents go `Claimed` to `Free` then `cache_or_unmap`.
+1. The freer calls `claim`. A run checks `issued`. The `safe` build also sets
+   a claim bit, so a second claim returns `HeapError::DoubleFree`. Fast leaves
+   that second claim undefined. An extent does the same: Fast stores
+   `Claimed`, and `safe` CASes the byte.
+2. The freer `hold`s the block on a `ThreadHeaps` slot (8 slots, each one open
+   chain of up to 16 blocks; the front slot is the run just freed). `Run::push`
+   moves the chain onto the run when it fills, when the fullest slot is
+   evicted, or when the thread exits. `Heap::enqueue` puts the run on the
+   owner inbox when the inbox link is idle (lease before a new enqueue).
+3. Draining owner: push every open chain, then `adopt` and owner `free`, or
+   `Heaps::{free,flush}`.
+4. Owner `flush` calls `accept`, which stores the inbox link idle and splices
+   the chain. `safe` clears the bits of those blocks. `Requeue` means a `push`
+   landed after the take. The guard is taken only to `push_available` or
+   `cache_or_unmap`. Draining `Heaps::flush` keeps one guard around accept,
+   list-or-cache, and reclaim.
 
 `Inbox` coalesces by owner. Claimed frees retry Active/Draining transitions.
 If the generation advances, the old owner already accepted the claim.
@@ -87,7 +124,7 @@ If the generation advances, the old owner already accepted the claim.
 ```text
 Free -> Active  bind
 Active -> Draining  unbind (wait in-flight leases, flush, then close)
-Draining -> Active  adopt (lock HeapInner before the CAS)
+Draining -> Active  adopt (CAS, then hold HeapInner through the first flush)
 Draining -> Free  reclaim (live atomics, then arena scans; CAS the generation)
 ```
 
@@ -95,8 +132,10 @@ Draining -> Free  reclaim (live atomics, then arena scans; CAS the generation)
 `Heap::matches`. Occupied slots never move. The arena grow lock covers mapping
 and insertion only, never flush, accept, or user copies.
 
-`THREAD_HEAPS` has two Active slots. Each captures `&Heap` and its generation
-at bind or adopt so unbind cannot close a later incarnation. Default Rust uses
+`THREAD_HEAPS` is a list of Active heaps. Bind pushes the alloc heap at the
+front. Adopt pushes at the back. Each heap stores the generation captured when
+it was linked, so unbind cannot close a later incarnation. The last heap stays
+attached. Default Rust uses
 a `std::thread_local!` guard for thread exit. Feature `c-abi` uses a pthread
 key to avoid allocator re-entry during glibc TLS teardown under `LD_PRELOAD`.
 
@@ -136,9 +175,9 @@ map. `Hints` is copied onto `RunHeap` / `ExtentHeap` at heap construction.
 | `Process` | mmap payload; not returned |
 | `Heaps` | `Arena<Heap>`, Free list, unbind, Draining `free` / `flush` / `reclaim` |
 | `Heap` | `HeapState`, `Inbox`, `Mutex<HeapInner>` |
-| `ThreadHeaps` | Two TLS slots, `current[class]`, Active mutation |
-| `Run` | In-page header, `&Heap`, freelist, claim bitmap |
-| `Extent` | Dedicated mapping metadata, `&Heap`, Claimed byte |
+| `ThreadHeaps` | TLS heap list, `current[class]`, Active mutation |
+| `Run` | In-page header, `&Heap`, freelist, remote chain. `safe` adds claim bits |
+| `Extent` | Dedicated mapping metadata, `&Heap`, state byte |
 | `PageMap` | Page-indexed lookup |
 | `Os` / `Mapping` | Platform `Memory` impl; `Drop` unmaps |
 

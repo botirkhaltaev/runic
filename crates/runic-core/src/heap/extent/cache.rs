@@ -1,20 +1,15 @@
-use crate::{
-    arena::Arena,
-    heap::{
-        Extent,
-        extent::{
-            ExtentId,
-            config::{ExtentConfig, ExtentPolicy},
-        },
-    },
+use super::super::list::LinkedList;
+use super::{
+    Extent,
+    config::{ExtentConfig, ExtentPolicy},
 };
 
-/// Intrusive index list of retained published extents.
+/// Retained published extents, linked through [`list::Link`](super::super::list::Link).
 ///
-/// Links are [`ExtentId`] values into the owning [`super::heap::ExtentHeap`]
-/// arena. The cache owns reuse policy; the arena owns metadata storage.
+/// The cache owns reuse policy. An extent is on this list or the unmapped-slot
+/// list, never both.
 pub(crate) struct ExtentCache {
-    head: Option<ExtentId>,
+    extents: LinkedList<'static, Extent>,
     count: usize,
     retained_bytes: usize,
     config: ExtentConfig,
@@ -23,46 +18,27 @@ pub(crate) struct ExtentCache {
 impl ExtentCache {
     pub(crate) const fn new(config: ExtentConfig) -> Self {
         Self {
-            head: None,
+            extents: LinkedList::new(),
             count: 0,
             retained_bytes: 0,
             config,
         }
     }
 
-    pub(crate) fn acquire(
-        &mut self,
-        extents: &Arena<Extent>,
-        len: usize,
-    ) -> Result<Option<ExtentId>, crate::heap::HeapError> {
-        let mut prev: Option<ExtentId> = None;
-        let mut current = self.head;
-        while let Some(id) = current {
-            let Some(extent) = extents.get(id.index()) else {
-                return Err(crate::heap::HeapError::MissingExtent);
-            };
+    pub(crate) fn take(&mut self, len: usize) -> Option<&'static Extent> {
+        let mut cursor = self.extents.cursor_front_mut();
+        while let Some(extent) = cursor.current() {
             if extent.mapping().len().get() == len {
-                let next = extent.next();
-                match prev {
-                    Some(previous) => {
-                        let Some(previous) = extents.get(previous.index()) else {
-                            return Err(crate::heap::HeapError::MissingExtent);
-                        };
-                        previous.set_next(next);
-                    }
-                    None => self.head = next,
-                }
-                extent.set_next(None);
+                cursor.remove_current();
                 debug_assert!(self.count >= 1);
                 debug_assert!(self.retained_bytes >= len);
                 self.count -= 1;
                 self.retained_bytes -= len;
-                return Ok(Some(id));
+                return Some(extent);
             }
-            prev = Some(id);
-            current = extent.next();
+            cursor.move_next();
         }
-        Ok(None)
+        None
     }
 
     fn will_retain(&self, len: usize) -> bool {
@@ -76,14 +52,13 @@ impl ExtentCache {
             && self.retained_bytes <= budget.bytes() - len
     }
 
-    pub(crate) fn insert(&mut self, extent: &Extent) -> bool {
+    pub(crate) fn insert(&mut self, extent: &'static Extent) -> bool {
         let len = extent.mapping().len().get();
         if !self.will_retain(len) {
             return false;
         }
 
-        extent.set_next(self.head);
-        self.head = Some(extent.id());
+        self.extents.push_front(extent);
         self.count += 1;
         self.retained_bytes += len;
         if self.config.policy() == ExtentPolicy::Discard {

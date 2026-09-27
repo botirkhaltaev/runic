@@ -10,9 +10,10 @@ process-wide flows.
 - `mod.rs`: `Heap`, `HeapInner`, `AllocatorCtx`, and re-exports.
 - `heaps.rs`: `Heaps` (`Arena<Heap>` + Free-heap freelist).
 - `state.rs`: `HeapMode`, `HeapState`, `Lease`.
-- `list.rs`: intrusive lock-free `List` (push onto the head, `drain` takes all).
-- `inbox.rs`: coalescing `Inbox`, `Node`, and `Link` over `List`.
-- `thread.rs`: `ThreadHeaps` / `ThreadHeap`.
+- `list.rs`: owner-exclusive `LinkedList` (adopted heaps, extent cache, unmapped slots).
+- `queue/`: `Queue` in `mod.rs` (available runs), `Mpsc` (inbox drain), `Mpmc` (free heaps). The CAS is `stack`.
+- `inbox.rs`: coalescing `Inbox` over `Mpsc`.
+- `thread.rs`: `ThreadHeaps`. Bind links the alloc heap at the front. Adopt links at the back.
 - `run/`: fixed-block runs and heap-owned run maps.
 - `extent/`: dedicated mappings (`Extent`, `ExtentHeap` with `Arena<Extent>`, `ExtentCache`).
 
@@ -33,12 +34,23 @@ process-wide flows.
   stays inside those implementations.
 - Active mutation goes through `ThreadHeaps`; Draining mutation goes through
   `Heaps`.
-- Remote free is `claim`, enqueue, then `accept`. Runs use a claim bitmap;
-  extents use a `Claimed` byte. Inbox nodes are intrusive and coalesce by owner.
+- Remote free is `claim`, `hold` on a thread slot, `Run::push` of that chain,
+  `enqueue` when the inbox link is idle, then owner `flush` and `accept`. Fast stores the extent state
+  byte. `safe` CASes it and adds run claim bits. Inbox nodes are intrusive
+  and coalesce by owner.
+- Active `Heap::flush_owner` accepts each inbox node outside `HeapInner` and
+  locks only to `push_available` or `cache_or_unmap` that node. Draining
+  `Heap::flush` does the same walk under the caller's guard so reclaim cannot
+  race `accept`.
+- Alloc miss extends the current run, then flushes every attached heap and
+  takes a run it already holds. If none has one, `acquire` runs on the first
+  heap that can map. Large allocation reuses a cached extent on every attached
+  heap, then `allocate`s on the first that can map. One guard at a time.
 - Reclaim checks run/extent live atomics, confirms with arena scans, then uses a
   lifecycle CAS to return the slot to the Free list.
-- `HeapState` packs generation, mode, and Active lease count. Each TLS slot
-  captures its generation so unbind cannot close a later incarnation.
+- `HeapState` packs generation, mode, and Active lease count. A linked heap
+  stores the generation captured at bind or adopt, so unbind cannot close a
+  later incarnation. The last attached heap stays.
 - The arena grow lock covers mapping and insertion only.
 - `THREAD_HEAPS` is `#[thread_local]` and `!Drop`. Default builds register
   `UnbindGuard`; `c-abi` registers a pthread `UnbindHook`.

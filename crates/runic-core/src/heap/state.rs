@@ -56,8 +56,8 @@ pub(super) struct Snapshot {
 /// Packed generation + mode + lease count — sole heap lifecycle authority.
 ///
 /// Linearization / ordering:
-/// - Active enqueue admit: successful `acquire_lease` `AcqRel` CAS
-/// - Inbox link: head CAS in [`super::list::List::push`] (after lease admit)
+/// - Active enqueue admit: successful `lease` `AcqRel` CAS
+/// - Inbox link: head CAS in [`super::queue::Mpsc::push`] (after lease admit)
 /// - Active→Draining close: `close` `AcqRel` CAS (preserves lease count)
 /// - Draining→Active adopt: Inner lock, then `adopt` `AcqRel` CAS (preserves lease count)
 /// - Lease release: `Release` `fetch_sub`; unbind observes zero with `Acquire` loads
@@ -116,6 +116,14 @@ impl HeapState {
         self.load().mode
     }
 
+    /// Mode bits only. Remote free checks Active without decoding generation
+    /// and leases.
+    pub(crate) fn is_active(&self) -> bool {
+        let word = self.word.load(Ordering::Acquire);
+        let mode = u64::from(HeapMode::Active.raw()) << MODE_SHIFT;
+        word & (0b11 << MODE_SHIFT) == mode
+    }
+
     pub(super) fn generation(&self) -> NonZeroU32 {
         self.load().generation
     }
@@ -133,12 +141,12 @@ impl HeapState {
         self.load().leases
     }
 
-    /// Admit one Active enqueue lease for `id`, or fail if closed / overflow.
+    /// One Active enqueue lease for `id`, or fail if closed / overflow.
     ///
-    /// Counts in-flight Active **enqueue** admits only — not inbox depth
-    /// (that stays live via claim bits / `has_live`). Does not serialize
+    /// Counts in-flight Active enqueues only, not inbox depth (a claimed block
+    /// stays live until `accept`; `has_live` confirms). Does not serialize
     /// concurrent freer bodies.
-    pub(super) fn acquire_lease(&self, id: HeapId) -> Result<Lease<'_>, HeapError> {
+    pub(super) fn lease(&self, id: HeapId) -> Result<Lease<'_>, HeapError> {
         loop {
             let word = self.word.load(Ordering::Acquire);
             let snap = Self::decode(word);

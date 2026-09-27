@@ -25,6 +25,7 @@ impl From<ExtentError> for HeapError {
     fn from(error: ExtentError) -> Self {
         match error {
             ExtentError::InvalidPointer => Self::InvalidExtentPointer,
+            #[cfg(feature = "safe")]
             ExtentError::DoubleFree => Self::DoubleFree,
         }
     }
