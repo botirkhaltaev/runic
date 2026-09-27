@@ -23,8 +23,10 @@ and telemetry are not implemented. Planned work is [ROADMAP.md](ROADMAP.md).
 | Capability | Status |
 |------------|--------|
 | Implemented | `alloc`, `dealloc`, `alloc_zeroed`, `realloc` via `RunicAlloc` |
-| Contract | Null `dealloc` aborts. Layout must match what was used to allocate. Interior pointers abort. A pointer the allocator never issued aborts, or faults on the run-header probe when it arrives with a small layout |
-| Double free | Undefined on Fast. With `--features safe`: a second owner free of a small block or extent aborts, and a second remote free of the same block aborts |
+| Contract | Null `dealloc` aborts. Interior pointers abort. A pointer the allocator never issued aborts, or faults on the run-header probe when it arrives with a small layout. A layout that does not match the allocation is undefined on both builds, as in the `GlobalAlloc` contract and mimalloc |
+| Double free | Undefined on Fast, as in mimalloc with secure mode off. With `--features safe`: a second owner free of a small block or extent aborts, and a second remote free of the same block aborts |
+| `mmap` failure | `alloc` returns null. Allocations that do not need a new mapping still succeed |
+| Fork | A single-threaded fork while no allocation is in progress keeps the parent's blocks and allocates in the child. Fork from another thread, or during `alloc` or `free`, is unsupported until `pthread_atfork` (roadmap 0.13) |
 | `realloc` | Preserves the prefix; may move. Uses the new `Layout` alignment in both builds |
 | Config | `RunicAlloc::new().with_*` (hugepage, NUMA, `ExtentConfig`, `RunConfig`). First `init` in the process wins. Safe is the `safe` Cargo feature, not a config field |
 

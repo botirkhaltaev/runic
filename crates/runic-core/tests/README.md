@@ -13,9 +13,16 @@ it is observed.
   frees flow back to an Active or Draining owner from bound and unbound
   freers, and a remote-free burst completes without owner progress.
 - `stress.rs`: seeded random traces, single-thread and across a ring of
-  threads, in the shape of mimalloc's `test-stress`.
+  threads, in the shape of mimalloc's `test-stress`. `multi_gigabyte_trace`
+  is ignored; it moves about 4 GiB and is run on demand.
+- `limits.rs`: a failed `mmap` returns null and the allocator stays usable,
+  and a single-threaded fork while idle keeps the parent's block and serves
+  the child.
 - `common/mod.rs`: class and extent size tables, `Rng`, and the `Block`
   pattern helpers.
+
+A layout that does not match the allocation is undefined on both builds, so
+nothing here asserts that a mismatched `dealloc` is rejected.
 
 ## Run
 

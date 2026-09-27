@@ -123,9 +123,10 @@ impl Allocator {
     ///
     /// `ptr` must be a pointer previously returned by this allocator for
     /// `layout`. Null is forbidden (`GlobalAlloc` contract) and is fail-closed
-    /// (`PageMap` miss → abort), not accepted. Passing an unknown pointer, an
-    /// interior pointer, or an incompatible layout violates the allocator
-    /// contract and may abort.
+    /// (`PageMap` miss → abort), not accepted. An unknown or interior pointer
+    /// aborts. A layout that does not match the allocation is undefined on
+    /// both builds, as in the `GlobalAlloc` contract and mimalloc: the pointer
+    /// is freed as whatever owns the page, with no check against `layout`.
     #[inline]
     pub unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         let spec = LayoutSpec::from_layout(layout);

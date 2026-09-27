@@ -234,3 +234,47 @@ fn short_lived_owners_hand_blocks_to_a_long_lived_freer() {
         release(&allocator, &block);
     }
 }
+
+/// Several gigabytes of checksummed traffic at a bounded resident set.
+///
+/// Ignored because of the volume, not because it is slow in wall clock: a
+/// debug run is on the order of a minute. Hours-long runs are a separate job
+/// in mimalloc and do not belong in `cargo test`.
+///
+/// ```sh
+/// cargo test -p runic-core --test stress -- --ignored multi_gigabyte
+/// ```
+#[test]
+#[ignore = "about 4 GiB of checksummed traffic"]
+fn multi_gigabyte_trace_keeps_every_block_intact() {
+    const BLOCK: usize = 256 * 1024;
+    const LIVE: usize = 512;
+    const ROUNDS: usize = 32;
+    let allocator = Allocator::new();
+    let layout = layout(BLOCK, 8);
+    let mut held: Vec<Block> = Vec::with_capacity(LIVE);
+
+    for round in 0..ROUNDS {
+        for slot in 0..LIVE {
+            if held.len() == LIVE {
+                release(&allocator, &held.remove(0));
+            }
+            // SAFETY: the layout is valid; `release` frees the block.
+            let ptr = unsafe { allocator.alloc(layout) };
+            assert!(!ptr.is_null(), "round {round} slot {slot}");
+            let block = Block {
+                ptr,
+                layout,
+                seed: u64::try_from(round * LIVE + slot).unwrap(),
+            };
+            block.fill();
+            held.push(block);
+        }
+        for block in &held {
+            block.check();
+        }
+    }
+    for block in held {
+        release(&allocator, &block);
+    }
+}

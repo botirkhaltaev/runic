@@ -382,22 +382,78 @@ mod tests {
         }
     }
 
+    /// `MADV_HUGEPAGE` is recorded on the VMA. `hg` is that flag; it does not
+    /// mean a huge page was actually allocated.
     #[test]
-    fn os_thp_payload_stays_writable() {
-        let mapping =
-            Os::map_payload(PAGE_SIZE, Hints::new().with_hugepage(HugePage::Thp)).unwrap();
+    fn os_thp_payload_sets_the_hugepage_vma_flag() {
+        let plain = Os::map_payload(PAGE_SIZE, Hints::new()).unwrap();
+        let plain_flags = vm_flags(plain.base().addr().get());
+        drop(plain);
+        let hinted = Os::map_payload(PAGE_SIZE, Hints::new().with_hugepage(HugePage::Thp)).unwrap();
+
+        assert!(
+            !plain_flags.contains("hg"),
+            "unhinted mapping flags: {plain_flags}"
+        );
+        let flags = vm_flags(hinted.base().addr().get());
+        assert!(flags.contains("hg"), "hinted mapping flags: {flags}");
+        // SAFETY: the hinted mapping is live and writable.
         unsafe {
-            mapping.base().as_ptr().write(0x11);
-            assert_eq!(mapping.base().as_ptr().read(), 0x11);
+            hinted.base().as_ptr().write(0x11);
+            assert_eq!(hinted.base().as_ptr().read(), 0x11);
         }
     }
 
+    /// `mbind(MPOL_PREFERRED)` is visible to `get_mempolicy` on the same address.
     #[test]
-    fn os_local_payload_stays_writable() {
+    fn os_local_payload_prefers_the_allocating_node() {
+        const MPOL_PREFERRED: libc::c_int = 1;
+        /// `MPOL_F_ADDR` from `linux/mempolicy.h`.
+        const MPOL_F_ADDR: libc::c_long = 2;
+
         let mapping = Os::map_payload(PAGE_SIZE, Hints::new().with_numa(Numa::Local)).unwrap();
+        let mut mode: libc::c_int = -1;
+        // SAFETY: `mode` is a live out-parameter and the mapping is live.
+        let queried = unsafe {
+            libc::syscall(
+                libc::SYS_get_mempolicy,
+                &raw mut mode,
+                core::ptr::null_mut::<libc::c_ulong>(),
+                0,
+                mapping.base().as_ptr(),
+                MPOL_F_ADDR,
+            )
+        };
+
+        assert_eq!(queried, 0, "get_mempolicy failed");
+        assert_eq!(mode, MPOL_PREFERRED);
+        // SAFETY: the mapping is live and writable.
         unsafe {
             mapping.base().as_ptr().write(0x22);
             assert_eq!(mapping.base().as_ptr().read(), 0x22);
         }
+    }
+
+    /// Flags of the VMA that contains `addr`. Adjacent maps collapse into one
+    /// VMA, so the header is not necessarily `addr` itself.
+    fn vm_flags(addr: usize) -> String {
+        let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+        let mut covers = false;
+        for line in smaps.lines() {
+            if let Some((start, rest)) = line.split_once('-')
+                && let Some(end) = rest.split_whitespace().next()
+                && let (Ok(start), Ok(end)) = (
+                    usize::from_str_radix(start, 16),
+                    usize::from_str_radix(end, 16),
+                )
+            {
+                covers = (start..end).contains(&addr);
+                continue;
+            }
+            if covers && let Some(flags) = line.strip_prefix("VmFlags:") {
+                return flags.to_owned();
+            }
+        }
+        panic!("no VmFlags covering {addr:#x}");
     }
 }
