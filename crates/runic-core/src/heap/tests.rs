@@ -2,11 +2,10 @@
 //! (require `ThreadHeaps::bind` / `Heaps::{unbind,enqueue,free,flush}`).
 
 use super::*;
-use crate::{
-    config::AllocatorConfig,
-    layout::LayoutSpec,
-    memory::{PageMap, PageOwner},
-};
+use crate::{config::AllocatorConfig, memory::PageMap};
+#[cfg(feature = "safe")]
+use crate::{layout::LayoutSpec, memory::PageOwner};
+#[cfg(feature = "safe")]
 use core::alloc::Layout;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -41,7 +40,7 @@ fn lease_rejected_after_close() {
     let id = heaps.acquire().unwrap().id();
     let heap = heaps.get(id).unwrap();
     assert_eq!(heap.state.close(id), Ok(()));
-    assert!(heap.state.acquire_lease(id).is_err());
+    assert!(heap.state.lease(id).is_err());
     unbind(&heaps, id);
 }
 
@@ -54,7 +53,7 @@ fn lease_count_overflow_fails_closed() {
     heap.state
         .store(id.generation(), HeapMode::Active, MAX_LEASES);
     assert!(matches!(
-        heap.state.acquire_lease(id),
+        heap.state.lease(id),
         Err(HeapError::InvalidMetadata)
     ));
     heap.state.store(id.generation(), HeapMode::Active, 0);
@@ -119,6 +118,7 @@ fn lifecycle_rejects_id_from_another_slot() {
     assert_eq!(heaps.unbind(second_id, &ctx), Ok(()));
 }
 
+#[cfg(feature = "safe")]
 #[test]
 fn flush_owner_preserves_extent_accept_error() {
     static HEAPS: OnceLock<Heaps> = OnceLock::new();
@@ -137,7 +137,7 @@ fn flush_owner_preserves_extent_accept_error() {
     let Some(PageOwner::Extent(extent)) = pages.get(ptr) else {
         panic!("expected extent owner");
     };
-    assert!(heap.extent_inbox.queue(extent));
+    assert!(heap.extent_inbox.enqueue(extent));
 
     drop(inner);
     assert_eq!(heap.flush_owner(&ctx), Err(HeapError::InvalidExtentPointer));
@@ -153,7 +153,7 @@ fn reclaim_rejects_nonzero_leases() {
     let heaps = Heaps::new(AllocatorConfig::new());
     let id = heaps.acquire().unwrap().id();
     let heap = heaps.get(id).unwrap();
-    let lease = heap.state.acquire_lease(id).unwrap();
+    let lease = heap.state.lease(id).unwrap();
     assert_eq!(heap.state.close(id), Ok(()));
     let inner = heap.inner.lock();
     assert!(!heap.reclaim(&inner, &heaps));

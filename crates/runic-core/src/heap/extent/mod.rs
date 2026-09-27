@@ -39,6 +39,8 @@ pub(crate) enum ExtentInit {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExtentError {
     InvalidPointer,
+    /// Second `claim` or `accept`. Fast leaves that free undefined.
+    #[cfg(feature = "safe")]
     DoubleFree,
 }
 
@@ -76,10 +78,12 @@ pub(crate) struct Extent {
     base: AtomicPtr<u8>,
     /// User length. Holder-exclusive (`resize_in_place` / `reuse`).
     len: Cell<usize>,
+    /// `Allocated` / `Claimed` / `Free`. Remote claim and the owner share it, so
+    /// it stays atomic. Fast stores the next state. `safe` CASes it.
     state: AtomicU8,
     /// Pages known zero-filled while cached (Discard insert succeeded). Owner-exclusive.
     clean: Cell<bool>,
-    /// Coalesced inbox membership (see `heap::inbox`). Only ever queued while
+    /// Coalesced inbox membership (see `heap::inbox`). Only ever enqueued while
     /// exactly one claim can be outstanding (`Claimed`), so no bulk scan is needed —
     /// unlike `Run`, `accept` is a single exact-pointer transition.
     inbox: Link<Extent>,
@@ -238,56 +242,57 @@ impl Extent {
 
     /// Owner-local free: exact pointer, then `Allocated → Free`.
     ///
-    /// Aborts unless the state byte is `Allocated`, so an owner double free of
-    /// a live cached extent cannot corrupt the cache. Remote admission is
-    /// `claim` / `accept`.
+    /// A second owner free is undefined on Fast. `safe` reports `DoubleFree`,
+    /// which the allocator aborts on, so the extent never enters the cache
+    /// twice. Remote admission is `claim` / `accept`.
     pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<(), ExtentError> {
-        self.validate_exact(ptr)?;
-        match self.state.compare_exchange(
-            ExtentState::Allocated.raw(),
-            ExtentState::Free.raw(),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => Ok(()),
-            Err(_) => Allocator::abort(),
-        }
+        self.transition(ptr, ExtentState::Allocated, ExtentState::Free)
     }
 
     /// Freer: exact pointer, then `Allocated → Claimed`.
     ///
-    /// The state CAS may stay Relaxed: a successful claim is published by the
-    /// inbox head's Release CAS, and owner accept follows an Acquire drain.
+    /// A second claim is undefined on Fast and `DoubleFree` on `safe`. The
+    /// inbox link coalesces a second enqueue either way.
     pub(crate) fn claim(&self, ptr: NonNull<u8>) -> Result<(), ExtentError> {
-        self.validate_exact(ptr)?;
-        match self.state.compare_exchange(
-            ExtentState::Allocated.raw(),
-            ExtentState::Claimed.raw(),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => Ok(()),
-            Err(value) if value == ExtentState::Claimed.raw() => Err(ExtentError::DoubleFree),
-            Err(value) if value == ExtentState::Free.raw() => Err(ExtentError::DoubleFree),
-            Err(_) => Err(ExtentError::InvalidPointer),
-        }
+        self.transition(ptr, ExtentState::Allocated, ExtentState::Claimed)
     }
 
-    /// Owner: exact pointer `Claimed → Free`, then clear inbox queued.
+    /// Owner: exact pointer, `Claimed → Free`, then store the inbox link idle.
     pub(crate) fn accept(&self, ptr: NonNull<u8>) -> Result<(), ExtentError> {
+        self.transition(ptr, ExtentState::Claimed, ExtentState::Free)?;
+        self.inbox.idle();
+        Ok(())
+    }
+
+    /// Exact pointer, then the state byte `from → to`.
+    ///
+    /// Fast stores `to`; a byte that is not `from` is a double free and stays
+    /// undefined. `safe` compares first: a byte already past `from` is
+    /// `DoubleFree`, anything else `InvalidPointer`. Relaxed suffices because a
+    /// claim is published by the inbox head's Release CAS and the owner's
+    /// accept follows an Acquire drain.
+    fn transition(
+        &self,
+        ptr: NonNull<u8>,
+        from: ExtentState,
+        to: ExtentState,
+    ) -> Result<(), ExtentError> {
         self.validate_exact(ptr)?;
-        match self.state.compare_exchange(
-            ExtentState::Claimed.raw(),
-            ExtentState::Free.raw(),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => {
-                self.inbox.clear_queued();
-                Ok(())
-            }
-            Err(value) if value == ExtentState::Free.raw() => Err(ExtentError::DoubleFree),
-            Err(_) => Err(ExtentError::InvalidPointer),
+        #[cfg(feature = "safe")]
+        {
+            self.state
+                .compare_exchange(from.raw(), to.raw(), Ordering::Relaxed, Ordering::Relaxed)
+                .map(|_| ())
+                .map_err(|found| match ExtentState::from_raw(found) {
+                    Some(ExtentState::Free | ExtentState::Claimed) => ExtentError::DoubleFree,
+                    Some(ExtentState::Allocated) | None => ExtentError::InvalidPointer,
+                })
+        }
+        #[cfg(not(feature = "safe"))]
+        {
+            debug_assert_eq!(self.state.load(Ordering::Relaxed), from.raw());
+            self.state.store(to.raw(), Ordering::Relaxed);
+            Ok(())
         }
     }
 
@@ -411,6 +416,20 @@ mod tests {
 
         assert_eq!(extent.claim(interior), Err(ExtentError::InvalidPointer));
         assert_eq!(extent.free(extent.ptr()), Ok(()));
+    }
+
+    #[cfg(feature = "safe")]
+    #[test]
+    fn extent_rejects_second_claim() {
+        let spec = layout_spec(128 * 1024, 4096);
+        let mapping = Os::map(spec.mapping_len(Os::page_size()).unwrap()).unwrap();
+        let extent = Extent::new(&OWNER, mapping, spec).unwrap();
+        let ptr = extent.ptr();
+
+        assert_eq!(extent.claim(ptr), Ok(()));
+        assert_eq!(extent.claim(ptr), Err(ExtentError::DoubleFree));
+        assert_eq!(extent.accept(ptr), Ok(()));
+        assert_eq!(extent.accept(ptr), Err(ExtentError::DoubleFree));
     }
 
     #[test]

@@ -12,13 +12,14 @@ Extent metadata owns dedicated large allocations. Retention:
 
 ## Same-thread path
 
-`ThreadHeaps::alloc_extent` tries `reuse_cached` on each adopted heap, then `allocate` on the front heap (its own cache, then a fresh mapping). `free_extent` frees on the owning attached heap. Large reuse is `ExtentCache` (exact mapping length). Unbound cold path is `Allocator::bind_alloc`.
+`ThreadHeaps::alloc_extent` tries `reuse_cached` on every attached heap, then `allocate` on the first heap that can map. `free_extent` frees on the owning attached heap. Large reuse is `ExtentCache` (exact mapping length). Unbound cold path is `Allocator::bind_alloc`.
 
 ## Invariants
 
 - An extent owns at most one mapping dedicated to one returned allocation and stores its process-lifetime owning `&Heap`; `heap().id()` derives the current generation. Its arena slot is immortal; unmap drops only the mapping and reuses the slot later.
-- Frees must use the exact returned pointer, not an interior pointer. Owner
-  double-free is undefined. Remote `claim` / `accept` still fail closed.
+- Frees must use the exact returned pointer, not an interior pointer. Fast
+  stores the state byte; a second free is undefined. `safe` CASes
+  `Allocated` / `Claimed` / `Free` and rejects a second free.
 - Remote frees `claim` then enqueue; the owning heap completes with `accept` (`Claimed → Free`) before shared `cache_or_unmap`.
 - **Published-while-cached:** Keep and Discard leave the arena entry and page-map stamp in place; the cache is a `LinkedList` of those slots. Cache-hit allocate calls `Extent::reuse(init)` and does not re-publish the mapping. True release (Unmap policy / over budget) calls `unmap`, which unpublishes and drops the mapping while retaining the immortal slot. Discard then `madvise(MADV_DONTNEED)`s the mapping.
 - Live large ownership increments/decrements the owning `Heap` atomic; `ExtentHeap::has_live` confirms by scanning Allocated/Claimed slots. Cached Free extents do not block reclaim.

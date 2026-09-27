@@ -42,7 +42,7 @@ impl RunHeap {
         }
     }
 
-    /// Checkout a run for `class`: available list or a new range in a heap map.
+    /// Acquire a run for `class`: available list or a new range in a heap map.
     pub(crate) fn acquire(
         &mut self,
         class: SizeClass,
@@ -92,9 +92,9 @@ impl RunHeap {
         Some(inserted.base())
     }
 
-    /// Any occupied run with outstanding allocated or claimed blocks.
+    /// Any live run: one with outstanding allocated or claimed blocks.
     ///
-    /// Production reclaim uses [`Heap::occupied`] then this scan.
+    /// Production reclaim uses [`Heap::is_live`] then this scan.
     pub(crate) fn has_live(&self) -> bool {
         self.runs.iter().any(|run| run.is_live())
     }

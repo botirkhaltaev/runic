@@ -11,11 +11,9 @@ pub(crate) mod thread;
 
 use core::cell::Cell;
 use core::num::NonZeroU32;
+use core::ops::DerefMut;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
-
-use list::Linked as ListLinked;
-use queue::stack::Linked as StackLinked;
 
 use spin::Mutex;
 
@@ -37,7 +35,7 @@ pub(crate) use heaps::Heaps;
 pub(crate) use id::HeapId;
 pub(crate) use run::{Accept, Run, RunError, RunFree, RunHeap, RunId};
 pub(crate) use state::HeapMode;
-pub(crate) use thread::{THREAD_HEAPS, ThreadFreeError};
+pub(crate) use thread::THREAD_HEAPS;
 
 /// Indexed heap entry: lifecycle, remote-free inboxes, and owner-local run/extent metadata.
 ///
@@ -51,40 +49,40 @@ pub(crate) struct Heap {
     pub(super) state: HeapState,
     /// Published arena slot (`HeapId` 1-based). Generation is in [`HeapState`].
     slot: NonZeroU32,
-    /// Occupied runs. Updated on each run's 0↔1 live edge. Release store / Acquire load.
+    /// Live runs. Updated on each run's 0↔1 live edge. Release store / Acquire load.
     runs_live: AtomicUsize,
-    /// Occupied extents. Updated on allocate / cache-or-unmap. Release store / Acquire load.
+    /// Live extents. Updated on allocate / cache-or-unmap. Release store / Acquire load.
     extents_live: AtomicUsize,
     run_inbox: Inbox<'static, Run>,
     extent_inbox: Inbox<'static, Extent>,
     inner: Mutex<HeapInner>,
     /// Free-heap stack link. Concurrent with other `Heaps` pop/push.
     free: queue::stack::Link<Heap>,
-    /// Owner-thread [`list::LinkedList`] membership. Remote threads do not read this.
+    /// Owner [`list::LinkedList`] membership. Freers do not read this.
     thread: list::Link<Heap>,
-    /// Generation captured when this heap was linked onto a thread. Zero when unlinked.
-    thread_gen: Cell<u32>,
+    /// Id captured when this heap was linked onto a thread. `None` when unlinked.
+    thread_id: Cell<Option<HeapId>>,
 }
 
-impl ListLinked for Heap {
+impl list::Linked for Heap {
     fn links(&self) -> &list::Link<Self> {
         &self.thread
     }
 }
 
-impl StackLinked for Heap {
+impl queue::stack::Linked for Heap {
     fn links(&self) -> &queue::stack::Link<Self> {
         &self.free
     }
 }
 
-// SAFETY: arena slots are never moved. `thread` and `thread_gen` are written only by
+// SAFETY: arena slots are never moved. `thread` and `thread_id` are written only by
 // the thread that has this heap on its list, and that thread unlinks it before the
-// slot can be bound again. Remote threads use `state`, the live counts, the inboxes,
+// slot can be bound again. Freers use `state`, the live counts, the inboxes,
 // and `free`. `NonNull<Heap>` inside the thread link does not carry `Send` by itself.
 unsafe impl Send for Heap {}
-// SAFETY: remote threads share `&Heap` and only touch atomics: `state`, the live
-// counts, the inboxes, and `free`. `thread` and `thread_gen` belong to the thread
+// SAFETY: freers share `&Heap` and only touch atomics: `state`, the live
+// counts, the inboxes, and `free`. `thread` and `thread_id` belong to the thread
 // that has this heap on its list.
 unsafe impl Sync for Heap {}
 
@@ -154,10 +152,6 @@ impl HeapInner {
         self.runs.push_available(run)
     }
 
-    pub(super) fn release(&mut self, run: &'static Run, outcome: RunFree) -> Result<(), HeapError> {
-        self.runs.release(run, outcome)
-    }
-
     /// Owner-local free. `Empty` when this owner is no longer live.
     ///
     /// Caller owns inbox `flush`. A live owner means the heap is not reclaimable,
@@ -198,7 +192,7 @@ impl Heap {
             inner: Mutex::new(HeapInner::new(config)),
             free: queue::stack::Link::new(),
             thread: list::Link::new(),
-            thread_gen: Cell::new(0),
+            thread_id: Cell::new(None),
         }
     }
 
@@ -223,18 +217,18 @@ impl Heap {
         self.extents_live.fetch_sub(1, Ordering::Release);
     }
 
-    /// Any occupied run or extent. Pairs with Release updates on the 0↔1 edges.
-    pub(super) fn occupied(&self) -> bool {
+    /// Any live run or extent. Pairs with Release updates on the 0↔1 edges.
+    pub(super) fn is_live(&self) -> bool {
         self.runs_live.load(Ordering::Acquire) != 0
             || self.extents_live.load(Ordering::Acquire) != 0
     }
 
-    /// Push-or-coalesce `owner` onto its inbox. Active freers only.
+    /// Enqueue-or-coalesce `owner` onto its inbox. Active freers only.
     ///
-    /// Already-queued claims coalesce with no lease. A new queue win takes a lease
-    /// **before** `Inbox::queue` so close cannot observe Queued without a link.
-    /// [`HeapState::acquire_lease`] is the Active admit; callers pass the `HeapId`
-    /// captured from this heap.
+    /// A link that is not idle coalesces with no lease. A new enqueue takes a
+    /// lease **before** `Inbox::enqueue` so close cannot observe a non-idle link
+    /// without a subsequent push. [`HeapState::lease`] is the Active
+    /// admit; callers pass the `HeapId` captured from this heap.
     pub(crate) fn enqueue(&self, id: HeapId, owner: PageOwner) -> Result<(), HeapError> {
         debug_assert!(self == owner.heap());
         debug_assert_eq!(self.slot, id.slot());
@@ -250,16 +244,21 @@ impl Heap {
         inbox: &Inbox<'static, T>,
         node: &'static T,
     ) -> Result<(), HeapError> {
-        if node.link().is_queued() {
+        if !node.link().is_idle() {
             return Ok(());
         }
-        let _lease = self.state.acquire_lease(id)?;
-        inbox.queue(node);
+        let _lease = self.state.lease(id)?;
+        inbox.enqueue(node);
         Ok(())
     }
 
     pub(super) fn inboxes_empty(&self) -> bool {
         self.run_inbox.is_empty() && self.extent_inbox.is_empty()
+    }
+
+    /// Nothing enqueued and nothing live. Reclaim confirms with the arena scans.
+    pub(super) fn is_idle(&self) -> bool {
+        self.inboxes_empty() && !self.is_live()
     }
 
     /// Current id when Active, from one Acquire load. Remote routing uses this
@@ -270,6 +269,10 @@ impl Heap {
             HeapMode::Active => Some(HeapId::from_slot(self.slot, snap.generation)),
             HeapMode::Free | HeapMode::Draining | HeapMode::Retired => None,
         }
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.state.is_active()
     }
 
     pub(crate) fn matches(&self, id: HeapId) -> bool {
@@ -312,18 +315,19 @@ impl Heap {
         self.state.close(id)
     }
 
-    /// Draining → Active. `try_lock` so a losing adopter never blocks into the
-    /// winner's flush: `require_inner` aborts when this mutex is held. The
-    /// returned guard stays with the caller through that flush, which also
-    /// keeps Draining reclaim off the slot until accept finishes.
+    /// Draining → Active, then the guard for the winner's first flush.
+    ///
+    /// The state CAS decides, so a losing adopter never touches the mutex and
+    /// cannot make the new owner's `require_inner` abort. The winner waits only
+    /// on a Draining `admit` or reclaim that is about to read Active and return.
+    /// The guard stays with the caller through that flush.
     #[cold]
     pub(crate) fn adopt(&self, id: HeapId) -> Result<spin::MutexGuard<'_, HeapInner>, HeapError> {
         if self.slot != id.slot() {
             return Err(HeapError::InvalidHeap);
         }
-        let inner = self.inner.try_lock().ok_or(HeapError::InvalidHeap)?;
         self.state.adopt(id)?;
-        Ok(inner)
+        Ok(self.inner.lock())
     }
 
     /// Active exclusive. Fail → abort.
@@ -345,7 +349,7 @@ impl Heap {
         if snap.mode != HeapMode::Draining || snap.leases != 0 {
             return false;
         }
-        if !self.inboxes_empty() || self.occupied() || inner.has_live() {
+        if !self.inboxes_empty() || self.is_live() || inner.has_live() {
             return false;
         }
         if !self.state.bump_or_retire(snap) {
@@ -360,8 +364,8 @@ impl Heap {
     /// Draining flush while the caller holds `inner`.
     ///
     /// [`Heaps::flush`](Heaps::flush) / [`Heaps::free`](Heaps::free) keep accept,
-    /// publish, and reclaim one critical section. `owner` queues a claimed remote
-    /// before accept so queue and flush share the guard.
+    /// list-or-cache, and reclaim one critical section. `owner` enqueues a
+    /// claimed remote before accept so enqueue and flush share the guard.
     pub(super) fn flush(
         &self,
         inner: &mut HeapInner,
@@ -371,64 +375,54 @@ impl Heap {
         if let Some(owner) = owner {
             debug_assert!(self == owner.heap());
             match owner {
-                PageOwner::Run(run) => self.run_inbox.queue(run),
-                PageOwner::Extent(extent) => self.extent_inbox.queue(extent),
+                PageOwner::Run(run) => self.run_inbox.enqueue(run),
+                PageOwner::Extent(extent) => self.extent_inbox.enqueue(extent),
             };
         }
-        while !self.run_inbox.is_empty() {
-            for run in self.run_inbox.drain() {
-                let was_full = run.is_full();
-                let accept = run.accept();
-                let published = if was_full && !run.is_full() && !run.listed() {
-                    inner.push_available(run)
-                } else {
-                    Ok(())
-                };
-                if accept == Accept::Requeue {
-                    self.run_inbox.queue(run);
-                }
-                published?;
-            }
-        }
-        while !self.extent_inbox.is_empty() {
-            for extent in self.extent_inbox.drain() {
-                extent.accept(extent.ptr())?;
-                inner.extents.cache_or_unmap(extent, ctx.pages)?;
-            }
-        }
-        Ok(())
+        self.run_inbox
+            .flush(|run, inbox| Self::accept_run(run, inbox, || &mut *inner))?;
+        self.extent_inbox
+            .flush(|extent, _| Self::accept_extent(extent, ctx.pages, || &mut *inner))
     }
 
     /// Active owner flush. Accept each node outside the lock, then take a guard
-    /// only to publish that node. Drop it before the next one.
+    /// only to list or cache that node. Drop it before the next one.
     ///
     /// A miss flushes before mapping: claimed-full runs must be accepted first or
     /// `acquire` returns null.
     pub(super) fn flush_owner(&self, ctx: &AllocatorCtx) -> Result<(), HeapError> {
-        while !self.run_inbox.is_empty() {
-            for run in self.run_inbox.drain() {
-                let was_full = run.is_full();
-                let accept = run.accept();
-                let published = if was_full && !run.is_full() && !run.listed() {
-                    self.require_inner().push_available(run)
-                } else {
-                    Ok(())
-                };
-                if accept == Accept::Requeue {
-                    self.run_inbox.queue(run);
-                }
-                published?;
-            }
+        self.run_inbox
+            .flush(|run, inbox| Self::accept_run(run, inbox, || self.require_inner()))?;
+        self.extent_inbox
+            .flush(|extent, _| Self::accept_extent(extent, ctx.pages, || self.require_inner()))
+    }
+
+    /// Accept one run's chain. A full run that gained blocks is listed under
+    /// `inner`. A push that landed after the swap enqueues the run again.
+    fn accept_run<G: DerefMut<Target = HeapInner>>(
+        run: &'static Run,
+        inbox: &Inbox<'static, Run>,
+        inner: impl FnOnce() -> G,
+    ) -> Result<(), HeapError> {
+        let was_full = run.is_full();
+        let again = run.accept() == Accept::Requeue;
+        if was_full && !run.is_full() && !run.listed() {
+            inner().push_available(run)?;
         }
-        while !self.extent_inbox.is_empty() {
-            for extent in self.extent_inbox.drain() {
-                extent.accept(extent.ptr())?;
-                self.require_inner()
-                    .extents
-                    .cache_or_unmap(extent, ctx.pages)?;
-            }
+        if again {
+            inbox.enqueue(run);
         }
         Ok(())
+    }
+
+    /// Accept one extent, then cache or unmap it under `inner`.
+    fn accept_extent<G: DerefMut<Target = HeapInner>>(
+        extent: &'static Extent,
+        pages: &PageMap,
+        inner: impl FnOnce() -> G,
+    ) -> Result<(), HeapError> {
+        extent.accept(extent.ptr())?;
+        inner().extents.cache_or_unmap(extent, pages)
     }
 }
 

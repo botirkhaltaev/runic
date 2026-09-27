@@ -34,17 +34,18 @@ process-wide flows.
   stays inside those implementations.
 - Active mutation goes through `ThreadHeaps`; Draining mutation goes through
   `Heaps`.
-- Remote free is `claim`, enqueue, then `accept`. Runs use a claim bitmap;
-  extents use a `Claimed` byte. Inbox nodes are intrusive and coalesce by owner.
+- Remote free is `claim`, `hold` on a thread slot, `Run::push` of that chain,
+  `enqueue` when the inbox link is idle, then owner `flush` and `accept`. Fast stores the extent state
+  byte. `safe` CASes it and adds run claim bits. Inbox nodes are intrusive
+  and coalesce by owner.
 - Active `Heap::flush_owner` accepts each inbox node outside `HeapInner` and
   locks only to `push_available` or `cache_or_unmap` that node. Draining
   `Heap::flush` does the same walk under the caller's guard so reclaim cannot
   race `accept`.
-- Alloc miss flushes each adopted heap and takes a run it already holds
-  (`take_available`), then the front heap `acquire`s (own list, then a new
-  run). Large allocation reuses adopted heaps' cached extents, then the front
-  heap `allocate`s. Adopted heaps never map, so draining them first moves them
-  toward idle. One guard at a time.
+- Alloc miss extends the current run, then flushes every attached heap and
+  takes a run it already holds. If none has one, `acquire` runs on the first
+  heap that can map. Large allocation reuses a cached extent on every attached
+  heap, then `allocate`s on the first that can map. One guard at a time.
 - Reclaim checks run/extent live atomics, confirms with arena scans, then uses a
   lifecycle CAS to return the slot to the Free list.
 - `HeapState` packs generation, mode, and Active lease count. A linked heap

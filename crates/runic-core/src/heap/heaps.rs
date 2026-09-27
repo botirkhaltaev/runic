@@ -77,7 +77,7 @@ impl Heaps {
         Ok(())
     }
 
-    /// Accept inboxes while Draining. `owner` queues a claimed remote first.
+    /// Accept inboxes while Draining. `owner` enqueues a claimed remote first.
     pub(crate) fn flush(
         &self,
         id: HeapId,
@@ -257,7 +257,7 @@ mod tests {
         let heaps = Heaps::new(AllocatorConfig::new());
         let id = heaps.acquire().unwrap().id();
         let heap = heaps.get(id).unwrap();
-        let lease = heap.state.acquire_lease(id).unwrap();
+        let lease = heap.state.lease(id).unwrap();
         let pages = PageMap::new();
         let start = Barrier::new(2);
         let (done_tx, done_rx) = mpsc::channel();

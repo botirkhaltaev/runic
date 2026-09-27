@@ -1,53 +1,57 @@
 //! Owner inbox: an [`Mpsc`] queue that holds each run or extent at most once.
 //!
-//! [`Inbox::queue`] pushes a node only on its idle→queued transition, so many remote
-//! frees against the same run collapse into one entry. The owner [`Inbox::drain`]s and
-//! [`crate::heap::Run::accept`]s (or extent accept) claimed work in one pass.
+//! [`Inbox::enqueue`] CASes the link from idle to pushing, then links the node.
+//! A loser sees a non-idle link and leaves it. The owner [`Inbox::drain`]s
+//! (reading `next` before the caller runs) and `accept` stores idle.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::ptr;
 
 use super::queue::{
     Drain, Mpsc,
     stack::{self, Linked},
 };
 
-/// Inbox membership embedded on `Run` / `Extent`: queue link plus a queued flag.
+/// Inbox link embedded on `Run` / `Extent`. One atomic `next`.
 ///
-/// Idle (`queued == false`) means the entity is on no inbox and may be pushed again;
-/// Queued means it is on exactly one inbox.
+/// Idle is [`Link::IDLE`], never null. Null is only a real tail's `next`.
+/// [`Link::PUSHING`] covers the window between the idle CAS and [`Mpsc::push`].
+/// Run and extent pointers are at least pointer-aligned, so the sentinels are
+/// never real nodes.
 pub(crate) struct Link<T> {
     stack: stack::Link<T>,
-    queued: AtomicBool,
 }
 
 impl<T> Link<T> {
+    const IDLE: usize = 1;
+    const PUSHING: usize = 2;
+
     pub(crate) const fn new() -> Self {
         Self {
-            stack: stack::Link::new(),
-            queued: AtomicBool::new(false),
+            stack: stack::Link::dangling(Self::IDLE),
         }
     }
 
-    /// Whether this entity is currently queued on an inbox.
+    /// Idle means the node is on no inbox and may be enqueued.
     #[inline]
-    pub(crate) fn is_queued(&self) -> bool {
-        self.queued.load(Ordering::Acquire)
+    pub(crate) fn is_idle(&self) -> bool {
+        self.stack.load().addr() == Self::IDLE
     }
 
-    /// Idle → Queued. `true` when this call won the transition.
+    /// Idle → pushing. `true` when this call won the CAS and owns the enqueue.
     ///
-    /// Active freers take an enqueue lease before calling this for a new queue win so
-    /// close cannot observe Queued without a subsequent [`Mpsc::push`]. Coalesced
-    /// freers use [`Self::is_queued`] and skip the lease.
+    /// Active freers take a lease before calling this for a new win so close
+    /// cannot observe a non-idle link without a subsequent [`Mpsc::push`].
     #[inline]
-    pub(crate) fn try_queue(&self) -> bool {
-        !self.queued.swap(true, Ordering::AcqRel)
+    pub(crate) fn reserve(&self) -> bool {
+        let idle = ptr::without_provenance_mut(Self::IDLE);
+        let pushing = ptr::without_provenance_mut(Self::PUSHING);
+        self.stack.cas(idle, pushing).is_ok()
     }
 
-    /// Queued → Idle. Owner-only, before scanning claims on a just-dequeued node.
+    /// Store idle. Owner-only, after [`Mpsc::drain`] has loaded `next`.
     #[inline]
-    pub(crate) fn clear_queued(&self) {
-        self.queued.store(false, Ordering::Release);
+    pub(crate) fn idle(&self) {
+        self.stack.store(ptr::without_provenance_mut(Self::IDLE));
     }
 }
 
@@ -72,9 +76,9 @@ impl<'a, T: Node> Inbox<'a, T> {
         Self { queue: Mpsc::new() }
     }
 
-    /// Push `node` unless it is already queued. `true` when this call pushed it.
-    pub(crate) fn queue(&self, node: &'a T) -> bool {
-        if !node.link().try_queue() {
+    /// Link `node` when it is idle. `true` when this call pushed it.
+    pub(crate) fn enqueue(&self, node: &'a T) -> bool {
+        if !node.link().reserve() {
             return false;
         }
         self.queue.push(node);
@@ -85,9 +89,23 @@ impl<'a, T: Node> Inbox<'a, T> {
         self.queue.is_empty()
     }
 
-    /// Take every queued node. The owner clears `queued` when it accepts each one.
+    /// Take every enqueued node. `accept` stores idle after this iterator has read `next`.
     pub(crate) fn drain(&self) -> Drain<'a, T> {
         self.queue.drain()
+    }
+
+    /// Drain until empty. `drain` has already read `next`, so `accept` may
+    /// [`Self::enqueue`] this inbox again.
+    pub(crate) fn flush<E>(
+        &self,
+        mut accept: impl FnMut(&'a T, &Self) -> Result<(), E>,
+    ) -> Result<(), E> {
+        while !self.is_empty() {
+            for node in self.drain() {
+                accept(node, self)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -112,25 +130,25 @@ mod tests {
     }
 
     #[test]
-    fn queue_pushes_once_until_cleared() {
+    fn enqueue_pushes_once_until_cleared() {
         let inbox = Inbox::new();
         let node = TestNode::new();
-        assert!(inbox.queue(&node));
-        assert!(!inbox.queue(&node));
-        assert!(!inbox.queue(&node));
+        assert!(inbox.enqueue(&node));
+        assert!(!inbox.enqueue(&node));
+        assert!(!inbox.enqueue(&node));
         assert_eq!(inbox.drain().count(), 1);
         assert!(inbox.is_empty());
     }
 
     #[test]
-    fn queue_after_clear_pushes_again() {
+    fn enqueue_after_clear_pushes_again() {
         let inbox = Inbox::new();
         let node = TestNode::new();
-        assert!(inbox.queue(&node));
+        assert!(inbox.enqueue(&node));
         assert_eq!(inbox.drain().count(), 1);
 
-        node.link.clear_queued();
-        assert!(inbox.queue(&node));
+        node.link.idle();
+        assert!(inbox.enqueue(&node));
         assert_eq!(inbox.drain().count(), 1);
     }
 }

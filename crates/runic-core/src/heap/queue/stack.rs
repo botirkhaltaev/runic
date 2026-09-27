@@ -22,12 +22,24 @@ impl<T> Link<T> {
         }
     }
 
-    pub(super) fn store(&self, next: *mut T) {
+    /// Address `addr` with no provenance. Inbox idle and pushing sentinels use this.
+    pub(crate) const fn dangling(addr: usize) -> Self {
+        Self {
+            next: AtomicPtr::new(ptr::without_provenance_mut(addr)),
+        }
+    }
+
+    pub(crate) fn store(&self, next: *mut T) {
         self.next.store(next, Ordering::Release);
     }
 
-    pub(super) fn load(&self) -> *mut T {
+    pub(crate) fn load(&self) -> *mut T {
         self.next.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn cas(&self, current: *mut T, next: *mut T) -> Result<*mut T, *mut T> {
+        self.next
+            .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
     }
 }
 

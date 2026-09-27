@@ -25,23 +25,20 @@ impl ExtentCache {
         }
     }
 
-    pub(crate) fn acquire(&mut self, len: usize) -> Option<&'static Extent> {
+    pub(crate) fn take(&mut self, len: usize) -> Option<&'static Extent> {
         let mut cursor = self.extents.cursor_front_mut();
-        loop {
-            let matched = cursor
-                .current()
-                .is_some_and(|extent| extent.mapping().len().get() == len);
-            if matched {
-                let extent = cursor.remove_current()?;
+        while let Some(extent) = cursor.current() {
+            if extent.mapping().len().get() == len {
+                cursor.remove_current();
                 debug_assert!(self.count >= 1);
                 debug_assert!(self.retained_bytes >= len);
                 self.count -= 1;
                 self.retained_bytes -= len;
                 return Some(extent);
             }
-            cursor.current()?;
             cursor.move_next();
         }
+        None
     }
 
     fn will_retain(&self, len: usize) -> bool {

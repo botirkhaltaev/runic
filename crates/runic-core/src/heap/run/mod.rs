@@ -1,10 +1,12 @@
 use core::{
     cell::Cell,
-    mem::{align_of, offset_of, size_of},
+    mem::{offset_of, size_of},
     num::NonZeroU32,
-    ptr::NonNull,
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    ptr::{self, NonNull},
+    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
+#[cfg(feature = "safe")]
+use core::{mem::align_of, sync::atomic::AtomicU64};
 
 pub(crate) mod config;
 mod freelist;
@@ -22,12 +24,11 @@ use crate::allocator::Allocator;
 use super::{
     Heap,
     inbox::{Link, Node},
-    queue::{self, Linked as QueueLinked},
+    queue,
 };
 
 use config::RunPolicy;
-use freelist::Freelist;
-
+pub(crate) use freelist::Freelist;
 pub(crate) use heap::RunHeap;
 
 pub(crate) const RUN_SIZE: usize = 64 * 1024;
@@ -38,8 +39,12 @@ pub(crate) const MAP_RUNS: usize = 16;
 pub(crate) const MAP_SIZE: usize = MAP_RUNS * RUN_SPACE;
 
 const _: () = assert!(MAP_SIZE == 2 * 1024 * 1024);
-/// Bits per claim-bitmap word (`AtomicU64`).
+/// Bits per claim-bitmap word (`AtomicU64`). `safe` only.
+#[cfg(feature = "safe")]
 const CLAIM_WORD_BITS: usize = 64;
+/// Claim words for the smallest block (`size_of::<usize>()`). Accept clears by word.
+#[cfg(feature = "safe")]
+const MAX_CLAIM_WORDS: usize = (RUN_SIZE / size_of::<usize>()).div_ceil(CLAIM_WORD_BITS);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RunId {
@@ -72,6 +77,7 @@ impl BlockIndex {
         self.index
     }
 
+    #[cfg(feature = "safe")]
     fn claim_word_bit(self) -> (usize, u64) {
         let index = self.get();
         let word = index / CLAIM_WORD_BITS;
@@ -121,16 +127,19 @@ pub(crate) enum Accept {
     Requeue,
 }
 
-/// Run-owned remote-admission bitmap.
+/// Run-owned remote double-free bits. Compiled only for `safe`.
 ///
-/// Remote `claim` is `issued` + `try_set`. A second claim on the same bit is
-/// `DoubleFree`. Owner `free` does not consult this map (owner DF is undefined).
-/// `accept` drains bits onto the pointer freelist.
+/// `claim` is `issued` plus `try_set`. A second claim on the same bit is
+/// `DoubleFree`, including while the block sits on a thread slot. Fast leaves
+/// that second claim undefined and does not store the map. `accept` clears the
+/// bits of the chain it splices.
+#[cfg(feature = "safe")]
 struct ClaimBits {
     /// 8-aligned claim words in the space tail.
     words: NonNull<[AtomicU64]>,
 }
 
+#[cfg(feature = "safe")]
 impl ClaimBits {
     fn byte_len(capacity: usize) -> Option<usize> {
         let words = capacity.div_ceil(CLAIM_WORD_BITS);
@@ -172,16 +181,10 @@ impl ClaimBits {
         self.word_unchecked(word).load(Ordering::Acquire) & mask != 0
     }
 
-    /// Atomically take every bit in `word`, returning the bits that were set beforehand.
+    /// Clear `mask` in `word`. Owner only, for blocks just taken off the remote chain.
     #[inline]
-    fn drain_word(&self, word: usize) -> u64 {
-        self.word_unchecked(word).swap(0, Ordering::AcqRel)
-    }
-
-    /// Cheap post-scan check for a straggling claim a bulk drain may have missed.
-    #[inline]
-    fn any_set(&self) -> bool {
-        (0..self.words.len()).any(|word| self.word_unchecked(word).load(Ordering::Acquire) != 0)
+    fn clear_mask(&self, word: usize, mask: u64) {
+        self.word_unchecked(word).fetch_and(!mask, Ordering::AcqRel);
     }
 
     fn word_unchecked(&self, word: usize) -> &AtomicU64 {
@@ -193,8 +196,8 @@ impl ClaimBits {
 }
 
 /// In-page header at `base + RUN_SIZE`. Owner hit packs `base`/`span`/`recip`
-/// next to `RunState` (`free`/`live` first). Remote `issued`/`link`/`claims`
-/// start on the next 64-byte line.
+/// next to `RunState` (`free`/`live` first). Remote `issued`/`link`/`chain`
+/// start on the next 64-byte line. `safe` adds claim bits on that line.
 #[repr(C, align(64))]
 pub(crate) struct Run {
     /// Cached payload base (`RUN_SIZE` bytes) in a heap-owned map.
@@ -225,16 +228,20 @@ struct RemoteLine {
     /// Mirror of `RunState.bump` for remote `claim`. Off the owner hit line.
     issued: AtomicUsize,
     link: Link<Run>,
+    /// Claimed-block chain. Null is empty. Each block's first word is the next address.
+    chain: AtomicPtr<u8>,
+    #[cfg(feature = "safe")]
     claims: ClaimBits,
 }
 
 // SAFETY: owner-local methods (`allocate` / `free` / `extend` / `accept` / available-list
-// membership) run only on the owning thread (or under `HeapInner`). Remote-safe surface is
-// `locate`, `claim`, `link`, `heap`, `class`, `range`, `header_of`, and `resize_in_place`
-// (which reads `issued`, not `RunState` Cells). Every `Cell` reader is owner-or-locked.
+// membership) run only on the owner (or under `HeapInner`). Remote-safe surface is
+// `locate`, `claim`, `push`, `link`, `heap`, `class`, `range`, `header_of`, and
+// `resize_in_place` (which reads `issued`, not `RunState` Cells). Every `Cell` reader is
+// owner-or-locked.
 unsafe impl Send for Run {}
 // SAFETY: same remote-safe surface as `Send`; shared access is atomic (`issued` / `link` /
-// claims) or immutable after publication (`base`, `span`, `recip`, `heap`).
+// `chain`, and `safe` claim bits) or immutable after publication (`base`, `span`, `recip`, `heap`).
 unsafe impl Sync for Run {}
 
 const _: () = assert!(offset_of!(Run, state) == 16);
@@ -247,7 +254,7 @@ impl Node for Run {
     }
 }
 
-impl QueueLinked for Run {
+impl queue::Linked for Run {
     fn links(&self) -> &queue::Link<Self> {
         &self.state.available
     }
@@ -272,17 +279,19 @@ impl Run {
     ) -> Option<Self> {
         let stride = class.size();
         let capacity = RUN_SIZE.checked_div(stride).filter(|&count| count > 0)?;
-        let claim_bytes = ClaimBits::byte_len(capacity)?;
-        let claim_offset = ClaimBits::space_offset()?;
-        let need = claim_offset.checked_add(claim_bytes)?;
-        if RUN_SPACE < need {
-            return None;
-        }
         if base.as_ptr().addr() & (RUN_SIZE - 1) != 0 {
             return None;
         }
-
-        let claims = ClaimBits::new(base, claim_offset, capacity)?;
+        #[cfg(feature = "safe")]
+        let claims = {
+            let claim_bytes = ClaimBits::byte_len(capacity)?;
+            let claim_offset = ClaimBits::space_offset()?;
+            let need = claim_offset.checked_add(claim_bytes)?;
+            if RUN_SPACE < need {
+                return None;
+            }
+            ClaimBits::new(base, claim_offset, capacity)?
+        };
         debug_assert!(stride >= size_of::<usize>());
         let span = u32::try_from(capacity.checked_mul(stride)?).ok()?;
         Some(Self {
@@ -298,6 +307,8 @@ impl Run {
             remote: RemoteLine {
                 issued: AtomicUsize::new(0),
                 link: Link::new(),
+                chain: AtomicPtr::new(ptr::null_mut()),
+                #[cfg(feature = "safe")]
                 claims,
             },
         })
@@ -452,54 +463,106 @@ impl Run {
         })
     }
 
-    /// Freer: reserve remote admission before publish / payload reuse.
+    /// Freer: claim remote admission. Does not push or enqueue.
+    ///
+    /// An index past `issued` is [`RunError::DoubleFree`]. On `safe`, a second
+    /// claim of an issued block is also `DoubleFree`, including while the block
+    /// sits on a thread slot. Fast leaves that second claim undefined. The
+    /// caller then links the block and [`Self::push`]es.
     pub(crate) fn claim(&self, ptr: NonNull<u8>) -> Result<(), RunError> {
         let block = self.locate(ptr)?;
         if block.index().get() >= self.remote.issued.load(Ordering::Relaxed) {
             return Err(RunError::DoubleFree);
         }
 
+        // Fast leaves a second claim undefined. `safe` reserves the block so a
+        // second claim, including one while it sits on a thread slot, aborts.
+        #[cfg(feature = "safe")]
         if !self.remote.claims.try_set(block.index()) {
             return Err(RunError::DoubleFree);
         }
         Ok(())
     }
 
-    /// Owner: clear inbox queued, drain every claimed bit, publish blocks to the freelist.
+    /// Prepend a claimed chain. `tail`'s first word becomes the previous head.
     ///
-    /// Wakeup proof (idle-first + recheck): clears queued *before* scanning, so a racing
-    /// `claim` + `Inbox::queue` may re-queue the run once it is dequeued. Returns `Requeue` when
-    /// claim bits remain after the scan — the caller must `Inbox::queue` again (or a racer
-    /// already did). Exactly one of those queues keeps the run queued when work remains.
-    pub(crate) fn accept(&self) -> Accept {
-        self.remote.link.clear_queued();
-
-        let was_live = self.state.live.get() != 0;
-        for word in 0..self.remote.claims.words.len() {
-            let mut bits = self.remote.claims.drain_word(word);
-            while bits != 0 {
-                // `trailing_zeros` of a nonzero `u64` is always < 64, so this never truncates.
-                let bit = usize::try_from(bits.trailing_zeros()).unwrap();
-                bits &= bits - 1;
-                let index = BlockIndex::new(word * CLAIM_WORD_BITS + bit);
-                debug_assert!(index.get() < self.state.capacity);
-                let live = self.state.live.get();
-                debug_assert!(live > 0);
-                self.state.live.set(live - 1);
-                self.state.free.push(self.address(index));
+    /// Every block in `head`…`tail` was [`Self::claim`]ed by this thread. A null
+    /// chain head means empty, the same end marker as [`Freelist`].
+    pub(crate) fn push(&self, head: NonNull<u8>, tail: NonNull<u8>) {
+        let mut current = self.remote.chain.load(Ordering::Acquire);
+        loop {
+            Freelist::link(tail, NonNull::new(current));
+            match self.remote.chain.compare_exchange(
+                current,
+                head.as_ptr(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
             }
         }
+    }
 
-        if was_live && self.state.live.get() == 0 {
+    /// Owner: store the inbox link idle, take the chain, and splice it.
+    /// `safe` clears the claim bits of those blocks.
+    ///
+    /// Idle is stored before the swap, so a freer who [`Self::push`]es after the
+    /// take sees an idle link and enqueues. [`Accept::Requeue`] means a push landed
+    /// after the swap. [`Accept::Done`] means the chain head is still empty.
+    pub(crate) fn accept(&self) -> Accept {
+        self.remote.link.idle();
+        let taken = self.remote.chain.swap(ptr::null_mut(), Ordering::AcqRel);
+        if let Some(head) = NonNull::new(taken) {
+            self.take_chain(head);
+        }
+        if self.remote.chain.load(Ordering::Acquire).is_null() {
+            Accept::Done
+        } else {
+            Accept::Requeue
+        }
+    }
+
+    /// Splice a taken chain onto the freelist and settle `live`.
+    fn take_chain(&self, head: NonNull<u8>) {
+        let mut count = 0usize;
+        #[cfg(feature = "safe")]
+        let mut masks = [0u64; MAX_CLAIM_WORDS];
+        let mut block = head;
+        let tail = loop {
+            #[cfg(feature = "safe")]
+            {
+                let Ok(located) = self.locate(block) else {
+                    Allocator::abort();
+                };
+                let (word, mask) = located.index().claim_word_bit();
+                let Some(bits) = masks.get_mut(word) else {
+                    Allocator::abort();
+                };
+                *bits |= mask;
+            }
+            count += 1;
+            match Freelist::next(block) {
+                Some(next) => block = next,
+                None => break block,
+            }
+        };
+        #[cfg(feature = "safe")]
+        for (word, mask) in masks.into_iter().enumerate() {
+            if mask != 0 {
+                self.remote.claims.clear_mask(word, mask);
+            }
+        }
+        self.state.free.splice(head, tail);
+        let live = self.state.live.get();
+        debug_assert!(live >= count);
+        let left = live.saturating_sub(count);
+        self.state.live.set(left);
+        if live != 0 && left == 0 {
             self.sub_live();
         }
         if self.is_discardable() {
             self.discard();
-        }
-        if self.remote.claims.any_set() {
-            Accept::Requeue
-        } else {
-            Accept::Done
         }
     }
 
@@ -528,6 +591,7 @@ impl Run {
         if block.index().get() >= self.remote.issued.load(Ordering::Acquire) {
             return Err(RunError::DoubleFree);
         }
+        #[cfg(feature = "safe")]
         if self.remote.claims.is_set(block.index()) {
             return Err(RunError::DoubleFree);
         }
@@ -865,6 +929,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "safe")]
     #[test]
     fn claim_run_reports_duplicate_remote_free() {
         let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
@@ -884,6 +949,7 @@ mod tests {
         let ptr = alloc_block(run).unwrap();
 
         assert_eq!(run.claim(ptr), Ok(()));
+        run.push(ptr, ptr);
         assert_eq!(run.accept(), Accept::Done);
         assert_eq!(run.allocate(), Some(ptr));
     }
@@ -907,6 +973,7 @@ mod tests {
             let run = runs.acquire(class_id(size, 8), &OWNER, &pages).unwrap();
             let ptr = alloc_block(run).unwrap();
             assert_eq!(run.claim(ptr), Ok(()), "size={size}");
+            run.push(ptr, ptr);
             assert_eq!(run.accept(), Accept::Done, "size={size}");
             assert_eq!(run.allocate(), Some(ptr), "size={size}");
         }
@@ -938,7 +1005,7 @@ mod tests {
     }
 
     #[test]
-    fn try_queue_wins_once_until_cleared() {
+    fn queue_wins_once_until_accept() {
         use super::super::inbox::Inbox;
 
         let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
@@ -949,14 +1016,13 @@ mod tests {
         let inbox: Inbox<'_, Run> = Inbox::new();
 
         assert_eq!(run.claim(a), Ok(()));
-        // First claim on an idle run wins the queue race and must push.
-        assert!(inbox.queue(run));
+        run.push(a, a);
+        assert!(inbox.enqueue(run));
 
         assert_eq!(run.claim(b), Ok(()));
-        // A second claim while still queued must not push again.
-        assert!(!inbox.queue(run));
+        run.push(b, b);
+        assert!(!inbox.enqueue(run));
 
-        // accept coalesces both claims from the single queued entry.
         assert_eq!(inbox.drain().count(), 1);
         assert_eq!(run.accept(), Accept::Done);
         assert_eq!(run.allocate(), Some(b));
@@ -964,12 +1030,11 @@ mod tests {
 
         // Cleared by accept: a fresh claim can queue again.
         assert_eq!(run.claim(a), Ok(()));
-        assert!(inbox.queue(run));
+        assert!(inbox.enqueue(run));
     }
 
-    /// Faithful simulation of the real `Heap::flush` loop: a freer claims and
-    /// pushes concurrently with an "owner" that drains the inbox and re-pushes
-    /// when `accept` returns true. No claim may ever be stranded (wakeup proof).
+    /// A freer claims, pushes, and enqueues while the owner drains and requeues
+    /// when `accept` returns [`Accept::Requeue`]. No pushed block stays off the freelist.
     #[test]
     fn accept_wakeup_proof_no_claim_is_ever_stranded() {
         use core::sync::atomic::AtomicBool;
@@ -995,7 +1060,8 @@ mod tests {
                     // SAFETY: addr is one of this run's own blocks, allocated above.
                     let ptr = NonNull::new(core::ptr::with_exposed_provenance_mut(addr)).unwrap();
                     run.claim(ptr).unwrap();
-                    inbox.queue(run);
+                    run.push(ptr, ptr);
+                    inbox.enqueue(run);
                 }
                 done.store(true, Ordering::Release);
             });
@@ -1006,11 +1072,14 @@ mod tests {
                 while !inbox.is_empty() {
                     for run in inbox.drain() {
                         if run.accept() == Accept::Requeue {
-                            inbox.queue(run);
+                            inbox.enqueue(run);
                         }
                     }
                 }
-                if finished && inbox.is_empty() && !run.remote.claims.any_set() {
+                if finished
+                    && inbox.is_empty()
+                    && run.remote.chain.load(Ordering::Acquire).is_null()
+                {
                     break;
                 }
                 spins += 1;
@@ -1061,6 +1130,7 @@ mod tests {
         let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
         let ptr = alloc_block(run).unwrap();
         assert_eq!(run.claim(ptr), Ok(()));
+        run.push(ptr, ptr);
         assert_eq!(run.accept(), Accept::Done);
         assert!(!run.is_live());
         assert!(run.allocate().is_none());

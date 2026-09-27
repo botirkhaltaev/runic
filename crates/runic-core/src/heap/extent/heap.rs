@@ -30,9 +30,9 @@ impl ExtentHeap {
         }
     }
 
-    /// Any occupied extent that is still Allocated or Claimed.
+    /// Any live extent: one still Allocated or Claimed.
     ///
-    /// Production reclaim uses [`Heap::occupied`] then this scan.
+    /// Production reclaim uses [`Heap::is_live`] then this scan.
     /// Cached Free extents stay in the arena while published but are not live.
     pub(crate) fn has_live(&self) -> bool {
         self.extents.iter().any(Extent::is_live)
@@ -107,7 +107,7 @@ impl ExtentHeap {
         let Some(len) = spec.mapping_len(Os::page_size()) else {
             return Ok(None);
         };
-        let Some(extent) = self.cache.acquire(len) else {
+        let Some(extent) = self.cache.take(len) else {
             return Ok(None);
         };
         if let Some(ptr) = extent.reuse(spec, init) {

@@ -54,7 +54,7 @@ impl Mapping {
     /// User range for `spec` inside this mapping, aligned up from the base.
     pub(crate) fn place(&self, spec: LayoutSpec) -> Option<AddressRange> {
         let addr = spec.align_addr(self.base.as_ptr().addr())?;
-        let base = NonNull::new(core::ptr::with_exposed_provenance_mut(addr))?;
+        let base = NonNull::new(self.base.as_ptr().with_addr(addr))?;
         let range = AddressRange::new(base, spec.size().max(1));
         self.range().contains(range).then_some(range)
     }
