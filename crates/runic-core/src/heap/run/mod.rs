@@ -11,6 +11,7 @@ use core::{mem::align_of, sync::atomic::AtomicU64};
 pub(crate) mod config;
 mod freelist;
 pub(crate) mod heap;
+mod slot;
 
 use crate::{
     layout::LayoutSpec,
@@ -18,8 +19,10 @@ use crate::{
     size_class::SizeClass,
 };
 
-#[cfg(feature = "safe")]
+#[cfg(any(feature = "safe", feature = "hardened"))]
 use crate::allocator::Allocator;
+#[cfg(feature = "hardened")]
+use crate::heap::checksum::Checksum;
 
 use super::{
     Heap,
@@ -30,6 +33,7 @@ use super::{
 use config::RunPolicy;
 pub(crate) use freelist::Freelist;
 pub(crate) use heap::RunHeap;
+use slot::{Canary, Slot};
 
 pub(crate) const RUN_SIZE: usize = 64 * 1024;
 /// Payload plus claim tail, `RUN_SIZE`-aligned.
@@ -127,6 +131,21 @@ pub(crate) enum Accept {
     Requeue,
 }
 
+/// Claim bits gathered while accepting one chain. Empty on Fast.
+struct ClaimMask {
+    #[cfg(feature = "safe")]
+    words: [u64; MAX_CLAIM_WORDS],
+}
+
+impl ClaimMask {
+    fn new() -> Self {
+        Self {
+            #[cfg(feature = "safe")]
+            words: [0; MAX_CLAIM_WORDS],
+        }
+    }
+}
+
 /// Run-owned remote double-free bits. Compiled only for `safe`.
 ///
 /// `claim` is `issued` plus `try_set`. A second claim on the same bit is
@@ -213,6 +232,9 @@ pub(crate) struct Run {
     heap: &'static Heap,
     policy: RunPolicy,
     remote: RemoteLine,
+    /// Class, owner, and base. Checked on acquire and free.
+    #[cfg(feature = "hardened")]
+    checksum: Checksum,
 }
 
 impl PartialEq for Run {
@@ -298,7 +320,7 @@ impl Run {
             base,
             span,
             recip: Self::recip(u32::try_from(stride).ok()?)?,
-            state: RunState::new(capacity),
+            state: RunState::new(capacity, base),
             stride,
             class,
             id,
@@ -311,7 +333,105 @@ impl Run {
                 #[cfg(feature = "safe")]
                 claims,
             },
+            #[cfg(feature = "hardened")]
+            checksum: Checksum::of(Self::digest(base, class, heap)),
         })
+    }
+
+    /// The header words the checksum covers.
+    #[cfg(feature = "hardened")]
+    fn digest(base: NonNull<u8>, class: SizeClass, heap: &Heap) -> [usize; 3] {
+        [
+            base.as_ptr().addr(),
+            class.index(),
+            core::ptr::from_ref(heap).addr(),
+        ]
+    }
+
+    /// Abort when the published header fields no longer match. No-op on Fast.
+    #[inline]
+    pub(crate) fn check_header(&self) {
+        #[cfg(feature = "hardened")]
+        if self.checksum != Checksum::of(Self::digest(self.base, self.class, self.heap)) {
+            Allocator::abort();
+        }
+        #[cfg(not(feature = "hardened"))]
+        {
+            let _ = self;
+        }
+    }
+
+    /// Bytes the caller may write. Hardened reserves the last word for the canary.
+    #[inline]
+    pub(crate) fn usable(&self) -> usize {
+        let size = self.class.size();
+        #[cfg(feature = "hardened")]
+        {
+            size.saturating_sub(size_of::<usize>())
+        }
+        #[cfg(not(feature = "hardened"))]
+        {
+            size
+        }
+    }
+
+    /// Push a block that just left the delay onto this freelist.
+    #[inline]
+    pub(crate) fn push_free(&self, block: NonNull<u8>) {
+        self.state.free.push(block);
+    }
+
+    /// Write `block`'s link with this run's cookie.
+    #[inline]
+    pub(crate) fn link_block(&self, block: NonNull<u8>, next: Option<NonNull<u8>>) {
+        self.state.free.link(block, next);
+    }
+
+    /// Read `block`'s link. `None` is the tail.
+    #[inline]
+    pub(crate) fn next_block(&self, block: NonNull<u8>) -> Option<NonNull<u8>> {
+        self.state.free.next(block)
+    }
+
+    /// Blocks held back for this run, once [`Self::extend`] cannot serve.
+    /// Fast has nothing held back.
+    #[inline]
+    pub(crate) fn restock(&self) -> Option<NonNull<u8>> {
+        #[cfg(feature = "hardened")]
+        {
+            self.heap.delay().recall(self);
+            self.allocate()
+        }
+        #[cfg(not(feature = "hardened"))]
+        {
+            let _ = self;
+            None
+        }
+    }
+
+    /// The slot beginning at `block`. `block` is a block of this run.
+    #[inline]
+    fn slot(&self, block: NonNull<u8>) -> Slot {
+        Slot::new(
+            block,
+            self.stride,
+            #[cfg(feature = "hardened")]
+            self.state.free.cookie(),
+        )
+    }
+
+    /// Owner free of one block. Fast pushes. Hardened delays until the budget,
+    /// except the block that would leave a fully issued run with an empty freelist.
+    #[inline]
+    fn release(&self, block: NonNull<u8>) {
+        #[cfg(feature = "hardened")]
+        if self.state.free.is_empty() && self.state.bump.get() == self.state.capacity {
+            self.push_free(block);
+        } else {
+            self.heap.delay().hold(self, block);
+        }
+        #[cfg(not(feature = "hardened"))]
+        self.push_free(block);
     }
 
     /// `ceil(2^32 / stride)` — exact `floor(offset / stride)` for `offset < 2^16`.
@@ -387,6 +507,7 @@ impl Run {
     #[inline]
     pub(crate) fn allocate(&self) -> Option<NonNull<u8>> {
         let ptr = self.state.free.pop()?;
+        self.slot(ptr).mark(Canary::Live);
         let live = self.state.live.get();
         debug_assert!(live < self.state.capacity);
         if live == 0 {
@@ -430,29 +551,15 @@ impl Run {
     pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<RunFree, RunError> {
         let block = self.locate(ptr)?;
         let live = self.state.live.get();
-        #[cfg(feature = "safe")]
-        {
-            if live == 0
-                || block.index().get() >= self.state.bump.get()
-                || self.remote.claims.is_set(block.index())
-            {
-                Allocator::abort();
-            }
-            if self
-                .state
-                .free
-                .ensure_absent(block.ptr(), self.state.capacity, |link| {
-                    self.locate(link).is_ok()
-                })
-                .is_err()
-            {
-                Allocator::abort();
-            }
-        }
+        self.check_header();
+        let slot = self.slot(block.ptr());
+        slot.expect(Canary::Live);
+        slot.mark(Canary::Free);
+        self.guard_owner(block, live);
         let was_full = live == self.state.capacity;
         debug_assert!(live > 0);
         self.state.live.set(live - 1);
-        self.state.free.push(block.ptr());
+        self.release(block.ptr());
         if live == 1 {
             self.sub_live();
         }
@@ -474,13 +581,12 @@ impl Run {
         if block.index().get() >= self.remote.issued.load(Ordering::Relaxed) {
             return Err(RunError::DoubleFree);
         }
-
-        // Fast leaves a second claim undefined. `safe` reserves the block so a
-        // second claim, including one while it sits on a thread slot, aborts.
-        #[cfg(feature = "safe")]
-        if !self.remote.claims.try_set(block.index()) {
+        if !self.try_claim(block.index()) {
             return Err(RunError::DoubleFree);
         }
+        let slot = self.slot(ptr);
+        slot.expect(Canary::Live);
+        slot.mark(Canary::Claim);
         Ok(())
     }
 
@@ -491,7 +597,7 @@ impl Run {
     pub(crate) fn push(&self, head: NonNull<u8>, tail: NonNull<u8>) {
         let mut current = self.remote.chain.load(Ordering::Acquire);
         loop {
-            Freelist::link(tail, NonNull::new(current));
+            self.link_block(tail, NonNull::new(current));
             match self.remote.chain.compare_exchange(
                 current,
                 head.as_ptr(),
@@ -511,6 +617,7 @@ impl Run {
     /// take sees an idle link and enqueues. [`Accept::Requeue`] means a push landed
     /// after the swap. [`Accept::Done`] means the chain head is still empty.
     pub(crate) fn accept(&self) -> Accept {
+        self.check_header();
         self.remote.link.idle();
         let taken = self.remote.chain.swap(ptr::null_mut(), Ordering::AcqRel);
         if let Some(head) = NonNull::new(taken) {
@@ -526,34 +633,23 @@ impl Run {
     /// Splice a taken chain onto the freelist and settle `live`.
     fn take_chain(&self, head: NonNull<u8>) {
         let mut count = 0usize;
-        #[cfg(feature = "safe")]
-        let mut masks = [0u64; MAX_CLAIM_WORDS];
+        let mut claims = ClaimMask::new();
         let mut block = head;
         let tail = loop {
-            #[cfg(feature = "safe")]
-            {
-                let Ok(located) = self.locate(block) else {
-                    Allocator::abort();
-                };
-                let (word, mask) = located.index().claim_word_bit();
-                let Some(bits) = masks.get_mut(word) else {
-                    Allocator::abort();
-                };
-                *bits |= mask;
-            }
+            self.record(block, &mut claims);
             count += 1;
-            match Freelist::next(block) {
+            let next = self.next_block(block);
+            let slot = self.slot(block);
+            slot.expect(Canary::Claim);
+            slot.mark(Canary::Free);
+            self.defer(block);
+            match next {
                 Some(next) => block = next,
                 None => break block,
             }
         };
-        #[cfg(feature = "safe")]
-        for (word, mask) in masks.into_iter().enumerate() {
-            if mask != 0 {
-                self.remote.claims.clear_mask(word, mask);
-            }
-        }
-        self.state.free.splice(head, tail);
+        self.clear_claims(&claims);
+        self.splice(head, tail);
         let live = self.state.live.get();
         debug_assert!(live >= count);
         let left = live.saturating_sub(count);
@@ -563,6 +659,113 @@ impl Run {
         }
         if self.is_discardable() {
             self.discard();
+        }
+    }
+
+    /// Owner double-free. No-op on Fast, where that free is undefined.
+    #[inline]
+    fn guard_owner(&self, block: Block, live: usize) {
+        #[cfg(feature = "safe")]
+        {
+            if live == 0
+                || block.index().get() >= self.state.bump.get()
+                || self.remote.claims.is_set(block.index())
+                || self
+                    .state
+                    .free
+                    .ensure_absent(block.ptr(), self.state.capacity, |link| {
+                        self.locate(link).is_ok()
+                    })
+                    .is_err()
+            {
+                Allocator::abort();
+            }
+        }
+        #[cfg(not(feature = "safe"))]
+        {
+            let _ = (self, block, live);
+        }
+    }
+
+    /// Reserve the block for this claim. Fast always succeeds: a second claim
+    /// is undefined there.
+    #[inline]
+    fn try_claim(&self, index: BlockIndex) -> bool {
+        #[cfg(feature = "safe")]
+        {
+            self.remote.claims.try_set(index)
+        }
+        #[cfg(not(feature = "safe"))]
+        {
+            let _ = (self, index);
+            true
+        }
+    }
+
+    /// `true` when a remote claim already owns the block. Always `false` on Fast.
+    #[inline]
+    fn was_claimed(&self, index: BlockIndex) -> bool {
+        #[cfg(feature = "safe")]
+        {
+            self.remote.claims.is_set(index)
+        }
+        #[cfg(not(feature = "safe"))]
+        {
+            let _ = (self, index);
+            false
+        }
+    }
+
+    /// Remember a claimed block so [`Self::clear_claims`] can drop its bit.
+    fn record(&self, block: NonNull<u8>, claims: &mut ClaimMask) {
+        #[cfg(feature = "safe")]
+        {
+            let Ok(located) = self.locate(block) else {
+                Allocator::abort();
+            };
+            let (word, mask) = located.index().claim_word_bit();
+            let Some(bits) = claims.words.get_mut(word) else {
+                Allocator::abort();
+            };
+            *bits |= mask;
+        }
+        #[cfg(not(feature = "safe"))]
+        {
+            let _ = (self, block, claims);
+        }
+    }
+
+    fn clear_claims(&self, claims: &ClaimMask) {
+        #[cfg(feature = "safe")]
+        for (word, mask) in claims.words.into_iter().enumerate() {
+            if mask != 0 {
+                self.remote.claims.clear_mask(word, mask);
+            }
+        }
+        #[cfg(not(feature = "safe"))]
+        {
+            let _ = (self, claims);
+        }
+    }
+
+    /// Hardened delays the block here. Fast splices the whole chain afterwards.
+    #[inline]
+    fn defer(&self, block: NonNull<u8>) {
+        #[cfg(feature = "hardened")]
+        self.release(block);
+        #[cfg(not(feature = "hardened"))]
+        {
+            let _ = (self, block);
+        }
+    }
+
+    /// Fast prepends the chain. Hardened already released each block in the walk.
+    fn splice(&self, head: NonNull<u8>, tail: NonNull<u8>) {
+        #[cfg(not(feature = "hardened"))]
+        self.state.free.splice(head, tail);
+        #[cfg(feature = "hardened")]
+        {
+            let _ = (self, head, tail);
         }
     }
 
@@ -580,6 +783,10 @@ impl Run {
     #[cold]
     pub(crate) fn discard(&self) {
         debug_assert!(self.is_discardable());
+        // Blocks still held back would return to a reset run and be issued
+        // twice by `extend`. Take them back before the freelist is cleared.
+        #[cfg(feature = "hardened")]
+        self.heap.delay().recall(self);
         self.state.bump.set(0);
         self.state.free.clear();
         self.remote.issued.store(0, Ordering::Relaxed);
@@ -591,8 +798,7 @@ impl Run {
         if block.index().get() >= self.remote.issued.load(Ordering::Acquire) {
             return Err(RunError::DoubleFree);
         }
-        #[cfg(feature = "safe")]
-        if self.remote.claims.is_set(block.index()) {
+        if self.was_claimed(block.index()) {
             return Err(RunError::DoubleFree);
         }
         Ok(block)
@@ -605,7 +811,7 @@ impl Run {
     ) -> Result<bool, RunError> {
         self.allocated(ptr)?;
 
-        Ok(self.stride >= spec.size() && spec.is_addr_aligned(ptr.as_ptr().addr()))
+        Ok(self.usable() >= spec.size() && spec.is_addr_aligned(ptr.as_ptr().addr()))
     }
 
     #[inline]
@@ -640,13 +846,13 @@ impl Run {
 }
 
 impl RunState {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, base: NonNull<u8>) -> Self {
         Self {
             live: Cell::new(0),
             capacity,
             bump: Cell::new(0),
             available: queue::Link::new(),
-            free: Freelist::new(),
+            free: Freelist::new(base.as_ptr().addr()),
         }
     }
 }
@@ -667,10 +873,15 @@ mod tests {
 
     use super::*;
 
-    static OWNER: Heap = Heap::new(
-        HeapId::new(0, NonZeroU32::MIN).unwrap(),
-        AllocatorConfig::new(),
-    );
+    fn owner() -> &'static Heap {
+        std::thread_local! {
+            static SLOT: &'static Heap = Box::leak(Box::new(Heap::new(
+                HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                AllocatorConfig::new(),
+            )));
+        }
+        SLOT.with(|heap| *heap)
+    }
 
     fn layout_spec(size: usize, align: usize) -> LayoutSpec {
         LayoutSpec::from_layout(Layout::from_size_align(size, align).unwrap())
@@ -692,8 +903,8 @@ mod tests {
         let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let class = class_id(64, 8);
-        let first = runs.acquire(class, &OWNER, &pages).unwrap();
-        let second = runs.acquire(class, &OWNER, &pages).unwrap();
+        let first = runs.acquire(class, owner(), &pages).unwrap();
+        let second = runs.acquire(class, owner(), &pages).unwrap();
         let ptr = alloc_block(first).unwrap();
 
         assert!(first == first);
@@ -714,7 +925,7 @@ mod tests {
         let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let class = class_id(64, 8);
-        let run = runs.acquire(class, &OWNER, &pages).unwrap();
+        let run = runs.acquire(class, owner(), &pages).unwrap();
         let capacity = RUN_SIZE / class.size();
         let mut seen = vec![false; capacity];
 
@@ -739,7 +950,7 @@ mod tests {
         let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let class = class_id(64, 8);
-        let run = runs.acquire(class, &OWNER, &pages).unwrap();
+        let run = runs.acquire(class, owner(), &pages).unwrap();
         assert!(run.allocate().is_none());
         assert!(run.extend());
         let first = run.allocate().unwrap();
@@ -757,20 +968,24 @@ mod tests {
     fn reusable_run_reuses_returned_block() {
         let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
-        let run = runs.acquire(class_id(128, 8), &OWNER, &pages).unwrap();
+        let run = runs.acquire(class_id(128, 8), owner(), &pages).unwrap();
 
         let ptr = alloc_block(run).unwrap();
 
         assert!(run.free(ptr).is_ok());
 
-        assert_eq!(run.allocate(), Some(ptr));
+        let again = run.allocate();
+        #[cfg(not(feature = "hardened"))]
+        assert_eq!(again, Some(ptr));
+        #[cfg(feature = "hardened")]
+        assert_ne!(again, Some(ptr));
     }
 
     #[test]
     fn reusable_run_resizes_block_in_place_for_same_class_layout() {
         let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
-        let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
+        let run = runs.acquire(class_id(64, 8), owner(), &pages).unwrap();
         let new = layout_spec(64, 8);
         let ptr = alloc_block(run).unwrap();
 
@@ -781,7 +996,7 @@ mod tests {
     fn reusable_run_rejects_allocated_block_that_needs_larger_class() {
         let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
-        let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
+        let run = runs.acquire(class_id(64, 8), owner(), &pages).unwrap();
         let new = layout_spec(80, 8);
         let ptr = alloc_block(run).unwrap();
 
@@ -796,7 +1011,13 @@ mod tests {
         let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         for &size in &SizeClasses::SIZES {
-            let run = runs.acquire(class_id(size, 8), &OWNER, &pages).unwrap();
+            #[cfg(feature = "hardened")]
+            let request = size - core::mem::size_of::<usize>();
+            #[cfg(not(feature = "hardened"))]
+            let request = size;
+            let class = class_id(request, 8);
+            assert_eq!(class.size(), size);
+            let run = runs.acquire(class, owner(), &pages).unwrap();
             let base = run.range().base();
             let span = (RUN_SIZE / size) * size;
 
@@ -828,12 +1049,16 @@ mod tests {
         let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         for size in [80, 96] {
-            let run = runs.acquire(class_id(size, 8), &OWNER, &pages).unwrap();
+            let run = runs.acquire(class_id(size, 8), owner(), &pages).unwrap();
             let ptr = alloc_block(run).unwrap();
 
             assert!(run.locate(ptr).is_ok(), "size={size}");
             assert!(run.free(ptr).is_ok(), "size={size}");
-            assert_eq!(run.allocate(), Some(ptr), "size={size}");
+            let again = run.allocate();
+            #[cfg(not(feature = "hardened"))]
+            assert_eq!(again, Some(ptr), "size={size}");
+            #[cfg(feature = "hardened")]
+            assert_ne!(again, Some(ptr), "size={size}");
         }
     }
 
@@ -841,7 +1066,7 @@ mod tests {
     fn reusable_run_rejects_claim_tail() {
         let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
-        let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
+        let run = runs.acquire(class_id(64, 8), owner(), &pages).unwrap();
         let claim_tail = NonNull::new(run.range().base().as_ptr().wrapping_add(RUN_SIZE)).unwrap();
 
         assert_eq!(run.locate(claim_tail), Err(RunError::OutOfRange));
@@ -852,8 +1077,8 @@ mod tests {
         let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let class = class_id(64, 8);
-        let base_a = runs.acquire(class, &OWNER, &pages).unwrap().range().base();
-        let base_b = runs.acquire(class, &OWNER, &pages).unwrap().range().base();
+        let base_a = runs.acquire(class, owner(), &pages).unwrap().range().base();
+        let base_b = runs.acquire(class, owner(), &pages).unwrap().range().base();
         let (Some(PageOwner::Run(run_a)), Some(PageOwner::Run(run_b))) =
             (pages.get(base_a), pages.get(base_b))
         else {
@@ -870,7 +1095,7 @@ mod tests {
     fn claim_run_reports_duplicate_remote_free() {
         let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
-        let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
+        let run = runs.acquire(class_id(64, 8), owner(), &pages).unwrap();
         let ptr = alloc_block(run).unwrap();
 
         assert_eq!(run.claim(ptr), Ok(()));
@@ -881,7 +1106,7 @@ mod tests {
     fn accept_without_any_claim_is_a_noop() {
         let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
-        let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
+        let run = runs.acquire(class_id(64, 8), owner(), &pages).unwrap();
         let ptr = alloc_block(run).unwrap();
         assert_eq!(run.accept(), Accept::Done);
         // `ptr`'s block is still live (never claimed), so the next allocate is fresh.
@@ -893,12 +1118,20 @@ mod tests {
         let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         for &size in &SizeClasses::SIZES {
-            let run = runs.acquire(class_id(size, 8), &OWNER, &pages).unwrap();
+            #[cfg(feature = "hardened")]
+            let request = size - core::mem::size_of::<usize>();
+            #[cfg(not(feature = "hardened"))]
+            let request = size;
+            let run = runs.acquire(class_id(request, 8), owner(), &pages).unwrap();
             let ptr = alloc_block(run).unwrap();
             assert_eq!(run.claim(ptr), Ok(()), "size={size}");
             run.push(ptr, ptr);
             assert_eq!(run.accept(), Accept::Done, "size={size}");
-            assert_eq!(run.allocate(), Some(ptr), "size={size}");
+            let again = run.allocate();
+            #[cfg(not(feature = "hardened"))]
+            assert_eq!(again, Some(ptr), "size={size}");
+            #[cfg(feature = "hardened")]
+            assert_ne!(again, Some(ptr), "size={size}");
         }
     }
 
@@ -907,7 +1140,7 @@ mod tests {
         let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let class = class_id(17, 16);
-        let run = runs.acquire(class, &OWNER, &pages).unwrap();
+        let run = runs.acquire(class, owner(), &pages).unwrap();
         let capacity = RUN_SIZE / class.size();
 
         for _ in 0..capacity {
@@ -922,7 +1155,7 @@ mod tests {
 
         let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
-        let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
+        let run = runs.acquire(class_id(64, 8), owner(), &pages).unwrap();
         let a = alloc_block(run).unwrap();
         let b = alloc_block(run).unwrap();
         let inbox: Inbox<'_, Run> = Inbox::new();
@@ -937,11 +1170,17 @@ mod tests {
 
         assert_eq!(inbox.drain().count(), 1);
         assert_eq!(run.accept(), Accept::Done);
-        assert_eq!(run.allocate(), Some(b));
-        assert_eq!(run.allocate(), Some(a));
-
-        // Cleared by accept: a fresh claim can queue again.
-        assert_eq!(run.claim(a), Ok(()));
+        #[cfg(not(feature = "hardened"))]
+        {
+            assert_eq!(run.allocate(), Some(b));
+            assert_eq!(run.allocate(), Some(a));
+            assert_eq!(run.claim(a), Ok(()));
+        }
+        #[cfg(feature = "hardened")]
+        {
+            let fresh = alloc_block(run).unwrap();
+            assert_eq!(run.claim(fresh), Ok(()));
+        }
         assert!(inbox.enqueue(run));
     }
 
@@ -956,7 +1195,7 @@ mod tests {
         let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let class = class_id(64, 8);
-        let run = runs.acquire(class, &OWNER, &pages).unwrap();
+        let run = runs.acquire(class, owner(), &pages).unwrap();
         let capacity = RUN_SIZE / class.size();
         // Addresses, not `NonNull<u8>`: a raw-pointer `Vec` is not `Sync`, and this slice
         // only ever crosses the thread boundary by shared reference below.
@@ -1010,7 +1249,7 @@ mod tests {
             Hints::new(),
         );
         let pages = PageMap::new();
-        let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
+        let run = runs.acquire(class_id(64, 8), owner(), &pages).unwrap();
         let ptr = alloc_block(run).unwrap();
         assert_eq!(run.free(ptr), Ok(RunFree::Unchanged));
         assert!(run.is_discardable());
@@ -1025,11 +1264,15 @@ mod tests {
     fn keep_empty_run_leaves_freelist() {
         let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
-        let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
+        let run = runs.acquire(class_id(64, 8), owner(), &pages).unwrap();
         let ptr = alloc_block(run).unwrap();
         assert_eq!(run.free(ptr), Ok(RunFree::Unchanged));
         assert!(!run.is_discardable());
-        assert_eq!(run.allocate(), Some(ptr));
+        let again = run.allocate();
+        #[cfg(not(feature = "hardened"))]
+        assert_eq!(again, Some(ptr));
+        #[cfg(feature = "hardened")]
+        assert_ne!(again, Some(ptr));
     }
 
     #[test]
@@ -1039,7 +1282,7 @@ mod tests {
             Hints::new(),
         );
         let pages = PageMap::new();
-        let run = runs.acquire(class_id(64, 8), &OWNER, &pages).unwrap();
+        let run = runs.acquire(class_id(64, 8), owner(), &pages).unwrap();
         let ptr = alloc_block(run).unwrap();
         assert_eq!(run.claim(ptr), Ok(()));
         run.push(ptr, ptr);
@@ -1061,15 +1304,15 @@ mod tests {
         );
         let pages = PageMap::new();
         let class = class_id(64, 8);
-        let run = runs.acquire(class, &OWNER, &pages).unwrap();
+        let run = runs.acquire(class, owner(), &pages).unwrap();
         let ptr = alloc_block(run).unwrap();
         // SAFETY: `ptr` is a live block of `class.size()` bytes.
-        unsafe { ptr.as_ptr().write_bytes(0x11, class.size()) };
+        unsafe { ptr.as_ptr().write_bytes(0x11, run.usable()) };
         assert_eq!(run.free(ptr), Ok(RunFree::Unchanged));
         run.discard();
 
         // SAFETY: the payload stays mapped for the process lifetime.
-        let payload = unsafe { core::slice::from_raw_parts(ptr.as_ptr(), class.size()) };
+        let payload = unsafe { core::slice::from_raw_parts(ptr.as_ptr(), run.usable()) };
         assert!(payload.iter().all(|&byte| byte == 0));
         assert!(run.extend());
         assert_eq!(run.allocate(), Some(ptr));
@@ -1078,5 +1321,109 @@ mod tests {
             ptr.as_ptr().write(0x22);
             assert_eq!(ptr.as_ptr().read(), 0x22);
         }
+    }
+
+    #[cfg(feature = "hardened")]
+    fn child_aborts(test: &str, var: &str, body: fn()) {
+        use std::os::unix::process::ExitStatusExt;
+
+        if std::env::var_os(var).is_some() {
+            body();
+            std::process::exit(0);
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--test-threads=1"])
+            .env(var, "1")
+            .status()
+            .unwrap();
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGABRT),
+            "{test} exited with {status}"
+        );
+    }
+
+    #[cfg(feature = "hardened")]
+    #[test]
+    fn delay_reuses_only_after_the_budget() {
+        let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
+        let pages = PageMap::new();
+        let class = class_id(64, 8);
+        let run = runs.acquire(class, owner(), &pages).unwrap();
+        let first = alloc_block(run).unwrap();
+        assert_eq!(run.free(first), Ok(RunFree::Unchanged));
+        assert_ne!(alloc_block(run).unwrap(), first);
+
+        // Leave one slot unissued so a full run does not push every free
+        // straight back onto its freelist. Five runs clear the 256 KiB budget.
+        for _ in 0..5 {
+            let next = runs.acquire(class, owner(), &pages).unwrap();
+            let capacity = RUN_SIZE / class.size();
+            for _ in 0..capacity.saturating_sub(1) {
+                let ptr = alloc_block(next).unwrap();
+                next.free(ptr).unwrap();
+            }
+        }
+
+        let mut found = false;
+        for _ in 0..capacity_of(class) {
+            let Some(ptr) = run.allocate() else { break };
+            if ptr == first {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "oldest block stayed delayed past the budget");
+    }
+
+    #[cfg(feature = "hardened")]
+    fn capacity_of(class: SizeClass) -> usize {
+        RUN_SIZE / class.size()
+    }
+
+    #[cfg(feature = "hardened")]
+    #[test]
+    fn damaged_run_checksum_aborts_on_free() {
+        child_aborts(
+            "heap::run::tests::damaged_run_checksum_aborts_on_free",
+            "RUNIC_DAMAGE_RUN_FREE",
+            || {
+                let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
+                let pages = PageMap::new();
+                let run = runs.acquire(class_id(64, 8), owner(), &pages).unwrap();
+                let ptr = alloc_block(run).unwrap();
+                // SAFETY: the child corrupts the header so free aborts.
+                unsafe {
+                    core::ptr::addr_of!(run.checksum)
+                        .cast_mut()
+                        .write(Checksum::damaged());
+                }
+                let _ = run.free(ptr);
+            },
+        );
+    }
+
+    #[cfg(feature = "hardened")]
+    #[test]
+    fn damaged_run_checksum_aborts_on_acquire() {
+        child_aborts(
+            "heap::run::tests::damaged_run_checksum_aborts_on_acquire",
+            "RUNIC_DAMAGE_RUN_ACQUIRE",
+            || {
+                let mut runs = RunHeap::new(RunConfig::new(), Hints::new());
+                let pages = PageMap::new();
+                let class = class_id(64, 8);
+                let run = runs.acquire(class, owner(), &pages).unwrap();
+                // SAFETY: the child corrupts the header so the next acquire aborts.
+                unsafe {
+                    core::ptr::addr_of!(run.checksum)
+                        .cast_mut()
+                        .write(Checksum::damaged());
+                }
+                runs.push_available(run).unwrap();
+                let _ = runs.take_available(class);
+            },
+        );
     }
 }

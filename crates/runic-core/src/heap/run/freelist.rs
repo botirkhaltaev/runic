@@ -6,19 +6,39 @@
 
 use core::{cell::Cell, mem::size_of, ptr::NonNull};
 
+#[cfg(feature = "hardened")]
+use crate::allocator::Allocator;
+
 /// Empty head and end-of-stack link. A payload address is never 0.
 const END: usize = 0;
 
-/// Head of the free-block stack. `repr(transparent)` keeps it one word in `RunState`.
-#[repr(transparent)]
+/// Hardened link word: a 16-bit tag over the top of the address, then the
+/// low 48 bits mixed with the cookie. A smashed word fails the tag.
+#[cfg(feature = "hardened")]
+const TAG: u64 = 0xA5A5;
+#[cfg(feature = "hardened")]
+const LOW: u64 = 0x0000_FFFF_FFFF_FFFF;
+
+/// Head of the free-block stack.
+///
+/// Fast stores the next address raw, so this stays one word. Hardened keeps a
+/// per-run cookie beside the head and encodes every link with it. Callers do
+/// not pass the cookie: [`Self::load`] and [`Self::store`] are the only place
+/// the build differs.
 pub(crate) struct Freelist {
     head: Cell<usize>,
+    #[cfg(feature = "hardened")]
+    cookie: u64,
 }
 
 impl Freelist {
-    pub(super) const fn new() -> Self {
+    pub(super) fn new(base: usize) -> Self {
+        #[cfg(not(feature = "hardened"))]
+        let _ = base;
         Self {
             head: Cell::new(END),
+            #[cfg(feature = "hardened")]
+            cookie: Self::word(base).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
         }
     }
 
@@ -30,14 +50,28 @@ impl Freelist {
             return None;
         }
         let block = NonNull::new(core::ptr::without_provenance_mut(raw))?;
-        self.head.set(Self::read(block));
+        let next = self.load(block);
+        self.head.set(next);
         Some(block)
+    }
+
+    /// `true` when [`Self::pop`] would return `None`.
+    #[inline]
+    #[cfg(feature = "hardened")]
+    pub(super) fn is_empty(&self) -> bool {
+        self.head.get() == END
+    }
+
+    #[cfg(feature = "hardened")]
+    #[inline]
+    pub(super) fn cookie(&self) -> u64 {
+        self.cookie
     }
 
     /// Push `block` in front of the head. `block` is not already on this stack.
     #[inline]
     pub(super) fn push(&self, block: NonNull<u8>) {
-        Self::write(block, self.head.get());
+        self.store(block, self.head.get());
         self.head.set(block.as_ptr().addr());
     }
 
@@ -48,22 +82,25 @@ impl Freelist {
 
     /// Write `block`'s link word. Remote chains and the owner stack share this word.
     #[inline]
-    pub(crate) fn link(block: NonNull<u8>, next: Option<NonNull<u8>>) {
-        Self::write(block, next.map_or(END, |next| next.as_ptr().addr()));
+    pub(super) fn link(&self, block: NonNull<u8>, next: Option<NonNull<u8>>) {
+        let addr = next.map_or(END, |next| next.as_ptr().addr());
+        self.store(block, addr);
     }
 
     /// Read `block`'s link word. `None` is the tail.
     #[inline]
-    pub(super) fn next(block: NonNull<u8>) -> Option<NonNull<u8>> {
-        NonNull::new(core::ptr::without_provenance_mut(Self::read(block)))
+    pub(super) fn next(&self, block: NonNull<u8>) -> Option<NonNull<u8>> {
+        NonNull::new(core::ptr::without_provenance_mut(self.load(block)))
     }
 
     /// Prepend the chain `head`…`tail` in front of this stack. Owner only.
     ///
     /// `tail`'s link becomes the previous head. Pop order is `head` first.
+    /// Hardened delays each block instead of splicing the chain.
+    #[cfg(not(feature = "hardened"))]
     #[inline]
     pub(super) fn splice(&self, head: NonNull<u8>, tail: NonNull<u8>) {
-        Self::write(tail, self.head.get());
+        self.store(tail, self.head.get());
         self.head.set(head.as_ptr().addr());
     }
 
@@ -84,10 +121,10 @@ impl Freelist {
             // SAFETY: `first` starts `count` in-bounds blocks of `stride` bytes,
             // so each step stays inside that span and never reaches address 0.
             let next = unsafe { block.byte_add(stride) };
-            Self::write(block, next.as_ptr().addr());
+            self.store(block, next.as_ptr().addr());
             block = next;
         }
-        Self::write(block, self.head.get());
+        self.store(block, self.head.get());
         self.head.set(first.as_ptr().addr());
     }
 
@@ -127,6 +164,53 @@ impl Freelist {
         } else {
             Err(FreelistError::Corrupt)
         }
+    }
+
+    /// Decode `block`'s link word. Hardened aborts on a bad tag.
+    #[inline]
+    fn load(&self, block: NonNull<u8>) -> usize {
+        let word = Self::read(block);
+        #[cfg(feature = "hardened")]
+        {
+            let word = Self::word(word);
+            if word >> 48 != self.tag() {
+                Allocator::abort();
+            }
+            Self::addr((word ^ self.cookie) & LOW)
+        }
+        #[cfg(not(feature = "hardened"))]
+        {
+            let _ = self;
+            word
+        }
+    }
+
+    /// Encode `next` into `block`'s link word.
+    #[inline]
+    fn store(&self, block: NonNull<u8>, next: usize) {
+        #[cfg(feature = "hardened")]
+        let next = Self::addr(self.tag() << 48 | (Self::word(next) ^ self.cookie) & LOW);
+        #[cfg(not(feature = "hardened"))]
+        let _ = self;
+        Self::write(block, next);
+    }
+
+    #[cfg(feature = "hardened")]
+    #[inline]
+    fn tag(&self) -> u64 {
+        (TAG ^ self.cookie.rotate_right(17)) & 0xFFFF
+    }
+
+    #[cfg(feature = "hardened")]
+    #[inline]
+    fn word(addr: usize) -> u64 {
+        u64::try_from(addr).unwrap_or_else(|_| Allocator::abort())
+    }
+
+    #[cfg(feature = "hardened")]
+    #[inline]
+    fn addr(word: u64) -> usize {
+        usize::try_from(word).unwrap_or_else(|_| Allocator::abort())
     }
 
     #[inline]
@@ -170,7 +254,7 @@ mod tests {
         let slots = [0_usize; 2];
         let first = addr_of(&slots[0]);
         let second = addr_of(&slots[1]);
-        let list = Freelist::new();
+        let list = Freelist::new(first);
 
         assert!(list.pop().is_none());
         list.push(at(first));
@@ -186,7 +270,7 @@ mod tests {
         let old = [0_usize; 1];
         let fresh_addrs = [addr_of(&fresh[0]), addr_of(&fresh[1]), addr_of(&fresh[2])];
         let old_addr = addr_of(&old[0]);
-        let list = Freelist::new();
+        let list = Freelist::new(old_addr);
 
         list.push(at(old_addr));
         list.push_contiguous(at(fresh_addrs[0]), 3, size_of::<usize>());
@@ -200,7 +284,7 @@ mod tests {
     #[test]
     fn clear_drops_the_head() {
         let slot = [0_usize; 1];
-        let list = Freelist::new();
+        let list = Freelist::new(addr_of(&slot[0]));
         list.push(at(addr_of(&slot[0])));
         list.clear();
         assert!(list.pop().is_none());
@@ -215,7 +299,7 @@ mod tests {
         let mut live_word = 1_usize;
         let listed = addr_of(&listed_slot[0]);
         let live = addr_of(&live_word);
-        let list = Freelist::new();
+        let list = Freelist::new(listed);
         let is_block = |ptr: NonNull<u8>| ptr.addr().get() == listed || ptr.addr().get() == live;
 
         list.push(at(listed));

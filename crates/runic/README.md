@@ -20,7 +20,9 @@ static GLOBAL: RunicAlloc = RunicAlloc::new();
 
 First `init` in the process wins; later configs are ignored. `new()` is the
 default Fast build with hugepage and NUMA off. `--features safe` also aborts an
-owner double-free of a small block. Extent policy
+owner double-free of a small block. `--features hardened` is exclusive with
+`safe` and checks freelist cookies, slot canaries, extent guard pages, a
+256 KiB delay, and header checksums. Extent policy
 applies on free: `Keep` retains a mapping while slot and byte budgets allow,
 `Discard` retains then `madvise`s, and `Unmap` does not retain. Allocate-side reuse is exact mapping length. Payload
 maps honor hugepage (`Off` / `Thp`) and NUMA (`Off` / `Local`).

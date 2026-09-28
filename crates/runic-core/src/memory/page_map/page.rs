@@ -1,5 +1,6 @@
 use core::{num::NonZeroU16, ops::Range, ptr::NonNull};
 
+#[cfg(test)]
 use crate::memory::Mapping;
 
 use super::{ADDRESSABLE_PAGES, L1_ENTRIES, L2_BITS, L2_ENTRIES, PAGE_SHIFT};
@@ -15,6 +16,7 @@ impl PageRange {
     ///
     /// `Mapping` already guarantees a page-aligned base and page-multiple
     /// nonzero length, so this is infallible for addressable mappings.
+    #[cfg(test)]
     pub(super) fn from_mapping(mapping: &Mapping) -> Option<Self> {
         Self::from_aligned(mapping.base(), mapping.len().get())
     }

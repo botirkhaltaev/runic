@@ -156,25 +156,41 @@ fn remote_frees_across_many_runs_all_return_to_the_owner() {
             blocks_tx.send(per_class).unwrap();
             freer.join().unwrap();
 
-            let mut reused = HashSet::new();
-            for &size in classes {
-                let layout = layout(size, 8);
-                let again: Vec<*mut u8> = (0..RUN / size)
-                    .map(|_| {
-                        // SAFETY: the layout is valid and the block is freed below.
-                        let ptr = unsafe { allocator.alloc(layout) };
-                        assert!(!ptr.is_null(), "size {size}");
-                        reused.insert(ptr.addr());
-                        ptr
-                    })
-                    .collect();
-                for ptr in again {
-                    // SAFETY: allocated just above with the same layout.
-                    unsafe { allocator.dealloc(ptr, layout) };
+            // One wave is the freelist on Fast. Hardened parks the tail in
+            // the delay, so later waves are what surface those blocks.
+            let waves = if cfg!(feature = "hardened") { 8 } else { 1 };
+            let mut seen = HashSet::new();
+            for _ in 0..waves {
+                let mut reused = HashSet::new();
+                for &size in classes {
+                    let layout = layout(size, 8);
+                    let again: Vec<*mut u8> = (0..RUN / size)
+                        .map(|_| {
+                            // SAFETY: the layout is valid and the block is freed below.
+                            let ptr = unsafe { allocator.alloc(layout) };
+                            assert!(!ptr.is_null(), "size {size}");
+                            reused.insert(ptr.addr());
+                            ptr
+                        })
+                        .collect();
+                    for ptr in again {
+                        // SAFETY: allocated just above with the same layout.
+                        unsafe { allocator.dealloc(ptr, layout) };
+                    }
+                }
+                if !cfg!(feature = "hardened") {
+                    assert_eq!(
+                        reused, handed_over,
+                        "the owner did not get every remote free back"
+                    );
+                }
+                seen.extend(reused);
+                if handed_over.is_subset(&seen) {
+                    break;
                 }
             }
-            assert_eq!(
-                reused, handed_over,
+            assert!(
+                handed_over.is_subset(&seen),
                 "the owner did not get every remote free back"
             );
         });

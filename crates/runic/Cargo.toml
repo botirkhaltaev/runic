@@ -11,6 +11,7 @@ name = "runic"
 
 [features]
 safe = ["runic-core/safe"]
+hardened = ["runic-core/hardened"]
 
 [lints]
 workspace = true

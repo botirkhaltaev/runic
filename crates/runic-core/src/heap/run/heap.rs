@@ -131,6 +131,7 @@ impl RunHeap {
         loop {
             let run = available.pop()?;
             if !run.is_full() {
+                run.check_header();
                 return Some(run);
             }
         }
@@ -176,10 +177,15 @@ mod tests {
     use super::super::{RUN_SIZE, RunFree, config::RunConfig};
     use super::*;
 
-    static OWNER: Heap = Heap::new(
-        HeapId::new(0, core::num::NonZeroU32::MIN).unwrap(),
-        AllocatorConfig::new(),
-    );
+    fn owner() -> &'static Heap {
+        std::thread_local! {
+            static SLOT: &'static Heap = Box::leak(Box::new(Heap::new(
+                HeapId::new(0, core::num::NonZeroU32::MIN).unwrap(),
+                AllocatorConfig::new(),
+            )));
+        }
+        SLOT.with(|heap| *heap)
+    }
 
     fn class_id(size: usize, align: usize) -> SizeClass {
         SizeClasses::class_for(LayoutSpec::from_layout(
@@ -200,7 +206,7 @@ mod tests {
         class: SizeClass,
         pages: &PageMap,
     ) -> Option<(&'static Run, NonNull<u8>)> {
-        let run = heap.acquire(class, &OWNER, pages)?;
+        let run = heap.acquire(class, owner(), pages)?;
         let ptr = run.allocate().or_else(|| {
             run.extend();
             run.allocate()
@@ -249,12 +255,12 @@ mod tests {
         let class = class_id(64, 8);
         // Occupy the range first; `insert_run` must fail closed rather than steal it.
         let mut occupant = RunHeap::new(RunConfig::new(), Hints::new());
-        let taken = occupant.acquire(class, &OWNER, &pages).unwrap();
+        let taken = occupant.acquire(class, owner(), &pages).unwrap();
         let base = taken.range().base();
 
         let index = heap.runs.vacant().unwrap();
         let id = RunId::from_index(index).unwrap();
-        let run = Run::new(id, &OWNER, base, class, RunPolicy::Keep).expect("conflict run");
+        let run = Run::new(id, owner(), base, class, RunPolicy::Keep).expect("conflict run");
         assert!(heap.insert_run(run, &pages).is_none());
 
         assert!(heap.runs.get(index).is_none());
@@ -270,8 +276,8 @@ mod tests {
         let class = class_id(64, 8);
         let class_index = class.index();
 
-        let run_a = heap.acquire(class, &OWNER, &pages).unwrap();
-        let run_b = heap.acquire(class, &OWNER, &pages).unwrap();
+        let run_a = heap.acquire(class, owner(), &pages).unwrap();
+        let run_b = heap.acquire(class, owner(), &pages).unwrap();
         let id_a = run_a.id();
         let id_b = run_b.id();
         assert_ne!(id_a, id_b);
@@ -280,9 +286,9 @@ mod tests {
         assert_eq!(heap.push_available(run_b), Ok(()));
         assert_eq!(heap.push_available(run_a), Ok(()));
 
-        let first = heap.acquire(class, &OWNER, &pages).unwrap();
+        let first = heap.acquire(class, owner(), &pages).unwrap();
         assert_eq!(first.id(), id_b);
-        let second = heap.acquire(class, &OWNER, &pages).unwrap();
+        let second = heap.acquire(class, owner(), &pages).unwrap();
         assert_eq!(second.id(), id_a);
         assert_eq!(available_run_id(&mut heap, class_index), None);
     }
@@ -294,7 +300,7 @@ mod tests {
         let class = class_id(64, 8);
         let class_index = class.index();
 
-        let run = heap.acquire(class, &OWNER, &pages).unwrap();
+        let run = heap.acquire(class, owner(), &pages).unwrap();
         let ptr = run
             .allocate()
             .or_else(|| {
@@ -310,7 +316,10 @@ mod tests {
         assert_eq!(available_run_id(&mut heap, class_index), Some(id));
 
         let (_run, reused) = alloc_block(&mut heap, class, &pages).unwrap();
+        #[cfg(not(feature = "hardened"))]
         assert_eq!(reused, ptr);
+        #[cfg(feature = "hardened")]
+        assert_ne!(reused, ptr);
     }
 
     #[test]
@@ -318,7 +327,7 @@ mod tests {
         let mut heap = RunHeap::new(RunConfig::new(), Hints::new());
         let pages = PageMap::new();
         let class = class_id(64, 8);
-        let run = heap.acquire(class, &OWNER, &pages).unwrap();
+        let run = heap.acquire(class, owner(), &pages).unwrap();
         let base = run.range().base();
         assert!(pages.get(base).is_some());
         let tail = NonNull::new(base.as_ptr().wrapping_byte_add(RUN_SIZE)).unwrap();

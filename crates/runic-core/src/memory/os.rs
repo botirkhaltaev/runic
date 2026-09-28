@@ -22,6 +22,11 @@ const NODE_WORDS: usize = NODE_BITS / 64;
 pub(crate) struct Mapping {
     base: NonNull<u8>,
     len: NonZeroUsize,
+    /// `1` when `PROT_NONE` pages sit on both sides of the payload.
+    /// `u8`, not `bool`: a `bool` niche would stop all-zero `Option<Mapping>`
+    /// from being `None`.
+    #[cfg(feature = "hardened")]
+    guarded: u8,
 }
 
 // SAFETY: `Mapping` uniquely owns an mmap; moving ownership across threads is
@@ -36,7 +41,12 @@ impl Mapping {
     fn new(base: NonNull<u8>, len: NonZeroUsize) -> Self {
         debug_assert!(base.as_ptr().addr().is_multiple_of(PAGE_SIZE));
         debug_assert!(len.get().is_multiple_of(PAGE_SIZE));
-        Self { base, len }
+        Self {
+            base,
+            len,
+            #[cfg(feature = "hardened")]
+            guarded: 0,
+        }
     }
 
     pub(crate) const fn base(&self) -> NonNull<u8> {
@@ -48,15 +58,46 @@ impl Mapping {
     }
 
     pub(crate) const fn range(&self) -> AddressRange {
-        AddressRange::new(self.base, self.len.get())
+        AddressRange::new(self.base, self.len().get())
     }
 
-    /// User range for `spec` inside this mapping, aligned up from the base.
+    /// Bytes the caller may use. Guard pages sit outside this range.
+    pub(crate) fn payload(&self) -> AddressRange {
+        #[cfg(feature = "hardened")]
+        if self.guarded == 1 {
+            let base = NonNull::new(self.base.as_ptr().wrapping_add(PAGE_SIZE))
+                .unwrap_or_else(|| crate::allocator::Allocator::abort());
+            let len = self.len.get().saturating_sub(PAGE_SIZE.saturating_mul(2));
+            return AddressRange::new(base, len);
+        }
+        self.range()
+    }
+
+    /// User range for `spec` inside [`Self::payload`], aligned up from its base.
     pub(crate) fn place(&self, spec: LayoutSpec) -> Option<AddressRange> {
-        let addr = spec.align_addr(self.base.as_ptr().addr())?;
-        let base = NonNull::new(self.base.as_ptr().with_addr(addr))?;
+        let payload = self.payload();
+        let addr = spec.align_addr(payload.base().as_ptr().addr())?;
+        let base = NonNull::new(payload.base().as_ptr().with_addr(addr))?;
         let range = AddressRange::new(base, spec.size().max(1));
-        self.range().contains(range).then_some(range)
+        payload.contains(range).then_some(range)
+    }
+
+    /// Map one `PROT_NONE` page before the payload and one after.
+    #[cfg(feature = "hardened")]
+    pub(crate) fn seal_guards(&mut self) {
+        let page = PAGE_SIZE;
+        let len = self.len.get();
+        if len < page.saturating_mul(2) {
+            return;
+        }
+        let front = self.base.as_ptr();
+        let back = front.wrapping_add(len - page);
+        // SAFETY: this mapping is live and both edges are one page inside it.
+        unsafe {
+            libc::mprotect(front.cast(), page, libc::PROT_NONE);
+            libc::mprotect(back.cast(), page, libc::PROT_NONE);
+        }
+        self.guarded = 1;
     }
 
     /// Apply payload hints. Each hint is independent and best effort.
@@ -161,6 +202,19 @@ pub(crate) trait Memory {
         let mapping = Self::map(len)?;
         mapping.prefer(hints);
         Some(mapping)
+    }
+
+    /// Extent map. Hardened adds one guard page on each side of `len`.
+    fn map_extent(len: usize, hints: Hints) -> Option<Mapping> {
+        #[cfg(feature = "hardened")]
+        {
+            let len = len.checked_add(PAGE_SIZE.saturating_mul(2))?;
+            let mut mapping = Self::map_payload(len, hints)?;
+            mapping.seal_guards();
+            Some(mapping)
+        }
+        #[cfg(not(feature = "hardened"))]
+        Self::map_payload(len, hints)
     }
 
     /// Run payload map at `align`, then hints.

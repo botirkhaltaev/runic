@@ -1,3 +1,7 @@
+#[cfg(feature = "hardened")]
+pub(crate) mod checksum;
+#[cfg(feature = "hardened")]
+mod delay;
 mod error;
 pub(crate) mod extent;
 mod heaps;
@@ -27,6 +31,8 @@ use crate::{
 use inbox::{Inbox, Node};
 use state::HeapState;
 
+#[cfg(feature = "hardened")]
+pub(crate) use delay::Delay;
 pub(crate) use error::HeapError;
 pub(crate) use extent::Extent;
 pub(crate) use extent::ExtentInit;
@@ -55,6 +61,9 @@ pub(crate) struct Heap {
     extents_live: AtomicUsize,
     run_inbox: Inbox<'static, Run>,
     extent_inbox: Inbox<'static, Extent>,
+    /// Frees held back before reuse. Lists are owner-only, same rule as `thread_id`.
+    #[cfg(feature = "hardened")]
+    delay: Delay,
     inner: Mutex<HeapInner>,
     /// Free-heap stack link. Concurrent with other `Heaps` pop/push.
     free: queue::stack::Link<Heap>,
@@ -82,8 +91,9 @@ impl queue::stack::Linked for Heap {
 // and `free`. `NonNull<Heap>` inside the thread link does not carry `Send` by itself.
 unsafe impl Send for Heap {}
 // SAFETY: freers share `&Heap` and only touch atomics: `state`, the live
-// counts, the inboxes, and `free`. `thread` and `thread_id` belong to the thread
-// that has this heap on its list.
+// counts, the inboxes, `free`, and on `hardened` the delay byte count. `thread`,
+// `thread_id`, and the delay lists belong to the thread that has this
+// heap on its list.
 unsafe impl Sync for Heap {}
 
 impl PartialEq for Heap {
@@ -103,7 +113,7 @@ pub(super) struct HeapInner {
 impl PageOwner {
     pub(crate) fn usable(self) -> usize {
         match self {
-            Self::Run(run) => run.class().size(),
+            Self::Run(run) => run.usable(),
             Self::Extent(extent) => extent.len(),
         }
     }
@@ -189,10 +199,32 @@ impl Heap {
             extents_live: AtomicUsize::new(0),
             run_inbox: Inbox::new(),
             extent_inbox: Inbox::new(),
+            #[cfg(feature = "hardened")]
+            delay: Delay::new(),
             inner: Mutex::new(HeapInner::new(config)),
             free: queue::stack::Link::new(),
             thread: list::Link::new(),
             thread_id: Cell::new(None),
+        }
+    }
+
+    /// Frees held back before reuse. The owning thread holds and releases;
+    /// freers only read the byte count.
+    #[cfg(feature = "hardened")]
+    pub(crate) fn delay(&self) -> &Delay {
+        &self.delay
+    }
+
+    /// Bytes held back. Zero when this build does not delay frees.
+    fn delayed(&self) -> usize {
+        #[cfg(feature = "hardened")]
+        {
+            self.delay.bytes()
+        }
+        #[cfg(not(feature = "hardened"))]
+        {
+            let _ = self;
+            0
         }
     }
 
@@ -221,6 +253,7 @@ impl Heap {
     pub(super) fn is_live(&self) -> bool {
         self.runs_live.load(Ordering::Acquire) != 0
             || self.extents_live.load(Ordering::Acquire) != 0
+            || self.delayed() != 0
     }
 
     /// Enqueue-or-coalesce `owner` onto its inbox. Active freers only.
@@ -258,7 +291,13 @@ impl Heap {
 
     /// Nothing enqueued and nothing live. Reclaim confirms with the arena scans.
     pub(super) fn is_idle(&self) -> bool {
-        self.inboxes_empty() && !self.is_live()
+        self.inboxes_empty() && !self.has_outstanding()
+    }
+
+    /// Live runs or extents. The delay is not outstanding: unbind empties it.
+    fn has_outstanding(&self) -> bool {
+        self.runs_live.load(Ordering::Acquire) != 0
+            || self.extents_live.load(Ordering::Acquire) != 0
     }
 
     /// Current id when Active, from one Acquire load. Remote routing uses this
@@ -382,7 +421,10 @@ impl Heap {
         self.run_inbox
             .flush(|run, inbox| Self::accept_run(run, inbox, || &mut *inner))?;
         self.extent_inbox
-            .flush(|extent, _| Self::accept_extent(extent, ctx.pages, || &mut *inner))
+            .flush(|extent, _| Self::accept_extent(extent, ctx.pages, || &mut *inner))?;
+        #[cfg(feature = "hardened")]
+        self.release_delay(inner, ctx.pages)?;
+        Ok(())
     }
 
     /// Active owner flush. Accept each node outside the lock, then take a guard
@@ -395,6 +437,21 @@ impl Heap {
             .flush(|run, inbox| Self::accept_run(run, inbox, || self.require_inner()))?;
         self.extent_inbox
             .flush(|extent, _| Self::accept_extent(extent, ctx.pages, || self.require_inner()))
+    }
+
+    /// Unbind empties the delay list onto freelists and the extent cache so a
+    /// heap with no outstanding allocations can be reclaimed.
+    #[cfg(feature = "hardened")]
+    pub(super) fn release_delay(
+        &self,
+        inner: &mut HeapInner,
+        pages: &PageMap,
+    ) -> Result<(), HeapError> {
+        while self.delay.release() {}
+        while let Some(extent) = self.delay.take_extent() {
+            inner.extents.retain(extent, pages)?;
+        }
+        Ok(())
     }
 
     /// Accept one run's chain. A full run that gained blocks is listed under

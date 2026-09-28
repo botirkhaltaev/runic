@@ -12,7 +12,6 @@ use crate::{
 };
 
 use super::list::LinkedList;
-use super::run::Freelist;
 use super::{AllocatorCtx, Heap};
 
 /// Open remote chains. The front slot is the run most recently freed, so a
@@ -177,8 +176,11 @@ impl ThreadHeaps {
     fn extend_current(&self, class: SizeClass) -> Option<NonNull<u8>> {
         let run = self.current(class)?;
         run.allocate().or_else(|| {
-            run.extend();
-            run.allocate()
+            if run.extend() {
+                run.allocate()
+            } else {
+                run.restock()
+            }
         })
     }
 
@@ -409,7 +411,7 @@ impl ThreadHeaps {
             self.bring_front(run)?;
         }
         let head = slot.head.replace(Some(ptr));
-        Freelist::link(ptr, head);
+        run.link_block(ptr, head);
         if head.is_none() {
             slot.run.set(Some(run));
             slot.tail.set(Some(ptr));
