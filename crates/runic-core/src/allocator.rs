@@ -396,7 +396,7 @@ impl Allocator {
     /// Remote free: Active claim onto a thread slot, else the Draining path.
     ///
     /// A run claim is held on a thread slot. The slot calls [`Run::push`] and
-    /// [`Self::enqueue_remote`] when its chain fills or is evicted. An extent
+    /// [`Self::enqueue_remote`] when its set needs the slot or the thread holds 16 KiB. An extent
     /// claim enqueues immediately. Coalescing is by owner inbox. The Draining
     /// path is outlined so this Active arm stays a straight claim and link.
     pub(crate) fn free_remote(
@@ -896,17 +896,20 @@ mod tests {
     }
 
     #[test]
-    fn remote_chain_pushes_on_the_sixteenth() {
+    fn remote_chain_pushes_at_the_budget() {
         let allocator = Allocator::new();
         let ctx = ctx(&allocator);
         let pages = ctx.pages;
         let layout = Layout::from_size_align(64, 8).unwrap();
+        let class = SizeClasses::class_for(LayoutSpec::from_layout(layout)).unwrap();
+        let count = u32::try_from(16 * 1024 / class.size()).unwrap();
         let tls = &THREAD_HEAPS;
         let id = tls.bind(&ctx).unwrap();
-        let live = alloc_live(tls, &ctx, layout, 16);
+        let live = alloc_live(tls, &ctx, layout, count);
         let run = run_of(pages, live[0]);
         let heap = ctx.heaps.get(id).unwrap();
-        for &ptr in &live[..15] {
+        let last = live.len() - 1;
+        for &ptr in &live[..last] {
             assert_eq!(
                 Allocator::free_remote(&ctx, PageOwner::Run(run), ptr),
                 Ok(())
@@ -914,7 +917,7 @@ mod tests {
         }
         assert!(heap.inboxes_empty());
         assert_eq!(
-            Allocator::free_remote(&ctx, PageOwner::Run(run), live[15]),
+            Allocator::free_remote(&ctx, PageOwner::Run(run), live[last]),
             Ok(())
         );
         assert!(!heap.inboxes_empty());
@@ -1027,6 +1030,7 @@ mod tests {
                     Ok(())
                 );
             }
+            THREAD_HEAPS.push_remote().unwrap();
             go_a.send(()).unwrap();
             go_b.send(()).unwrap();
             assert!(!finished_a.recv().unwrap());

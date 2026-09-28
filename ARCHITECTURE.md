@@ -43,7 +43,7 @@ One word per concept. Code, comments, and docs use these and no synonyms.
 | free | Owner returns a block or extent. |
 | claim | Freer reserves a block or extent for remote admission. |
 | hold | Freer links a claimed block on one of its slots. |
-| slot / chain | A slot is one of the eight `ThreadHeaps` cells. Its chain is the linked claimed blocks, up to `CHAIN_LIMIT`. |
+| slot / chain | A slot is one of sixteen `ThreadHeaps` cells, eight sets of two. Its chain is the linked claimed blocks. A chain stays open until the set needs the slot or the thread holds 16 KiB. |
 | push | `Run::push` moves a chain onto the run. |
 | enqueue | Put a run or extent on the owner inbox once; the link coalesces repeats. |
 | flush | Owner drains an inbox and `accept`s every node. |
@@ -103,11 +103,11 @@ A block is held by the user, the owner freelist, or a remote claim.
    a claim bit, so a second claim returns `HeapError::DoubleFree`. Fast leaves
    that second claim undefined. An extent does the same: Fast stores
    `Claimed`, and `safe` CASes the byte.
-2. The freer `hold`s the block on a `ThreadHeaps` slot (8 slots, each one open
-   chain of up to 16 blocks; the front slot is the run just freed). `Run::push`
-   moves the chain onto the run when it fills, when the fullest slot is
-   evicted, or when the thread exits. `Heap::enqueue` puts the run on the
-   owner inbox when the inbox link is idle (lease before a new enqueue).
+2. The freer `hold`s the block on a `ThreadHeaps` slot. Sixteen slots are
+   eight sets of two, and the run hashes into its set. A chain stays open
+   until that set needs the slot, or the thread is holding 16 KiB. Then
+   `Run::push` and `Heap::enqueue` (lease before a new enqueue). Thread exit
+   pushes whatever is open.
 3. Draining owner: push every open chain, then `adopt` and owner `free`, or
    `Heaps::{free,flush}`.
 4. Owner `flush` calls `accept`, which stores the inbox link idle and splices
