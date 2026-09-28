@@ -15,20 +15,33 @@ use super::list::LinkedList;
 use super::run::Freelist;
 use super::{AllocatorCtx, Heap};
 
-/// Open remote chains. The front slot is the run most recently freed, so a
-/// burst hits one compare. Eight covers the runs a freer of a worker pool
-/// actually touches; a full front slot, or the fullest slot when all are in
-/// use, is what pushes.
-const REMOTE_SLOTS: usize = 8;
-/// Blocks per chain before `Run::push`. One push replaces per-block inbox traffic.
-const CHAIN_LIMIT: u16 = 16;
+/// Open remote chains, grouped as eight sets of two. A run hashes into its
+/// set, so a burst hits one of two compares. A chain stays open until its
+/// set needs the slot, or the thread is holding [`REMOTE_BUDGET`] bytes.
+const REMOTE_SETS: usize = 8;
+const REMOTE_WAYS: usize = 2;
+const REMOTE_SLOTS: usize = REMOTE_SETS * REMOTE_WAYS;
+/// Claimed bytes a thread holds before every open chain is pushed.
+const REMOTE_BUDGET: usize = 16 * 1024;
+/// Odd mix. Run bases are 64 KiB aligned, so `>> 16` keeps the address bits that differ.
+const REMOTE_MIX: usize = 0x7EFB_352D;
+
+const _: () = assert!(REMOTE_SETS.is_power_of_two());
 
 /// One open chain of claimed blocks for `run`. Empty when `run` is `None`.
 struct RemoteSlot {
     run: Cell<Option<&'static Run>>,
     head: Cell<Option<NonNull<u8>>>,
     tail: Cell<Option<NonNull<u8>>>,
-    count: Cell<u16>,
+    bytes: Cell<usize>,
+}
+
+/// A chain taken off its slot. The freer owns it until [`Run::push`].
+struct Chain {
+    run: &'static Run,
+    head: NonNull<u8>,
+    tail: NonNull<u8>,
+    bytes: usize,
 }
 
 impl RemoteSlot {
@@ -37,8 +50,39 @@ impl RemoteSlot {
             run: Cell::new(None),
             head: Cell::new(None),
             tail: Cell::new(None),
-            count: Cell::new(0),
+            bytes: Cell::new(0),
         }
+    }
+
+    /// Link `ptr` at the head. The slot is empty or already holds `run`.
+    /// Returns the block size and whether this opened the chain.
+    fn link(&self, run: &'static Run, ptr: NonNull<u8>) -> (usize, bool) {
+        let size = run.class().size();
+        let previous = self.head.replace(Some(ptr));
+        Freelist::link(ptr, previous);
+        let opened = previous.is_none();
+        if opened {
+            self.run.set(Some(run));
+            self.tail.set(Some(ptr));
+            self.bytes.set(size);
+        } else {
+            self.bytes.set(self.bytes.get() + size);
+        }
+        (size, opened)
+    }
+
+    /// Take the open chain. `None` when the slot is empty.
+    fn take(&self) -> Option<Chain> {
+        let run = self.run.take()?;
+        let (Some(head), Some(tail)) = (self.head.take(), self.tail.take()) else {
+            Allocator::abort();
+        };
+        Some(Chain {
+            run,
+            head,
+            tail,
+            bytes: self.bytes.replace(0),
+        })
     }
 }
 
@@ -51,6 +95,8 @@ pub(crate) struct ThreadHeaps {
     heaps: UnsafeCell<LinkedList<'static, Heap>>,
     current: [Cell<Option<&'static Run>>; SizeClasses::COUNT],
     remote: [RemoteSlot; REMOTE_SLOTS],
+    /// Claimed bytes sitting in `remote`. Pushed at [`REMOTE_BUDGET`].
+    remote_bytes: Cell<usize>,
     exit: ExitHook,
 }
 
@@ -60,6 +106,7 @@ impl ThreadHeaps {
             heaps: UnsafeCell::new(LinkedList::new()),
             current: [const { Cell::new(None) }; SizeClasses::COUNT],
             remote: [const { RemoteSlot::new() }; REMOTE_SLOTS],
+            remote_bytes: Cell::new(0),
             exit: ExitHook::new(),
         }
     }
@@ -396,114 +443,99 @@ impl ThreadHeaps {
 
     /// Claim `ptr` and link it on this thread's chain for `run`.
     ///
-    /// The front slot is that run after the first block of a burst. A full
-    /// chain, or the fullest chain when every slot is in use, is [`Run::push`]
-    /// then [`Allocator::enqueue_remote`]. A Draining retry lives in
-    /// `enqueue_remote` and does not push the chain again.
+    /// The run hashes into a set of two slots. A hit is one link. A miss pushes
+    /// the fullest slot in that set, then opens `run` there. The thread pushes
+    /// every open chain once [`REMOTE_BUDGET`] bytes are claimed. A Draining
+    /// retry lives in `enqueue_remote` and does not push the chain again.
     pub(crate) fn hold(&self, run: &'static Run, ptr: NonNull<u8>) -> Result<(), HeapError> {
         run.claim(ptr)?;
-        let Some(slot) = self.remote.first() else {
-            Allocator::abort();
-        };
-        if slot.run.get() != Some(run) {
-            self.bring_front(run)?;
-        }
-        let head = slot.head.replace(Some(ptr));
-        Freelist::link(ptr, head);
-        if head.is_none() {
-            slot.run.set(Some(run));
-            slot.tail.set(Some(ptr));
-            slot.count.set(1);
-            return Ok(());
-        }
-        let count = slot.count.get() + 1;
-        slot.count.set(count);
-        if count == CHAIN_LIMIT {
-            self.push_slot(0)?;
-        }
-        Ok(())
-    }
-
-    /// Make slot 0 the chain for `run`: promote a hit, or park an empty slot
-    /// there, or flush the fullest chain and park that slot there.
-    ///
-    /// Every new chain starts here, and a thread that only frees never links
-    /// a heap, so this is the other place state first lands on the thread.
-    #[cold]
-    #[inline(never)]
-    fn bring_front(&self, run: &'static Run) -> Result<(), HeapError> {
-        self.exit.arm();
-        let mut empty = None;
-        let mut fullest = 0usize;
-        let mut fullest_count = 0u16;
-        for (index, slot) in self.remote.iter().enumerate() {
-            match slot.run.get() {
-                Some(held) if held == run => {
-                    self.swap_slots(0, index);
-                    return Ok(());
-                }
-                None => empty = empty.or(Some(index)),
-                Some(_) => {
-                    let count = slot.count.get();
-                    if count >= fullest_count {
-                        fullest = index;
-                        fullest_count = count;
-                    }
-                }
+        let base = Self::set_of(run) * REMOTE_WAYS;
+        for way in 0..REMOTE_WAYS {
+            let slot = self.slot(base + way);
+            if slot.run.get() == Some(run) {
+                let (bytes, opened) = slot.link(run, ptr);
+                self.linked(bytes, opened);
+                return self.push_over_budget();
             }
         }
-        if let Some(index) = empty {
-            self.swap_slots(0, index);
-            return Ok(());
+        let slot = self.fullest(base);
+        if slot.run.get().is_some() {
+            self.push_slot(slot)?;
         }
-        self.push_slot(fullest)?;
-        self.swap_slots(0, fullest);
-        Ok(())
+        let (bytes, opened) = slot.link(run, ptr);
+        self.linked(bytes, opened);
+        self.push_over_budget()
     }
 
-    fn swap_slots(&self, left: usize, right: usize) {
-        if left == right {
-            return;
+    fn set_of(run: &Run) -> usize {
+        let key = core::ptr::from_ref(run).addr();
+        (key.wrapping_mul(REMOTE_MIX) >> 16) & (REMOTE_SETS - 1)
+    }
+
+    fn slot(&self, index: usize) -> &RemoteSlot {
+        self.remote.get(index).unwrap_or_else(|| Allocator::abort())
+    }
+
+    /// An empty slot in the set, or the one holding the most bytes.
+    fn fullest(&self, base: usize) -> &RemoteSlot {
+        let mut choice = self.slot(base);
+        let mut most = 0usize;
+        for way in 0..REMOTE_WAYS {
+            let slot = self.slot(base + way);
+            if slot.run.get().is_none() {
+                return slot;
+            }
+            let bytes = slot.bytes.get();
+            if bytes > most {
+                most = bytes;
+                choice = slot;
+            }
         }
-        let Some(a) = self.remote.get(left) else {
-            Allocator::abort();
-        };
-        let Some(b) = self.remote.get(right) else {
-            Allocator::abort();
-        };
-        a.run.swap(&b.run);
-        a.head.swap(&b.head);
-        a.tail.swap(&b.tail);
-        a.count.swap(&b.count);
+        choice
+    }
+
+    /// Count a linked block. The first block of a chain arms thread exit:
+    /// a thread that only frees never links a heap.
+    fn linked(&self, bytes: usize, opened: bool) {
+        if opened {
+            self.exit.arm();
+        }
+        self.remote_bytes.set(self.remote_bytes.get() + bytes);
+    }
+
+    fn push_over_budget(&self) -> Result<(), HeapError> {
+        if self.remote_bytes.get() < REMOTE_BUDGET {
+            return Ok(());
+        }
+        self.push_remote()
     }
 
     /// Push every open chain. A Draining free adopts next; claimed blocks still
     /// in a slot would keep that heap live and linked for the rest of the process.
+    #[cold]
     pub(crate) fn push_remote(&self) -> Result<(), HeapError> {
-        for index in 0..REMOTE_SLOTS {
-            self.push_slot(index)?;
+        for slot in &self.remote {
+            self.push_slot(slot)?;
         }
         Ok(())
     }
 
-    fn push_slot(&self, index: usize) -> Result<(), HeapError> {
-        let Some(slot) = self.remote.get(index) else {
-            Allocator::abort();
-        };
-        let Some(run) = slot.run.take() else {
+    #[cold]
+    fn push_slot(&self, slot: &RemoteSlot) -> Result<(), HeapError> {
+        let Some(chain) = slot.take() else {
             return Ok(());
         };
-        let (Some(head), Some(tail)) = (slot.head.take(), slot.tail.take()) else {
+        chain.run.push(chain.head, chain.tail);
+        let Some(left) = self.remote_bytes.get().checked_sub(chain.bytes) else {
             Allocator::abort();
         };
-        slot.count.set(0);
-        run.push(head, tail);
+        self.remote_bytes.set(left);
         let Some(ctx) = Allocator::ctx() else {
             Allocator::abort();
         };
-        let owner = run.heap();
+        let owner = chain.run.heap();
         let id = owner.active_id().unwrap_or_else(|| owner.id());
-        Allocator::enqueue_remote(&ctx, owner, id, PageOwner::Run(run))
+        Allocator::enqueue_remote(&ctx, owner, id, PageOwner::Run(chain.run))
     }
 
     /// Unbind TLS heaps. `live` stays exact. The process payload stays.

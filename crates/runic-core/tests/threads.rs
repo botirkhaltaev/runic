@@ -99,9 +99,9 @@ fn owner_exit_with_many_live_blocks_frees_cleanly_later() {
     }
 }
 
-/// Remote frees spanning more runs than a freer holds open slots for all
-/// reach the owner no later than the freer exiting: the owner then refills
-/// every run with exactly the blocks that were freed.
+/// Remote frees across many runs all reach the owner once the freer exits.
+/// Exit posts every open chain. The owner then refills every run with exactly
+/// the blocks that were freed.
 #[test]
 fn remote_frees_across_many_runs_all_return_to_the_owner() {
     const RUN: usize = 64 * 1024;
@@ -112,8 +112,7 @@ fn remote_frees_across_many_runs_all_return_to_the_owner() {
 
     thread::scope(|scope| {
         let freer = scope.spawn(move || {
-            // Round-robin over classes so the freer rotates through more
-            // runs than it has slots, evicting partial chains as it goes.
+            // Round-robin over classes so the freer holds several runs open.
             let mut per_class = blocks_rx.recv().unwrap();
             while per_class.iter().any(|blocks| !blocks.is_empty()) {
                 for blocks in &mut per_class {

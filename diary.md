@@ -938,3 +938,28 @@ arc_broadcast              -           +2.0% (p 0.52)
 The old code against its own baseline moves 14.8% on `shard_aggregator`, so
 the machine noise is larger than any of the new deltas. Not a kept delta in
 either direction.
+
+## Hashed remote slots, 16 KiB post
+
+Replaces the front slot and the flush every 16 blocks. Sixteen slots, eight
+sets of two, hashed from the run address. A chain stays open until its set
+needs the slot, the thread holds 16 KiB, or the thread exits. Close is still
+`Run::push` then `enqueue`. The owner never reads an open chain. This is not
+the declined four-way BatchIt, which flushed on eviction.
+
+Criterion, CPUs 24-27, 10 samples x 1 s, warmup 250 ms. Paired with snmalloc
+on the same pins immediately after. Midpoints in ms.
+
+```text
+                      runic      sn    vs sn
+word_count            1.119   1.102   1.02×
+async_server          1.789   1.746   1.02×
+thread_pool_jobs      0.967   0.881   1.10×
+shard_aggregator      0.490   0.447   1.10×
+```
+
+`thread_pool_jobs` was 1.17× to 1.21× snmalloc on the previous protocol
+(runic 1.03 to 1.05 ms, snmalloc 0.87 to 0.88 ms). snmalloc today is 0.881 ms,
+so the move is runic. `word_count` stays with snmalloc. `shard_aggregator`
+stays near 1.10×; that gap is adopt, which this path does not touch.
+`async_server` did not abort. Kept.
