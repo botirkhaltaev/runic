@@ -19,6 +19,9 @@ runic-alloc = "0.8"
   header page). `free` null aborts. C `free(NULL)` is handled in `runic-cabi`.
 - First `init` in the process wins. `Allocator::preload()` overlays `RUNIC_*` at
   that init (cabi). `RunicAlloc::new().with_*` does not read env.
+- `safe` and `hardened` are exclusive Cargo features. Fast leaves owner
+  double-free undefined. `hardened` adds a freelist cookie, a slot canary,
+  extent guard pages, a 256 KiB delay, and header checksums.
 - Thread exit is `ExitHook`, armed once per thread. Feature `c-abi` registers
   it as a pthread key for `LD_PRELOAD`; default is a `std::thread_local!` guard.
 

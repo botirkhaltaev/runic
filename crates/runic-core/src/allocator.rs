@@ -572,6 +572,14 @@ mod tests {
             .expect("allocator ctx")
     }
 
+    /// The block just freed. Fast hands it back. Hardened holds it back.
+    fn freed<T: PartialEq + core::fmt::Debug>(again: &T, first: &T) {
+        #[cfg(not(feature = "hardened"))]
+        assert_eq!(again, first);
+        #[cfg(feature = "hardened")]
+        assert_ne!(again, first);
+    }
+
     fn alloc_small(tls: &ThreadHeaps, ctx: &AllocatorCtx, layout: Layout) -> NonNull<u8> {
         let class = SizeClasses::class_for(LayoutSpec::from_layout(layout)).unwrap();
         if let Some(ptr) = tls.alloc(class) {
@@ -630,8 +638,9 @@ mod tests {
             let _id = tls.bind(&ctx).unwrap();
             let ptr = alloc_small(tls, &ctx, layout);
             assert_eq!(tls.free(ptr, class), Some(()));
-            assert_eq!(tls.alloc(class), Some(ptr));
-            assert_eq!(tls.free(ptr, class), Some(()));
+            let again = tls.alloc(class);
+            freed(&again, &Some(ptr));
+            assert_eq!(tls.free(again.unwrap(), class), Some(()));
             tls.unbind(&ctx);
         };
     }
@@ -680,8 +689,9 @@ mod tests {
         assert_eq!(Allocator::free_remote(&ctx, owner, remote), Ok(()));
         assert!(ctx.heaps.get(remote_id).is_none());
         assert_eq!(tls.bind(&ctx), Some(bound));
-        assert_eq!(tls.alloc(class), Some(local));
-        assert_eq!(tls.free(local, class), Some(()));
+        let again = tls.alloc(class).unwrap();
+        freed(&again, &local);
+        assert_eq!(tls.free(again, class), Some(()));
         tls.unbind(&ctx);
     }
 
@@ -715,8 +725,9 @@ mod tests {
             let run = run_of(pages, ptr);
             assert_eq!(tls.free_run(run, ptr), Ok(()));
             assert!(!run.is_live());
-            assert_eq!(run.allocate(), Some(ptr));
-            assert_eq!(tls.free_run(run, ptr), Ok(()));
+            let again = run.allocate().unwrap();
+            freed(&again, &ptr);
+            assert_eq!(tls.free_run(run, again), Ok(()));
             tls.unbind(&ctx);
         };
     }
@@ -757,7 +768,8 @@ mod tests {
         {
             let tls = &THREAD_HEAPS;
             let _id = tls.bind(&ctx).unwrap();
-            let capacity = crate::heap::run::RUN_SIZE / 64;
+            let class = SizeClasses::class_for(LayoutSpec::from_layout(layout)).unwrap();
+            let capacity = crate::heap::run::RUN_SIZE / class.size();
             let mut a_ptrs = Vec::with_capacity(capacity);
             for _ in 0..capacity {
                 a_ptrs.push(alloc_small(tls, &ctx, layout));
@@ -799,7 +811,7 @@ mod tests {
             assert!(Run::header_of(ptr).unwrap() == run);
             assert_eq!(tls.free_slow(ptr, spec, &ctx), Ok(()));
             let again = alloc_small(tls, &ctx, layout);
-            assert_eq!(again, ptr);
+            freed(&again, &ptr);
             assert!(Run::header_of(again).unwrap() == run);
             assert_eq!(tls.free_run(run, again), Ok(()));
             tls.unbind(&ctx);
@@ -846,8 +858,9 @@ mod tests {
             assert_eq!(run.claim(ptr), Ok(()));
             run.push(ptr, ptr);
             assert_eq!(run.accept(), crate::heap::Accept::Done);
-            assert_eq!(run.allocate(), Some(ptr));
-            assert!(run.free(ptr).is_ok());
+            let again = run.allocate().unwrap();
+            freed(&again, &ptr);
+            assert!(run.free(again).is_ok());
             tls.unbind(&ctx);
         };
     }
@@ -1496,8 +1509,10 @@ mod tests {
         // SAFETY: valid layout.
         let ptr = unsafe { allocator.alloc(layout) };
         assert!(!ptr.is_null());
-        let class = SizeClasses::class_for(LayoutSpec::from_layout(layout)).unwrap();
-        assert_eq!(allocator.usable_size(ptr), class.size());
+        let usable = allocator.usable_size(ptr);
+        let run = Run::header_of(NonNull::new(ptr).unwrap()).unwrap();
+        assert!(usable >= layout.size());
+        assert_eq!(usable, run.usable());
         // SAFETY: ptr was returned by alloc.
         unsafe { allocator.free(ptr) };
     }

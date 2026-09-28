@@ -68,6 +68,18 @@ jobs:
           cargo clippy -p runic-alloc --all-targets --features safe -- -D warnings
           cargo clippy -p runic-cabi --all-targets --features safe -- -D warnings
 
+      - name: Test hardened feature
+        run: |
+          cargo test -p runic-core --features hardened
+          cargo test -p runic-alloc --features hardened
+          cargo test -p runic-cabi --features hardened
+
+      - name: Lint hardened feature
+        run: |
+          cargo clippy -p runic-core --all-targets --features hardened -- -D warnings
+          cargo clippy -p runic-alloc --all-targets --features hardened -- -D warnings
+          cargo clippy -p runic-cabi --all-targets --features hardened -- -D warnings
+
       - name: Build benchmarks
         run: cargo bench -p runic-bench --no-run
 

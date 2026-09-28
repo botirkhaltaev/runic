@@ -62,16 +62,20 @@ impl PageOwner {
         }
     }
 
-    /// Pages this owner is stamped over: a run's payload, an extent's whole mapping.
+    /// Pages this owner is stamped over: a run's payload, an extent's payload.
     ///
-    /// A run's claim tail sits past the payload and stays unstamped.
+    /// A run's claim tail sits past the payload and stays unstamped. Hardened
+    /// extent guard pages stay unstamped the same way.
     fn pages(self) -> Option<PageRange> {
         match self {
             Self::Run(run) => {
                 let range = run.range();
                 PageRange::from_aligned(range.base(), range.len())
             }
-            Self::Extent(extent) => PageRange::from_mapping(extent.mapping()),
+            Self::Extent(extent) => {
+                let range = extent.payload();
+                PageRange::from_aligned(range.base(), range.len())
+            }
         }
     }
 }

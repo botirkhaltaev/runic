@@ -17,6 +17,8 @@ fn class_of(size: usize, align: usize) -> Option<usize> {
     if align > 4096 {
         return None;
     }
+    #[cfg(feature = "hardened")]
+    let size = size.saturating_add(core::mem::size_of::<usize>());
     CLASS_SIZES
         .into_iter()
         .find(|&class| class >= size.max(align) && class.is_multiple_of(align))

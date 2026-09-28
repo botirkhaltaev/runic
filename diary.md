@@ -938,3 +938,16 @@ arc_broadcast              -           +2.0% (p 0.52)
 The old code against its own baseline moves 14.8% on `shard_aggregator`, so
 the machine noise is larger than any of the new deltas. Not a kept delta in
 either direction.
+
+## Hardened column
+
+`global/runic-hardened/word_count`, unpinned, Criterion defaults (10 samples,
+250 ms warmup, about 1 s measurement). Not a Fast parity gate. The pinned
+Fast screen above is a different protocol.
+
+```text
+global/runic-hardened/word_count    1.564 ms    [1.549, 1.576]
+```
+
+Folding the checks into the freelist, the run, and the mapping left Fast
+`word_count` at 1.165 ms [1.134, 1.199] against 1.161 ms, p = 0.87. No change.

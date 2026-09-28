@@ -2,7 +2,8 @@
 //!
 //! Public type: [`Allocator`]. Most modules are crate-private. Feature `c-abi`
 //! switches thread-exit to a pthread hook for `LD_PRELOAD`; default is
-//! `std::thread_local!`.
+//! `std::thread_local!`. `safe` and `hardened` are alternate builds and cannot
+//! be combined. Fast is the default build.
 
 #![feature(thread_local)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -17,6 +18,9 @@
         clippy::undocumented_unsafe_blocks
     )
 )]
+
+#[cfg(all(feature = "safe", feature = "hardened"))]
+compile_error!("features `safe` and `hardened` cannot be combined");
 
 pub(crate) mod allocator;
 pub(crate) mod arena;

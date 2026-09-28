@@ -7,6 +7,7 @@ Run metadata owns small size-class allocations. Hit/miss:
 
 - `mod.rs`: `Run`, `RunId`, `extend`, in-page header at `base + RUN_SIZE`. The `safe` build stores a private claim bitmap after the header.
 - `freelist.rs`: owner-exclusive free-block stack. The head and each free block's first word are payload addresses (`0` = end).
+- `slot.rs`: one size-class slot. Hardened writes a `Canary` in the last word (live, free, claim). Fast leaves the word unused.
 - `config.rs`: `RunConfig` / `RunPolicy::{Keep,Discard}`.
 - `heap.rs`: `RunHeap` with `Arena<&'static Run>` (in-space headers) then `Arena<Mapping>`, available-run lists, `Hints` on payload maps, and payload-only page-map publication.
 

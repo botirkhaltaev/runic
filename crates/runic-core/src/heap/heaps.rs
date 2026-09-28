@@ -72,6 +72,8 @@ impl Heaps {
         let (heap, mut inner) = self.admit(id, Some(owner))?;
         let state = inner.free(owner, ptr, ctx.pages)?;
         if state == OwnerState::Empty {
+            #[cfg(feature = "hardened")]
+            heap.release_delay(&mut inner, ctx.pages)?;
             heap.reclaim(&inner, self);
         }
         Ok(())

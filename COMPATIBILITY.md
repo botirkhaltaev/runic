@@ -5,7 +5,9 @@ points listed below. It supports remote free and thread exit and requires
 nightly Rust. The default build is Fast, where an owner double-free is
 undefined, as in glibc, mimalloc, and snmalloc. `--features safe` aborts an
 owner double-free of a small block or an extent and a second remote free of
-the same block. Hardened is not implemented.
+the same block. `--features hardened` is a separate build: freelist cookies,
+slot canaries, extent guard pages, a 256 KiB delay, and header checksums.
+`safe` and `hardened` cannot be combined.
 Hugepage and NUMA knobs exist on payload maps (default Off). Background purge
 and telemetry are not implemented. Planned work is [ROADMAP.md](ROADMAP.md).
 
@@ -24,11 +26,11 @@ and telemetry are not implemented. Planned work is [ROADMAP.md](ROADMAP.md).
 |------------|--------|
 | Implemented | `alloc`, `dealloc`, `alloc_zeroed`, `realloc` via `RunicAlloc` |
 | Contract | Null `dealloc` aborts. Interior pointers abort. A pointer the allocator never issued aborts, or faults on the run-header probe when it arrives with a small layout. A layout that does not match the allocation is undefined on both builds, as in the `GlobalAlloc` contract and mimalloc |
-| Double free | Undefined on Fast, as in mimalloc with secure mode off. With `--features safe`: a second owner free of a small block or extent aborts, and a second remote free of the same block aborts |
+| Double free | Undefined on Fast, as in mimalloc with secure mode off. With `--features safe` or `--features hardened`: a second owner free of a small block or extent aborts, and a second remote free of the same block aborts |
 | `mmap` failure | `alloc` returns null. Allocations that do not need a new mapping still succeed |
 | Fork | A single-threaded fork while no allocation is in progress keeps the parent's blocks and allocates in the child. Fork from another thread, or during `alloc` or `free`, is unsupported until `pthread_atfork` (roadmap 0.13) |
 | `realloc` | Preserves the prefix; may move. Uses the new `Layout` alignment in both builds |
-| Config | `RunicAlloc::new().with_*` (hugepage, NUMA, `ExtentConfig`, `RunConfig`). First `init` in the process wins. Safe is the `safe` Cargo feature, not a config field |
+| Config | `RunicAlloc::new().with_*` (hugepage, NUMA, `ExtentConfig`, `RunConfig`). First `init` in the process wins. `safe` and `hardened` are Cargo features, not config fields |
 
 ## C malloc family (`runic-cabi`)
 
@@ -74,6 +76,10 @@ running under the preload.
 
 ## Hardening and ops
 
-Missing: quarantine, canaries, guard pages, cookies, checksums, delayed
-reuse. Hardened is roadmap 0.11. Stats dashboards and `MALLOC_*` compatibility
-stay declined. See [ROADMAP.md](ROADMAP.md).
+| Capability | Status |
+|------------|--------|
+| `--features hardened` | Freelist cookie, slot-end canary, `PROT_NONE` pages around extent payloads, 256 KiB delay before reuse, checksum of run headers and extent slots. A smashed link, a bad canary, a second free, or a damaged header aborts. A write into a guard page faults |
+| Not in this build | Randomized placement. Reclaim and `pthread_atfork` stay on the roadmap |
+
+Stats dashboards and `MALLOC_*` compatibility stay declined. See
+[ROADMAP.md](ROADMAP.md).

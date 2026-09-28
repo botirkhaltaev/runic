@@ -16,6 +16,11 @@ fn assert_aborts(case: &str) {
     assert_eq!(run(case), Some(libc::SIGABRT), "{case} did not abort");
 }
 
+#[cfg(feature = "hardened")]
+fn assert_faults(case: &str) {
+    assert_eq!(run(case), Some(libc::SIGSEGV), "{case} did not fault");
+}
+
 #[test]
 fn null_dealloc_aborts() {
     assert_aborts("null-free");
@@ -45,16 +50,34 @@ fn interior_pointer_realloc_aborts() {
     assert_aborts("large-interior-realloc");
 }
 
-#[cfg(feature = "safe")]
+#[cfg(any(feature = "safe", feature = "hardened"))]
 #[test]
 fn owner_double_free_aborts() {
     assert_aborts("small-double-free");
     assert_aborts("large-double-free");
 }
 
-#[cfg(feature = "safe")]
+#[cfg(any(feature = "safe", feature = "hardened"))]
 #[test]
 fn remote_double_free_aborts() {
     assert_aborts("small-remote-double-free");
     assert_aborts("large-remote-double-free");
+}
+
+#[cfg(feature = "hardened")]
+#[test]
+fn smashed_freelist_link_aborts() {
+    assert_aborts("smashed-link");
+}
+
+#[cfg(feature = "hardened")]
+#[test]
+fn slot_canary_aborts_on_free() {
+    assert_aborts("slot-canary");
+}
+
+#[cfg(feature = "hardened")]
+#[test]
+fn extent_guard_page_faults() {
+    assert_faults("extent-guard");
 }

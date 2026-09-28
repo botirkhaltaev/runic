@@ -154,7 +154,7 @@ builds; no researched allocator keeps `memalign` alignment across `realloc`.
 
 ### 0.11 Hardened
 
-Cookies, canaries, extent guard pages, delayed reuse / quarantine, metadata
+Cookies, canaries, extent guard pages, a 256 KiB delay, metadata
 checksums. Randomized placement only after Safe is stable. Nothing on Fast.
 
 ### 0.12 Reclaim

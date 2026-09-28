@@ -10,6 +10,7 @@ description.workspace = true
 default = []
 c-abi = []
 safe = []
+hardened = []
 
 [lints]
 workspace = true

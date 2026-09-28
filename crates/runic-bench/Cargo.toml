@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+hardened = ["runic/hardened"]
+
 [lints]
 workspace = true
 
@@ -39,6 +42,11 @@ harness = false
 [[bench]]
 name = "global_runic"
 harness = false
+
+[[bench]]
+name = "global_runic_hardened"
+harness = false
+required-features = ["hardened"]
 
 [[bench]]
 name = "global_mimalloc"

@@ -50,6 +50,15 @@ jobs:
               cargo clippy -p runic-core --all-targets --features safe -- -D warnings
               cargo clippy -p runic-alloc --all-targets --features safe -- -D warnings
               cargo clippy -p runic-cabi --all-targets --features safe -- -D warnings
+          - name: Hardened
+            test: |
+              cargo test -p runic-core --features hardened
+              cargo test -p runic-alloc --features hardened
+              cargo test -p runic-cabi --features hardened
+            clippy: |
+              cargo clippy -p runic-core --all-targets --features hardened -- -D warnings
+              cargo clippy -p runic-alloc --all-targets --features hardened -- -D warnings
+              cargo clippy -p runic-cabi --all-targets --features hardened -- -D warnings
 
     steps:
       - name: Checkout

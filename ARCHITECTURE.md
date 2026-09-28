@@ -41,6 +41,7 @@ One word per concept. Code, comments, and docs use these and no synonyms.
 | alloc / allocate / acquire | Frontend `alloc`. A block or extent is `allocate`d. A run or heap is `acquire`d. |
 | extend | Thread fresh blocks of the current run onto its freelist. |
 | free | Owner returns a block or extent. |
+| delay | Freed blocks and extents held back before reuse. Hardened only. |
 | claim | Freer reserves a block or extent for remote admission. |
 | hold | Freer links a claimed block on one of its slots. |
 | slot / chain | A slot is one of the eight `ThreadHeaps` cells. Its chain is the linked claimed blocks, up to `CHAIN_LIMIT`. |
@@ -67,7 +68,7 @@ the payload pages only.
 | Alloc miss | `extend` if the current run is empty; flush every attached heap and take a run it already holds; if none has one, `acquire` on the first heap that can map |
 | Unbound alloc | `bind`, flush, then alloc |
 | Owner free hit | `Run::free`: `locate` then push |
-| Owner double-free | Undefined on Fast; `--features safe` filters the first word, then walks the freelist |
+| Owner double-free | Undefined on Fast; `--features safe` filters the first word, then walks the freelist; `--features hardened` aborts on a bad freelist cookie or slot canary |
 | Interior pointer | `locate` aborts |
 
 `current[class]` is a hint, not ownership. A run may also be on the available
@@ -94,6 +95,20 @@ The default `Keep` policy retains mappings within slot and byte budgets and
 reuses an exact length. `Discard` retains the mapping after `madvise`;
 `Unmap` releases it. Zeroed Keep reuse at or above 64 KiB discards pages;
 smaller mappings use memset.
+
+## Hardened
+
+`--features hardened` is a third build, exclusive with `safe`. Fast calls the
+same methods. Each check lives on the type that owns the word it checks; there
+is no hardened module besides the two types below that exist only in this build.
+
+| Check | Where |
+|-------|--------|
+| Freelist cookie | `Freelist` encodes the block's next word with a per-run cookie. `pop` and `next` abort when it does not decode |
+| Slot canary | `Slot` writes its last word on issue, free, and claim (`Canary`: live, free, claim). `class_for` reserves that word. `Run::free` and `claim` abort when it is wrong |
+| Extent guard pages | `Mapping` maps one `PROT_NONE` page before the payload and one after. `PageMap` publishes only `payload()` |
+| Delay | `Delay`, one per `Heap`. `Run::release` and the extent cache `hold`; the oldest leaves once 256 KiB wait. A run `recall`s its own blocks on a miss or before `discard`. Remote free still claims immediately |
+| Metadata checksum | `Checksum` of the run header (class, owner, base) and the extent slot (owner, mapping). `check_header` on acquire and free, off the alloc hit |
 
 ## Remote free
 

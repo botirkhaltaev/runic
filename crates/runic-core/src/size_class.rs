@@ -1,5 +1,8 @@
 use crate::{layout::LayoutSpec, memory::PAGE_SIZE};
 
+#[cfg(feature = "hardened")]
+use core::mem::size_of;
+
 /// Trusted size class (index into [`SizeClasses::SIZES`]).
 ///
 /// Only [`SizeClasses`] can construct this type, and only for in-range indexes,
@@ -177,6 +180,19 @@ impl SizeClasses {
         table
     }
 
+    /// Bytes the slot must hold. Hardened reserves the last word for a canary.
+    #[inline]
+    pub(super) fn slot_size(size: usize) -> usize {
+        #[cfg(feature = "hardened")]
+        {
+            size.saturating_add(size_of::<usize>())
+        }
+        #[cfg(not(feature = "hardened"))]
+        {
+            size
+        }
+    }
+
     /// Map a layout to a small size class, or `None` for large/over-aligned.
     ///
     /// Default-align (`align < 16`) and `size < SMALL_MAX` is one unsigned
@@ -186,7 +202,7 @@ impl SizeClasses {
     /// and the align-remap table.
     #[inline]
     pub(crate) fn class_for(spec: LayoutSpec) -> Option<SizeClass> {
-        let size = spec.size();
+        let size = Self::slot_size(spec.size());
         let align = spec.align().get();
 
         if (size >> Self::SMALL_MAX.trailing_zeros())
@@ -244,13 +260,14 @@ mod tests {
         for size in 0..=SizeClasses::SMALL_MAX + 1 {
             for align in aligns.clone() {
                 let class = SizeClasses::class_for(spec(size, align)).map(SizeClass::size);
+                let fit = SizeClasses::slot_size(size);
                 let smallest = if align > PAGE_SIZE {
                     None
                 } else {
                     SizeClasses::SIZES
                         .iter()
                         .copied()
-                        .find(|block| *block >= size && block.is_multiple_of(align))
+                        .find(|block| *block >= fit && block.is_multiple_of(align))
                 };
 
                 assert_eq!(class, smallest, "size {size} align {align}");

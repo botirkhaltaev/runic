@@ -52,7 +52,7 @@ impl ExtentHeap {
         let Some(len) = spec.mapping_len(Os::page_size()) else {
             return Ok(None);
         };
-        let Some(mapping) = Os::map_payload(len, self.hints) else {
+        let Some(mapping) = Os::map_extent(len, self.hints) else {
             return Ok(None);
         };
         let Some(ptr) = self.allocate_mapping(spec, heap, mapping, pages) else {
@@ -136,11 +136,47 @@ impl ExtentHeap {
     ) -> Result<(), HeapError> {
         debug_assert!(!extent.is_live());
         extent.heap().sub_extent_live();
+        // Fast retains. Hardened delays while the shared budget allows, and
+        // unmaps once that budget is already full: retaining on top of it
+        // would overflow the cache when the delay list drains.
+        #[cfg(feature = "hardened")]
+        {
+            let delay = extent.heap().delay();
+            let (count, held) = delay.extents();
+            if self.cache.accepts(extent, count, held) {
+                delay.hold_extent(extent);
+                self.drain(delay, pages)
+            } else {
+                self.unmap(extent, pages)
+            }
+        }
+        #[cfg(not(feature = "hardened"))]
+        self.retain(extent, pages)
+    }
+
+    pub(crate) fn retain(
+        &mut self,
+        extent: &'static Extent,
+        pages: &PageMap,
+    ) -> Result<(), HeapError> {
         if self.cache.insert(extent) {
             return Ok(());
         }
 
         self.unmap(extent, pages)
+    }
+
+    /// Release the oldest held frees until the budget is met. Blocks go back
+    /// to their runs; an extent goes back to this cache.
+    #[cfg(feature = "hardened")]
+    fn drain(&mut self, delay: &crate::heap::Delay, pages: &PageMap) -> Result<(), HeapError> {
+        while delay.over_budget() && !delay.release() {
+            let Some(extent) = delay.take_extent() else {
+                break;
+            };
+            self.retain(extent, pages)?;
+        }
+        Ok(())
     }
 
     fn unmap(&mut self, extent: &'static Extent, pages: &PageMap) -> Result<(), HeapError> {
@@ -168,10 +204,15 @@ mod tests {
     use super::super::LAZY_ZERO;
     use super::*;
 
-    static OWNER: Heap = Heap::new(
-        HeapId::new(0, core::num::NonZeroU32::MIN).unwrap(),
-        AllocatorConfig::new(),
-    );
+    fn owner() -> &'static Heap {
+        std::thread_local! {
+            static SLOT: &'static Heap = Box::leak(Box::new(Heap::new(
+                HeapId::new(0, core::num::NonZeroU32::MIN).unwrap(),
+                AllocatorConfig::new(),
+            )));
+        }
+        SLOT.with(|heap| *heap)
+    }
 
     fn layout_spec(size: usize, align: usize) -> LayoutSpec {
         LayoutSpec::from_layout(Layout::from_size_align(size, align).unwrap())
@@ -182,7 +223,7 @@ mod tests {
         let len = spec.mapping_len(Os::page_size()).unwrap();
         let mapping = Os::map(len).unwrap();
 
-        Extent::new(&OWNER, mapping, spec).unwrap()
+        Extent::new(owner(), mapping, spec).unwrap()
     }
 
     #[test]
@@ -211,7 +252,7 @@ mod tests {
         let pages = PageMap::new();
         let spec = layout_spec(128 * 1024, 4096);
         let ptr = heap
-            .allocate(spec, &OWNER, &pages, ExtentInit::Uninit)
+            .allocate(spec, owner(), &pages, ExtentInit::Uninit)
             .unwrap()
             .unwrap();
         let Some(PageOwner::Extent(extent)) = pages.get(ptr) else {
@@ -232,15 +273,15 @@ mod tests {
         let large = layout_spec(256 * 1024, 4096);
 
         let first = heap
-            .allocate(small, &OWNER, &pages, ExtentInit::Uninit)
+            .allocate(small, owner(), &pages, ExtentInit::Uninit)
             .unwrap()
             .unwrap();
         let second = heap
-            .allocate(medium, &OWNER, &pages, ExtentInit::Uninit)
+            .allocate(medium, owner(), &pages, ExtentInit::Uninit)
             .unwrap()
             .unwrap();
         let third = heap
-            .allocate(large, &OWNER, &pages, ExtentInit::Uninit)
+            .allocate(large, owner(), &pages, ExtentInit::Uninit)
             .unwrap()
             .unwrap();
         for ptr in [first, second, third] {
@@ -251,16 +292,18 @@ mod tests {
         }
 
         // Cache holds large, medium, small; each request must unlink its own length.
+        // On hardened the three payloads exceed the delay budget, so the
+        // oldest land in the cache before these lookups.
         assert_eq!(
-            heap.allocate(medium, &OWNER, &pages, ExtentInit::Uninit),
+            heap.allocate(medium, owner(), &pages, ExtentInit::Uninit),
             Ok(Some(second))
         );
         assert_eq!(
-            heap.allocate(small, &OWNER, &pages, ExtentInit::Uninit),
+            heap.allocate(small, owner(), &pages, ExtentInit::Uninit),
             Ok(Some(first))
         );
         assert_eq!(
-            heap.allocate(large, &OWNER, &pages, ExtentInit::Uninit),
+            heap.allocate(large, owner(), &pages, ExtentInit::Uninit),
             Ok(Some(third))
         );
     }
@@ -274,13 +317,13 @@ mod tests {
         let pages = PageMap::new();
         let spec = layout_spec(128 * 1024, 4096);
         let ptrs = [
-            heap.allocate(spec, &OWNER, &pages, ExtentInit::Uninit)
+            heap.allocate(spec, owner(), &pages, ExtentInit::Uninit)
                 .unwrap()
                 .unwrap(),
-            heap.allocate(spec, &OWNER, &pages, ExtentInit::Uninit)
+            heap.allocate(spec, owner(), &pages, ExtentInit::Uninit)
                 .unwrap()
                 .unwrap(),
-            heap.allocate(spec, &OWNER, &pages, ExtentInit::Uninit)
+            heap.allocate(spec, owner(), &pages, ExtentInit::Uninit)
                 .unwrap()
                 .unwrap(),
         ];
@@ -306,13 +349,13 @@ mod tests {
         );
         let pages = PageMap::new();
         let ptrs = [
-            heap.allocate(spec, &OWNER, &pages, ExtentInit::Uninit)
+            heap.allocate(spec, owner(), &pages, ExtentInit::Uninit)
                 .unwrap()
                 .unwrap(),
-            heap.allocate(spec, &OWNER, &pages, ExtentInit::Uninit)
+            heap.allocate(spec, owner(), &pages, ExtentInit::Uninit)
                 .unwrap()
                 .unwrap(),
-            heap.allocate(spec, &OWNER, &pages, ExtentInit::Uninit)
+            heap.allocate(spec, owner(), &pages, ExtentInit::Uninit)
                 .unwrap()
                 .unwrap(),
         ];
@@ -334,7 +377,7 @@ mod tests {
         let pages = PageMap::new();
         let spec = layout_spec(128 * 1024, 4096);
         let first = heap
-            .allocate(spec, &OWNER, &pages, ExtentInit::Uninit)
+            .allocate(spec, owner(), &pages, ExtentInit::Uninit)
             .unwrap()
             .unwrap();
         let Some(PageOwner::Extent(extent)) = pages.get(first) else {
@@ -343,11 +386,14 @@ mod tests {
         heap.free(extent, first, &pages).unwrap();
 
         let reused = heap
-            .allocate(spec, &OWNER, &pages, ExtentInit::Uninit)
+            .allocate(spec, owner(), &pages, ExtentInit::Uninit)
             .unwrap()
             .unwrap();
+        #[cfg(not(feature = "hardened"))]
         assert_eq!(reused, first);
-        assert_eq!(pages.get(reused), Some(PageOwner::Extent(extent)));
+        #[cfg(feature = "hardened")]
+        assert_ne!(reused, first);
+        assert!(pages.get(reused).is_some());
     }
 
     #[test]
@@ -359,7 +405,7 @@ mod tests {
         let pages = PageMap::new();
         let spec = layout_spec(128 * 1024, 4096);
         let ptr = heap
-            .allocate(spec, &OWNER, &pages, ExtentInit::Uninit)
+            .allocate(spec, owner(), &pages, ExtentInit::Uninit)
             .unwrap()
             .unwrap();
         let Some(PageOwner::Extent(extent)) = pages.get(ptr) else {
@@ -378,7 +424,7 @@ mod tests {
         let spec = layout_spec(128 * 1024, 4096);
         let size = 128 * 1024;
         let first = heap
-            .allocate(spec, &OWNER, &pages, ExtentInit::Zeroed)
+            .allocate(spec, owner(), &pages, ExtentInit::Zeroed)
             .unwrap()
             .unwrap();
         // SAFETY: first is valid for size bytes.
@@ -390,10 +436,13 @@ mod tests {
         heap.free(extent, first, &pages).unwrap();
 
         let reused = heap
-            .allocate(spec, &OWNER, &pages, ExtentInit::Zeroed)
+            .allocate(spec, owner(), &pages, ExtentInit::Zeroed)
             .unwrap()
             .unwrap();
+        #[cfg(not(feature = "hardened"))]
         assert_eq!(reused, first);
+        #[cfg(feature = "hardened")]
+        assert_ne!(reused, first);
         // SAFETY: reused is valid for size bytes.
         assert!(
             unsafe { core::slice::from_raw_parts(reused.as_ptr(), size) }
@@ -413,7 +462,7 @@ mod tests {
         let pages = PageMap::new();
         let spec = layout_spec(LAZY_ZERO, 4096);
         let first = heap
-            .allocate(spec, &OWNER, &pages, ExtentInit::Zeroed)
+            .allocate(spec, owner(), &pages, ExtentInit::Zeroed)
             .unwrap()
             .unwrap();
         // SAFETY: first is valid for LAZY_ZERO bytes.
@@ -424,10 +473,13 @@ mod tests {
         heap.free(extent, first, &pages).unwrap();
 
         let second = heap
-            .allocate(spec, &OWNER, &pages, ExtentInit::Zeroed)
+            .allocate(spec, owner(), &pages, ExtentInit::Zeroed)
             .unwrap()
             .unwrap();
+        #[cfg(not(feature = "hardened"))]
         assert_eq!(second, first);
+        #[cfg(feature = "hardened")]
+        assert_ne!(second, first);
         // SAFETY: second is a Zeroed reuse of the same mapping.
         assert!(
             unsafe { core::slice::from_raw_parts(second.as_ptr(), LAZY_ZERO) }
@@ -436,20 +488,29 @@ mod tests {
         );
         // SAFETY: dirty the mapping again so a stale skip_zero would leak.
         unsafe { write_bytes(second.as_ptr(), 0xcd, LAZY_ZERO) };
-        heap.free(extent, second, &pages).unwrap();
+        let Some(PageOwner::Extent(second_extent)) = pages.get(second) else {
+            panic!("expected extent owner");
+        };
+        heap.free(second_extent, second, &pages).unwrap();
 
         let third = heap
-            .allocate(spec, &OWNER, &pages, ExtentInit::Zeroed)
+            .allocate(spec, owner(), &pages, ExtentInit::Zeroed)
             .unwrap()
             .unwrap();
+        #[cfg(not(feature = "hardened"))]
         assert_eq!(third, first);
+        #[cfg(feature = "hardened")]
+        assert_ne!(third, first);
         // SAFETY: third must be zero even after a prior Keep lazy-zero discard.
         assert!(
             unsafe { core::slice::from_raw_parts(third.as_ptr(), LAZY_ZERO) }
                 .iter()
                 .all(|&byte| byte == 0)
         );
-        heap.free(extent, third, &pages).unwrap();
+        let Some(PageOwner::Extent(third_extent)) = pages.get(third) else {
+            panic!("expected extent owner");
+        };
+        heap.free(third_extent, third, &pages).unwrap();
     }
 
     #[test]
@@ -462,7 +523,7 @@ mod tests {
         let spec = layout_spec(128 * 1024, 4096);
         let size = 128 * 1024;
         let first = heap
-            .allocate(spec, &OWNER, &pages, ExtentInit::Zeroed)
+            .allocate(spec, owner(), &pages, ExtentInit::Zeroed)
             .unwrap()
             .unwrap();
         // SAFETY: first is valid for size bytes.
@@ -475,10 +536,13 @@ mod tests {
         assert_eq!(pages.get(first), Some(PageOwner::Extent(extent)));
 
         let reused = heap
-            .allocate(spec, &OWNER, &pages, ExtentInit::Zeroed)
+            .allocate(spec, owner(), &pages, ExtentInit::Zeroed)
             .unwrap()
             .unwrap();
+        #[cfg(not(feature = "hardened"))]
         assert_eq!(reused, first);
+        #[cfg(feature = "hardened")]
+        assert_ne!(reused, first);
         // SAFETY: reused is valid for size bytes; Discard must yield zeros without Keep memset.
         assert!(
             unsafe { core::slice::from_raw_parts(reused.as_ptr(), size) }
@@ -499,7 +563,7 @@ mod tests {
         let spec = layout_spec(128 * 1024, 4096);
         let size = 128 * 1024;
         let first = heap
-            .allocate(spec, &OWNER, &pages, ExtentInit::Uninit)
+            .allocate(spec, owner(), &pages, ExtentInit::Uninit)
             .unwrap()
             .unwrap();
         // SAFETY: first is valid for size bytes.
@@ -511,16 +575,21 @@ mod tests {
         heap.free(extent, first, &pages).unwrap();
 
         let reused = heap
-            .allocate(spec, &OWNER, &pages, ExtentInit::Uninit)
+            .allocate(spec, owner(), &pages, ExtentInit::Uninit)
             .unwrap()
             .unwrap();
-        assert_eq!(reused, first);
-        // SAFETY: reused is valid for size bytes.
-        assert!(
-            unsafe { core::slice::from_raw_parts(reused.as_ptr(), size) }
-                .iter()
-                .all(|&byte| byte == 0xcd)
-        );
+        #[cfg(not(feature = "hardened"))]
+        {
+            assert_eq!(reused, first);
+            // SAFETY: reused is valid for size bytes.
+            assert!(
+                unsafe { core::slice::from_raw_parts(reused.as_ptr(), size) }
+                    .iter()
+                    .all(|&byte| byte == 0xcd)
+            );
+        }
+        #[cfg(feature = "hardened")]
+        assert_ne!(reused, first);
 
         let Some(PageOwner::Extent(extent)) = pages.get(reused) else {
             panic!("expected extent owner");

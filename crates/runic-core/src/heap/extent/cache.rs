@@ -28,7 +28,7 @@ impl ExtentCache {
     pub(crate) fn take(&mut self, len: usize) -> Option<&'static Extent> {
         let mut cursor = self.extents.cursor_front_mut();
         while let Some(extent) = cursor.current() {
-            if extent.mapping().len().get() == len {
+            if extent.payload().len() == len {
                 cursor.remove_current();
                 debug_assert!(self.count >= 1);
                 debug_assert!(self.retained_bytes >= len);
@@ -42,18 +42,28 @@ impl ExtentCache {
     }
 
     fn will_retain(&self, len: usize) -> bool {
+        self.accepts_len(len, 0, 0)
+    }
+
+    /// `extra` is extents already waiting in the delay, counted against the same budget.
+    #[cfg(feature = "hardened")]
+    pub(super) fn accepts(&self, extent: &Extent, extra_count: usize, extra_bytes: usize) -> bool {
+        self.accepts_len(extent.payload().len(), extra_count, extra_bytes)
+    }
+
+    fn accepts_len(&self, len: usize, extra_count: usize, extra_bytes: usize) -> bool {
         if !self.config.policy().retains() {
             return false;
         }
 
         let budget = self.config.budget();
-        self.count < budget.slots()
+        self.count + extra_count < budget.slots()
             && budget.bytes() >= len
-            && self.retained_bytes <= budget.bytes() - len
+            && self.retained_bytes + extra_bytes <= budget.bytes() - len
     }
 
     pub(crate) fn insert(&mut self, extent: &'static Extent) -> bool {
-        let len = extent.mapping().len().get();
+        let len = extent.payload().len();
         if !self.will_retain(len) {
             return false;
         }

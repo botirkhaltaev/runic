@@ -15,6 +15,8 @@ use crate::{
     size_class::SizeClasses,
 };
 
+#[cfg(feature = "hardened")]
+use super::checksum::Checksum;
 use super::list::{self, Linked as ListLinked};
 use super::{
     Heap,
@@ -40,7 +42,7 @@ pub(crate) enum ExtentInit {
 pub(crate) enum ExtentError {
     InvalidPointer,
     /// Second `claim` or `accept`. Fast leaves that free undefined.
-    #[cfg(feature = "safe")]
+    #[cfg(any(feature = "safe", feature = "hardened"))]
     DoubleFree,
 }
 
@@ -89,6 +91,9 @@ pub(crate) struct Extent {
     inbox: Link<Extent>,
     /// Cache, unmapped-slot, or accepted list. Owner-exclusive; a slot is on at most one.
     slot: list::Link<Extent>,
+    /// Owner, mapping base, and mapping length. Checked on reuse and free.
+    #[cfg(feature = "hardened")]
+    checksum: Cell<Checksum>,
 }
 
 impl PartialEq for Extent {
@@ -125,6 +130,8 @@ impl ListLinked for Extent {
 impl Extent {
     pub(crate) fn new(heap: &'static Heap, mapping: Mapping, spec: LayoutSpec) -> Option<Self> {
         let range = mapping.place(spec)?;
+        #[cfg(feature = "hardened")]
+        let checksum = Checksum::of(Self::digest(heap, &mapping));
         Some(Self {
             heap,
             mapping: UnsafeCell::new(Some(mapping)),
@@ -134,7 +141,48 @@ impl Extent {
             clean: Cell::new(false),
             inbox: Link::new(),
             slot: list::Link::new(),
+            #[cfg(feature = "hardened")]
+            checksum: Cell::new(checksum),
         })
+    }
+
+    /// User bytes. Guard pages stay outside this range.
+    pub(crate) fn payload(&self) -> AddressRange {
+        self.mapping().payload()
+    }
+
+    /// The slot words the checksum covers.
+    #[cfg(feature = "hardened")]
+    fn digest(heap: &Heap, mapping: &Mapping) -> [usize; 3] {
+        [
+            core::ptr::from_ref(heap).addr(),
+            mapping.base().as_ptr().addr(),
+            mapping.len().get(),
+        ]
+    }
+
+    /// Abort when the slot no longer matches its mapping. No-op on Fast.
+    #[inline]
+    pub(crate) fn check_header(&self) {
+        #[cfg(feature = "hardened")]
+        if self.checksum.get() != Checksum::of(Self::digest(self.heap, self.mapping())) {
+            Allocator::abort();
+        }
+        #[cfg(not(feature = "hardened"))]
+        {
+            let _ = self;
+        }
+    }
+
+    /// Record `mapping` as this slot's current mapping.
+    fn seal(&self, mapping: &Mapping) {
+        #[cfg(feature = "hardened")]
+        self.checksum
+            .set(Checksum::of(Self::digest(self.heap, mapping)));
+        #[cfg(not(feature = "hardened"))]
+        {
+            let _ = (self, mapping);
+        }
     }
 
     pub(crate) const fn heap(&self) -> &'static Heap {
@@ -144,7 +192,7 @@ impl Extent {
     /// `MADV_DONTNEED` the mapping. Owner-exclusive; records whether advise succeeded.
     #[cold]
     pub(crate) fn discard(&self) {
-        self.clean.set(Os::discard(self.mapping().range()));
+        self.clean.set(Os::discard(self.payload()));
     }
 
     pub(crate) fn ptr(&self) -> NonNull<u8> {
@@ -189,7 +237,7 @@ impl Extent {
         }
 
         let requested = AddressRange::new(ptr, spec.size().max(1));
-        if !self.mapping().range().contains(requested) {
+        if !self.payload().contains(requested) {
             return Ok(false);
         }
 
@@ -216,6 +264,7 @@ impl Extent {
 
     pub(super) fn remount(&self, mapping: Mapping, spec: LayoutSpec) -> Option<NonNull<u8>> {
         let range = mapping.place(spec)?;
+        self.seal(&mapping);
         // SAFETY: unmapped slot is owner-exclusive; previous mapping was taken.
         unsafe {
             *self.mapping.get() = Some(mapping);
@@ -246,6 +295,7 @@ impl Extent {
     /// which the allocator aborts on, so the extent never enters the cache
     /// twice. Remote admission is `claim` / `accept`.
     pub(crate) fn free(&self, ptr: NonNull<u8>) -> Result<(), ExtentError> {
+        self.check_header();
         self.transition(ptr, ExtentState::Allocated, ExtentState::Free)
     }
 
@@ -259,6 +309,7 @@ impl Extent {
 
     /// Owner: exact pointer, `Claimed → Free`, then store the inbox link idle.
     pub(crate) fn accept(&self, ptr: NonNull<u8>) -> Result<(), ExtentError> {
+        self.check_header();
         self.transition(ptr, ExtentState::Claimed, ExtentState::Free)?;
         self.inbox.idle();
         Ok(())
@@ -278,7 +329,7 @@ impl Extent {
         to: ExtentState,
     ) -> Result<(), ExtentError> {
         self.validate_exact(ptr)?;
-        #[cfg(feature = "safe")]
+        #[cfg(any(feature = "safe", feature = "hardened"))]
         {
             self.state
                 .compare_exchange(from.raw(), to.raw(), Ordering::Relaxed, Ordering::Relaxed)
@@ -288,7 +339,7 @@ impl Extent {
                     Some(ExtentState::Allocated) | None => ExtentError::InvalidPointer,
                 })
         }
-        #[cfg(not(feature = "safe"))]
+        #[cfg(not(any(feature = "safe", feature = "hardened")))]
         {
             debug_assert_eq!(self.state.load(Ordering::Relaxed), from.raw());
             self.state.store(to.raw(), Ordering::Relaxed);
@@ -300,6 +351,7 @@ impl Extent {
     /// reuse: Discard-insert is already clean; Keep discards when `size ≥ 64 KiB`
     /// or memsets. Allocate-time Keep discard does not set [`Self::clean`].
     pub(crate) fn reuse(&self, spec: LayoutSpec, init: ExtentInit) -> Option<NonNull<u8>> {
+        self.check_header();
         if self.load_state().ok()? != ExtentState::Free {
             return None;
         }
@@ -313,7 +365,7 @@ impl Extent {
     }
 
     fn zero_user(&self, spec: LayoutSpec) {
-        let zeroed = spec.size() >= LAZY_ZERO && Os::discard(self.mapping().range());
+        let zeroed = spec.size() >= LAZY_ZERO && Os::discard(self.payload());
         if !zeroed {
             // SAFETY: `reuse` just allocated this user range for `spec`.
             unsafe { write_bytes(self.ptr().as_ptr(), 0, spec.size()) };
@@ -345,10 +397,15 @@ mod tests {
 
     use super::*;
 
-    static OWNER: Heap = Heap::new(
-        HeapId::new(0, NonZeroU32::MIN).unwrap(),
-        AllocatorConfig::new(),
-    );
+    fn owner() -> &'static Heap {
+        std::thread_local! {
+            static SLOT: &'static Heap = Box::leak(Box::new(Heap::new(
+                HeapId::new(0, NonZeroU32::MIN).unwrap(),
+                AllocatorConfig::new(),
+            )));
+        }
+        SLOT.with(|heap| *heap)
+    }
 
     fn layout_spec(size: usize, align: usize) -> LayoutSpec {
         LayoutSpec::from_layout(Layout::from_size_align(size, align).unwrap())
@@ -358,13 +415,13 @@ mod tests {
     fn extent_equality_is_identity() {
         let spec = layout_spec(128 * 1024, 4096);
         let first = Extent::new(
-            &OWNER,
+            owner(),
             Os::map(spec.mapping_len(Os::page_size()).unwrap()).unwrap(),
             spec,
         )
         .unwrap();
         let second = Extent::new(
-            &OWNER,
+            owner(),
             Os::map(spec.mapping_len(Os::page_size()).unwrap()).unwrap(),
             spec,
         )
@@ -379,7 +436,7 @@ mod tests {
         let spec = layout_spec(128 * 1024, 4096);
         let mapping = Os::map(spec.mapping_len(Os::page_size()).unwrap()).unwrap();
         let mapping_range = mapping.range();
-        let extent = Extent::new(&OWNER, mapping, spec).unwrap();
+        let extent = Extent::new(owner(), mapping, spec).unwrap();
 
         assert!(spec.is_addr_aligned(extent.ptr().as_ptr().addr()));
         assert_eq!(extent.len.get(), spec.size());
@@ -390,7 +447,7 @@ mod tests {
     fn extent_rejects_interior_pointer() {
         let spec = layout_spec(128 * 1024, 4096);
         let mapping = Os::map(spec.mapping_len(Os::page_size()).unwrap()).unwrap();
-        let extent = Extent::new(&OWNER, mapping, spec).unwrap();
+        let extent = Extent::new(owner(), mapping, spec).unwrap();
         let interior = NonNull::new(extent.ptr().as_ptr().wrapping_add(1)).unwrap();
 
         assert!(!extent.starts_at(interior));
@@ -401,7 +458,7 @@ mod tests {
     fn extent_accepts_exact_pointer() {
         let spec = layout_spec(128 * 1024, 4096);
         let mapping = Os::map(spec.mapping_len(Os::page_size()).unwrap()).unwrap();
-        let extent = Extent::new(&OWNER, mapping, spec).unwrap();
+        let extent = Extent::new(owner(), mapping, spec).unwrap();
 
         assert!(extent.starts_at(extent.ptr()));
         assert_eq!(extent.free(extent.ptr()), Ok(()));
@@ -411,19 +468,19 @@ mod tests {
     fn extent_rejects_interior_claim_without_state_change() {
         let spec = layout_spec(128 * 1024, 4096);
         let mapping = Os::map(spec.mapping_len(Os::page_size()).unwrap()).unwrap();
-        let extent = Extent::new(&OWNER, mapping, spec).unwrap();
+        let extent = Extent::new(owner(), mapping, spec).unwrap();
         let interior = NonNull::new(extent.ptr().as_ptr().wrapping_add(1)).unwrap();
 
         assert_eq!(extent.claim(interior), Err(ExtentError::InvalidPointer));
         assert_eq!(extent.free(extent.ptr()), Ok(()));
     }
 
-    #[cfg(feature = "safe")]
+    #[cfg(any(feature = "safe", feature = "hardened"))]
     #[test]
     fn extent_rejects_second_claim() {
         let spec = layout_spec(128 * 1024, 4096);
         let mapping = Os::map(spec.mapping_len(Os::page_size()).unwrap()).unwrap();
-        let extent = Extent::new(&OWNER, mapping, spec).unwrap();
+        let extent = Extent::new(owner(), mapping, spec).unwrap();
         let ptr = extent.ptr();
 
         assert_eq!(extent.claim(ptr), Ok(()));
@@ -436,7 +493,7 @@ mod tests {
     fn extent_resizes_in_place_for_smaller_layout() {
         let spec = layout_spec(128 * 1024, 4096);
         let mapping = Os::map(spec.mapping_len(Os::page_size()).unwrap()).unwrap();
-        let extent = Extent::new(&OWNER, mapping, spec).unwrap();
+        let extent = Extent::new(owner(), mapping, spec).unwrap();
         let smaller = layout_spec(64 * 1024, 4096);
 
         assert_eq!(extent.resize_in_place(extent.ptr(), smaller), Ok(true));
@@ -446,7 +503,7 @@ mod tests {
     fn extent_does_not_resize_in_place_beyond_mapping() {
         let spec = layout_spec(128 * 1024, 4096);
         let mapping = Os::map(spec.mapping_len(Os::page_size()).unwrap()).unwrap();
-        let extent = Extent::new(&OWNER, mapping, spec).unwrap();
+        let extent = Extent::new(owner(), mapping, spec).unwrap();
         let larger = layout_spec(256 * 1024, 4096);
 
         assert_eq!(extent.resize_in_place(extent.ptr(), larger), Ok(false));
@@ -456,7 +513,7 @@ mod tests {
     fn extent_grows_in_place_within_larger_mapping() {
         let spec = layout_spec(128 * 1024, 4096);
         let mapping = Os::map(512 * 1024).unwrap();
-        let extent = Extent::new(&OWNER, mapping, spec).unwrap();
+        let extent = Extent::new(owner(), mapping, spec).unwrap();
         let larger = layout_spec(256 * 1024, 4096);
 
         assert_eq!(extent.resize_in_place(extent.ptr(), larger), Ok(true));
@@ -467,7 +524,7 @@ mod tests {
     fn extent_grows_in_place_when_page_range_does_not_change() {
         let spec = layout_spec(33 * 1024, 8);
         let mapping = Os::map(spec.mapping_len(Os::page_size()).unwrap()).unwrap();
-        let extent = Extent::new(&OWNER, mapping, spec).unwrap();
+        let extent = Extent::new(owner(), mapping, spec).unwrap();
         let larger = layout_spec(36 * 1024, 8);
 
         assert_eq!(extent.resize_in_place(extent.ptr(), larger), Ok(true));
@@ -478,10 +535,64 @@ mod tests {
     fn extent_does_not_resize_in_place_to_size_class() {
         let spec = layout_spec(64 * 1024, 8);
         let mapping = Os::map(spec.mapping_len(Os::page_size()).unwrap()).unwrap();
-        let extent = Extent::new(&OWNER, mapping, spec).unwrap();
+        let extent = Extent::new(owner(), mapping, spec).unwrap();
         let small = layout_spec(4096, 8);
 
         assert_eq!(extent.resize_in_place(extent.ptr(), small), Ok(false));
         assert_eq!(extent.len.get(), 64 * 1024);
+    }
+
+    #[cfg(feature = "hardened")]
+    fn child_aborts(test: &str, var: &str, body: fn()) {
+        use std::os::unix::process::ExitStatusExt;
+
+        if std::env::var_os(var).is_some() {
+            body();
+            std::process::exit(0);
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--test-threads=1"])
+            .env(var, "1")
+            .status()
+            .unwrap();
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGABRT),
+            "{test} exited with {status}"
+        );
+    }
+
+    #[cfg(feature = "hardened")]
+    #[test]
+    fn damaged_extent_checksum_aborts_on_free() {
+        child_aborts(
+            "heap::extent::tests::damaged_extent_checksum_aborts_on_free",
+            "RUNIC_DAMAGE_EXTENT_FREE",
+            || {
+                let spec = layout_spec(128 * 1024, 4096);
+                let mapping = Os::map(spec.mapping_len(Os::page_size()).unwrap()).unwrap();
+                let extent = Extent::new(owner(), mapping, spec).unwrap();
+                extent.checksum.set(Checksum::damaged());
+                let _ = extent.free(extent.ptr());
+            },
+        );
+    }
+
+    #[cfg(feature = "hardened")]
+    #[test]
+    fn damaged_extent_checksum_aborts_on_reuse() {
+        child_aborts(
+            "heap::extent::tests::damaged_extent_checksum_aborts_on_reuse",
+            "RUNIC_DAMAGE_EXTENT_REUSE",
+            || {
+                let spec = layout_spec(128 * 1024, 4096);
+                let mapping = Os::map(spec.mapping_len(Os::page_size()).unwrap()).unwrap();
+                let extent = Extent::new(owner(), mapping, spec).unwrap();
+                extent.free(extent.ptr()).unwrap();
+                extent.checksum.set(Checksum::damaged());
+                let _ = extent.reuse(spec, ExtentInit::Uninit);
+            },
+        );
     }
 }
